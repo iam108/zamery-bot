@@ -1,0 +1,26 @@
+{
+  "name": "zamery-bot",
+  "version": "1.0.0",
+  "description": "Telegram бот для замерщиков",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
+    "migrate": "node src/db/migrate.js"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "pg": "^8.11.3",
+    "express": "^4.18.2",
+    "express-session": "^1.17.3",
+    "dotenv": "^16.3.1",
+    "date-fns": "^3.3.1",
+    "node-cron": "^3.0.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
