@@ -19,7 +19,7 @@ async function main() {
   const app = express();
   setupWeb(app);
 
-  app.listen(PORT, () => {
+  
     console.log(`🌐 Веб-сервер запущен на порту ${PORT}`);
   });
 
@@ -27,6 +27,7 @@ async function main() {
 
   if (process.env.NODE_ENV === 'production') {
     const webhookPath = `/webhook/${process.env.BOT_TOKEN}`;
+app.listen(PORT, '0.0.0.0', () => {
     await bot.telegram.setWebhook(`${WEBAPP_URL}${webhookPath}`);
     app.use(bot.webhookCallback(webhookPath));
     console.log('🤖 Бот запущен в режиме webhook');
