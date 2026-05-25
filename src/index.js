@@ -5,43 +5,40 @@ const { setupWeb } = require('./web/index');
 const pool = require('./db/pool');
 
 const PORT = process.env.PORT || 3000;
-const WEBAPP_URL = process.env.WEBAPP_URL;
 
 async function main() {
   try {
     await pool.query('SELECT 1');
-    console.log('✅ PostgreSQL подключён');
+    console.log('PostgreSQL ok');
   } catch (err) {
-    console.error('❌ Ошибка подключения к PostgreSQL:', err.message);
+    console.error('DB error:', err.message);
     process.exit(1);
   }
 
   const app = express();
   setupWeb(app);
-
-  
-    console.log(`🌐 Веб-сервер запущен на порту ${PORT}`);
-  });
-
   const bot = setupBot();
 
   if (process.env.NODE_ENV === 'production') {
-    const webhookPath = `/webhook/${process.env.BOT_TOKEN}`;
-app.listen(PORT, '0.0.0.0', () => {
-    await bot.telegram.setWebhook(`${WEBAPP_URL}${webhookPath}`);
+    const webhookPath = '/webhook/' + process.env.BOT_TOKEN;
+    await bot.telegram.setWebhook(process.env.WEBAPP_URL + webhookPath);
     app.use(bot.webhookCallback(webhookPath));
-    console.log('🤖 Бот запущен в режиме webhook');
+    console.log('webhook mode');
   } else {
     await bot.telegram.deleteWebhook();
     bot.launch();
-    console.log('🤖 Бот запущен в режиме polling (dev)');
+    console.log('polling mode');
   }
 
-  process.once('SIGINT', () => bot.stop('SIGINT'));
-  process.once('SIGTERM', () => bot.stop('SIGTERM'));
+  app.listen(PORT, '0.0.0.0', function() {
+    console.log('Server on port ' + PORT);
+  });
+
+  process.once('SIGINT', function() { bot.stop('SIGINT'); });
+  process.once('SIGTERM', function() { bot.stop('SIGTERM'); });
 }
 
-main().catch(err => {
-  console.error('Fatal error:', err);
+main().catch(function(err) {
+  console.error(err);
   process.exit(1);
 });
