@@ -16,19 +16,19 @@ async function main() {
   }
 
   const app = express();
-  setupWeb(app);
   const bot = setupBot();
 
   if (process.env.NODE_ENV === 'production') {
     const webhookPath = '/webhook/' + process.env.BOT_TOKEN;
     await bot.telegram.setWebhook(process.env.WEBAPP_URL + webhookPath);
     app.use(bot.webhookCallback(webhookPath));
-    console.log('webhook mode');
+    console.log('webhook registered: ' + webhookPath);
   } else {
     await bot.telegram.deleteWebhook();
     bot.launch();
-    console.log('polling mode');
   }
+
+  setupWeb(app);
 
   app.listen(PORT, '0.0.0.0', function() {
     console.log('Server on port ' + PORT);
