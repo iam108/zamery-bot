@@ -64,4 +64,4 @@ async function migrate() {
   }
 }
 
-migrate().catch(() => process.exit(1));
+migrate().then(() => process.exit(0)).catch(() => process.exit(1));
