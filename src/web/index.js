@@ -63,7 +63,7 @@ function setupWeb(app) {
       const order = await createOrder(data);
       await addLog(order.id, 'created', String(data.tg_user_id || 'web'), 'Заявка создана через Mini App');
 
-      const { formatOrderMessage } = require('./formatter');
+      const { formatOrderMessage } = require('../bot/formatter');
       const botInstance = require('../bot/instance');
       const text = formatOrderMessage(order);
       const msg = await botInstance.telegram.sendMessage(process.env.GROUP_CHAT_ID, text, {
