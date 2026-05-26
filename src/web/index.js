@@ -1,7 +1,7 @@
 const express = require('express');
 const session = require('express-session');
 const path = require('path');
-const { getOrders, getOrderById, updateOrderStatus, getOrderLogs, getStats } = require('../db/queries');
+const { getOrders, getOrderById, updateOrderStatus, getOrderLogs, getStats, createOrder, addLog, setTelegramMsgId } = require('../db/queries');
 
 function setupWeb(app) {
   app.use(express.json());
@@ -54,6 +54,45 @@ function setupWeb(app) {
     const { id, status } = req.body;
     const order = await updateOrderStatus(id, status, 'admin-web');
     res.json({ ok: true, order });
+  });
+
+  // API для Mini App формы заявки
+  app.post('/api/order', async (req, res) => {
+    try {
+      const data = req.body;
+      const order = await createOrder(data);
+      await addLog(order.id, 'created', String(data.tg_user_id || 'web'), 'Заявка создана через Mini App');
+
+      const { formatOrderMessage } = require('./formatter');
+      const botInstance = require('../bot/instance');
+      const text = formatOrderMessage(order);
+      const msg = await botInstance.telegram.sendMessage(process.env.GROUP_CHAT_ID, text, {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[
+          { text: '🔧 Взять в работу', callback_data: 'status:in_progress:' + order.id },
+          { text: '✅ Готово', callback_data: 'status:done:' + order.id },
+        ]]}
+      });
+      await setTelegramMsgId(order.id, msg.message_id);
+      res.json({ ok: true, id: order.id });
+    } catch (e) {
+      console.error('api/order error:', e);
+      res.json({ ok: false, error: e.message });
+    }
+  });
+
+  // API для отчёта аудитора
+  app.post('/api/audit', async (req, res) => {
+    try {
+      const data = req.body;
+      const { handleAuditReport } = require('../bot/audit-handler');
+      const botInstance = require('../bot/instance');
+      await handleAuditReport({ telegram: botInstance.telegram, reply: async () => {} }, data);
+      res.json({ ok: true });
+    } catch (e) {
+      console.error('api/audit error:', e);
+      res.json({ ok: false, error: e.message });
+    }
   });
 
   app.get('/form', (req, res) => res.send(miniAppForm()));
@@ -272,7 +311,6 @@ function miniAppForm() {
   .submit-btn:disabled{opacity:.5}
 </style></head><body>
 <h1>📋 Новая заявка</h1>
-
 <div class="field">
   <label>Адрес объекта <span class="required">*</span></label>
   <input id="address" type="text" placeholder="Город, улица, дом">
@@ -301,17 +339,12 @@ function miniAppForm() {
   <label>Название объекта</label>
   <input id="object_name" type="text" placeholder="Например: Кафе «Весна»">
 </div>
-
 <div class="field">
-  <div class="toggle-row" id="video-row" onclick="toggleVideo()">
+  <div class="toggle-row" onclick="toggleVideo()">
     <span>🎥 Нужно видео</span>
-    <div class="toggle">
-      <input type="checkbox" id="has_video">
-      <span class="slider"></span>
-    </div>
+    <div class="toggle"><input type="checkbox" id="has_video"><span class="slider"></span></div>
   </div>
 </div>
-
 <div class="field">
   <label>Информация о зонах</label>
   <textarea id="zones_info" placeholder="Описание зон, площадь, особенности..."></textarea>
@@ -324,51 +357,52 @@ function miniAppForm() {
   <label>Контакты и доп. информация</label>
   <textarea id="contacts" placeholder="Телефон, имя контакта, сумма, примечания..."></textarea>
 </div>
-
 <div class="bottom">
   <button class="submit-btn" id="submit-btn" onclick="submitForm()">Отправить заявку</button>
 </div>
-
 <script>
 var tg = window.Telegram.WebApp;
-tg.ready();
-tg.expand();
-
+tg.ready(); tg.expand();
 function toggleVideo() {
   var cb = document.getElementById('has_video');
   cb.checked = !cb.checked;
 }
-
-function submitForm() {
+async function submitForm() {
   var valid = true;
   ['address','owner_name','object_type'].forEach(function(id) {
     var el = document.getElementById(id);
     var err = document.getElementById('err-' + id);
-    if (!el.value.trim()) {
-      err.classList.add('show');
-      el.style.borderColor = '#f87171';
-      valid = false;
-    } else {
-      err.classList.remove('show');
-      el.style.borderColor = 'transparent';
-    }
+    if (!el.value.trim()) { err.classList.add('show'); el.style.borderColor='#f87171'; valid=false; }
+    else { err.classList.remove('show'); el.style.borderColor='transparent'; }
   });
   if (!valid) return;
-
   var btn = document.getElementById('submit-btn');
-  btn.disabled = true;
-  btn.textContent = 'Отправляем...';
-
-  tg.sendData(JSON.stringify({
-    address:     document.getElementById('address').value.trim(),
-    owner_name:  document.getElementById('owner_name').value.trim(),
-    object_type: document.getElementById('object_type').value,
-    object_name: document.getElementById('object_name').value.trim(),
-    has_video:   document.getElementById('has_video').checked,
-    zones_info:  document.getElementById('zones_info').value.trim(),
-    deadline:    document.getElementById('deadline').value || null,
-    contacts:    document.getElementById('contacts').value.trim(),
-  }));
+  btn.disabled = true; btn.textContent = 'Отправляем...';
+  try {
+    var r = await fetch('/api/order', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        address:     document.getElementById('address').value.trim(),
+        owner_name:  document.getElementById('owner_name').value.trim(),
+        object_type: document.getElementById('object_type').value,
+        object_name: document.getElementById('object_name').value.trim(),
+        has_video:   document.getElementById('has_video').checked,
+        zones_info:  document.getElementById('zones_info').value.trim(),
+        deadline:    document.getElementById('deadline').value || null,
+        contacts:    document.getElementById('contacts').value.trim(),
+        tg_user_id:  tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user.id : null,
+      }),
+    });
+    var result = await r.json();
+    if (result.ok) {
+      btn.textContent = '✅ Заявка отправлена!';
+      setTimeout(function() { tg.close(); }, 1500);
+    } else { throw new Error(result.error || 'Ошибка сервера'); }
+  } catch(e) {
+    btn.disabled = false; btn.textContent = 'Отправить заявку';
+    alert('Ошибка: ' + e.message);
+  }
 }
 <\/script></body></html>`;
 }
