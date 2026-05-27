@@ -1,10 +1,10 @@
-const { Markup } = require('telegraf');
+const { Telegraf, Markup } = require('telegraf');
 const { createOrder, updateOrderStatus, getOrderById, addLog, getStats, setTelegramMsgId } = require('../db/queries');
 const { formatOrderMessage, STATUS_EMOJI } = require('./formatter');
 const { handleAuditReport } = require('./audit-handler');
 
 function setupBot() {
-  const bot = require('./instance');
+  const bot = new Telegraf(process.env.BOT_TOKEN);
   const GROUP_ID = process.env.GROUP_CHAT_ID;
   const WEBAPP_URL = process.env.WEBAPP_URL;
 
