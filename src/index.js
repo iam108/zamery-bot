@@ -21,13 +21,19 @@ async function main() {
   if (process.env.NODE_ENV === 'production') {
     const webhookPath = '/webhook/' + process.env.BOT_TOKEN;
     await bot.telegram.setWebhook(process.env.WEBAPP_URL + webhookPath);
-    app.use(bot.webhookCallback(webhookPath));
+
+    // Webhook роут БЕЗ json middleware — Telegraf сам парсит
+    app.use(webhookPath, bot.webhookCallback(webhookPath));
     console.log('webhook mode');
   } else {
     await bot.telegram.deleteWebhook();
     bot.launch();
     console.log('polling mode');
   }
+
+  // JSON middleware с большим лимитом — ПОСЛЕ webhook роута
+  app.use(express.json({ limit: '50mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
   setupWeb(app);
 
