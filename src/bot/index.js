@@ -50,16 +50,13 @@ function setupBot() {
     try {
       const raw = ctx.webAppData && ctx.webAppData.data && ctx.webAppData.data.text();
       if (!raw) return;
-
       const data = JSON.parse(raw);
 
-      // Отчёт аудитора
       if (data.type === 'audit') {
         await handleAuditReport(ctx, data);
         return;
       }
 
-      // Заявка на замер
       data.submitted_by = ctx.from.id;
       const order = await createOrder(data);
       await addLog(order.id, 'created', String(ctx.from.id), 'Заявка создана через Mini App');
@@ -79,12 +76,30 @@ function setupBot() {
           ]],
         },
       });
-
       await setTelegramMsgId(order.id, msg.message_id);
 
     } catch (err) {
       console.error('web_app_data error:', err);
       await ctx.reply('❌ Ошибка при сохранении. Попробуйте ещё раз.');
+    }
+  });
+
+  // Кнопка "Написать отчёт" — отправляем ссылку в личку аудитору
+  bot.action(/^report:(\d+)$/, async (ctx) => {
+    const orderId = ctx.match[1];
+    const userId = ctx.from.id;
+    const auditUrl = WEBAPP_URL + '/audit?order_id=' + orderId;
+
+    try {
+      await ctx.telegram.sendMessage(userId,
+        '📋 Заполни отчёт по заявке #' + orderId + ':',
+        Markup.inlineKeyboard([
+          Markup.button.webApp('🔍 Открыть форму отчёта', auditUrl),
+        ])
+      );
+      await ctx.answerCbQuery('Ссылка отправлена в личку 👆');
+    } catch (e) {
+      await ctx.answerCbQuery('Напиши боту в личку сначала — нажми /start');
     }
   });
 
@@ -99,13 +114,22 @@ function setupBot() {
 
       const text = formatOrderMessage(order);
       let buttons = [];
+
       if (newStatus === 'in_progress') {
         buttons = [[
           { text: '✅ Готово', callback_data: 'status:done:' + orderId },
           { text: '❌ Отменить', callback_data: 'status:cancelled:' + orderId },
+        ], [
+          { text: '📋 Написать отчёт', callback_data: 'report:' + orderId },
         ]];
       } else if (newStatus === 'new') {
-        buttons = [[{ text: '🔧 Взять в работу', callback_data: 'status:in_progress:' + orderId }]];
+        buttons = [[
+          { text: '🔧 Взять в работу', callback_data: 'status:in_progress:' + orderId },
+        ]];
+      } else if (newStatus === 'done') {
+        buttons = [[
+          { text: '📋 Написать отчёт', callback_data: 'report:' + orderId },
+        ]];
       }
 
       await ctx.editMessageText(text, {
