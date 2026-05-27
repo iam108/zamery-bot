@@ -4,8 +4,7 @@ const path = require('path');
 const { getOrders, getOrderById, updateOrderStatus, getOrderLogs, getStats, createOrder, addLog, setTelegramMsgId } = require('../db/queries');
 
 function setupWeb(app) {
-  app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+  
 
   app.get('/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
   app.use(express.static(path.join(__dirname, '../../public')));
