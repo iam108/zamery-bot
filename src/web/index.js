@@ -83,17 +83,22 @@ function setupWeb(app) {
 
   // API для отчёта аудитора
   app.post('/api/audit', async (req, res) => {
-    try {
-      const data = req.body;
-      const { handleAuditReport } = require('../bot/audit-handler');
-      const botInstance = require('../bot/instance');
-      await handleAuditReport({ telegram: botInstance.telegram, reply: async () => {} }, data);
-      res.json({ ok: true });
-    } catch (e) {
-      console.error('api/audit error:', e);
-      res.json({ ok: false, error: e.message });
-    }
-  });
+  try {
+    const data = req.body;
+    const { handleAuditReport } = require('../bot/audit-handler');
+    const botInstance = require('./bot-instance');
+    const fakeCtx = {
+      from: { id: data.tg_user_id, username: null, first_name: 'аудитор' },
+      telegram: botInstance.telegram,
+      reply: async () => {},
+    };
+    await handleAuditReport(fakeCtx, data);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('api/audit error:', e);
+    res.json({ ok: false, error: e.message });
+  }
+});
 
   app.get('/form', (req, res) => res.send(miniAppForm()));
 
