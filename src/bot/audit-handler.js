@@ -1,6 +1,10 @@
+const { getOrderById } = require('../db/queries');
+
 async function handleAuditReport(ctx, data) {
   const GROUP_ID = process.env.GROUP_CHAT_ID;
-  const actor = ctx.from.username ? '@' + ctx.from.username : ctx.from.first_name;
+  const actor = ctx.from
+    ? (ctx.from.username ? '@' + ctx.from.username : ctx.from.first_name)
+    : 'аудитор';
 
   var zonesText = 'Нет';
   if (data.zones && data.zones.length > 0) {
@@ -15,8 +19,11 @@ async function handleAuditReport(ctx, data) {
   var y = '✅';
   var n = '—';
 
+  var header = '🔍 *Отчёт аудитора*';
+  if (data.order_id) header += ' по заявке *#' + data.order_id + '*';
+
   var lines = [
-    '🔍 *Отчёт аудитора*',
+    header,
     '',
     '🏢 *Здание:* ' + (data.building_type || '—'),
     '📐 *Границы:* ' + (data.boundaries || '—'),
@@ -52,6 +59,21 @@ async function handleAuditReport(ctx, data) {
 
   var text = lines.join('\n');
 
+  // Ищем reply_to_message_id если есть order_id
+  var replyToMsgId = null;
+  if (data.order_id) {
+    try {
+      const order = await getOrderById(data.order_id);
+      if (order && order.telegram_msg_id) {
+        replyToMsgId = order.telegram_msg_id;
+      }
+    } catch(e) {
+      console.error('getOrderById error:', e.message);
+    }
+  }
+
+  var telegramApi = ctx.telegram || (ctx.from ? ctx : null);
+
   if (data.photos && data.photos.length > 0) {
     try {
       var media = data.photos.map(function(p, i) {
@@ -62,15 +84,25 @@ async function handleAuditReport(ctx, data) {
           parse_mode: i === 0 ? 'Markdown' : undefined,
         };
       });
-      await ctx.telegram.sendMediaGroup(GROUP_ID, media);
+      var extra = replyToMsgId ? { reply_to_message_id: replyToMsgId } : {};
+      await telegramApi.telegram.sendMediaGroup(GROUP_ID, media, extra);
     } catch (e) {
-      await ctx.telegram.sendMessage(GROUP_ID, text, { parse_mode: 'Markdown' });
+      console.error('media group error:', e.message);
+      await telegramApi.telegram.sendMessage(GROUP_ID, text, {
+        parse_mode: 'Markdown',
+        reply_to_message_id: replyToMsgId || undefined,
+      });
     }
   } else {
-    await ctx.telegram.sendMessage(GROUP_ID, text, { parse_mode: 'Markdown' });
+    await telegramApi.telegram.sendMessage(GROUP_ID, text, {
+      parse_mode: 'Markdown',
+      reply_to_message_id: replyToMsgId || undefined,
+    });
   }
 
-  await ctx.reply('✅ Отчёт отправлен в группу!');
+  if (ctx.reply) {
+    await ctx.reply('✅ Отчёт отправлен в группу!');
+  }
 }
 
 module.exports = { handleAuditReport };
