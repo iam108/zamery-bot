@@ -128,7 +128,11 @@ textarea:focus,input:focus{border-color:var(--tg-theme-button-color,#6366f1)}
 <script>
 var tg = window.Telegram.WebApp;
 tg.ready(); tg.expand();
-
+var orderId = new URLSearchParams(window.location.search).get('order_id') || '';
+if (orderId) {
+  document.title = 'Отчёт по заявке #' + orderId;
+  document.querySelector('h1').textContent = '🔍 Отчёт по заявке #' + orderId;
+}
 function selectRadio(el, group) {
   document.querySelectorAll('#' + group + ' .radio-btn').forEach(function(b) { b.classList.remove('active'); });
   el.classList.add('active');
@@ -172,23 +176,39 @@ async function submitForm() {
   for (var i = 0; i < Math.min(photoFiles.length, 5); i++) {
     photos.push({ data: await toBase64(photoFiles[i]), name: photoFiles[i].name });
   }
-  tg.sendData(JSON.stringify({
-    type: 'audit',
-    building_type: getRadioVal('building-type'),
-    boundaries: getRadioVal('boundaries'),
-    bti: getRadioVal('bti'),
-    to: getRadioVal('to'),
-    zones: zones,
-    nearby: document.getElementById('nearby').value.trim(),
-    veranda: document.getElementById('veranda').checked,
-    patz: document.getElementById('patz').checked,
-    replan: document.getElementById('replan').checked,
-    passport_interest: document.getElementById('passport').checked,
-    is_owner: document.getElementById('owner').checked,
-    video_url: document.getElementById('video-url').value.trim(),
-    photos: photos,
-    conclusion: conclusion,
-  }));
+  try {
+    var r = await fetch('/api/audit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'audit',
+        order_id: orderId,
+        building_type: getRadioVal('building-type'),
+        boundaries: getRadioVal('boundaries'),
+        bti: getRadioVal('bti'),
+        to: getRadioVal('to'),
+        zones: zones,
+        nearby: document.getElementById('nearby').value.trim(),
+        veranda: document.getElementById('veranda').checked,
+        patz: document.getElementById('patz').checked,
+        replan: document.getElementById('replan').checked,
+        passport_interest: document.getElementById('passport').checked,
+        is_owner: document.getElementById('owner').checked,
+        video_url: document.getElementById('video-url').value.trim(),
+        photos: photos,
+        conclusion: conclusion,
+        tg_user_id: tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user.id : null,
+      }),
+    });
+    var result = await r.json();
+    if (result.ok) {
+      btn.textContent = '✅ Отчёт отправлен!';
+      setTimeout(function() { tg.close(); }, 1500);
+    } else { throw new Error(result.error || 'Ошибка сервера'); }
+  } catch(e) {
+    btn.disabled = false; btn.textContent = 'Отправить отчёт';
+    alert('Ошибка: ' + e.message);
+  }
 }
 </` + `script>
 </body></html>`;
