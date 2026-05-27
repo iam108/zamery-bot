@@ -1,36 +1,45 @@
 require('dotenv').config();
 const express = require('express');
-const { Telegraf } = require('telegraf');
+const { setupBot } = require('./bot/index');
 const { setupWeb } = require('./web/index');
 const pool = require('./db/pool');
 
 const PORT = process.env.PORT || 3000;
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const WEBAPP_URL = process.env.WEBAPP_URL;
-const WEBHOOK_PATH = '/webhook/' + BOT_TOKEN;
-
-const app = express();
-const bot = new Telegraf(BOT_TOKEN);
-
-bot.start(function(ctx) { ctx.reply('Привет! Нажми кнопку для новой заявки.'); });
-bot.command('stats', function(ctx) { ctx.reply('stats ok'); });
 
 async function main() {
-  await pool.query('SELECT 1');
-  console.log('DB ok');
+  try {
+    await pool.query('SELECT 1');
+    console.log('DB ok');
+  } catch (err) {
+    console.error('DB error:', err.message);
+    process.exit(1);
+  }
 
-  await bot.telegram.setWebhook(WEBAPP_URL + WEBHOOK_PATH);
-  console.log('Webhook set: ' + WEBAPP_URL + WEBHOOK_PATH);
+  const app = express();
+  const bot = setupBot();
 
-  app.use(bot.webhookCallback(WEBHOOK_PATH));
+  if (process.env.NODE_ENV === 'production') {
+    const webhookPath = '/webhook/' + process.env.BOT_TOKEN;
+    await bot.telegram.setWebhook(process.env.WEBAPP_URL + webhookPath);
+    app.use(bot.webhookCallback(webhookPath));
+    console.log('webhook mode');
+  } else {
+    await bot.telegram.deleteWebhook();
+    bot.launch();
+    console.log('polling mode');
+  }
+
   setupWeb(app);
 
   app.listen(PORT, '0.0.0.0', function() {
     console.log('Server on port ' + PORT);
   });
+
+  process.once('SIGINT', function() { bot.stop('SIGINT'); });
+  process.once('SIGTERM', function() { bot.stop('SIGTERM'); });
 }
 
-main().catch(function(e) {
-  console.error(e);
+main().catch(function(err) {
+  console.error(err);
   process.exit(1);
 });
