@@ -85,7 +85,8 @@ function setupWeb(app) {
   try {
     const data = req.body;
     const { handleAuditReport } = require('../bot/audit-handler');
-    const botInstance = require('./bot-instance');
+    const { Telegraf } = require('telegraf');
+    const botInstance = new Telegraf(process.env.BOT_TOKEN);
     const fakeCtx = {
       from: { id: data.tg_user_id, username: null, first_name: 'аудитор' },
       telegram: botInstance.telegram,
