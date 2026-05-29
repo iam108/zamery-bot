@@ -18,26 +18,19 @@ async function handleAuditReport(ctx, data) {
 
   var y = '✅';
   var n = '—';
-
   var header = '🔍 *Отчёт аудитора*';
   if (data.order_id) header += ' по заявке *#' + data.order_id + '*';
 
   var lines = [
-    header,
-    '',
+    header, '',
     '🏢 *Здание:* ' + (data.building_type || '—'),
     '📐 *Границы:* ' + (data.boundaries || '—'),
     '📋 *БТИ:* ' + (data.bti === 'Да' ? y + ' Подходит' : '❌ Не подходит'),
     '🔧 *ТО:* ' + (data.to || '—'),
-    '',
-    '🚫 *Зоны:*',
-    zonesText,
+    '', '🚫 *Зоны:*', zonesText,
   ];
 
-  if (data.nearby) {
-    lines.push('');
-    lines.push('👁 *На заметку:* ' + data.nearby);
-  }
+  if (data.nearby) { lines.push(''); lines.push('👁 *На заметку:* ' + data.nearby); }
 
   lines.push('');
   lines.push('*Характеристики:*');
@@ -47,10 +40,7 @@ async function handleAuditReport(ctx, data) {
   lines.push((data.passport_interest ? y : n) + ' Паспорт безопасности');
   lines.push((data.is_owner ? y : n) + ' Собственник');
 
-  if (data.video_url) {
-    lines.push('');
-    lines.push('🎥 *Видео:* ' + data.video_url);
-  }
+  if (data.video_url) { lines.push(''); lines.push('🎥 *Видео:* ' + data.video_url); }
 
   lines.push('');
   lines.push('📝 *Итог:* ' + data.conclusion);
@@ -59,14 +49,11 @@ async function handleAuditReport(ctx, data) {
 
   var text = lines.join('\n');
 
-  // Ищем reply_to_message_id если есть order_id
   var replyToMsgId = null;
   if (data.order_id) {
     try {
       const order = await getOrderById(data.order_id);
-      if (order && order.telegram_msg_id) {
-        replyToMsgId = order.telegram_msg_id;
-      }
+      if (order && order.telegram_msg_id) replyToMsgId = order.telegram_msg_id;
     } catch(e) {
       console.error('getOrderById error:', e.message);
     }
@@ -99,8 +86,7 @@ async function handleAuditReport(ctx, data) {
     });
   }
 
-  if (ctx.reply) {
-    await ctx.reply('✅ Отчёт отправлен в группу!');
-  }
+  if (ctx.reply) await ctx.reply('✅ Отчёт отправлен в группу!');
+}
 
 module.exports = { handleAuditReport };
