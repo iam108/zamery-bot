@@ -72,7 +72,7 @@ async function handleAuditReport(ctx, data) {
     }
   }
 
-  var telegramApi = ctx.telegram || (ctx.from ? ctx : null);
+  var tg = ctx.telegram;
 
   if (data.photos && data.photos.length > 0) {
     try {
@@ -84,17 +84,16 @@ async function handleAuditReport(ctx, data) {
           parse_mode: i === 0 ? 'Markdown' : undefined,
         };
       });
-      var extra = replyToMsgId ? { reply_to_message_id: replyToMsgId } : {};
-      await telegramApi.sendMediaGroup(GROUP_ID, media, extra);
+      await tg.sendMediaGroup(GROUP_ID, media, replyToMsgId ? { reply_to_message_id: replyToMsgId } : {});
     } catch (e) {
       console.error('media group error:', e.message);
-      await telegramApi.sendMessage(GROUP_ID, text, {
+      await tg.sendMessage(GROUP_ID, text, {
         parse_mode: 'Markdown',
         reply_to_message_id: replyToMsgId || undefined,
       });
     }
   } else {
-    await telegramApi.sendMessage(GROUP_ID, text, {
+    await tg.sendMessage(GROUP_ID, text, {
       parse_mode: 'Markdown',
       reply_to_message_id: replyToMsgId || undefined,
     });
@@ -103,6 +102,5 @@ async function handleAuditReport(ctx, data) {
   if (ctx.reply) {
     await ctx.reply('✅ Отчёт отправлен в группу!');
   }
-}
 
 module.exports = { handleAuditReport };
