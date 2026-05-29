@@ -85,16 +85,16 @@ async function handleAuditReport(ctx, data) {
         };
       });
       var extra = replyToMsgId ? { reply_to_message_id: replyToMsgId } : {};
-      await telegramApi.telegram.sendMediaGroup(GROUP_ID, media, extra);
+      await telegramApi.sendMediaGroup(GROUP_ID, media, extra);
     } catch (e) {
       console.error('media group error:', e.message);
-      await telegramApi.telegram.sendMessage(GROUP_ID, text, {
+      await telegramApi.sendMessage(GROUP_ID, text, {
         parse_mode: 'Markdown',
         reply_to_message_id: replyToMsgId || undefined,
       });
     }
   } else {
-    await telegramApi.telegram.sendMessage(GROUP_ID, text, {
+    await telegramApi.sendMessage(GROUP_ID, text, {
       parse_mode: 'Markdown',
       reply_to_message_id: replyToMsgId || undefined,
     });
