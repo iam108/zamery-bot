@@ -99,5 +99,66 @@ async function getStats() {
   `);
   return rows[0];
 }
+async function getStatsByMonth() {
+  const { rows } = await pool.query(`
+    SELECT 
+      TO_CHAR(created_at, 'YYYY-MM') AS month,
+      COUNT(*) AS total,
+      COUNT(*) FILTER (WHERE status = 'done') AS done,
+      COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled
+    FROM orders
+    GROUP BY month
+    ORDER BY month DESC
+    LIMIT 12
+  `);
+  return rows;
+}
 
-module.exports = { createOrder, getOrders, getOrderById, updateOrderStatus, setTelegramMsgId, addLog, getOrderLogs, getStats };
+async function getStatsByType() {
+  const { rows } = await pool.query(`
+    SELECT 
+      object_type,
+      COUNT(*) AS total,
+      COUNT(*) FILTER (WHERE status = 'done') AS done
+    FROM orders
+    GROUP BY object_type
+    ORDER BY total DESC
+  `);
+  return rows;
+}
+
+async function searchObjects({ search = '' } = {}) {
+  const { rows } = await pool.query(`
+    SELECT 
+      COALESCE(NULLIF(object_name, ''), address) AS display_name,
+      object_name,
+      address,
+      object_type,
+      COUNT(*) AS visits,
+      MAX(created_at) AS last_visit,
+      COUNT(*) FILTER (WHERE status = 'done') AS done_count
+    FROM orders
+    WHERE 
+      address ILIKE $1 OR 
+      object_name ILIKE $1 OR
+      contacts ILIKE $1
+    GROUP BY object_name, address, object_type
+    ORDER BY last_visit DESC
+    LIMIT 50
+  `, [`%${search}%`]);
+  return rows;
+}
+
+async function getOrdersByObject(address, objectName) {
+  const { rows } = await pool.query(`
+    SELECT * FROM orders
+    WHERE address = $1 AND (object_name = $2 OR ($2 = '' AND object_name IS NULL))
+    ORDER BY created_at DESC
+  `, [address, objectName || '']);
+  return rows;
+}
+module.exports = { 
+  createOrder, getOrders, getOrderById, updateOrderStatus, 
+  setTelegramMsgId, addLog, getOrderLogs, getStats,
+  getStatsByMonth, getStatsByType, searchObjects, getOrdersByObject
+};
