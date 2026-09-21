@@ -4,7 +4,7 @@ const { setupBot } = require('./bot/index');
 const { setupWeb } = require('./web/index');
 const pool = require('./db/pool');
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 
 async function main() {
   try {
@@ -21,8 +21,6 @@ async function main() {
   if (process.env.NODE_ENV === 'production') {
     const webhookPath = '/webhook/' + process.env.BOT_TOKEN;
     await bot.telegram.setWebhook(process.env.WEBAPP_URL + webhookPath);
-
-    // Webhook роут БЕЗ json middleware — Telegraf сам парсит
     app.post(webhookPath, bot.webhookCallback(webhookPath));
     console.log('webhook mode');
   } else {
@@ -31,7 +29,6 @@ async function main() {
     console.log('polling mode');
   }
 
-  // JSON middleware с большим лимитом — ПОСЛЕ webhook роута
   app.use(express.json({ limit: '50mb' }));
   app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
@@ -41,12 +38,13 @@ async function main() {
     console.log('Server on port ' + PORT);
   });
 
-  process.once('SIGINT', function() { 
-  try { bot.stop('SIGINT'); } catch(e) {} 
-});
-process.once('SIGTERM', function() { 
-  try { bot.stop('SIGTERM'); } catch(e) {} 
-});
+  process.once('SIGINT', function() {
+    try { bot.stop('SIGINT'); } catch(e) {}
+  });
+  process.once('SIGTERM', function() {
+    try { bot.stop('SIGTERM'); } catch(e) {}
+  });
+}
 
 main().catch(function(err) {
   console.error(err);
