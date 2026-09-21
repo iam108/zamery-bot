@@ -42,11 +42,12 @@ async function main() {
   });
 
   process.once('SIGINT', function() { 
-  try { bot.stop('SIGINT'); } catch(e) {} 
-});
-process.once('SIGTERM', function() { 
-  try { bot.stop('SIGTERM'); } catch(e) {} 
-});
+    try { bot.stop('SIGINT'); } catch(e) {} 
+  });
+  process.once('SIGTERM', function() { 
+    try { bot.stop('SIGTERM'); } catch(e) {} 
+  });
+}
 
 main().catch(function(err) {
   console.error(err);
