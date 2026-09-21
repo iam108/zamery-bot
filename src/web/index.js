@@ -380,6 +380,15 @@ function miniAppForm() {
   <label>Контакты и доп. информация</label>
   <textarea id="contacts" placeholder="Телефон, имя контакта, сумма, примечания..."></textarea>
 </div>
+<div class="field">
+  <label>Документы и фото</label>
+  <label class="toggle-row" style="cursor:pointer;justify-content:flex-start;gap:12px">
+    <span>📎 Прикрепить файлы</span>
+    <span class="file-count" id="file-count" style="color:var(--tg-theme-hint-color,#64748b);font-size:13px">не выбрано</span>
+    <input type="file" id="attachments" accept="image/*,.pdf" multiple style="display:none" onchange="previewFiles(this)">
+  </label>
+  <div id="files-preview" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px"></div>
+</div>
 <div class="bottom">
   <button class="submit-btn" id="submit-btn" onclick="submitForm()">Отправить заявку</button>
 </div>
@@ -389,6 +398,21 @@ tg.ready(); tg.expand();
 function toggleVideo() {
   var cb = document.getElementById('has_video');
   cb.checked = !cb.checked;
+}
+var attachedFiles = [];
+function previewFiles(input) {
+  attachedFiles = Array.from(input.files);
+  document.getElementById('file-count').textContent = attachedFiles.length + ' файл(ов)';
+  var p = document.getElementById('files-preview'); p.innerHTML = '';
+  attachedFiles.forEach(function(f) {
+    var tag = document.createElement('div');
+    tag.style.cssText = 'padding:6px 10px;background:var(--tg-theme-secondary-bg-color,#1e293b);border-radius:8px;font-size:12px;color:var(--tg-theme-hint-color,#64748b)';
+    tag.textContent = f.name.length > 20 ? f.name.substring(0,20)+'...' : f.name;
+    p.appendChild(tag);
+  });
+}
+function fileToBase64(file) {
+  return new Promise(function(res) { var r = new FileReader(); r.onload = function() { res(r.result.split(',')[1]); }; r.readAsDataURL(file); });
 }
 async function submitForm() {
   var valid = true;
@@ -415,6 +439,9 @@ async function submitForm() {
         deadline:    document.getElementById('deadline').value || null,
         contacts:    document.getElementById('contacts').value.trim(),
         tg_user_id:  tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user.id : null,
+        attachments: await Promise.all(attachedFiles.slice(0,5).map(async function(f) {
+  return { data: await fileToBase64(f), name: f.name, type: f.type };
+})),
       }),
     });
     var result = await r.json();
