@@ -23,7 +23,7 @@ async function main() {
     await bot.telegram.setWebhook(process.env.WEBAPP_URL + webhookPath);
 
     // Webhook роут БЕЗ json middleware — Telegraf сам парсит
-    app.use(bot.webhookCallback(webhookPath));
+    app.post(webhookPath, bot.webhookCallback(webhookPath));
     console.log('webhook mode');
   } else {
     await bot.telegram.deleteWebhook();
