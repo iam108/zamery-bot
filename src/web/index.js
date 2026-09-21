@@ -99,7 +99,28 @@ function setupWeb(app) {
     res.json({ ok: false, error: e.message });
   }
 });
+  // ── Stats page ───────────────────────────────────────────
+  app.get('/admin/stats', requireAuth, async (req, res) => {
+    const { getStatsByMonth, getStatsByType } = require('../db/queries');
+    const byMonth = await getStatsByMonth();
+    const byType = await getStatsByType();
+    res.send(statsPage({ byMonth, byType }));
+  });
 
+  // ── Objects page ─────────────────────────────────────────
+  app.get('/admin/objects', requireAuth, async (req, res) => {
+    const { searchObjects } = require('../db/queries');
+    const { search = '' } = req.query;
+    const objects = await searchObjects({ search });
+    res.send(objectsPage({ objects, search }));
+  });
+
+  app.get('/admin/objects/detail', requireAuth, async (req, res) => {
+    const { getOrdersByObject } = require('../db/queries');
+    const { address, name } = req.query;
+    const orders = await getOrdersByObject(address, name);
+    res.send(objectDetailPage({ orders, address, name }));
+  });
   app.get('/form', (req, res) => res.send(miniAppForm()));
 
   const { auditForm } = require('./audit-form');
@@ -191,7 +212,7 @@ function adminPage({ orders, stats, status, search, page, totalPages, total }) {
   .pager a.active,.pager a:hover{background:#6366f1;color:#fff;border-color:#6366f1}
   .total{color:#64748b;font-size:13px;margin-bottom:10px}
 </style></head><body>
-<div class="topbar"><h1>📋 Замеры</h1><a href="/admin/logout">Выйти</a></div>
+<div class="topbar"><h1>📋 Замеры</h1><div style="display:flex;gap:8px;align-items:center"><a href="/admin/stats" style="padding:6px 12px;border:1px solid #334155;border-radius:8px;font-size:13px;color:#94a3b8;text-decoration:none">📊 Стат</a><a href="/admin/objects" style="padding:6px 12px;border:1px solid #334155;border-radius:8px;font-size:13px;color:#94a3b8;text-decoration:none">🏢 Объекты</a><a href="/admin/logout" style="color:#94a3b8;font-size:13px;text-decoration:none">Выйти</a></div></div>
 <div class="main">
   <div class="stats">
     <div class="stat"><div class="num" style="color:#6366f1">${stats.new_count}</div><div class="lbl">🆕 Новые</div></div>
@@ -411,5 +432,208 @@ async function submitForm() {
 }
 <\/script></body></html>`;
 }
+function statsPage({ byMonth, byType }) {
+  const statusColors = { new:'#6366f1', in_progress:'#f59e0b', done:'#22c55e', cancelled:'#6b7280' };
+  
+  const monthRows = byMonth.map(r => {
+    const d = new Date(r.month + '-01').toLocaleDateString('ru-RU', { month: 'long', year: 'numeric' });
+    const pct = r.total > 0 ? Math.round(r.done / r.total * 100) : 0;
+    return `<tr>
+      <td>${d}</td>
+      <td style="font-weight:600">${r.total}</td>
+      <td style="color:#22c55e">${r.done}</td>
+      <td style="color:#6b7280">${r.cancelled}</td>
+      <td>
+        <div style="display:flex;align-items:center;gap:8px">
+          <div style="flex:1;height:6px;background:#1a2744;border-radius:3px">
+            <div style="width:${pct}%;height:100%;background:#22c55e;border-radius:3px"></div>
+          </div>
+          <span style="font-size:12px;color:#64748b;width:32px">${pct}%</span>
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
 
+  const typeRows = byType.map(r => {
+    const pct = r.total > 0 ? Math.round(r.done / r.total * 100) : 0;
+    return `<tr>
+      <td>${r.object_type || '—'}</td>
+      <td style="font-weight:600">${r.total}</td>
+      <td style="color:#22c55e">${r.done}</td>
+      <td>
+        <div style="display:flex;align-items:center;gap:8px">
+          <div style="flex:1;height:6px;background:#1a2744;border-radius:3px">
+            <div style="width:${pct}%;height:100%;background:#6366f1;border-radius:3px"></div>
+          </div>
+          <span style="font-size:12px;color:#64748b;width:32px">${pct}%</span>
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+
+  return `<!DOCTYPE html><html lang="ru"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Статистика — Замеры</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;color:#f1f5f9;min-height:100vh}
+  .topbar{background:#1e293b;border-bottom:1px solid #334155;padding:0 24px;height:60px;display:flex;align-items:center;gap:16px}
+  .topbar a{color:#94a3b8;font-size:13px;text-decoration:none}
+  .topbar h1{font-size:17px;font-weight:700;flex:1}
+  .nav{display:flex;gap:8px}
+  .nav a{padding:6px 14px;border-radius:8px;text-decoration:none;font-size:13px;color:#94a3b8;border:1px solid #334155}
+  .nav a:hover,.nav a.active{background:#6366f1;color:#fff;border-color:#6366f1}
+  .main{padding:24px;max-width:1000px;margin:0 auto}
+  h2{font-size:15px;font-weight:600;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;margin-bottom:16px;margin-top:32px}
+  h2:first-child{margin-top:0}
+  .table-wrap{background:#1e293b;border-radius:12px;border:1px solid #334155;overflow:hidden;margin-bottom:8px}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th{padding:12px 16px;text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#64748b;border-bottom:1px solid #334155}
+  td{padding:13px 16px;border-bottom:1px solid #1a2744;vertical-align:middle}
+  tr:last-child td{border-bottom:none}
+  tr:hover td{background:#263351}
+</style></head><body>
+<div class="topbar">
+  <a href="/admin">← Назад</a>
+  <h1>📊 Статистика</h1>
+  <div class="nav">
+    <a href="/admin/stats" class="active">📊 Статистика</a>
+    <a href="/admin/objects">🏢 Объекты</a>
+  </div>
+</div>
+<div class="main">
+  <h2>По месяцам</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Месяц</th><th>Всего</th><th>Выполнено</th><th>Отменено</th><th>Успешность</th></tr></thead>
+      <tbody>${monthRows || '<tr><td colspan="5" style="text-align:center;padding:32px;color:#64748b">Нет данных</td></tr>'}</tbody>
+    </table>
+  </div>
+
+  <h2>По типам объектов</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Тип объекта</th><th>Всего</th><th>Выполнено</th><th>Конверсия</th></tr></thead>
+      <tbody>${typeRows || '<tr><td colspan="4" style="text-align:center;padding:32px;color:#64748b">Нет данных</td></tr>'}</tbody>
+    </table>
+  </div>
+</div></body></html>`;
+}
+
+function objectsPage({ objects, search }) {
+  const rows = objects.map(o => {
+    const last = new Date(o.last_visit).toLocaleDateString('ru-RU', { day:'numeric', month:'short', year:'numeric' });
+    const name = o.object_name || '—';
+    const params = new URLSearchParams({ address: o.address, name: o.object_name || '' });
+    return `<tr onclick="location='/admin/objects/detail?${params}'" style="cursor:pointer">
+      <td><strong>${name}</strong><div style="font-size:12px;color:#64748b;margin-top:2px">${o.address}</div></td>
+      <td>${o.object_type || '—'}</td>
+      <td style="text-align:center"><span style="background:#6366f120;color:#6366f1;border:1px solid #6366f140;padding:3px 10px;border-radius:20px;font-size:13px">${o.visits}</span></td>
+      <td style="color:#22c55e">${o.done_count}</td>
+      <td style="color:#64748b;font-size:12px">${last}</td>
+    </tr>`;
+  }).join('');
+
+  return `<!DOCTYPE html><html lang="ru"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Объекты — Замеры</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;color:#f1f5f9;min-height:100vh}
+  .topbar{background:#1e293b;border-bottom:1px solid #334155;padding:0 24px;height:60px;display:flex;align-items:center;gap:16px}
+  .topbar a{color:#94a3b8;font-size:13px;text-decoration:none}
+  .topbar h1{font-size:17px;font-weight:700;flex:1}
+  .nav{display:flex;gap:8px}
+  .nav a{padding:6px 14px;border-radius:8px;text-decoration:none;font-size:13px;color:#94a3b8;border:1px solid #334155}
+  .nav a:hover,.nav a.active{background:#6366f1;color:#fff;border-color:#6366f1}
+  .main{padding:24px;max-width:1000px;margin:0 auto}
+  .search-row{display:flex;gap:10px;margin-bottom:20px}
+  .search-row input{flex:1;padding:10px 14px;background:#1e293b;border:1px solid #334155;border-radius:10px;color:#f1f5f9;font-size:14px;outline:none}
+  .search-row input:focus{border-color:#6366f1}
+  .search-row button{padding:10px 20px;background:#6366f1;color:#fff;border:none;border-radius:10px;font-size:14px;cursor:pointer;font-weight:500}
+  .table-wrap{background:#1e293b;border-radius:12px;border:1px solid #334155;overflow:hidden}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th{padding:12px 16px;text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#64748b;border-bottom:1px solid #334155}
+  td{padding:13px 16px;border-bottom:1px solid #1a2744;vertical-align:middle}
+  tr:last-child td{border-bottom:none}
+  tr:hover td{background:#263351}
+</style></head><body>
+<div class="topbar">
+  <a href="/admin">← Назад</a>
+  <h1>🏢 Объекты</h1>
+  <div class="nav">
+    <a href="/admin/stats">📊 Статистика</a>
+    <a href="/admin/objects" class="active">🏢 Объекты</a>
+  </div>
+</div>
+<div class="main">
+  <form class="search-row" method="GET" action="/admin/objects">
+    <input name="search" placeholder="Поиск по названию, адресу, контакту..." value="${search}" autofocus>
+    <button type="submit">Найти</button>
+  </form>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Объект</th><th>Тип</th><th>Визитов</th><th>Выполнено</th><th>Последний визит</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="5" style="text-align:center;padding:32px;color:#64748b">Ничего не найдено</td></tr>'}</tbody>
+    </table>
+  </div>
+</div></body></html>`;
+}
+
+function objectDetailPage({ orders, address, name }) {
+  const statusColors = { new:'#6366f1', in_progress:'#f59e0b', done:'#22c55e', cancelled:'#6b7280' };
+  const statusLabels = { new:'Новая', in_progress:'В работе', done:'Готово', cancelled:'Отменена' };
+
+  const rows = orders.map(o => {
+    const d = new Date(o.created_at).toLocaleDateString('ru-RU', { day:'numeric', month:'short', year:'numeric' });
+    const deadline = o.deadline ? new Date(o.deadline).toLocaleDateString('ru-RU') : '—';
+    return `<tr onclick="location='/admin/order/${o.id}'" style="cursor:pointer">
+      <td><strong>#${o.id}</strong></td>
+      <td style="color:#64748b;font-size:13px">${d}</td>
+      <td>${deadline}</td>
+      <td>${o.contacts || '—'}</td>
+      <td><span style="background:${statusColors[o.status]}20;color:${statusColors[o.status]};border:1px solid ${statusColors[o.status]}40;padding:3px 10px;border-radius:20px;font-size:12px">${statusLabels[o.status]}</span></td>
+    </tr>`;
+  }).join('');
+
+  return `<!DOCTYPE html><html lang="ru"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${name || address} — Замеры</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;color:#f1f5f9;min-height:100vh}
+  .topbar{background:#1e293b;border-bottom:1px solid #334155;padding:0 24px;height:60px;display:flex;align-items:center;gap:16px}
+  .topbar a{color:#94a3b8;font-size:13px;text-decoration:none}
+  .topbar h1{font-size:16px;font-weight:700;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .main{padding:24px;max-width:900px;margin:0 auto}
+  .meta{background:#1e293b;border-radius:12px;border:1px solid #334155;padding:20px;margin-bottom:20px}
+  .meta .addr{font-size:13px;color:#64748b;margin-top:4px}
+  .meta .count{font-size:28px;font-weight:700;color:#6366f1;margin-top:12px}
+  .meta .count-label{font-size:12px;color:#64748b}
+  .table-wrap{background:#1e293b;border-radius:12px;border:1px solid #334155;overflow:hidden}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th{padding:12px 16px;text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#64748b;border-bottom:1px solid #334155}
+  td{padding:13px 16px;border-bottom:1px solid #1a2744;vertical-align:middle}
+  tr:last-child td{border-bottom:none}
+  tr:hover td{background:#263351}
+</style></head><body>
+<div class="topbar">
+  <a href="/admin/objects">← Объекты</a>
+  <h1>${name || address}</h1>
+</div>
+<div class="main">
+  <div class="meta">
+    <div style="font-size:16px;font-weight:600">${name || '—'}</div>
+    <div class="addr">📍 ${address}</div>
+    <div class="count">${orders.length}</div>
+    <div class="count-label">визитов всего</div>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Дата</th><th>Дедлайн</th><th>Контакты</th><th>Статус</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="5" style="text-align:center;padding:32px;color:#64748b">Нет заявок</td></tr>'}</tbody>
+    </table>
+  </div>
+</div></body></html>`;
+}
 module.exports = { setupWeb };
