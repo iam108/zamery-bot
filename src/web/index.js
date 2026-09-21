@@ -72,7 +72,31 @@ function setupWeb(app) {
           { text: '✅ Готово', callback_data: 'status:done:' + order.id },
         ]]}
       });
-      await setTelegramMsgId(order.id, msg.message_id);
+      
+            await setTelegramMsgId(order.id, msg.message_id);
+
+      if (data.attachments && data.attachments.length > 0) {
+        for (var i = 0; i < data.attachments.length; i++) {
+          var att = data.attachments[i];
+          var buf = Buffer.from(att.data, 'base64');
+          try {
+            if (att.type && att.type.indexOf('pdf') !== -1) {
+              await botInstance.telegram.sendDocument(process.env.GROUP_CHAT_ID,
+                { source: buf, filename: att.name },
+                { caption: '📎 ' + att.name, reply_to_message_id: msg.message_id }
+              );
+            } else {
+              await botInstance.telegram.sendPhoto(process.env.GROUP_CHAT_ID,
+                { source: buf },
+                { caption: '📎 ' + att.name, reply_to_message_id: msg.message_id }
+              );
+            }
+          } catch(fileErr) {
+            console.error('file send error:', fileErr.message);
+          }
+        }
+      }
+
       res.json({ ok: true, id: order.id });
     } catch (e) {
       console.error('api/order error:', e);
