@@ -41,9 +41,12 @@ async function main() {
     console.log('Server on port ' + PORT);
   });
 
-  process.once('SIGINT', function() { bot.stop('SIGINT'); });
-  process.once('SIGTERM', function() { bot.stop('SIGTERM'); });
-}
+  process.once('SIGINT', function() { 
+  try { bot.stop('SIGINT'); } catch(e) {} 
+});
+process.once('SIGTERM', function() { 
+  try { bot.stop('SIGTERM'); } catch(e) {} 
+});
 
 main().catch(function(err) {
   console.error(err);
