@@ -351,14 +351,11 @@ function miniAppForm() {
   <label>Тип объекта <span class="required">*</span></label>
   <select id="object_type">
     <option value="">— выбрать —</option>
-    <option>Общепит алкоголь</option>
-    <option>Общепит безалкоголь</option>
-    <option>Розничная торговля</option>
-    <option>Склад</option>
-    <option>Офис</option>
-    <option>Производство</option>
-    <option>Другое</option>
-  </select>
+    <option value="Общепит алкоголь">🍺 Общепит алкоголь</option>
+    <option value="Розничная торговля">🛒 Розничная торговля</option>
+    <option value="Табак">🚬 Табак</option>
+    <option value="Другое">📦 Другое</option>
+</select>
   <div class="err" id="err-object_type">Выберите тип</div>
 </div>
 <div class="field">
