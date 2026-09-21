@@ -32,13 +32,17 @@ async function handleAuditReport(ctx, data) {
 
   if (data.nearby) { lines.push(''); lines.push('👁 *На заметку:* ' + data.nearby); }
 
-  lines.push('');
-  lines.push('*Характеристики:*');
-  lines.push((data.veranda ? y : n) + ' Веранда');
-  lines.push((data.patz ? y : n) + ' ПАТЗ');
-  lines.push((data.replan ? y : n) + ' Перепланировка');
-  lines.push((data.passport_interest ? y : n) + ' Паспорт безопасности');
-  lines.push((data.is_owner ? y : n) + ' Собственник');
+   var extras = [];
+  if (data.veranda) extras.push('🏗 Веранда');
+  if (data.patz) extras.push('📄 ПАТЗ');
+  if (data.replan) extras.push('🔨 Перепланировка');
+  if (data.passport_interest) extras.push('🛡 Интерес к паспорту безопасности');
+  if (data.is_owner) extras.push('🔑 Собственник');
+  if (extras.length > 0) {
+    lines.push('');
+    lines.push('*Доп. характеристики:*');
+    extras.forEach(function(e) { lines.push('✅ ' + e); });
+  }
 
   if (data.video_url) { lines.push(''); lines.push('🎥 *Видео:* ' + data.video_url); }
 
