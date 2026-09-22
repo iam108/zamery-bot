@@ -145,7 +145,44 @@ function setupBot() {
       await ctx.answerCbQuery('Ошибка, попробуйте ещё раз');
     }
   });
-
+// Получаем файлы от пользователя в личке — прикрепляем к последней заявке
+bot.on(['photo', 'document'], async (ctx) => {
+  if (ctx.chat.type !== 'private') return;
+  
+  try {
+    const { getOrders, getOrderById } = require('../db/queries');
+    // Берём последнюю заявку этого пользователя
+    const { orders } = await getOrders({ limit: 1, offset: 0 });
+    const userOrders = orders.filter(o => String(o.submitted_by) === String(ctx.from.id));
+    
+    if (userOrders.length === 0) {
+      return ctx.reply('Нет активных заявок для прикрепления файлов.');
+    }
+    
+    const order = userOrders[0];
+    const replyTo = order.telegram_msg_id;
+    
+    const caption = '📎 Файл к заявке #' + order.id;
+    
+    if (ctx.message.photo) {
+      const photo = ctx.message.photo[ctx.message.photo.length - 1];
+      await ctx.telegram.sendPhoto(GROUP_ID, photo.file_id, {
+        caption: caption,
+        reply_to_message_id: replyTo,
+      });
+    } else if (ctx.message.document) {
+      await ctx.telegram.sendDocument(GROUP_ID, ctx.message.document.file_id, {
+        caption: caption,
+        reply_to_message_id: replyTo,
+      });
+    }
+    
+    await ctx.reply('✅ Файл прикреплён к заявке #' + order.id);
+  } catch(e) {
+    console.error('file attach error:', e.message);
+    await ctx.reply('Ошибка при прикреплении файла.');
+  }
+});
   return bot;
 }
 
