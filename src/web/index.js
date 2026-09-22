@@ -472,7 +472,11 @@ var r = await fetch('/api/order', {
     var result = await r.json();
     if (result.ok) {
       btn.textContent = '✅ Заявка отправлена!';
-      setTimeout(function() { tg.close(); }, 1500);
+if (attachedFiles.length > 0) {
+  tg.showAlert('Заявка #' + result.id + ' принята!\n\nТеперь отправь файлы прямо в этот чат — бот прикрепит их к заявке.');
+} else {
+  setTimeout(function() { tg.close(); }, 1500);
+}
     } else { throw new Error(result.error || 'Ошибка сервера'); }
   } catch(e) {
     btn.disabled = false; btn.textContent = 'Отправить заявку';
