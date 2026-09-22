@@ -6,7 +6,8 @@ const multer = require('multer');
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 function setupWeb(app) {
   
-
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
   app.get('/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
   app.use(express.static(path.join(__dirname, '../../public')));
 
