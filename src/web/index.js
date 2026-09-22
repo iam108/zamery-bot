@@ -2,7 +2,8 @@ const express = require('express');
 const session = require('express-session');
 const path = require('path');
 const { getOrders, getOrderById, updateOrderStatus, getOrderLogs, getStats, createOrder, addLog, setTelegramMsgId } = require('../db/queries');
-
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 function setupWeb(app) {
   
 
@@ -56,9 +57,10 @@ function setupWeb(app) {
   });
 
   // API для Mini App формы заявки
-  app.post('/api/order', async (req, res) => {
+  app.post('/api/order', upload.array('files', 5), async (req, res) => {
     try {
       const data = req.body;
+      const files = req.files || [];
       const order = await createOrder(data);
       await addLog(order.id, 'created', String(data.tg_user_id || 'web'), 'Заявка создана через Mini App');
 
@@ -75,34 +77,34 @@ function setupWeb(app) {
       
             await setTelegramMsgId(order.id, msg.message_id);
 
-      if (data.attachments && data.attachments.length > 0) {
-        for (var i = 0; i < data.attachments.length; i++) {
-          var att = data.attachments[i];
-          var buf = Buffer.from(att.data, 'base64');
-          try {
-            if (att.type && att.type.indexOf('pdf') !== -1) {
-              await botInstance.telegram.sendDocument(process.env.GROUP_CHAT_ID,
-                { source: buf, filename: att.name },
-                { caption: '📎 ' + att.name, reply_to_message_id: msg.message_id }
-              );
-            } else {
-              await botInstance.telegram.sendPhoto(process.env.GROUP_CHAT_ID,
-                { source: buf },
-                { caption: '📎 ' + att.name, reply_to_message_id: msg.message_id }
-              );
-            }
-          } catch(fileErr) {
-            console.error('file send error:', fileErr.message);
-          }
-        }
+     if (files.length > 0) {
+  for (var i = 0; i < files.length; i++) {
+    var att = files[i];
+    var buf = att.buffer;
+    try {
+      if (att.mimetype && att.mimetype.indexOf('pdf') !== -1) {
+        await botInstance.telegram.sendDocument(process.env.GROUP_CHAT_ID,
+          { source: buf, filename: att.originalname },
+          { caption: '📎 ' + att.originalname, reply_to_message_id: msg.message_id }
+        );
+      } else {
+        await botInstance.telegram.sendPhoto(process.env.GROUP_CHAT_ID,
+          { source: buf },
+          { caption: '📎 ' + att.originalname, reply_to_message_id: msg.message_id }
+        );
       }
-
-      res.json({ ok: true, id: order.id });
-    } catch (e) {
-      console.error('api/order error:', e);
-      res.json({ ok: false, error: e.message });
+    } catch(fileErr) {
+      console.error('file send error:', fileErr.message);
     }
-  });
+  }
+}
+
+res.json({ ok: true, id: order.id });
+} catch (e) {
+  console.error('api/order error:', e);
+  res.json({ ok: false, error: e.message });
+}
+});
 
   // API для отчёта аудитора
   app.post('/api/audit', async (req, res) => {
