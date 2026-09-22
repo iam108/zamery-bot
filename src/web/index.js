@@ -450,24 +450,23 @@ async function submitForm() {
   var btn = document.getElementById('submit-btn');
   btn.disabled = true; btn.textContent = 'Отправляем...';
   try {
-    var r = await fetch('/api/order', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        address:     document.getElementById('address').value.trim(),
-        owner_name:  document.getElementById('owner_name').value.trim(),
-        object_type: document.getElementById('object_type').value,
-        object_name: document.getElementById('object_name').value.trim(),
-        has_video:   document.getElementById('has_video').checked,
-        zones_info:  document.getElementById('zones_info').value.trim(),
-        deadline:    document.getElementById('deadline').value || null,
-        contacts:    document.getElementById('contacts').value.trim(),
-        tg_user_id:  tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user.id : null,
-        attachments: await Promise.all(attachedFiles.slice(0,5).map(async function(f) {
-  return { data: await fileToBase64(f), name: f.name, type: f.type };
-})),
-      }),
-    });
+  var formData = new FormData();
+formData.append('address', document.getElementById('address').value.trim());
+formData.append('owner_name', document.getElementById('owner_name').value.trim());
+formData.append('object_type', document.getElementById('object_type').value);
+formData.append('object_name', document.getElementById('object_name').value.trim());
+formData.append('has_video', document.getElementById('has_video').checked);
+formData.append('zones_info', document.getElementById('zones_info').value.trim());
+formData.append('deadline', document.getElementById('deadline').value || '');
+formData.append('contacts', document.getElementById('contacts').value.trim());
+formData.append('tg_user_id', tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user.id : '');
+attachedFiles.slice(0,5).forEach(function(f) {
+  formData.append('files', f, f.name);
+});
+var r = await fetch('/api/order', {
+  method: 'POST',
+  body: formData,
+});
     var result = await r.json();
     if (result.ok) {
       btn.textContent = '✅ Заявка отправлена!';
