@@ -429,7 +429,6 @@ function toggleVideo(e) {
   var cb = document.getElementById('has_video');
   cb.checked = !cb.checked;
 }
-}
 var attachedFiles = [];
 function previewFiles(input) {
   attachedFiles = Array.from(input.files);
