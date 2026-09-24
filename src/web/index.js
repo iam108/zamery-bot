@@ -478,7 +478,7 @@ var r = await fetch('/api/order', {
     if (result.ok) {
       btn.textContent = '✅ Заявка отправлена!';
 if (attachedFiles.length > 0) {
-  tg.showAlert('Заявка #' + result.id + ' принята!\n\nТеперь отправь файлы...');
+    tg.showAlert('Заявка #' + result.id + ' принята! Теперь отправь файлы прямо в этот чат.');
 } else {
   setTimeout(function() { tg.close(); }, 1500);
 }
