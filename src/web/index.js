@@ -390,13 +390,14 @@ function miniAppForm() {
   <input id="object_name" type="text" placeholder="Например: Кафе «Весна»">
 </div>
 <div class="field">
-<div class="toggle-row" onclick="toggleVideo(event)" style="cursor:pointer">
+  <div class="toggle-row" onclick="toggleVideo(event)" style="cursor:pointer">
     <span>🎥 Нужно видео</span>
     <label class="toggle" onclick="event.stopPropagation()">
       <input type="checkbox" id="has_video">
       <span class="slider"></span>
     </label>
   </div>
+</div>
 <div class="field">
   <label>Информация о зонах</label>
   <textarea id="zones_info" placeholder="Описание зон, площадь, особенности..."></textarea>
@@ -477,7 +478,7 @@ var r = await fetch('/api/order', {
     if (result.ok) {
       btn.textContent = '✅ Заявка отправлена!';
 if (attachedFiles.length > 0) {
-  tg.showAlert('Заявка #' + result.id + ' принята!\n\nТеперь отправь файлы прямо в этот чат — бот прикрепит их к заявке.');
+  tg.showAlert('Заявка #' + result.id + ' принята!\n\nТеперь отправь файлы...');
 } else {
   setTimeout(function() { tg.close(); }, 1500);
 }
