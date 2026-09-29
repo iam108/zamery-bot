@@ -3,7 +3,7 @@ const session = require('express-session');
 const path = require('path');
 const { getOrders, getOrderById, updateOrderStatus, getOrderLogs, getStats, createOrder, addLog, setTelegramMsgId } = require('../db/queries');
 const multer = require('multer');
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 function setupWeb(app) {
   
 app.use(express.json({ limit: '50mb' }));
@@ -147,6 +147,10 @@ res.json({ ok: true, id: order.id });
     const { address, name } = req.query;
     const orders = await getOrdersByObject(address, name);
     res.send(objectDetailPage({ orders, address, name }));
+  });
+    app.use(function(err, req, res, next) {
+    console.error('server error:', err.message);
+    res.status(200).json({ ok: false, error: err.code === 'LIMIT_FILE_SIZE' ? 'Файл слишком большой (макс 50 МБ)' : err.message });
   });
   app.get('/form', (req, res) => res.send(miniAppForm()));
 
