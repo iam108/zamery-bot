@@ -236,7 +236,25 @@ function previewPhotos(input) {
   photoFiles.slice(0,6).forEach(function(f) { var img = document.createElement('img'); img.src = URL.createObjectURL(f); p.appendChild(img); });
 }
 function toBase64(file) {
-  return new Promise(function(res) { var r = new FileReader(); r.onload = function() { res(r.result.split(',')[1]); }; r.readAsDataURL(file); });
+  return new Promise(function(res, rej) {
+    var img = new Image();
+    var url = URL.createObjectURL(file);
+    img.onload = function() {
+      var max = 1600;
+      var w = img.width, h = img.height;
+      if (w > max || h > max) {
+        if (w > h) { h = Math.round(h * max / w); w = max; }
+        else { w = Math.round(w * max / h); h = max; }
+      }
+      var c = document.createElement('canvas');
+      c.width = w; c.height = h;
+      c.getContext('2d').drawImage(img, 0, 0, w, h);
+      URL.revokeObjectURL(url);
+      res(c.toDataURL('image/jpeg', 0.7).split(',')[1]);
+    };
+    img.onerror = rej;
+    img.src = url;
+  });
 }
 
 async function submitForm() {
