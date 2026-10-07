@@ -183,6 +183,33 @@ bot.on(['photo', 'document'], async (ctx) => {
     await ctx.reply('Ошибка при прикреплении файла.');
   }
 });
+    // Кнопка «Передать юристу» в группе замеров → ссылка на форму в личку
+  bot.action(/^handoff:(\d+)$/, async (ctx) => {
+    const orderId = ctx.match[1];
+    try {
+      await ctx.telegram.sendMessage(ctx.from.id, '⚖️ Передать заявку #' + orderId + ' юристу:', {
+        reply_markup: { inline_keyboard: [[{ text: '📝 Открыть форму', web_app: { url: WEBAPP_URL + '/handoff?order_id=' + orderId } }]] },
+      });
+      await ctx.answerCbQuery('Форма отправлена вам в личку 👆');
+    } catch (e) {
+      await ctx.answerCbQuery('Сначала напишите боту /start в личке', { show_alert: true });
+    }
+  });
+
+  // Юрист: список моих клиентов с чек-листами
+  bot.command('cases', async (ctx) => {
+    const pool = require('../db/pool');
+    const { rows } = await pool.query(
+      'SELECT id, org, done, total FROM cases WHERE lawyer_tg_id=$1 AND completed_at IS NULL ORDER BY created_at DESC LIMIT 20',
+      [ctx.from.id]
+    );
+    if (!rows.length) return ctx.reply('У вас нет открытых клиентов 🎉');
+    await ctx.reply('📂 Ваши клиенты в работе:', {
+      reply_markup: { inline_keyboard: rows.map(function(c) {
+        return [{ text: c.org + ' — ' + c.done + '/' + c.total, web_app: { url: WEBAPP_URL + '/checklist?case_id=' + c.id } }];
+      }) },
+    });
+  });
   return bot;
 }
 
