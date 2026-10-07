@@ -68,7 +68,7 @@ function caseText(c) {
   L.push('');
   L.push('🏢 <b>' + esc(c.org) + '</b>');
   if (c.inn) L.push('ИНН: <code>' + esc(c.inn) + '</code>');
-  L.push('👤 Клиент: ' + esc(c.client) + (c.phone ? ' ' + esc(c.phone) : ''));
+  if (c.client || c.phone) L.push('👤 Клиент: ' + [esc(c.client), esc(c.phone)].filter(Boolean).join(', '));
   if (c.address) L.push('📍 Адрес: ' + esc(c.address));
   if (c.priority) L.push('⚡ Приоритет: ' + esc(c.priority));
   L.push('⚖️ Юрист: ' + esc(c.lawyer_name));
@@ -95,27 +95,29 @@ async function ensureReports() {
       UNIQUE (chat_id, first_id)
     );
     CREATE INDEX IF NOT EXISTS reports_chat_time ON reports (chat_id, created_at DESC);
+    ALTER TABLE reports ADD COLUMN IF NOT EXISTS reply_to BIGINT;
+    CREATE INDEX IF NOT EXISTS reports_reply ON reports (chat_id, reply_to);
   `);
 }
 
 var MERGE_SEC = 180; // сообщения одного автора подряд в пределах 3 минут — один отчёт
 
-async function addToReports(chatId, msgId, text, author, authorId, mgid, date) {
+async function addToReports(chatId, msgId, text, author, authorId, mgid, date, replyTo) {
   var when = date || new Date();
   var r = null;
   if (mgid) r = (await pool.query('SELECT id FROM reports WHERE chat_id=$1 AND mgid=$2 ORDER BY id DESC LIMIT 1', [chatId, mgid])).rows[0];
   if (!r) r = (await pool.query(
-    "SELECT id FROM reports WHERE chat_id=$1 AND author=$2 AND created_at > $3::timestamptz - INTERVAL '" + MERGE_SEC + " seconds' AND created_at <= $3::timestamptz + INTERVAL '5 seconds' ORDER BY id DESC LIMIT 1",
-    [chatId, author, when])).rows[0];
+    "SELECT id FROM reports WHERE chat_id=$1 AND author=$2 AND created_at > $3::timestamptz - INTERVAL '" + MERGE_SEC + " seconds' AND created_at <= $3::timestamptz + INTERVAL '5 seconds' AND ($4::bigint IS NULL OR reply_to = $4) ORDER BY id DESC LIMIT 1",
+    [chatId, author, when, replyTo || null])).rows[0];
   if (r) {
     await pool.query(
-      "UPDATE reports SET msg_ids = array_append(msg_ids, $1), text = CASE WHEN $2 = '' THEN text WHEN text = '' THEN $2 ELSE text || E'\\n' || $2 END, mgid = COALESCE(mgid, $3) WHERE id=$4 AND NOT ($1 = ANY(msg_ids))",
-      [msgId, text || '', mgid || null, r.id]);
+      "UPDATE reports SET msg_ids = array_append(msg_ids, $1), text = CASE WHEN $2 = '' THEN text WHEN text = '' THEN $2 ELSE text || E'\\n' || $2 END, mgid = COALESCE(mgid, $3), reply_to = COALESCE(reply_to, $5) WHERE id=$4 AND NOT ($1 = ANY(msg_ids))",
+      [msgId, text || '', mgid || null, r.id, replyTo || null]);
     return;
   }
   await pool.query(
-    'INSERT INTO reports (chat_id, first_id, msg_ids, text, author, author_id, mgid, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (chat_id, first_id) DO NOTHING',
-    [chatId, msgId, [msgId], text || '', author, authorId || null, mgid || null, when]);
+    'INSERT INTO reports (chat_id, first_id, msg_ids, text, author, author_id, mgid, created_at, reply_to) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (chat_id, first_id) DO NOTHING',
+    [chatId, msgId, [msgId], text || '', author, authorId || null, mgid || null, when, replyTo || null]);
 }
 
 // Бот запоминает каждое сообщение в чате замеров
@@ -128,13 +130,17 @@ function setupReportsBot(bot) {
       var hasMedia = !!(m.photo || m.document || m.video);
       if (text || hasMedia) {
         var author = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ') || 'аудитор';
-        try { await addToReports(ctx.chat.id, m.message_id, text, author, ctx.from.id, m.media_group_id, new Date(m.date * 1000)); }
+        try { await addToReports(ctx.chat.id, m.message_id, text, author, ctx.from.id, m.media_group_id, new Date(m.date * 1000), m.reply_to_message ? m.reply_to_message.message_id : null); }
         catch (e) { console.error('report save:', e.message); }
       }
     }
     return next();
   });
 }
+
+// Карточка заявки (от бота или старой формы), а не отчёт
+function isOrderCard(t) { return /^[^\wА-Яа-я]*(Новая заявка|Заявка\s*#\d+)/i.test(t || '') || /Чей объект\s*:/.test(t || ''); }
+function orderNum(t) { var m = String(t || '').match(/Заявка\s*#(\d+)/i); return m ? parseInt(m[1]) : null; }
 
 // Поиск: по адресу, названию, ИНН, #номеру заявки — по всем словам сразу
 async function searchReports(q) {
@@ -144,24 +150,51 @@ async function searchReports(q) {
     params.push('%' + w.replace(/^#/, '') + '%');
     var n = '$' + params.length;
     condA.push("replace(lower(concat_ws(' ', a.text, o.address, o.object_name, o.owner_name, '#' || a.order_id)), 'ё', 'е') LIKE " + n);
-    condR.push("replace(lower(r.text), 'ё', 'е') LIKE " + n);
+    condR.push("replace(lower(concat_ws(' ', r.text, o2.address, o2.object_name, o2.owner_name, '#' || o2.id)), 'ё', 'е') LIKE " + n);
   });
   var sql =
-    "SELECT 'a' AS src, a.id, a.text, a.created_at, a.order_id, o.address, o.object_name, NULL AS author " +
+    "SELECT 'a' AS src, a.id, a.text, a.created_at, a.order_id, o.address, NULL::text AS author " +
     "FROM audits a LEFT JOIN orders o ON o.id = a.order_id " + (condA.length ? 'WHERE ' + condA.join(' AND ') : '') +
     " UNION ALL " +
-    "SELECT 'r', r.id, r.text, r.created_at, NULL, NULL, NULL, r.author FROM reports r WHERE r.text <> '' " + (condR.length ? 'AND ' + condR.join(' AND ') : '') +
+    "SELECT 'r', r.id, r.text, r.created_at, o2.id, o2.address, r.author FROM reports r " +
+    "LEFT JOIN orders o2 ON o2.telegram_msg_id = r.reply_to " +
+    "WHERE r.text <> '' " + (condR.length ? 'AND ' + condR.join(' AND ') : '') +
     " ORDER BY created_at DESC LIMIT 20";
-  return (await pool.query(sql, params)).rows;
+  var rows = (await pool.query(sql, params)).rows;
+  for (var i = 0; i < rows.length; i++) {
+    var it = rows[i];
+    it.kind = it.src === 'r' && isOrderCard(it.text) ? 'order' : 'report';
+    if (it.kind === 'order') {
+      if (!it.order_id) it.order_id = orderNum(it.text);
+      var full = await getReport('r', it.id);
+      it.linked = full ? full.linked : 0;
+    }
+  }
+  return rows;
 }
 
+// Отчёт + всё, что пришло ответом на него (для карточки заявки — сам отчёт аудитора)
 async function getReport(src, id) {
   if (src === 'a') {
     var a = (await pool.query('SELECT * FROM audits WHERE id=$1', [id])).rows[0];
-    return a ? { chat_id: a.chat_id, msg_ids: a.msg_ids, text: a.text } : null;
+    return a ? { chat_id: a.chat_id, msg_ids: a.msg_ids, text: a.text, linked: 0 } : null;
   }
   var r = (await pool.query('SELECT * FROM reports WHERE id=$1', [id])).rows[0];
-  return r ? { chat_id: r.chat_id, msg_ids: r.msg_ids, text: r.text } : null;
+  if (!r) return null;
+  var ids = (r.msg_ids || []).map(Number);
+  var replies = (await pool.query(
+    'SELECT * FROM reports WHERE chat_id=$1 AND reply_to = ANY($2::bigint[]) AND id <> $3 ORDER BY first_id', [r.chat_id, ids, r.id])).rows;
+  var num = isOrderCard(r.text) ? orderNum(r.text) : null;
+  var audits = num ? (await pool.query('SELECT * FROM audits WHERE order_id=$1 ORDER BY created_at', [num])).rows : [];
+  var texts = replies.map(function (x) { return x.text; }).filter(Boolean).concat(audits.map(function (x) { return x.text; }));
+  replies.forEach(function (x) { ids = ids.concat((x.msg_ids || []).map(Number)); });
+  return {
+    chat_id: r.chat_id,
+    msg_ids: ids,
+    extra: audits.filter(function (x) { return String(x.chat_id) === String(r.chat_id); }).reduce(function (acc, x) { return acc.concat((x.msg_ids || []).map(Number)); }, []),
+    text: isOrderCard(r.text) ? (texts.join('\n\n') || '') : [r.text].concat(texts).join('\n\n'),
+    linked: replies.length + audits.length
+  };
 }
 
 var RU_MONTHS = { 'января': 1, 'февраля': 2, 'марта': 3, 'апреля': 4, 'мая': 5, 'июня': 6, 'июля': 7, 'августа': 8, 'сентября': 9, 'октября': 10, 'ноября': 11, 'декабря': 12 };
@@ -191,7 +224,7 @@ function parseExport(buf, name) {
     (j.messages || []).forEach(function (m) {
       if (m.type !== 'message') return;
       var t = typeof m.text === 'string' ? m.text : (m.text || []).map(function (x) { return typeof x === 'string' ? x : x.text; }).join('');
-      out.push({ id: m.id, date: new Date(m.date), author: m.from || '', text: t, media: !!(m.photo || m.file) });
+      out.push({ id: m.id, date: new Date(m.date), author: m.from || '', text: t, media: !!(m.photo || m.file), reply: m.reply_to_message_id || null });
     });
     return out;
   }
@@ -205,21 +238,24 @@ function parseExport(buf, name) {
     var date = parseExportDate(body);
     var tm = body.match(/<div class="text">([\s\S]*?)<\/div>/);
     var media = /class="media_wrap|class="photo_wrap|class="media clearfix/.test(body);
-    out.push({ id: id, date: date, author: lastAuthor, text: tm ? clean(tm[1]) : '', media: media });
+    var rm = body.match(/class="reply_to details"[\s\S]{0,300}?go_to_message(-?\d+)/);
+    out.push({ id: id, date: date, author: lastAuthor, text: tm ? clean(tm[1]) : '', media: media, reply: rm ? parseInt(rm[1]) : null });
   }
   return out;
 }
 
-function adminImportPage(msg) {
+function adminImportPage(msg, isErr) {
   return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Импорт отчётов</title>' +
     '<style>body{font-family:-apple-system,sans-serif;background:#0f172a;color:#f1f5f9;padding:32px;max-width:640px;margin:0 auto;line-height:1.5}a{color:#94a3b8}' +
     '.card{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:24px;margin-top:16px}input{margin:14px 0;color:#f1f5f9}' +
-    'button{padding:12px 20px;background:#6366f1;color:#fff;border:0;border-radius:10px;font-size:15px;cursor:pointer}.ok{color:#22c55e;font-weight:600}ol{padding-left:20px;color:#cbd5e1}</style></head><body>' +
+    'button{padding:12px 20px;background:#6366f1;color:#fff;border:0;border-radius:10px;font-size:15px;cursor:pointer}.ok{color:#22c55e;font-weight:600}.err{color:#f87171;font-weight:600}button:disabled{opacity:.6}#fc{color:#94a3b8;font-size:13px}ol{padding-left:20px;color:#cbd5e1}</style></head><body>' +
     '<a href="/admin">← Назад</a><h1 style="margin-top:12px">Импорт отчётов из чата замеров</h1>' +
-    (msg ? '<p class="ok">' + esc(msg) + '</p>' : '') +
+    (msg ? '<p class="' + (isErr ? 'err' : 'ok') + '">' + esc(msg) + '</p>' : '') +
     '<div class="card"><ol><li>Telegram Desktop → чат замеров → ⋮ → «Экспорт истории чата».</li><li>Снять все галочки (фото, файлы не нужны), формат HTML или JSON.</li>' +
     '<li>Загрузить сюда все файлы <b>messages*.html</b> или <b>result.json</b>.</li></ol>' +
-    '<form method="POST" enctype="multipart/form-data"><input type="file" name="files" multiple accept=".html,.json"><br><button type="submit">Загрузить</button></form>' +
+    '<form method="POST" action="/admin/import" enctype="multipart/form-data" onsubmit="var f=document.getElementById(\'fi\');if(!f.files.length){alert(\'Сначала выберите файлы\');return false}var b=document.getElementById(\'sb\');b.disabled=true;b.textContent=\'Загружаю, не закрывайте страницу…\'">' +
+    '<input id="fi" type="file" name="files" multiple accept=".html,.json" onchange="document.getElementById(\'fc\').textContent=this.files.length?\'Выбрано файлов: \'+this.files.length:\'\'"><div id="fc"></div><br>' +
+    '<button id="sb" type="submit">Загрузить</button></form>' +
     '<p style="color:#94a3b8;font-size:13px">Повторная загрузка не создаёт дублей.</p></div></body></html>';
 }
 
@@ -233,21 +269,57 @@ function setupReportsWeb(app, upload) {
 
   function auth(req, res, next) { if (req.session && req.session.auth) return next(); res.redirect('/admin/login'); }
   app.get('/admin/import', auth, function (req, res) { res.send(adminImportPage()); });
-  app.post('/admin/import', auth, upload.array('files', 30), async function (req, res) {
+  app.post('/admin/import', auth, upload.array('files', 50), async function (req, res) {
     try {
+      var files = req.files || [];
+      if (!files.length) return res.send(adminImportPage('Файлы не выбраны. Нажмите «Выберите файлы» и отметьте messages.html.', true));
       var msgs = [];
-      (req.files || []).forEach(function (f) { msgs = msgs.concat(parseExport(f.buffer, f.originalname)); });
+      files.forEach(function (f) { msgs = msgs.concat(parseExport(f.buffer, f.originalname)); });
       msgs.sort(function (a, b) { return a.id - b.id; });
-      var chatId = process.env.GROUP_CHAT_ID, n = 0;
-      for (var i = 0; i < msgs.length; i++) {
-        var m = msgs[i];
-        if (!m.text && !m.media) continue;
-        await addToReports(chatId, m.id, m.text, m.author || 'аудитор', null, null, m.date);
-        n++;
+      var chatId = process.env.GROUP_CHAT_ID;
+
+      // Склеиваем в памяти: один автор подряд в пределах 3 минут = один отчёт
+      var groups = [], cur = null;
+      msgs.forEach(function (m) {
+        if (!m.text && !m.media) return;
+        var author = m.author || 'аудитор';
+        var sameThread = !m.reply || m.reply === cur.reply;
+        if (cur && cur.author === author && (m.date - cur.last) <= MERGE_SEC * 1000 && sameThread) {
+          cur.ids.push(m.id); if (m.text) cur.text.push(m.text); cur.last = m.date;
+        } else {
+          cur = { first: m.id, ids: [m.id], text: m.text ? [m.text] : [], author: author, date: m.date, last: m.date, reply: m.reply || null };
+          groups.push(cur);
+        }
+      });
+
+      // Пересобираем ранее импортированное (без дублей); живые записи бота не трогаем
+      if (msgs.length) {
+        await pool.query('DELETE FROM reports WHERE chat_id=$1 AND author_id IS NULL AND first_id BETWEEN $2 AND $3',
+          [chatId, msgs[0].id, msgs[msgs.length - 1].id]);
+      }
+      var live = new Set((await pool.query('SELECT unnest(msg_ids) AS id FROM reports WHERE chat_id=$1', [chatId])).rows.map(function (x) { return String(x.id); }));
+      groups = groups.filter(function (g) { return !g.ids.some(function (id) { return live.has(String(id)); }); });
+
+      // Пишем пачками по 500
+      var added = 0;
+      for (var i = 0; i < groups.length; i += 500) {
+        var part = groups.slice(i, i + 500);
+        var r = await pool.query(
+          "INSERT INTO reports (chat_id, first_id, msg_ids, text, author, created_at, reply_to) " +
+          "SELECT $1, f, string_to_array(ids, ',')::bigint[], t, a, d, NULLIF(rp, 0) FROM unnest($2::bigint[], $3::text[], $4::text[], $5::text[], $6::timestamptz[], $7::bigint[]) AS x(f, ids, t, a, d, rp) " +
+          "ON CONFLICT (chat_id, first_id) DO UPDATE SET reply_to = COALESCE(reports.reply_to, EXCLUDED.reply_to), msg_ids = EXCLUDED.msg_ids, text = EXCLUDED.text",
+          [chatId,
+            part.map(function (g) { return g.first; }),
+            part.map(function (g) { return g.ids.join(','); }),
+            part.map(function (g) { return g.text.join('\n'); }),
+            part.map(function (g) { return g.author; }),
+            part.map(function (g) { return g.date.toISOString(); }),
+            part.map(function (g) { return g.reply || 0; })]);
+        added += r.rowCount;
       }
       var cnt = (await pool.query('SELECT COUNT(*)::int AS c FROM reports WHERE chat_id=$1', [chatId])).rows[0].c;
-      res.send(adminImportPage('Обработано сообщений: ' + n + '. Отчётов в базе: ' + cnt + '.'));
-    } catch (e) { console.error('import:', e); res.send(adminImportPage('Ошибка: ' + e.message)); }
+      res.send(adminImportPage('Готово. Файлов: ' + files.length + ', сообщений: ' + msgs.length + ', отчётов загружено: ' + added + '. Всего в базе: ' + cnt + '.'));
+    } catch (e) { console.error('import:', e); res.send(adminImportPage('Ошибка: ' + e.message, true)); }
   });
 }
 
@@ -287,6 +359,10 @@ function setupHandoff(app) {
       if (!lawyer) return res.json({ ok: false, error: 'Юрист не найден. Он должен нажать /start в боте и выбрать роль «Юрист».' });
       if (d.kind === 'Табак') d.checklist_key = null; else d.checklist_key = pickChecklist(d.region, d.kind, d.service);
       var total = 0;
+      var audit = null;
+      if (d.report_src && d.report_id) audit = await getReport(d.report_src, parseInt(d.report_id));
+      if (audit && audit.msg_ids) audit.msg_ids = Array.from(new Set(audit.msg_ids.concat(audit.extra || []).map(Number))).sort(function (x, y) { return x - y; }).slice(0, 100);
+      if (audit && audit.text && !d.audit_text_manual) d.audit_text = audit.text;
       var c = (await pool.query(
         `INSERT INTO cases (order_id, lawyer_tg_id, lawyer_name, checklist_key, org, inn, client, phone, address,
           region, kind, service, priority, comment, audit_text, total, created_by)
@@ -296,9 +372,6 @@ function setupHandoff(app) {
       )).rows[0];
 
       var text = caseText(c);
-      var audit = null;
-      if (d.report_src && d.report_id) audit = await getReport(d.report_src, parseInt(d.report_id));
-      if (audit && audit.msg_ids) audit.msg_ids = audit.msg_ids.map(Number).sort(function (x, y) { return x - y; }).slice(0, 100);
 
       // 1) Чат «Заявки по клиенту»: файлы аудитора + карточка
       var CLIENTS = process.env.CLIENTS_CHAT_ID;
@@ -418,7 +491,14 @@ function handoffClient() {
     if (!REP) { box.hidden = true; $('rq').hidden = false; return; }
     $('rq').hidden = true; box.hidden = false;
     $('chosen-text').textContent = preview(it.text);
-    $('chosen-meta').textContent = (it.order_id ? 'Заявка #' + it.order_id + ', ' : '') + (it.author ? it.author + ', ' : '') + fmtDate(it.created_at);
+    var meta = $('chosen-meta');
+    if (it.kind === 'order') {
+      meta.textContent = it.linked ? 'Заявка' + (it.order_id ? ' #' + it.order_id : '') + ' + отчёт аудитора: прикрепится вместе с фото' : 'Заявка' + (it.order_id ? ' #' + it.order_id : '') + ': отчёта в ответах нет. Найдите отчёт отдельно';
+      meta.className = 'chosen-m' + (it.linked ? '' : ' no');
+    } else {
+      meta.textContent = 'Отчёт' + (it.order_id ? ' по заявке #' + it.order_id : '') + ', ' + (it.author ? it.author + ', ' : '') + fmtDate(it.created_at);
+      meta.className = 'chosen-m';
+    }
     try { tg.HapticFeedback.selectionChanged(); } catch (e) {}
     fillFrom(it.text);
   }
@@ -451,8 +531,12 @@ function handoffClient() {
         var row = document.createElement('button'); row.type = 'button'; row.className = 'res';
         var t = document.createElement('div'); t.className = 'res-t'; t.textContent = preview(it.text).slice(0, 160);
         var m = document.createElement('div'); m.className = 'res-m';
-        m.textContent = (it.order_id ? '#' + it.order_id + ' · ' : '') + (it.address ? it.address + ' · ' : '') + (it.author ? it.author + ' · ' : '') + fmtDate(it.created_at);
-        row.appendChild(t); row.appendChild(m);
+        var tag = document.createElement('span');
+        if (it.kind === 'order') { tag.className = 'tag ' + (it.linked ? 'tag-ok' : 'tag-no'); tag.textContent = it.linked ? 'Заявка · отчёт есть' : 'Заявка · отчёта нет'; }
+        else { tag.className = 'tag tag-rep'; tag.textContent = 'Отчёт'; }
+        m.appendChild(tag);
+        m.appendChild(document.createTextNode((it.order_id ? '#' + it.order_id + ', ' : '') + (it.author ? it.author + ', ' : '') + fmtDate(it.created_at)));
+        row.appendChild(m); row.appendChild(t);
         row.onclick = function () { choose(it); };
         box.appendChild(row);
       });
@@ -508,7 +592,11 @@ function handoffPage() {
     '.chosen-t{font-size:14px;line-height:1.45;white-space:pre-wrap;max-height:180px;overflow:auto;padding-right:26px}',
     '.chosen-m{font-size:12px;color:#22c55e;margin-top:6px;font-weight:600}',
     '#chosen-x{position:absolute;top:8px;right:8px;width:26px;height:26px;border-radius:13px;border:0;background:rgba(128,128,128,.25);color:inherit;font-size:14px;cursor:pointer}',
-    '.warn{font-size:13px;color:#f87171}'
+    '.warn{font-size:13px;color:#f87171}',
+    '.res-m{display:flex;align-items:center;gap:8px;margin:0 0 5px}',
+    '.tag{font-size:11px;font-weight:700;padding:2px 8px;border-radius:6px}',
+    '.tag-rep{background:rgba(34,197,94,.18);color:#22c55e}.tag-ok{background:rgba(99,102,241,.2);color:#818cf8}.tag-no{background:rgba(248,113,113,.18);color:#f87171}',
+    '.chosen-m.no{color:#f87171}'
   ].join('\n');
   return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">' +
     '<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">' +
