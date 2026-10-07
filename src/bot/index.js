@@ -7,7 +7,7 @@ function setupBot() {
   const bot = new Telegraf(process.env.BOT_TOKEN);
   const GROUP_ID = process.env.GROUP_CHAT_ID;
   const WEBAPP_URL = process.env.WEBAPP_URL;
-
+  require('../web/handoff').setupReportsBot(bot);
    bot.start(async (ctx) => {
     const pool = require('../db/pool');
     const me = (await pool.query('SELECT * FROM staff WHERE tg_id=$1', [ctx.from.id])).rows[0];
