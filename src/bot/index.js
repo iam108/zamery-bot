@@ -8,14 +8,42 @@ function setupBot() {
   const GROUP_ID = process.env.GROUP_CHAT_ID;
   const WEBAPP_URL = process.env.WEBAPP_URL;
 
-  bot.start(async (ctx) => {
-    await ctx.reply(
-      '👋 Привет!\n\nВыбери действие:',
-      Markup.keyboard([
-        [Markup.button.webApp('📋 Новая заявка', WEBAPP_URL + '/form')],
-        [Markup.button.webApp('🔍 Отчёт аудитора', WEBAPP_URL + '/audit')],
-      ]).resize()
+   bot.start(async (ctx) => {
+    const pool = require('../db/pool');
+    const me = (await pool.query('SELECT * FROM staff WHERE tg_id=$1', [ctx.from.id])).rows[0];
+    if (!me) {
+      return ctx.reply('👋 Привет! Кто вы в команде?', Markup.inlineKeyboard([
+        [Markup.button.callback('👔 Менеджер', 'role:manager')],
+        [Markup.button.callback('⚖️ Юрист', 'role:lawyer')],
+        [Markup.button.callback('🔍 Аудитор', 'role:auditor')],
+      ]));
+    }
+    const roles = { manager: 'Менеджер', lawyer: 'Юрист', auditor: 'Аудитор' };
+    await ctx.reply('👋 ' + me.name + ' (' + roles[me.role] + ')\n\nВыбери действие:', Markup.keyboard([
+      [Markup.button.webApp('📋 Новая заявка', WEBAPP_URL + '/form')],
+      [Markup.button.webApp('🔍 Отчёт аудитора', WEBAPP_URL + '/audit')],
+    ]).resize());
+  });
+
+  bot.action(/^role:(\w+)$/, async (ctx) => {
+    const pool = require('../db/pool');
+    const role = ctx.match[1];
+    const name = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ');
+    await pool.query(
+      'INSERT INTO staff (tg_id, name, username, role) VALUES ($1,$2,$3,$4) ON CONFLICT (tg_id) DO UPDATE SET name=$2, username=$3, role=$4',
+      [ctx.from.id, name, ctx.from.username || null, role]
     );
+    const roles = { manager: 'Менеджер', lawyer: 'Юрист', auditor: 'Аудитор' };
+    await ctx.editMessageText('✅ Вы зарегистрированы как: ' + roles[role] + '\n\nНажмите /start');
+    await ctx.answerCbQuery();
+  });
+
+  bot.command('role', async (ctx) => {
+    await ctx.reply('Сменить роль:', Markup.inlineKeyboard([
+      [Markup.button.callback('👔 Менеджер', 'role:manager')],
+      [Markup.button.callback('⚖️ Юрист', 'role:lawyer')],
+      [Markup.button.callback('🔍 Аудитор', 'role:auditor')],
+    ]));
   });
 
   bot.command('stats', async (ctx) => {
