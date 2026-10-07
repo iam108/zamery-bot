@@ -18,13 +18,14 @@ function setupBot() {
         [Markup.button.callback('🔍 Аудитор', 'role:auditor')],
       ]));
     }
-    const roles = { manager: 'Менеджер', lawyer: 'Юрист', auditor: 'Аудитор' };
-    await ctx.reply('👋 ' + me.name + ' (' + roles[me.role] + ')\n\nВыбери действие:', Markup.keyboard([
-      [Markup.button.webApp('📋 Новая заявка', WEBAPP_URL + '/form')],
-      [Markup.button.webApp('🔍 Отчёт аудитора', WEBAPP_URL + '/audit')],
-    ]).resize());
+       const roles = { manager: 'Менеджер', lawyer: 'Юрист', auditor: 'Аудитор' };
+    const zamer = Markup.button.webApp('📋 Заявка на замер', WEBAPP_URL + '/form');
+    let kb;
+    if (me.role === 'manager') kb = [[zamer], [Markup.button.webApp('⚖️ Передать юристу', WEBAPP_URL + '/handoff')]];
+    else if (me.role === 'lawyer') kb = [[zamer], ['📂 Мои клиенты']];
+    else kb = [[Markup.button.webApp('🔍 Отчёт аудитора', WEBAPP_URL + '/audit')]];
+    await ctx.reply('👋 ' + me.name + ' (' + roles[me.role] + ')\n\nВыбери действие:', Markup.keyboard(kb).resize());
   });
-
   bot.action(/^role:(\w+)$/, async (ctx) => {
     const pool = require('../db/pool');
     const role = ctx.match[1];
@@ -224,8 +225,10 @@ bot.on(['photo', 'document'], async (ctx) => {
     }
   });
 
-  // Юрист: список моих клиентов с чек-листами
-  bot.command('cases', async (ctx) => {
+   // Юрист: список моих клиентов с чек-листами
+  bot.hears('📂 Мои клиенты', (ctx) => showCases(ctx));
+  bot.command('cases', (ctx) => showCases(ctx));
+  async function showCases(ctx) {
     const pool = require('../db/pool');
     const { rows } = await pool.query(
       'SELECT id, org, done, total FROM cases WHERE lawyer_tg_id=$1 AND completed_at IS NULL ORDER BY created_at DESC LIMIT 20',
@@ -237,7 +240,8 @@ bot.on(['photo', 'document'], async (ctx) => {
         return [{ text: c.org + ' — ' + c.done + '/' + c.total, web_app: { url: WEBAPP_URL + '/checklist?case_id=' + c.id } }];
       }) },
     });
-  });
+  }
+
   return bot;
 }
 
