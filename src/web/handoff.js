@@ -72,10 +72,183 @@ function caseText(c) {
   if (c.address) L.push('📍 Адрес: ' + esc(c.address));
   if (c.priority) L.push('⚡ Приоритет: ' + esc(c.priority));
   L.push('⚖️ Юрист: ' + esc(c.lawyer_name));
-  if (c.audit_text) { L.push(''); L.push('🔍 <b>Комментарий аудитора:</b>'); L.push(esc(c.audit_text)); }
+  if (c.audit_text) { L.push(''); L.push('🔍 <b>Комментарий аудитора:</b>'); var at = String(c.audit_text).replace(/[*_`]/g, ''); L.push(esc(at.length > 1500 ? at.slice(0, 1500) + '…' : at)); }
   if (c.comment) { L.push(''); L.push('💬 <b>Комментарий менеджера:</b>'); L.push(esc(c.comment)); }
   L.push(''); L.push('#заявка' + c.id);
   return L.join('\n');
+}
+
+
+// ── Отчёты из чата замеров: запоминание, поиск, импорт выгрузки ─────────
+async function ensureReports() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS reports (
+      id         SERIAL PRIMARY KEY,
+      chat_id    BIGINT,
+      first_id   BIGINT,
+      msg_ids    BIGINT[] DEFAULT '{}',
+      text       TEXT DEFAULT '',
+      author     TEXT,
+      author_id  BIGINT,
+      mgid       TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE (chat_id, first_id)
+    );
+    CREATE INDEX IF NOT EXISTS reports_chat_time ON reports (chat_id, created_at DESC);
+  `);
+}
+
+var MERGE_SEC = 180; // сообщения одного автора подряд в пределах 3 минут — один отчёт
+
+async function addToReports(chatId, msgId, text, author, authorId, mgid, date) {
+  var when = date || new Date();
+  var r = null;
+  if (mgid) r = (await pool.query('SELECT id FROM reports WHERE chat_id=$1 AND mgid=$2 ORDER BY id DESC LIMIT 1', [chatId, mgid])).rows[0];
+  if (!r) r = (await pool.query(
+    "SELECT id FROM reports WHERE chat_id=$1 AND author=$2 AND created_at > $3::timestamptz - INTERVAL '" + MERGE_SEC + " seconds' AND created_at <= $3::timestamptz + INTERVAL '5 seconds' ORDER BY id DESC LIMIT 1",
+    [chatId, author, when])).rows[0];
+  if (r) {
+    await pool.query(
+      "UPDATE reports SET msg_ids = array_append(msg_ids, $1), text = CASE WHEN $2 = '' THEN text WHEN text = '' THEN $2 ELSE text || E'\\n' || $2 END, mgid = COALESCE(mgid, $3) WHERE id=$4 AND NOT ($1 = ANY(msg_ids))",
+      [msgId, text || '', mgid || null, r.id]);
+    return;
+  }
+  await pool.query(
+    'INSERT INTO reports (chat_id, first_id, msg_ids, text, author, author_id, mgid, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (chat_id, first_id) DO NOTHING',
+    [chatId, msgId, [msgId], text || '', author, authorId || null, mgid || null, when]);
+}
+
+// Бот запоминает каждое сообщение в чате замеров
+function setupReportsBot(bot) {
+  ensureReports().catch(function (e) { console.error('reports table:', e.message); });
+  bot.on('message', async function (ctx, next) {
+    if (String(ctx.chat.id) === String(process.env.GROUP_CHAT_ID)) {
+      var m = ctx.message;
+      var text = m.text || m.caption || '';
+      var hasMedia = !!(m.photo || m.document || m.video);
+      if (text || hasMedia) {
+        var author = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ') || 'аудитор';
+        try { await addToReports(ctx.chat.id, m.message_id, text, author, ctx.from.id, m.media_group_id, new Date(m.date * 1000)); }
+        catch (e) { console.error('report save:', e.message); }
+      }
+    }
+    return next();
+  });
+}
+
+// Поиск: по адресу, названию, ИНН, #номеру заявки — по всем словам сразу
+async function searchReports(q) {
+  var words = String(q || '').toLowerCase().replace(/ё/g, 'е').split(/[\s,.;]+/).filter(function (w) { return w.length > 1 || /^\d+$/.test(w); }).slice(0, 6);
+  var params = [], condA = [], condR = [];
+  words.forEach(function (w) {
+    params.push('%' + w.replace(/^#/, '') + '%');
+    var n = '$' + params.length;
+    condA.push("replace(lower(concat_ws(' ', a.text, o.address, o.object_name, o.owner_name, '#' || a.order_id)), 'ё', 'е') LIKE " + n);
+    condR.push("replace(lower(r.text), 'ё', 'е') LIKE " + n);
+  });
+  var sql =
+    "SELECT 'a' AS src, a.id, a.text, a.created_at, a.order_id, o.address, o.object_name, NULL AS author " +
+    "FROM audits a LEFT JOIN orders o ON o.id = a.order_id " + (condA.length ? 'WHERE ' + condA.join(' AND ') : '') +
+    " UNION ALL " +
+    "SELECT 'r', r.id, r.text, r.created_at, NULL, NULL, NULL, r.author FROM reports r WHERE r.text <> '' " + (condR.length ? 'AND ' + condR.join(' AND ') : '') +
+    " ORDER BY created_at DESC LIMIT 20";
+  return (await pool.query(sql, params)).rows;
+}
+
+async function getReport(src, id) {
+  if (src === 'a') {
+    var a = (await pool.query('SELECT * FROM audits WHERE id=$1', [id])).rows[0];
+    return a ? { chat_id: a.chat_id, msg_ids: a.msg_ids, text: a.text } : null;
+  }
+  var r = (await pool.query('SELECT * FROM reports WHERE id=$1', [id])).rows[0];
+  return r ? { chat_id: r.chat_id, msg_ids: r.msg_ids, text: r.text } : null;
+}
+
+var RU_MONTHS = { 'января': 1, 'февраля': 2, 'марта': 3, 'апреля': 4, 'мая': 5, 'июня': 6, 'июля': 7, 'августа': 8, 'сентября': 9, 'октября': 10, 'ноября': 11, 'декабря': 12 };
+function parseExportDate(body) {
+  var m = body.match(/class="pull_right date details" title="([^"]+)"/);
+  if (!m) return new Date();
+  var t = m[1], p;
+  if ((p = t.match(/(\d{1,2})\.(\d{2})\.(\d{4}) (\d{2}):(\d{2}):(\d{2})/))) {
+    return new Date(p[3] + '-' + p[2] + '-' + ('0' + p[1]).slice(-2) + 'T' + p[4] + ':' + p[5] + ':' + p[6] + '+03:00');
+  }
+  if ((p = t.match(/(\d{1,2}) ([а-я]+) (\d{4}), (\d{2}):(\d{2}):(\d{2})/i)) && RU_MONTHS[p[2].toLowerCase()]) {
+    return new Date(p[3] + '-' + ('0' + RU_MONTHS[p[2].toLowerCase()]).slice(-2) + '-' + ('0' + p[1]).slice(-2) + 'T' + p[4] + ':' + p[5] + ':' + p[6] + '+03:00');
+  }
+  return new Date();
+}
+
+// Разбор выгрузки Telegram Desktop (HTML или JSON)
+function parseExport(buf, name) {
+  var s = buf.toString('utf8');
+  var out = [];
+  function clean(h) {
+    return h.replace(/<br\s*\/?>/g, '\n').replace(/<[^>]+>/g, '')
+      .replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').trim();
+  }
+  if (/\.json$/i.test(name) || s.trim().charAt(0) === '{') {
+    var j = JSON.parse(s);
+    (j.messages || []).forEach(function (m) {
+      if (m.type !== 'message') return;
+      var t = typeof m.text === 'string' ? m.text : (m.text || []).map(function (x) { return typeof x === 'string' ? x : x.text; }).join('');
+      out.push({ id: m.id, date: new Date(m.date), author: m.from || '', text: t, media: !!(m.photo || m.file) });
+    });
+    return out;
+  }
+  var blocks = s.split(/<div class="message default clearfix( joined)?" id="message(-?\d+)">/);
+  var lastAuthor = '';
+  for (var i = 1; i + 2 < blocks.length; i += 3) {
+    var id = parseInt(blocks[i + 1]);
+    var body = blocks[i + 2];
+    var fm = body.match(/<div class="from_name">\s*([\s\S]*?)\s*<\/div>/);
+    if (fm) lastAuthor = clean(fm[1]).replace(/\s+\d{2}\.\d{2}\.\d{4}.*$/, '');
+    var date = parseExportDate(body);
+    var tm = body.match(/<div class="text">([\s\S]*?)<\/div>/);
+    var media = /class="media_wrap|class="photo_wrap|class="media clearfix/.test(body);
+    out.push({ id: id, date: date, author: lastAuthor, text: tm ? clean(tm[1]) : '', media: media });
+  }
+  return out;
+}
+
+function adminImportPage(msg) {
+  return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Импорт отчётов</title>' +
+    '<style>body{font-family:-apple-system,sans-serif;background:#0f172a;color:#f1f5f9;padding:32px;max-width:640px;margin:0 auto;line-height:1.5}a{color:#94a3b8}' +
+    '.card{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:24px;margin-top:16px}input{margin:14px 0;color:#f1f5f9}' +
+    'button{padding:12px 20px;background:#6366f1;color:#fff;border:0;border-radius:10px;font-size:15px;cursor:pointer}.ok{color:#22c55e;font-weight:600}ol{padding-left:20px;color:#cbd5e1}</style></head><body>' +
+    '<a href="/admin">← Назад</a><h1 style="margin-top:12px">Импорт отчётов из чата замеров</h1>' +
+    (msg ? '<p class="ok">' + esc(msg) + '</p>' : '') +
+    '<div class="card"><ol><li>Telegram Desktop → чат замеров → ⋮ → «Экспорт истории чата».</li><li>Снять все галочки (фото, файлы не нужны), формат HTML или JSON.</li>' +
+    '<li>Загрузить сюда все файлы <b>messages*.html</b> или <b>result.json</b>.</li></ol>' +
+    '<form method="POST" enctype="multipart/form-data"><input type="file" name="files" multiple accept=".html,.json"><br><button type="submit">Загрузить</button></form>' +
+    '<p style="color:#94a3b8;font-size:13px">Повторная загрузка не создаёт дублей.</p></div></body></html>';
+}
+
+function setupReportsWeb(app, upload) {
+  ensureReports().catch(function (e) { console.error('reports table:', e.message); });
+
+  app.get('/api/reports/search', async function (req, res) {
+    try { res.json({ ok: true, items: await searchReports(req.query.q) }); }
+    catch (e) { console.error(e); res.json({ ok: false, error: e.message }); }
+  });
+
+  function auth(req, res, next) { if (req.session && req.session.auth) return next(); res.redirect('/admin/login'); }
+  app.get('/admin/import', auth, function (req, res) { res.send(adminImportPage()); });
+  app.post('/admin/import', auth, upload.array('files', 30), async function (req, res) {
+    try {
+      var msgs = [];
+      (req.files || []).forEach(function (f) { msgs = msgs.concat(parseExport(f.buffer, f.originalname)); });
+      msgs.sort(function (a, b) { return a.id - b.id; });
+      var chatId = process.env.GROUP_CHAT_ID, n = 0;
+      for (var i = 0; i < msgs.length; i++) {
+        var m = msgs[i];
+        if (!m.text && !m.media) continue;
+        await addToReports(chatId, m.id, m.text, m.author || 'аудитор', null, null, m.date);
+        n++;
+      }
+      var cnt = (await pool.query('SELECT COUNT(*)::int AS c FROM reports WHERE chat_id=$1', [chatId])).rows[0].c;
+      res.send(adminImportPage('Обработано сообщений: ' + n + '. Отчётов в базе: ' + cnt + '.'));
+    } catch (e) { console.error('import:', e); res.send(adminImportPage('Ошибка: ' + e.message)); }
+  });
 }
 
 function setupHandoff(app) {
@@ -95,6 +268,7 @@ function setupHandoff(app) {
       var lawyers = (await pool.query("SELECT tg_id, name FROM staff WHERE role='lawyer' ORDER BY name")).rows;
       res.json({
         ok: true, lawyers: lawyers,
+        report: audit ? { src: 'a', id: audit.id, text: audit.text, created_at: audit.created_at, order_id: audit.order_id } : null,
         order: order ? {
           id: order.id, org: order.object_name || '', client: order.owner_name || '',
           address: order.address || '', contacts: order.contacts || '',
@@ -122,7 +296,9 @@ function setupHandoff(app) {
       )).rows[0];
 
       var text = caseText(c);
-      var audit = d.order_id ? (await pool.query('SELECT * FROM audits WHERE order_id=$1 ORDER BY created_at DESC LIMIT 1', [d.order_id])).rows[0] : null;
+      var audit = null;
+      if (d.report_src && d.report_id) audit = await getReport(d.report_src, parseInt(d.report_id));
+      if (audit && audit.msg_ids) audit.msg_ids = audit.msg_ids.map(Number).sort(function (x, y) { return x - y; }).slice(0, 100);
 
       // 1) Чат «Заявки по клиенту»: файлы аудитора + карточка
       var CLIENTS = process.env.CLIENTS_CHAT_ID;
@@ -222,12 +398,127 @@ var BASE_CSS = [
   '.btn:disabled{opacity:.5}'
 ].join('\n');
 
+function handoffClient() {
+  var tg = window.Telegram.WebApp; tg.ready(); tg.expand();
+  var Q = new URLSearchParams(location.search);
+  var orderId = Q.get('order_id') || '';
+  var S = { lawyer: null, region: 'МСК', kind: 'Общепит', service: 'Получение', priority: 'обычный' };
+  var REP = null; // выбранный отчёт {src,id,text}
+  function $(i) { return document.getElementById(i); }
+  function mark(g, v) { S[g] = v; document.querySelectorAll('[data-g=' + g + '] .pill').forEach(function (p) { p.classList.toggle('on', p.dataset.v === v); }); }
+  document.querySelectorAll('[data-g]').forEach(function (box) { box.addEventListener('click', function (e) { var p = e.target.closest('.pill'); if (p) mark(box.dataset.g, p.dataset.v); }); });
+
+  function fmtDate(s) { var d = new Date(s); return ('0' + d.getDate()).slice(-2) + '.' + ('0' + (d.getMonth() + 1)).slice(-2) + '.' + String(d.getFullYear()).slice(2); }
+  function preview(t) { return String(t || '').replace(/[*_`]/g, '').replace(/\s+/g, ' ').trim(); }
+
+  function choose(it) {
+    REP = it ? { src: it.src, id: it.id, text: it.text } : null;
+    $('results').innerHTML = '';
+    var box = $('chosen');
+    if (!REP) { box.hidden = true; $('rq').hidden = false; return; }
+    $('rq').hidden = true; box.hidden = false;
+    $('chosen-text').textContent = preview(it.text);
+    $('chosen-meta').textContent = (it.order_id ? 'Заявка #' + it.order_id + ', ' : '') + (it.author ? it.author + ', ' : '') + fmtDate(it.created_at);
+    try { tg.HapticFeedback.selectionChanged(); } catch (e) {}
+    fillFrom(it.text);
+  }
+  // Заполняем пустые поля из текста отчёта
+  function fillFrom(t) {
+    t = String(t || '');
+    function set(id, v) { if (v && !$(id).value.trim()) $(id).value = v.trim(); }
+    var m;
+    if ((m = t.match(/ИНН[^\d\n]*(\d{10,12})/i))) set('inn', m[1]);
+    if ((m = t.match(/^\s*((?:ООО|ИП|АО|ПАО|ЗАО)\s*[^\n]*)/im))) set('org', m[1]);
+    if ((m = t.match(/Адрес\s*:\s*([^\n]+)/i))) set('address', m[1]);
+    if ((m = t.match(/Клиент\s*:\s*([^\n+\d]+)/i))) set('client', m[1]);
+    if ((m = t.match(/\+?[78][\s\-()]*\d{3}[\s\-()]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}/))) set('phone', m[0]);
+    var head = t.slice(0, 300);
+    if (/табак/i.test(head)) mark('kind', 'Табак'); else if (/магазин|розниц/i.test(head)) mark('kind', 'Магазин'); else if (/общепит/i.test(head)) mark('kind', 'Общепит');
+    if (/переоформ/i.test(head)) mark('service', 'Переоформление'); else if (/продлен/i.test(head)) mark('service', 'Продление'); else if (/получен/i.test(head)) mark('service', 'Получение');
+    if (/московская обл|городской округ/i.test(t)) mark('region', 'МО'); else if (/москва/i.test(head)) mark('region', 'МСК');
+  }
+  $('chosen-x').onclick = function () { choose(null); $('rq').focus(); };
+
+  var timer = null, seq = 0;
+  function search() {
+    var q = $('rq').value.trim(), my = ++seq;
+    fetch('/api/reports/search?q=' + encodeURIComponent(q)).then(function (r) { return r.json(); }).then(function (d) {
+      if (my !== seq) return;
+      var box = $('results'); box.innerHTML = '';
+      if (!d.ok) return;
+      if (!d.items.length) { var e = document.createElement('div'); e.className = 'empty'; e.textContent = q ? 'Ничего не нашлось. Попробуйте часть адреса или ИНН.' : 'Отчётов пока нет'; box.appendChild(e); return; }
+      d.items.forEach(function (it) {
+        var row = document.createElement('button'); row.type = 'button'; row.className = 'res';
+        var t = document.createElement('div'); t.className = 'res-t'; t.textContent = preview(it.text).slice(0, 160);
+        var m = document.createElement('div'); m.className = 'res-m';
+        m.textContent = (it.order_id ? '#' + it.order_id + ' · ' : '') + (it.address ? it.address + ' · ' : '') + (it.author ? it.author + ' · ' : '') + fmtDate(it.created_at);
+        row.appendChild(t); row.appendChild(m);
+        row.onclick = function () { choose(it); };
+        box.appendChild(row);
+      });
+    });
+  }
+  $('rq').oninput = function () { clearTimeout(timer); timer = setTimeout(search, 250); };
+  $('rq').onfocus = function () { if (!$('results').children.length) search(); };
+
+  fetch('/api/handoff/prefill?order_id=' + orderId).then(function (r) { return r.json(); }).then(function (d) {
+    var L = $('lawyers');
+    if (!d.lawyers.length) { var w = document.createElement('span'); w.className = 'warn'; w.textContent = 'Нет зарегистрированных юристов. Пусть нажмут /start в боте.'; L.appendChild(w); }
+    d.lawyers.forEach(function (x) {
+      var p = document.createElement('div'); p.className = 'pill'; p.textContent = x.name;
+      p.onclick = function () { S.lawyer = x.tg_id; L.querySelectorAll('.pill').forEach(function (q) { q.classList.remove('on'); }); p.classList.add('on'); };
+      L.appendChild(p);
+    });
+    if (d.order) {
+      $('sub').textContent = 'По заявке на замер #' + d.order.id;
+      $('org').value = d.order.org; $('client').value = d.order.client; $('address').value = d.order.address; $('comment').value = d.order.contacts;
+      mark('region', d.order.region); mark('kind', d.order.kind);
+      if (d.report) choose(d.report);
+      else if (d.order.address) { $('rq').value = d.order.address.split(',').slice(-2).join(' '); search(); }
+    } else { $('sub').textContent = 'Новый клиент'; mark('region', 'МСК'); mark('kind', 'Общепит'); }
+    mark('service', 'Получение'); mark('priority', 'обычный');
+  });
+
+  window.send = async function () {
+    if (!S.lawyer) { tg.showAlert('Выберите юриста'); return; }
+    if (!$('org').value.trim()) { tg.showAlert('Укажите организацию'); return; }
+    var b = $('go'); b.disabled = true; b.textContent = 'Отправляем...';
+    try {
+      var r = await fetch('/api/handoff', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+        order_id: orderId ? parseInt(orderId) : null, lawyer_tg_id: S.lawyer, region: S.region, kind: S.kind, service: S.service, priority: S.priority,
+        org: $('org').value.trim(), inn: $('inn').value.trim(), client: $('client').value.trim(), phone: $('phone').value.trim(),
+        address: $('address').value.trim(), comment: $('comment').value.trim(),
+        report_src: REP ? REP.src : null, report_id: REP ? REP.id : null, audit_text: REP ? REP.text : '',
+        tg_user_id: tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user.id : null }) });
+      var j = await r.json(); if (!j.ok) throw new Error(j.error || 'Ошибка');
+      b.textContent = '✅ Передано';
+      if (j.warn) tg.showAlert(j.warn, function () { tg.close(); }); else setTimeout(function () { tg.close(); }, 1200);
+    } catch (e) { b.disabled = false; b.textContent = 'Передать юристу'; tg.showAlert('Ошибка: ' + e.message); }
+  };
+}
+
 function handoffPage() {
+  var css = BASE_CSS + '\n' + [
+    '.res{display:block;width:100%;text-align:left;background:var(--tg-theme-secondary-bg-color,#1e293b);color:var(--tg-theme-text-color,#f1f5f9);border:0;border-radius:12px;padding:11px 13px;margin-top:6px;font:inherit;cursor:pointer}',
+    '.res:active{opacity:.7}',
+    '.res-t{font-size:14px;line-height:1.35}',
+    '.res-m{font-size:12px;color:var(--tg-theme-hint-color,#64748b);margin-top:4px}',
+    '.empty{font-size:13px;color:var(--tg-theme-hint-color,#64748b);padding:10px 2px}',
+    '.chosen{background:var(--tg-theme-secondary-bg-color,#1e293b);border:1.5px solid #22c55e;border-radius:12px;padding:12px 14px;position:relative}',
+    '.chosen-t{font-size:14px;line-height:1.45;white-space:pre-wrap;max-height:180px;overflow:auto;padding-right:26px}',
+    '.chosen-m{font-size:12px;color:#22c55e;margin-top:6px;font-weight:600}',
+    '#chosen-x{position:absolute;top:8px;right:8px;width:26px;height:26px;border-radius:13px;border:0;background:rgba(128,128,128,.25);color:inherit;font-size:14px;cursor:pointer}',
+    '.warn{font-size:13px;color:#f87171}'
+  ].join('\n');
   return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">' +
     '<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">' +
     '<title>Передать юристу</title><script src="https://telegram.org/js/telegram-web-app.js"></script>' +
-    '<style>' + BASE_CSS + '</style></head><body>' +
+    '<style>' + css + '</style></head><body>' +
     '<h1>⚖️ Передать юристу</h1><p class="sub" id="sub">Загрузка...</p>' +
+    '<div class="field"><label class="l">Отчёт аудитора</label>' +
+    '<input id="rq" type="search" autocomplete="off" placeholder="Адрес, название, ИНН или #номер заявки">' +
+    '<div id="chosen" class="chosen" hidden><button id="chosen-x" type="button" aria-label="Убрать">✕</button><div id="chosen-text" class="chosen-t"></div><div id="chosen-meta" class="chosen-m"></div></div>' +
+    '<div id="results"></div></div>' +
     '<div class="field"><label class="l">Юрист *</label><div class="pills" id="lawyers"></div></div>' +
     '<div class="field"><label class="l">Регион</label><div class="pills" data-g="region"><div class="pill" data-v="МСК">МСК</div><div class="pill" data-v="МО">МО</div></div></div>' +
     '<div class="field"><label class="l">Вид</label><div class="pills" data-g="kind"><div class="pill" data-v="Общепит">🍺 Общепит</div><div class="pill" data-v="Магазин">🛒 Магазин</div><div class="pill" data-v="Табак">🚬 Табак</div></div></div>' +
@@ -238,36 +529,9 @@ function handoffPage() {
     '<div class="field"><label class="l">Клиент</label><input id="client" placeholder="Имя"></div>' +
     '<div class="field"><label class="l">Телефон</label><input id="phone" inputmode="tel" placeholder="+7 ..."></div>' +
     '<div class="field"><label class="l">Адрес</label><textarea id="address"></textarea></div>' +
-    '<div class="field"><label class="l">Комментарий аудитора</label><div class="audit" id="audit">—</div></div>' +
     '<div class="field"><label class="l">Комментарий менеджера</label><textarea id="comment" placeholder="Что важно знать юристу"></textarea></div>' +
     '<div class="bottom"><button class="btn" id="go" onclick="send()">Передать юристу</button></div>' +
-    '<script>' +
-    'var tg=window.Telegram.WebApp;tg.ready();tg.expand();' +
-    'var Q=new URLSearchParams(location.search);var orderId=Q.get("order_id")||"";var S={lawyer:null,region:"МСК",kind:"Общепит",service:"Получение",priority:"обычный"};var auditText="";' +
-    'function mark(g,v){S[g]=v;document.querySelectorAll("[data-g="+g+"] .pill").forEach(function(p){p.classList.toggle("on",p.dataset.v===v)})}' +
-    'document.querySelectorAll("[data-g]").forEach(function(box){box.addEventListener("click",function(e){var p=e.target.closest(".pill");if(p)mark(box.dataset.g,p.dataset.v)})});' +
-    'function $(i){return document.getElementById(i)}' +
-    'fetch("/api/handoff/prefill?order_id="+orderId).then(function(r){return r.json()}).then(function(d){' +
-    ' var L=$("lawyers");if(!d.lawyers.length)L.innerHTML="<span style=\\"font-size:13px;color:#f87171\\">Нет зарегистрированных юристов. Пусть нажмут /start в боте.</span>";' +
-    ' d.lawyers.forEach(function(x){var p=document.createElement("div");p.className="pill";p.textContent=x.name;p.onclick=function(){S.lawyer=x.tg_id;L.querySelectorAll(".pill").forEach(function(q){q.classList.remove("on")});p.classList.add("on")};L.appendChild(p)});' +
-    ' if(d.order){$("sub").textContent="По заявке #"+d.order.id;$("org").value=d.order.org;$("client").value=d.order.client;$("address").value=d.order.address;$("comment").value=d.order.contacts;mark("region",d.order.region);mark("kind",d.order.kind)}else{$("sub").textContent="Новый клиент";mark("region","МСК");mark("kind","Общепит")}' +
-    ' mark("service","Получение");mark("priority","обычный");' +
-    ' auditText=d.audit_text||"";$("audit").textContent=auditText||"Отчёт аудитора не найден";' +
-    '});' +
-    'async function send(){' +
-    ' if(!S.lawyer){tg.showAlert("Выберите юриста");return}' +
-    ' if(!$("org").value.trim()){tg.showAlert("Укажите организацию");return}' +
-    ' var b=$("go");b.disabled=true;b.textContent="Отправляем...";' +
-    ' try{var r=await fetch("/api/handoff",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({' +
-    '  order_id:orderId?parseInt(orderId):null,lawyer_tg_id:S.lawyer,region:S.region,kind:S.kind,service:S.service,priority:S.priority,' +
-    '  org:$("org").value.trim(),inn:$("inn").value.trim(),client:$("client").value.trim(),phone:$("phone").value.trim(),' +
-    '  address:$("address").value.trim(),comment:$("comment").value.trim(),audit_text:auditText,' +
-    '  tg_user_id:tg.initDataUnsafe&&tg.initDataUnsafe.user?tg.initDataUnsafe.user.id:null})});' +
-    '  var j=await r.json();if(!j.ok)throw new Error(j.error||"Ошибка");' +
-    '  b.textContent="✅ Передано";if(j.warn)tg.showAlert(j.warn,function(){tg.close()});else setTimeout(function(){tg.close()},1200);' +
-    ' }catch(e){b.disabled=false;b.textContent="Передать юристу";tg.showAlert("Ошибка: "+e.message)}' +
-    '}' +
-    '</script></body></html>';
+    '<script>(' + handoffClient.toString() + ')();</script></body></html>';
 }
 
 // Клиентский код чек-листа (Liquid Glass). Выполняется в браузере.
@@ -716,4 +980,4 @@ function checklistPage(c, L) {
     '</body></html>';
 }
 
-module.exports = { setupHandoff: setupHandoff, saveAudit: saveAudit };
+module.exports = { setupHandoff: setupHandoff, saveAudit: saveAudit, setupReportsBot: setupReportsBot, setupReportsWeb: setupReportsWeb };
