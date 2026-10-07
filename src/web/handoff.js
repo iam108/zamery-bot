@@ -128,6 +128,20 @@ async function addToReports(chatId, msgId, text, author, authorId, mgid, date, r
 // Бот запоминает каждое сообщение в чате замеров
 function setupReportsBot(bot) {
   ensureReports().catch(function (e) { console.error('reports table:', e.message); });
+  bot.action(/^rq:(\d+)$/, async function (ctx) {
+    var id = ctx.match[1];
+    var done = (await pool.query('SELECT lawyer_name FROM cases WHERE request_id=$1 ORDER BY id DESC LIMIT 1', [id])).rows[0];
+    if (done) return ctx.answerCbQuery('Уже передано: ' + done.lawyer_name, { show_alert: true });
+    try {
+      await ctx.telegram.sendMessage(ctx.from.id, '⚖️ Распределить заявку', {
+        reply_markup: { inline_keyboard: [[{ text: '📝 Открыть форму', web_app: { url: process.env.WEBAPP_URL + '/handoff?request_id=' + id } }]] }
+      });
+      await ctx.answerCbQuery('Форма отправлена вам в личку');
+    } catch (e) {
+      await ctx.answerCbQuery('Сначала напишите боту /start в личке', { show_alert: true });
+    }
+  });
+  bot.action('noop', function (ctx) { return ctx.answerCbQuery(); });
   bot.on('message', async function (ctx, next) {
     var cid = String(ctx.chat.id);
     if (cid === String(process.env.GROUP_CHAT_ID) || cid === String(process.env.CLIENTS_CHAT_ID)) {
@@ -422,6 +436,31 @@ function setupRequestsWeb(app) {
   });
 
   app.get('/requests', function (req, res) { res.send(requestsPage()); });
+
+  // Google-форма → сюда (Apps Script). Бот публикует заявку в «Заявки по клиенту» с кнопкой «Распределить»
+  app.post('/api/requests/incoming', async function (req, res) {
+    try {
+      var token = req.query.token || req.body.token;
+      if (!process.env.REQUEST_TOKEN || token !== process.env.REQUEST_TOKEN) return res.status(403).json({ ok: false, error: 'bad token' });
+      var CLIENTS = process.env.CLIENTS_CHAT_ID;
+      var fields = Array.isArray(req.body.fields) ? req.body.fields : [];
+      var lines = fields
+        .filter(function (x) { return x && String(x.a || '').trim(); })
+        .map(function (x) { return String(x.q || '').replace(/[\s:]+$/, '') + ': ' + String(x.a).trim(); });
+      if (!lines.length) return res.json({ ok: false, error: 'empty' });
+      var text = '📩 Новая форма заполнена:\n\n' + lines.join('\n');
+      var row = (await pool.query(
+        "INSERT INTO reports (chat_id, first_id, msg_ids, text, author, created_at) VALUES ($1, -floor(random()*1e12)::bigint, '{}', $2, 'Google-форма', NOW()) RETURNING id",
+        [CLIENTS, text])).rows[0];
+      var bot = require('../bot/instance');
+      var msg = await bot.telegram.sendMessage(CLIENTS, text.slice(0, 4000), {
+        disable_web_page_preview: true,
+        reply_markup: { inline_keyboard: [[{ text: '⚖️ Распределить', callback_data: 'rq:' + row.id }]] }
+      });
+      await pool.query('UPDATE reports SET first_id=$1, msg_ids=$2 WHERE id=$3', [msg.message_id, [msg.message_id], row.id]);
+      res.json({ ok: true, id: row.id });
+    } catch (e) { console.error('incoming request:', e); res.status(500).json({ ok: false, error: e.message }); }
+  });
 }
 
 function requestsClient() {
@@ -604,6 +643,10 @@ function setupHandoff(app) {
         if (reqRow && String(reqRow.chat_id) === String(CLIENTS)) opts.reply_to_message_id = Number(reqRow.first_id);
         try { await bot.telegram.sendMessage(CLIENTS, text, opts); }
         catch (e) { delete opts.reply_to_message_id; await bot.telegram.sendMessage(CLIENTS, text, opts); }
+        if (reqRow && String(reqRow.chat_id) === String(CLIENTS)) {
+          try { await bot.telegram.editMessageReplyMarkup(CLIENTS, Number(reqRow.first_id), undefined, { inline_keyboard: [[{ text: '✅ Передано: ' + lawyer.name, callback_data: 'noop' }]] }); }
+          catch (e) { /* заявка опубликована другим ботом — кнопку не поменять */ }
+        }
       }
 
       // 2) Юристу в личку: исходная заявка, файлы аудитора, карточка + кнопка чек-листа
