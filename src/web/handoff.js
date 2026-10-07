@@ -35,6 +35,7 @@ async function ensureTables() {
       created_at    TIMESTAMPTZ DEFAULT NOW(),
       completed_at  TIMESTAMPTZ
     );
+    ALTER TABLE cases ADD COLUMN IF NOT EXISTS contacts JSONB DEFAULT '[]';
   `);
 }
 
@@ -68,7 +69,11 @@ function caseText(c) {
   L.push('');
   L.push('🏢 <b>' + esc(c.org) + '</b>');
   if (c.inn) L.push('ИНН: <code>' + esc(c.inn) + '</code>');
-  if (c.client || c.phone) L.push('👤 Клиент: ' + [esc(c.client), esc(c.phone)].filter(Boolean).join(', '));
+  var cl = Array.isArray(c.contacts) && c.contacts.length ? c.contacts : [{ name: c.client, phone: c.phone }];
+  cl.forEach(function (x) {
+    var line = [x.name, x.phone, x.tg ? (String(x.tg).charAt(0) === '@' ? x.tg : '@' + x.tg) : ''].filter(Boolean).map(esc).join(', ');
+    if (line) L.push('👤 ' + line);
+  });
   if (c.address) L.push('📍 Адрес: ' + esc(c.address));
   if (c.priority) L.push('⚡ Приоритет: ' + esc(c.priority));
   L.push('⚖️ Юрист: ' + esc(c.lawyer_name));
@@ -262,6 +267,14 @@ function adminImportPage(msg, isErr) {
 function setupReportsWeb(app, upload) {
   ensureReports().catch(function (e) { console.error('reports table:', e.message); });
 
+  app.get('/api/reports/get', async function (req, res) {
+    try {
+      var r = await getReport(req.query.src, parseInt(req.query.id));
+      if (!r) return res.json({ ok: false });
+      res.json({ ok: true, text: r.text || '', files: (r.msg_ids || []).length + (r.extra || []).length });
+    } catch (e) { console.error(e); res.json({ ok: false, error: e.message }); }
+  });
+
   app.get('/api/reports/search', async function (req, res) {
     try { res.json({ ok: true, items: await searchReports(req.query.q) }); }
     catch (e) { console.error(e); res.json({ ok: false, error: e.message }); }
@@ -343,6 +356,7 @@ function setupHandoff(app) {
         report: audit ? { src: 'a', id: audit.id, text: audit.text, created_at: audit.created_at, order_id: audit.order_id } : null,
         order: order ? {
           id: order.id, org: order.object_name || '', client: order.owner_name || '',
+          owner: order.owner_name || '', name: order.object_name || '', zones: order.zones_info || '',
           address: order.address || '', contacts: order.contacts || '',
           region: guessRegion(order.address), kind: guessKind(order.object_type)
         } : null,
@@ -358,17 +372,24 @@ function setupHandoff(app) {
       var lawyer = (await pool.query('SELECT * FROM staff WHERE tg_id=$1', [d.lawyer_tg_id])).rows[0];
       if (!lawyer) return res.json({ ok: false, error: 'Юрист не найден. Он должен нажать /start в боте и выбрать роль «Юрист».' });
       if (d.kind === 'Табак') d.checklist_key = null; else d.checklist_key = pickChecklist(d.region, d.kind, d.service);
+      var contacts = Array.isArray(d.contacts) ? d.contacts.filter(function (x) { return x && (x.name || x.phone || x.tg); }).slice(0, 10) : [];
+      if (contacts.length) { d.client = d.client || contacts[0].name || ''; d.phone = d.phone || contacts[0].phone || ''; }
+      var picked = null;
+      if (d.report_src && d.report_id) {
+        picked = await getReport(d.report_src, parseInt(d.report_id));
+        if (picked && picked.text) d.audit_text = picked.text;
+      }
       var total = 0;
       var audit = null;
-      if (d.report_src && d.report_id) audit = await getReport(d.report_src, parseInt(d.report_id));
+      if (picked) audit = picked;
       if (audit && audit.msg_ids) audit.msg_ids = Array.from(new Set(audit.msg_ids.concat(audit.extra || []).map(Number))).sort(function (x, y) { return x - y; }).slice(0, 100);
       if (audit && audit.text && !d.audit_text_manual) d.audit_text = audit.text;
       var c = (await pool.query(
         `INSERT INTO cases (order_id, lawyer_tg_id, lawyer_name, checklist_key, org, inn, client, phone, address,
-          region, kind, service, priority, comment, audit_text, total, created_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
+          region, kind, service, priority, comment, audit_text, total, created_by, contacts)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
         [d.order_id || null, lawyer.tg_id, lawyer.name, d.checklist_key, d.org, d.inn, d.client, d.phone, d.address,
-          d.region, d.kind, d.service, d.priority, d.comment, d.audit_text, total, d.tg_user_id || null]
+          d.region, d.kind, d.service, d.priority, d.comment, d.audit_text, total, d.tg_user_id || null, JSON.stringify(contacts)]
       )).rows[0];
 
       var text = caseText(c);
@@ -473,6 +494,9 @@ var BASE_CSS = [
 
 function handoffClient() {
   var tg = window.Telegram.WebApp; tg.ready(); tg.expand();
+  var scheme = tg.colorScheme || (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  document.documentElement.dataset.theme = scheme;
+  try { tg.setHeaderColor(scheme === 'dark' ? '#070B16' : '#E8EEF6'); tg.setBackgroundColor(scheme === 'dark' ? '#070B16' : '#E8EEF6'); } catch (e) {}
   var Q = new URLSearchParams(location.search);
   var orderId = Q.get('order_id') || '';
   var S = { lawyer: null, region: 'МСК', kind: 'Общепит', service: 'Получение', priority: 'обычный' };
@@ -501,23 +525,103 @@ function handoffClient() {
     }
     try { tg.HapticFeedback.selectionChanged(); } catch (e) {}
     fillFrom(it.text);
+    fetch('/api/reports/get?src=' + it.src + '&id=' + it.id).then(function (r) { return r.json(); }).then(function (d) {
+      if (!d.ok || !REP || REP.id !== it.id || REP.src !== it.src) return;
+      if (d.text) { REP.text = d.text; $('chosen-text').textContent = preview(d.text); fillFrom(d.text); }
+    });
   }
-  // Заполняем пустые поля из текста отчёта
+  // ── Контакты: несколько человек, у каждого имя, телефон, ник в Telegram
+  var PHONE_RE = /(?:\+7|8|7)[\s\-()]*\d{3}[\s\-()]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}/g;
+  function digits(x) { return String(x || '').replace(/\D/g, '').replace(/^8/, '7'); }
+  function normPhone(x) { var d = digits(x); return d.length === 11 ? '+7 ' + d.slice(1, 4) + ' ' + d.slice(4, 7) + '-' + d.slice(7, 9) + '-' + d.slice(9) : x; }
+  function contactRows() { return Array.prototype.slice.call(document.querySelectorAll('#contacts .ct')); }
+  function readContacts() {
+    return contactRows().map(function (r) {
+      return { name: r.querySelector('.c-name').value.trim(), phone: r.querySelector('.c-phone').value.trim(), tg: r.querySelector('.c-tg').value.trim().replace(/^https?:\/\/t\.me\//i, '') };
+    }).filter(function (c) { return c.name || c.phone || c.tg; });
+  }
+  function addContact(c, force) {
+    c = c || {};
+    var rows = contactRows();
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i], ph = r.querySelector('.c-phone'), nm = r.querySelector('.c-name'), tgi = r.querySelector('.c-tg');
+      var same = (c.phone && digits(ph.value) && digits(ph.value) === digits(c.phone)) || (c.tg && tgi.value && tgi.value.replace('@', '').toLowerCase() === c.tg.replace('@', '').toLowerCase());
+      var empty = !nm.value && !ph.value && !tgi.value;
+      if (same || (empty && !force)) {
+        if (c.name && !nm.value) nm.value = c.name;
+        if (c.phone && !ph.value) ph.value = normPhone(c.phone);
+        if (c.tg && !tgi.value) tgi.value = c.tg.charAt(0) === '@' ? c.tg : '@' + c.tg;
+        return r;
+      }
+    }
+    var row = document.createElement('div'); row.className = 'ct';
+    row.innerHTML = '<input class="c-name" placeholder="Имя" autocomplete="off">' +
+      '<input class="c-phone" placeholder="+7 ..." inputmode="tel" autocomplete="off">' +
+      '<input class="c-tg" placeholder="@ник в Telegram" autocomplete="off">' +
+      '<button type="button" class="c-x" aria-label="Удалить контакт">✕</button>';
+    row.querySelector('.c-name').value = c.name || '';
+    row.querySelector('.c-phone').value = c.phone ? normPhone(c.phone) : '';
+    row.querySelector('.c-tg').value = c.tg ? (c.tg.charAt(0) === '@' ? c.tg : '@' + c.tg) : '';
+    row.querySelector('.c-x').onclick = function () { row.remove(); if (!contactRows().length) addContact({}, true); };
+    $('contacts').appendChild(row);
+    return row;
+  }
+  $('add-contact').onclick = function () { var r = addContact({}, true); r.querySelector('.c-name').focus(); };
+
+  // Разбор контактов из текста: каждый телефон со своим именем и ником
+  function cleanName(x) {
+    var n = String(x || '').replace(/(?:https?:\/\/)?t\.me\/\S+|@[A-Za-z0-9_]+/g, ' ')
+      .replace(/^[^A-Za-zА-Яа-яЁё]*(Контакты|Клиент|Имя клиента|Номер|Телефон|Тел)\s*:?\s*:?/i, ' ')
+      .replace(/[^A-Za-zА-Яа-яЁё\s\-]/g, ' ').replace(/\s+/g, ' ').trim()
+      .split(' ').filter(function (w) { return !/^(доп|доб|тел|моб|сумма|оплата|руб|и|номер)$/i.test(w); }).join(' ');
+    n = n.split(' ').slice(0, 3).join(' ');
+    return n.length > 40 || /^(контакты|клиент|номер|телефон)$/i.test(n) ? '' : n;
+  }
+  function nicksIn(x) { return (String(x || '').match(/(?:@|t\.me\/)([A-Za-z][A-Za-z0-9_]{3,31})/g) || []).map(function (v) { return '@' + v.replace(/^(@|t\.me\/)/, ''); }); }
+  function parseContacts(t) {
+    var out = [];
+    String(t || '').split('\n').forEach(function (line) {
+      var ms = [], m, re = new RegExp(PHONE_RE.source, 'g');
+      while ((m = re.exec(line))) ms.push({ ph: m[0], start: m.index, end: m.index + m[0].length });
+      if (!ms.length) {
+        var nk = nicksIn(line);
+        if (nk.length) out.push({ name: cleanName(line), phone: '', tg: nk[0] });
+        return;
+      }
+      var before = line.slice(0, ms[0].start);
+      ms.forEach(function (x, k) {
+        var after = line.slice(x.end, k + 1 < ms.length ? ms[k + 1].start : line.length);
+        var name = cleanName(after) || (k === 0 ? cleanName(before) : '');
+        var nk = nicksIn(after);
+        if (!nk.length && k === 0) nk = nicksIn(before);
+        out.push({ name: name, phone: x.ph, tg: nk[0] || '' });
+      });
+    });
+    return out;
+  }
+
+  // Заполняем пустые поля из текста заявки или отчёта
   function fillFrom(t) {
-    t = String(t || '');
-    function set(id, v) { if (v && !$(id).value.trim()) $(id).value = v.trim(); }
-    var m;
-    if ((m = t.match(/ИНН[^\d\n]*(\d{10,12})/i))) set('inn', m[1]);
-    if ((m = t.match(/^\s*((?:ООО|ИП|АО|ПАО|ЗАО)\s*[^\n]*)/im))) set('org', m[1]);
-    if ((m = t.match(/Адрес\s*:\s*([^\n]+)/i))) set('address', m[1]);
-    if ((m = t.match(/Клиент\s*:\s*([^\n+\d]+)/i))) set('client', m[1]);
-    if ((m = t.match(/\+?[78][\s\-()]*\d{3}[\s\-()]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}/))) set('phone', m[0]);
-    var head = t.slice(0, 300);
+    t = String(t || '').replace(/[*`]/g, '');
+    function set(id, v) { if (v && !$(id).value.trim()) $(id).value = v.replace(/^[\s:]+/, '').trim(); }
+    function grab(re) { var m = t.match(re); return m ? m[1].trim() : ''; }
+    set('inn', grab(/ИНН[^\d\n]*(\d{10,12})/i));
+    var owner = grab(/(?:Чей объект|Наименование организации)\s*:\s*:?\s*([^\n]+)/i) || grab(/^\s*((?:ООО|ИП|АО|ПАО|ЗАО)\s*[^\n]*)/im);
+    var oname = grab(/Название(?: объекта)?\s*:\s*([^\n]+)/i);
+    set('org', owner && oname && owner.indexOf(oname) === -1 ? owner + ' (' + oname + ')' : owner || oname);
+    set('address', grab(/Адрес(?: лицензирования)?\s*:\s*([^\n]+)/i));
+    var who = grab(/(?:Имя клиента|Клиент)\s*:\s*:?\s*([А-Яа-яЁёA-Za-z][^\n+\d]*)/i);
+    var list = parseContacts(t);
+    if (who) { if (list.length && !list[0].name) list[0].name = who.trim(); else if (!list.length) list.push({ name: who.trim() }); }
+    list.forEach(function (c) { addContact(c); });
+    var tp = grab(/(?:Тип|Вид объекта)\s*:\s*([^\n]+)/i);
+    var head = (tp + ' ' + t.slice(0, 300));
     if (/табак/i.test(head)) mark('kind', 'Табак'); else if (/магазин|розниц/i.test(head)) mark('kind', 'Магазин'); else if (/общепит/i.test(head)) mark('kind', 'Общепит');
     if (/переоформ/i.test(head)) mark('service', 'Переоформление'); else if (/продлен/i.test(head)) mark('service', 'Продление'); else if (/получен/i.test(head)) mark('service', 'Получение');
     if (/московская обл|городской округ/i.test(t)) mark('region', 'МО'); else if (/москва/i.test(head)) mark('region', 'МСК');
   }
   $('chosen-x').onclick = function () { choose(null); $('rq').focus(); };
+  addContact({}, true);
 
   var timer = null, seq = 0;
   function search() {
@@ -550,12 +654,17 @@ function handoffClient() {
     if (!d.lawyers.length) { var w = document.createElement('span'); w.className = 'warn'; w.textContent = 'Нет зарегистрированных юристов. Пусть нажмут /start в боте.'; L.appendChild(w); }
     d.lawyers.forEach(function (x) {
       var p = document.createElement('div'); p.className = 'pill'; p.textContent = x.name;
-      p.onclick = function () { S.lawyer = x.tg_id; L.querySelectorAll('.pill').forEach(function (q) { q.classList.remove('on'); }); p.classList.add('on'); };
+      p.onclick = function () { try { tg.HapticFeedback.selectionChanged(); } catch (e) {} S.lawyer = x.tg_id; L.querySelectorAll('.pill').forEach(function (q) { q.classList.remove('on'); }); p.classList.add('on'); };
       L.appendChild(p);
     });
     if (d.order) {
       $('sub').textContent = 'По заявке на замер #' + d.order.id;
-      $('org').value = d.order.org; $('client').value = d.order.client; $('address').value = d.order.address; $('comment').value = d.order.contacts;
+      var o = d.order;
+      $('org').value = o.owner && o.name && o.owner !== o.name ? o.owner + ' (' + o.name + ')' : (o.owner || o.name || '');
+      $('address').value = o.address || '';
+      parseContacts(o.contacts).forEach(function (c) { addContact(c); });
+      var rest = String(o.contacts || '').replace(PHONE_RE, '').replace(/@[A-Za-z0-9_]+/g, '').trim();
+      $('comment').value = [o.zones ? 'Зоны: ' + o.zones : '', rest && rest.length > 15 ? rest : ''].filter(Boolean).join('\n');
       mark('region', d.order.region); mark('kind', d.order.kind);
       if (d.report) choose(d.report);
       else if (d.order.address) { $('rq').value = d.order.address.split(',').slice(-2).join(' '); search(); }
@@ -570,7 +679,7 @@ function handoffClient() {
     try {
       var r = await fetch('/api/handoff', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
         order_id: orderId ? parseInt(orderId) : null, lawyer_tg_id: S.lawyer, region: S.region, kind: S.kind, service: S.service, priority: S.priority,
-        org: $('org').value.trim(), inn: $('inn').value.trim(), client: $('client').value.trim(), phone: $('phone').value.trim(),
+        org: $('org').value.trim(), inn: $('inn').value.trim(), contacts: readContacts(),
         address: $('address').value.trim(), comment: $('comment').value.trim(),
         report_src: REP ? REP.src : null, report_id: REP ? REP.id : null, audit_text: REP ? REP.text : '',
         tg_user_id: tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user.id : null }) });
@@ -582,43 +691,111 @@ function handoffClient() {
 }
 
 function handoffPage() {
-  var css = BASE_CSS + '\n' + [
-    '.res{display:block;width:100%;text-align:left;background:var(--tg-theme-secondary-bg-color,#1e293b);color:var(--tg-theme-text-color,#f1f5f9);border:0;border-radius:12px;padding:11px 13px;margin-top:6px;font:inherit;cursor:pointer}',
-    '.res:active{opacity:.7}',
+  var css = [
+    ':root{--bg:#E8EEF6;--ink:#0E1A2B;--ink2:#5B6B82;--glass:rgba(255,255,255,.56);--glass2:rgba(255,255,255,.74);--edge:rgba(255,255,255,.85);--hair:rgba(14,26,43,.08);--well:rgba(14,26,43,.06);',
+    ' --ok:#1FA971;--bad:#E5484D;--accent:#2F6BFF;--o1:#8EC5FF;--o2:#C3B2FF;--o3:#9CEBD3;--shadow:0 10px 30px rgba(30,52,90,.12),0 1px 2px rgba(30,52,90,.06)}',
+    '[data-theme=dark]{--bg:#070B16;--ink:#EEF2F8;--ink2:#93A0B5;--glass:rgba(28,36,56,.48);--glass2:rgba(36,46,70,.66);--edge:rgba(255,255,255,.14);--hair:rgba(255,255,255,.08);--well:rgba(255,255,255,.07);',
+    ' --ok:#2FB57C;--bad:#FF6369;--accent:#3E6EF2;--o1:#1D4ED8;--o2:#6D28D9;--o3:#0F766E;--shadow:0 12px 34px rgba(0,0,0,.45)}',
+    '*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}',
+    'html{background:var(--bg)}',
+    'body{font:15px/1.4 -apple-system,BlinkMacSystemFont,"SF Pro Text","Inter","Segoe UI",Roboto,sans-serif;color:var(--ink);min-height:100vh;padding:0 14px 110px;letter-spacing:-.01em}',
+    '.field-bg{position:fixed;inset:-20%;z-index:-1;pointer-events:none;filter:blur(60px);opacity:.75}',
+    '[data-theme=dark] .field-bg{opacity:.42}',
+    '.field-bg i{position:absolute;border-radius:50%}',
+    '.field-bg i:nth-child(1){width:55%;height:45%;left:-5%;top:5%;background:var(--o1)}',
+    '.field-bg i:nth-child(2){width:50%;height:45%;right:-5%;top:30%;background:var(--o2)}',
+    '.field-bg i:nth-child(3){width:55%;height:40%;left:15%;bottom:0;background:var(--o3)}',
+    '.glass{background:var(--glass);-webkit-backdrop-filter:blur(24px) saturate(180%);backdrop-filter:blur(24px) saturate(180%);border:1px solid var(--edge);box-shadow:var(--shadow);position:relative}',
+    '.glass:before{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;background:linear-gradient(180deg,rgba(255,255,255,.35),rgba(255,255,255,0) 38%)}',
+    '[data-theme=dark] .glass:before{background:linear-gradient(180deg,rgba(255,255,255,.08),rgba(255,255,255,0) 40%)}',
+    '.top{padding:18px 4px 14px}',
+    '.kicker{font-size:13px;color:var(--ink2);font-weight:500}',
+    'h1{font-size:28px;line-height:1.1;font-weight:700;letter-spacing:-.025em;margin-top:4px}',
+    '.grp{border-radius:22px;margin-bottom:12px;padding:14px 16px 16px}',
+    '.grp h2{font-size:16px;font-weight:650;letter-spacing:-.015em;margin-bottom:10px;position:relative}',
+    '.f{margin-top:12px}.f:first-of-type{margin-top:0}',
+    '.lbl{display:block;font-size:13px;color:var(--ink2);margin-bottom:6px}',
+    '.req{color:var(--bad)}',
+    'input,textarea{width:100%;font:inherit;font-size:15px;color:var(--ink);background:var(--well);border:1px solid transparent;border-radius:12px;padding:11px 13px;outline:none;-webkit-appearance:none;position:relative}',
+    'input::placeholder,textarea::placeholder{color:var(--ink2);opacity:.75}',
+    'input:focus,textarea:focus{border-color:var(--accent);background:var(--glass2)}',
+    'textarea{resize:vertical;min-height:72px}',
+    '.pills{display:flex;flex-wrap:wrap;gap:6px;position:relative}',
+    '.pill{padding:8px 13px;border-radius:11px;background:var(--well);font-size:14px;font-weight:550;cursor:pointer;user-select:none;transition:background .18s,color .18s,transform .12s}',
+    '.pill:active{transform:scale(.96)}',
+    '.pill.on{background:var(--accent);color:#fff}',
+    '#lawyers .pill{padding:10px 16px;font-size:15px}',
+    '#lawyers .pill.on{background:var(--ok)}',
+    '.warn{font-size:13px;color:var(--bad)}',
+    // поиск отчёта
+    '#rq{padding-left:38px;background-image:radial-gradient(circle at 18px 50%,transparent 5px,var(--ink2) 5.5px,var(--ink2) 7px,transparent 7.5px);background-repeat:no-repeat}',
+    '.res{display:block;width:100%;text-align:left;background:var(--well);color:var(--ink);border:0;border-radius:14px;padding:11px 13px;margin-top:6px;font:inherit;cursor:pointer;position:relative}',
+    '.res:active{transform:scale(.99)}',
     '.res-t{font-size:14px;line-height:1.35}',
-    '.res-m{font-size:12px;color:var(--tg-theme-hint-color,#64748b);margin-top:4px}',
-    '.empty{font-size:13px;color:var(--tg-theme-hint-color,#64748b);padding:10px 2px}',
-    '.chosen{background:var(--tg-theme-secondary-bg-color,#1e293b);border:1.5px solid #22c55e;border-radius:12px;padding:12px 14px;position:relative}',
-    '.chosen-t{font-size:14px;line-height:1.45;white-space:pre-wrap;max-height:180px;overflow:auto;padding-right:26px}',
-    '.chosen-m{font-size:12px;color:#22c55e;margin-top:6px;font-weight:600}',
-    '#chosen-x{position:absolute;top:8px;right:8px;width:26px;height:26px;border-radius:13px;border:0;background:rgba(128,128,128,.25);color:inherit;font-size:14px;cursor:pointer}',
-    '.warn{font-size:13px;color:#f87171}',
-    '.res-m{display:flex;align-items:center;gap:8px;margin:0 0 5px}',
-    '.tag{font-size:11px;font-weight:700;padding:2px 8px;border-radius:6px}',
-    '.tag-rep{background:rgba(34,197,94,.18);color:#22c55e}.tag-ok{background:rgba(99,102,241,.2);color:#818cf8}.tag-no{background:rgba(248,113,113,.18);color:#f87171}',
-    '.chosen-m.no{color:#f87171}'
+    '.res-m{display:flex;align-items:center;gap:8px;margin:0 0 5px;font-size:12px;color:var(--ink2)}',
+    '.tag{font-size:11.5px;font-weight:650;padding:2px 8px;border-radius:7px}',
+    '.tag-rep{background:color-mix(in srgb,var(--ok) 18%,transparent);color:var(--ok)}',
+    '.tag-ok{background:color-mix(in srgb,var(--accent) 18%,transparent);color:var(--accent)}',
+    '.tag-no{background:color-mix(in srgb,var(--bad) 16%,transparent);color:var(--bad)}',
+    '.empty{font-size:13px;color:var(--ink2);padding:10px 2px}',
+    '.chosen{background:var(--glass2);border:1px solid color-mix(in srgb,var(--ok) 55%,var(--edge));border-radius:16px;padding:12px 14px;position:relative}',
+    '.chosen:before{content:"";position:absolute;left:0;top:12px;bottom:12px;width:3px;border-radius:2px;background:var(--ok)}',
+    '.chosen-t{font-size:14px;line-height:1.45;white-space:pre-wrap;max-height:180px;overflow:auto;padding-right:30px}',
+    '.chosen-m{font-size:12.5px;color:var(--ok);margin-top:8px;font-weight:600}',
+    '.chosen-m.no{color:var(--bad)}',
+    '#chosen-x,.c-x{position:absolute;width:26px;height:26px;border-radius:13px;border:0;background:var(--well);color:var(--ink2);font-size:12px;cursor:pointer;z-index:1}',
+    '#chosen-x{top:10px;right:10px}',
+    // контакты
+    '.ct{display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:8px;border-radius:16px;background:var(--well);margin-bottom:8px;position:relative}',
+    '.ct input{padding:10px 12px;font-size:14px;background:var(--glass2)}',
+    '.ct .c-name{grid-column:1/-1;padding-right:40px;font-weight:600}',
+    '.c-x{top:13px;right:13px}',
+    '.addc{width:100%;padding:11px;border-radius:14px;border:1.5px dashed color-mix(in srgb,var(--accent) 45%,transparent);background:none;color:var(--accent);font:inherit;font-size:14px;font-weight:600;cursor:pointer}',
+    // нижняя панель
+    '.dock{position:fixed;left:12px;right:12px;bottom:max(12px,env(safe-area-inset-bottom));z-index:6;border-radius:999px;padding:7px;background:var(--glass2)}',
+    '.btn{width:100%;padding:14px;border:0;border-radius:999px;background:var(--accent);color:#fff;font:inherit;font-size:16px;font-weight:650;cursor:pointer;position:relative}',
+    '.btn:disabled{opacity:.6}',
+    'button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}',
+    '@media (prefers-reduced-motion:reduce){*{transition:none!important}}'
   ].join('\n');
+
+  function seg(g, opts) {
+    return '<div class="pills" data-g="' + g + '">' + opts.map(function (o) { return '<div class="pill" data-v="' + o[0] + '">' + o[1] + '</div>'; }).join('') + '</div>';
+  }
+
   return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">' +
-    '<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">' +
     '<title>Передать юристу</title><script src="https://telegram.org/js/telegram-web-app.js"></script>' +
     '<style>' + css + '</style></head><body>' +
-    '<h1>⚖️ Передать юристу</h1><p class="sub" id="sub">Загрузка...</p>' +
-    '<div class="field"><label class="l">Отчёт аудитора</label>' +
-    '<input id="rq" type="search" autocomplete="off" placeholder="Адрес, название, ИНН или #номер заявки">' +
-    '<div id="chosen" class="chosen" hidden><button id="chosen-x" type="button" aria-label="Убрать">✕</button><div id="chosen-text" class="chosen-t"></div><div id="chosen-meta" class="chosen-m"></div></div>' +
-    '<div id="results"></div></div>' +
-    '<div class="field"><label class="l">Юрист *</label><div class="pills" id="lawyers"></div></div>' +
-    '<div class="field"><label class="l">Регион</label><div class="pills" data-g="region"><div class="pill" data-v="МСК">МСК</div><div class="pill" data-v="МО">МО</div></div></div>' +
-    '<div class="field"><label class="l">Вид</label><div class="pills" data-g="kind"><div class="pill" data-v="Общепит">🍺 Общепит</div><div class="pill" data-v="Магазин">🛒 Магазин</div><div class="pill" data-v="Табак">🚬 Табак</div></div></div>' +
-    '<div class="field"><label class="l">Услуга</label><div class="pills" data-g="service"><div class="pill" data-v="Получение">Получение</div><div class="pill" data-v="Продление">Продление</div><div class="pill" data-v="Переоформление">Переоформление</div></div></div>' +
-    '<div class="field"><label class="l">Приоритет</label><div class="pills" data-g="priority"><div class="pill" data-v="обычный">Обычный</div><div class="pill" data-v="🔥 горящий">🔥 Горящий</div></div></div>' +
-    '<div class="field"><label class="l">Организация *</label><input id="org" placeholder="ООО «КАИСА»"></div>' +
-    '<div class="field"><label class="l">ИНН</label><input id="inn" inputmode="numeric" placeholder="7708285998"></div>' +
-    '<div class="field"><label class="l">Клиент</label><input id="client" placeholder="Имя"></div>' +
-    '<div class="field"><label class="l">Телефон</label><input id="phone" inputmode="tel" placeholder="+7 ..."></div>' +
-    '<div class="field"><label class="l">Адрес</label><textarea id="address"></textarea></div>' +
-    '<div class="field"><label class="l">Комментарий менеджера</label><textarea id="comment" placeholder="Что важно знать юристу"></textarea></div>' +
-    '<div class="bottom"><button class="btn" id="go" onclick="send()">Передать юристу</button></div>' +
+    '<div class="field-bg" aria-hidden="true"><i></i><i></i><i></i></div>' +
+    '<header class="top"><div class="kicker" id="sub">Загрузка…</div><h1>Передать юристу</h1></header>' +
+
+    '<section class="glass grp"><h2>Отчёт аудитора</h2>' +
+    '<input id="rq" type="search" autocomplete="off" placeholder="Адрес, название, ИНН или #номер">' +
+    '<div id="chosen" class="chosen" hidden><button id="chosen-x" type="button" aria-label="Убрать отчёт">✕</button><div id="chosen-text" class="chosen-t"></div><div id="chosen-meta" class="chosen-m"></div></div>' +
+    '<div id="results"></div></section>' +
+
+    '<section class="glass grp"><h2>Клиент</h2>' +
+    '<div class="f"><label class="lbl" for="org">Организация <span class="req">*</span></label><input id="org" placeholder="ООО «Название»"></div>' +
+    '<div class="f"><label class="lbl" for="inn">ИНН</label><input id="inn" inputmode="numeric" placeholder="10 или 12 цифр"></div>' +
+    '<div class="f"><label class="lbl" for="address">Адрес</label><textarea id="address" rows="2" style="min-height:56px"></textarea></div>' +
+    '<div class="f"><span class="lbl">Контакты</span><div id="contacts"></div>' +
+    '<button type="button" id="add-contact" class="addc">+ Добавить контакт</button></div>' +
+    '</section>' +
+
+    '<section class="glass grp"><h2>Лицензия</h2>' +
+    '<div class="f"><span class="lbl">Регион</span>' + seg('region', [['МСК', 'Москва'], ['МО', 'Подмосковье']]) + '</div>' +
+    '<div class="f"><span class="lbl">Вид объекта</span>' + seg('kind', [['Общепит', 'Общепит'], ['Магазин', 'Магазин'], ['Табак', 'Табак']]) + '</div>' +
+    '<div class="f"><span class="lbl">Услуга</span>' + seg('service', [['Получение', 'Получение'], ['Продление', 'Продление'], ['Переоформление', 'Переоформление']]) + '</div>' +
+    '<div class="f"><span class="lbl">Приоритет</span>' + seg('priority', [['обычный', 'Обычный'], ['🔥 горящий', 'Горящий']]) + '</div>' +
+    '</section>' +
+
+    '<section class="glass grp"><h2>Кому передать</h2>' +
+    '<div class="f"><span class="lbl">Юрист <span class="req">*</span></span><div class="pills" id="lawyers"></div></div>' +
+    '<div class="f"><label class="lbl" for="comment">Комментарий для юриста</label><textarea id="comment" placeholder="Что важно знать: сроки, особенности, договорённости"></textarea></div>' +
+    '</section>' +
+
+    '<div class="dock glass"><button class="btn" id="go" type="button" onclick="send()">Передать юристу</button></div>' +
     '<script>(' + handoffClient.toString() + ')();</script></body></html>';
 }
 
