@@ -129,7 +129,8 @@ async function addToReports(chatId, msgId, text, author, authorId, mgid, date, r
 function setupReportsBot(bot) {
   ensureReports().catch(function (e) { console.error('reports table:', e.message); });
   bot.on('message', async function (ctx, next) {
-    if (String(ctx.chat.id) === String(process.env.GROUP_CHAT_ID)) {
+    var cid = String(ctx.chat.id);
+    if (cid === String(process.env.GROUP_CHAT_ID) || cid === String(process.env.CLIENTS_CHAT_ID)) {
       var m = ctx.message;
       var text = m.text || m.caption || '';
       var hasMedia = !!(m.photo || m.document || m.video);
@@ -250,21 +251,25 @@ function parseExport(buf, name) {
 }
 
 function adminImportPage(msg, isErr) {
-  return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Импорт отчётов</title>' +
+  return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Импорт чатов</title>' +
     '<style>body{font-family:-apple-system,sans-serif;background:#0f172a;color:#f1f5f9;padding:32px;max-width:640px;margin:0 auto;line-height:1.5}a{color:#94a3b8}' +
     '.card{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:24px;margin-top:16px}input{margin:14px 0;color:#f1f5f9}' +
     'button{padding:12px 20px;background:#6366f1;color:#fff;border:0;border-radius:10px;font-size:15px;cursor:pointer}.ok{color:#22c55e;font-weight:600}.err{color:#f87171;font-weight:600}button:disabled{opacity:.6}#fc{color:#94a3b8;font-size:13px}ol{padding-left:20px;color:#cbd5e1}</style></head><body>' +
-    '<a href="/admin">← Назад</a><h1 style="margin-top:12px">Импорт отчётов из чата замеров</h1>' +
+    '<a href="/admin">← Назад</a><h1 style="margin-top:12px">Импорт истории чатов</h1>' +
     (msg ? '<p class="' + (isErr ? 'err' : 'ok') + '">' + esc(msg) + '</p>' : '') +
-    '<div class="card"><ol><li>Telegram Desktop → чат замеров → ⋮ → «Экспорт истории чата».</li><li>Снять все галочки (фото, файлы не нужны), формат HTML или JSON.</li>' +
+    '<div class="card"><ol><li>Telegram Desktop → нужный чат → ⋮ → «Экспорт истории чата».</li><li>Снять все галочки (фото, файлы не нужны), формат HTML или JSON.</li>' +
     '<li>Загрузить сюда все файлы <b>messages*.html</b> или <b>result.json</b>.</li></ol>' +
     '<form method="POST" action="/admin/import" enctype="multipart/form-data" onsubmit="var f=document.getElementById(\'fi\');if(!f.files.length){alert(\'Сначала выберите файлы\');return false}var b=document.getElementById(\'sb\');b.disabled=true;b.textContent=\'Загружаю, не закрывайте страницу…\'">' +
+    '<p style="margin-top:14px"><b>Какой чат загружаете:</b></p>' +
+    '<label style="display:block;margin:6px 0"><input type="radio" name="chat" value="zamery" checked style="margin:0 8px 0 0">Замеры (отчёты аудиторов)</label>' +
+    '<label style="display:block;margin:6px 0"><input type="radio" name="chat" value="clients" style="margin:0 8px 0 0">Заявки по клиенту</label>' +
     '<input id="fi" type="file" name="files" multiple accept=".html,.json" onchange="document.getElementById(\'fc\').textContent=this.files.length?\'Выбрано файлов: \'+this.files.length:\'\'"><div id="fc"></div><br>' +
     '<button id="sb" type="submit">Загрузить</button></form>' +
     '<p style="color:#94a3b8;font-size:13px">Повторная загрузка не создаёт дублей.</p></div></body></html>';
 }
 
 function setupReportsWeb(app, upload) {
+  setupRequestsWeb(app);
   ensureReports().catch(function (e) { console.error('reports table:', e.message); });
 
   app.get('/api/reports/get', async function (req, res) {
@@ -289,14 +294,14 @@ function setupReportsWeb(app, upload) {
       var msgs = [];
       files.forEach(function (f) { msgs = msgs.concat(parseExport(f.buffer, f.originalname)); });
       msgs.sort(function (a, b) { return a.id - b.id; });
-      var chatId = process.env.GROUP_CHAT_ID;
+      var chatId = req.body.chat === 'clients' ? process.env.CLIENTS_CHAT_ID : process.env.GROUP_CHAT_ID;
 
       // Склеиваем в памяти: один автор подряд в пределах 3 минут = один отчёт
       var groups = [], cur = null;
       msgs.forEach(function (m) {
         if (!m.text && !m.media) return;
         var author = m.author || 'аудитор';
-        var sameThread = !m.reply || m.reply === cur.reply;
+        var sameThread = !m.reply || (cur && m.reply === cur.reply);
         if (cur && cur.author === author && (m.date - cur.last) <= MERGE_SEC * 1000 && sameThread) {
           cur.ids.push(m.id); if (m.text) cur.text.push(m.text); cur.last = m.date;
         } else {
@@ -336,6 +341,194 @@ function setupReportsWeb(app, upload) {
   });
 }
 
+
+// ── Заявки по клиенту: нераспределённые ───────────────────────────────
+var REQ_RE = 'Новая форма заполнена|Наименование организации|ИНН[^0-9]{0,6}[0-9]{10}';
+var NOT_REQ_RE = 'Клиент передан юристу|Чек-лист выполнен|Красный флаг|Запросить документы|Заявка не распределена';
+
+function parseRequest(text) {
+  var t = String(text || '');
+  var f = {};
+  function grab(re) { var m = t.match(re); return m ? m[1].replace(/^[\s:]+/, '').trim() : ''; }
+  f.client = grab(/Имя клиента\s*:([^\n]*)/i) || grab(/Клиент\s*:([^\n+\d]*)/i);
+  f.phone = grab(/Номер\s*:([^\n]*)/i) || (t.match(/\+?[78][\s\-()]*\d{3}[\s\-()]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}/) || [''])[0];
+  f.org = grab(/Наименование организации\s*:([^\n]*)/i);
+  if (!f.org) { var m = t.match(/^\s*((?:ООО|ИП|АО|ПАО|ЗАО)\s*[^\n]*)/im); if (m) f.org = m[1].trim(); }
+  f.inn = grab(/ИНН[^\d\n]*(\d{10,12})/i);
+  f.city = grab(/Город\s*:([^\n]*)/i);
+  f.address = grab(/Адрес лицензирования\s*:([^\n]*)/i) || grab(/Адрес\s*:([^\n]*)/i);
+  var kind = grab(/Вид объекта\s*:([^\n]*)/i) || t.slice(0, 200);
+  f.kind = /табак/i.test(kind) ? 'Табак' : /магазин|розниц/i.test(kind) ? 'Магазин' : /общепит|кафе|бар|ресторан/i.test(kind) ? 'Общепит' : '';
+  var svc = grab(/Услуга\s*:([^\n]*)/i) || t.slice(0, 200);
+  f.service = /переоформ/i.test(svc) ? 'Переоформление' : /продлен/i.test(svc) ? 'Продление' : /получен/i.test(svc) ? 'Получение' : '';
+  var where = (f.city + ' ' + f.address).toLowerCase();
+  f.region = /московская обл|городской округ/.test(where) ? 'МО' : /москва/.test(where) ? 'МСК' : (f.city ? 'МО' : '');
+  f.priority = /горящ|срочно/i.test(t) ? '🔥 горящий' : '';
+  var comment = [];
+  var com = grab(/Комментари[ий]\s*:([^\n]*)/i); if (com) comment.push(com);
+  var osob = grab(/Особые услуги\s*:([^\n]*)/i); if (osob) comment.push('Особые услуги: ' + osob);
+  var tech = grab(/Техническое описание\s*:([^\n]*)/i); if (tech) comment.push('Техническое описание: ' + tech);
+  var zones = grab(/Зоны запрета\s*:([^\n]*)/i); if (zones) comment.push('Зоны запрета: ' + zones);
+  var amo = (t.match(/https?:\/\/\S*amocrm\S*/i) || [''])[0]; if (amo) comment.push('AmoCRM: ' + amo);
+  f.comment = comment.join('\n');
+  Object.keys(f).forEach(function (k) { if (!f[k]) delete f[k]; });
+  return f;
+}
+
+async function ensureRequests() {
+  await pool.query(`
+    ALTER TABLE reports ADD COLUMN IF NOT EXISTS dismissed BOOLEAN DEFAULT false;
+    ALTER TABLE cases ADD COLUMN IF NOT EXISTS request_id INT;
+  `);
+}
+
+async function listRequests(q, limit) {
+  var params = [process.env.CLIENTS_CHAT_ID, REQ_RE, NOT_REQ_RE];
+  var where = '';
+  String(q || '').toLowerCase().replace(/ё/g, 'е').split(/[\s,.;]+/).filter(function (w) { return w.length > 1; }).slice(0, 5).forEach(function (w) {
+    params.push('%' + w + '%');
+    where += " AND replace(lower(r.text), 'ё', 'е') LIKE $" + params.length;
+  });
+  var sql = "SELECT r.id, r.text, r.created_at, r.author FROM reports r " +
+    "WHERE r.chat_id = $1 AND NOT COALESCE(r.dismissed, false) AND r.text ~* $2 AND NOT (r.text ~* $3) " +
+    "AND NOT EXISTS (SELECT 1 FROM cases c WHERE c.request_id = r.id)" + where +
+    " ORDER BY r.created_at DESC LIMIT " + (limit || 100);
+  return (await pool.query(sql, params)).rows;
+}
+
+function setupRequestsWeb(app) {
+  ensureReports().then(ensureRequests).catch(function (e) { console.error('requests table:', e.message); });
+
+  app.get('/api/requests', async function (req, res) {
+    try {
+      var rows = await listRequests(req.query.q, 150);
+      var total = (await pool.query(
+        "SELECT COUNT(*)::int AS c FROM reports r WHERE r.chat_id=$1 AND NOT COALESCE(r.dismissed,false) AND r.text ~* $2 AND NOT (r.text ~* $3) AND NOT EXISTS (SELECT 1 FROM cases c WHERE c.request_id = r.id)",
+        [process.env.CLIENTS_CHAT_ID, REQ_RE, NOT_REQ_RE])).rows[0].c;
+      res.json({ ok: true, total: total, items: rows.map(function (r) { return { id: r.id, created_at: r.created_at, author: r.author, f: parseRequest(r.text) }; }) });
+    } catch (e) { console.error(e); res.json({ ok: false, error: e.message }); }
+  });
+
+  app.post('/api/requests/dismiss', async function (req, res) {
+    try {
+      if (req.body.older_days) {
+        var r = await pool.query("UPDATE reports SET dismissed = true WHERE chat_id=$1 AND created_at < NOW() - ($2 || ' days')::interval AND text ~* $3 AND NOT EXISTS (SELECT 1 FROM cases c WHERE c.request_id = reports.id)",
+          [process.env.CLIENTS_CHAT_ID, String(parseInt(req.body.older_days) || 30), REQ_RE]);
+        return res.json({ ok: true, n: r.rowCount });
+      }
+      await pool.query('UPDATE reports SET dismissed = $1 WHERE id = $2', [req.body.undo ? false : true, parseInt(req.body.id)]);
+      res.json({ ok: true });
+    } catch (e) { console.error(e); res.json({ ok: false, error: e.message }); }
+  });
+
+  app.get('/requests', function (req, res) { res.send(requestsPage()); });
+}
+
+function requestsClient() {
+  var tg = window.Telegram && window.Telegram.WebApp;
+  if (tg && tg.ready) { tg.ready(); tg.expand(); }
+  var scheme = (tg && tg.colorScheme) || (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  document.documentElement.dataset.theme = scheme;
+  try { tg.setHeaderColor(scheme === 'dark' ? '#070B16' : '#E8EEF6'); tg.setBackgroundColor(scheme === 'dark' ? '#070B16' : '#E8EEF6'); } catch (e) {}
+  function $(i) { return document.getElementById(i); }
+  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+  function fmt(s) { var d = new Date(s); return d.toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' }) + (d.getFullYear() !== new Date().getFullYear() ? ' ' + d.getFullYear() : ''); }
+  function haptic() { try { tg.HapticFeedback.selectionChanged(); } catch (e) {} }
+
+  var seq = 0, timer = null;
+  function load() {
+    var my = ++seq;
+    $('list').classList.add('loading');
+    fetch('/api/requests?q=' + encodeURIComponent($('q').value.trim())).then(function (r) { return r.json(); }).then(function (d) {
+      if (my !== seq) return;
+      $('list').classList.remove('loading');
+      $('count').textContent = d.ok ? d.total : '—';
+      var box = $('list'); box.innerHTML = '';
+      if (!d.ok) { box.appendChild(el('div', 'empty', 'Ошибка загрузки')); return; }
+      if (!d.items.length) { box.appendChild(el('div', 'empty', $('q').value ? 'Ничего не найдено' : 'Все заявки распределены')); return; }
+      d.items.forEach(function (it) {
+        var f = it.f || {};
+        var card = el('article', 'glass card');
+        var top = el('div', 'ctop');
+        top.appendChild(el('div', 'org', f.org || f.client || 'Без названия'));
+        top.appendChild(el('div', 'date', fmt(it.created_at)));
+        card.appendChild(top);
+        var chips = el('div', 'chips');
+        [f.kind, f.region === 'МО' ? 'Подмосковье' : f.region === 'МСК' ? 'Москва' : '', f.service].filter(Boolean).forEach(function (c) { chips.appendChild(el('span', 'chip', c)); });
+        if (f.priority) chips.appendChild(el('span', 'chip hot', 'Горящий'));
+        card.appendChild(chips);
+        var lines = [f.inn ? 'ИНН ' + f.inn : '', f.address || f.city || '', [f.client, f.phone].filter(Boolean).join(', ')].filter(Boolean);
+        lines.forEach(function (l) { card.appendChild(el('div', 'line', l)); });
+        var act = el('div', 'acts');
+        var go = el('button', 'go', 'Распределить'); go.type = 'button';
+        go.onclick = function () { haptic(); location.href = '/handoff?request_id=' + it.id; };
+        var hide = el('button', 'hide', 'Скрыть'); hide.type = 'button';
+        hide.onclick = function () {
+          haptic(); card.classList.add('gone');
+          fetch('/api/requests/dismiss', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: it.id }) })
+            .then(function () { setTimeout(function () { card.remove(); $('count').textContent = Math.max(0, parseInt($('count').textContent) - 1); }, 250); });
+        };
+        act.appendChild(hide); act.appendChild(go);
+        card.appendChild(act);
+        box.appendChild(card);
+      });
+    });
+  }
+  $('q').oninput = function () { clearTimeout(timer); timer = setTimeout(load, 250); };
+  $('old').onclick = function () {
+    var go = function () {
+      fetch('/api/requests/dismiss', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ older_days: 30 }) })
+        .then(function (r) { return r.json(); }).then(function (d) { load(); if (tg && tg.showAlert) tg.showAlert('Скрыто: ' + (d.n || 0)); });
+    };
+    if (tg && tg.showConfirm) tg.showConfirm('Скрыть все нераспределённые заявки старше 30 дней?', function (ok) { if (ok) go(); });
+    else if (confirm('Скрыть все нераспределённые заявки старше 30 дней?')) go();
+  };
+  load();
+}
+
+function requestsPage() {
+  var css = [
+    ':root{--bg:#E8EEF6;--ink:#0E1A2B;--ink2:#5B6B82;--glass:rgba(255,255,255,.56);--glass2:rgba(255,255,255,.74);--edge:rgba(255,255,255,.85);--well:rgba(14,26,43,.06);--ok:#1FA971;--bad:#E5484D;--accent:#2F6BFF;--o1:#8EC5FF;--o2:#C3B2FF;--o3:#9CEBD3;--shadow:0 10px 30px rgba(30,52,90,.12),0 1px 2px rgba(30,52,90,.06)}',
+    '[data-theme=dark]{--bg:#070B16;--ink:#EEF2F8;--ink2:#93A0B5;--glass:rgba(28,36,56,.48);--glass2:rgba(36,46,70,.66);--edge:rgba(255,255,255,.14);--well:rgba(255,255,255,.07);--ok:#2FB57C;--bad:#FF6369;--accent:#3E6EF2;--o1:#1D4ED8;--o2:#6D28D9;--o3:#0F766E;--shadow:0 12px 34px rgba(0,0,0,.45)}',
+    '*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}html{background:var(--bg)}',
+    'body{font:15px/1.4 -apple-system,BlinkMacSystemFont,"SF Pro Text","Inter","Segoe UI",Roboto,sans-serif;color:var(--ink);min-height:100vh;padding:0 14px 40px;letter-spacing:-.01em}',
+    '.bg{position:fixed;inset:-20%;z-index:-1;pointer-events:none;filter:blur(60px);opacity:.75}[data-theme=dark] .bg{opacity:.42}',
+    '.bg i{position:absolute;border-radius:50%}.bg i:nth-child(1){width:55%;height:45%;left:-5%;top:5%;background:var(--o1)}.bg i:nth-child(2){width:50%;height:45%;right:-5%;top:30%;background:var(--o2)}.bg i:nth-child(3){width:55%;height:40%;left:15%;bottom:0;background:var(--o3)}',
+    '.glass{background:var(--glass);-webkit-backdrop-filter:blur(24px) saturate(180%);backdrop-filter:blur(24px) saturate(180%);border:1px solid var(--edge);box-shadow:var(--shadow);position:relative}',
+    '.top{padding:18px 4px 12px;display:flex;align-items:flex-end;gap:12px}',
+    'h1{font-size:28px;line-height:1.1;font-weight:700;letter-spacing:-.025em;flex:1}',
+    '#count{font-size:15px;font-weight:700;color:#fff;background:var(--bad);border-radius:999px;padding:4px 11px;margin-bottom:3px}',
+    '.bar{position:sticky;top:10px;z-index:5;display:flex;gap:8px;padding:6px;border-radius:999px;background:var(--glass2);margin-bottom:12px}',
+    '#q{flex:1;border:0;background:transparent;font:inherit;font-size:15px;color:var(--ink);padding:9px 12px;outline:none}',
+    '#q::placeholder{color:var(--ink2)}',
+    '#old{border:0;border-radius:999px;background:var(--well);color:var(--ink2);font:inherit;font-size:13px;font-weight:600;padding:8px 12px;cursor:pointer;white-space:nowrap}',
+    '.card{border-radius:20px;padding:14px 16px;margin-bottom:10px;transition:opacity .25s,transform .25s}',
+    '.card.gone{opacity:0;transform:translateX(30px)}',
+    '.ctop{display:flex;gap:10px;align-items:baseline}',
+    '.org{flex:1;font-size:16.5px;font-weight:650;letter-spacing:-.015em;line-height:1.25}',
+    '.date{font-size:12.5px;color:var(--ink2);white-space:nowrap}',
+    '.chips{display:flex;flex-wrap:wrap;gap:5px;margin:8px 0 6px}',
+    '.chip{font-size:12px;font-weight:600;padding:3px 9px;border-radius:8px;background:var(--well);color:var(--ink2)}',
+    '.chip.hot{background:color-mix(in srgb,var(--bad) 16%,transparent);color:var(--bad)}',
+    '.line{font-size:14px;color:var(--ink2);line-height:1.4}',
+    '.acts{display:flex;gap:8px;margin-top:12px}',
+    '.acts button{border:0;border-radius:12px;font:inherit;font-size:14.5px;font-weight:600;padding:11px 14px;cursor:pointer}',
+    '.go{flex:1;background:var(--accent);color:#fff}.hide{background:var(--well);color:var(--ink2)}',
+    '.empty{text-align:center;color:var(--ink2);padding:40px 0;font-size:15px}',
+    '#list.loading{opacity:.5}',
+    '@media (prefers-reduced-motion:reduce){*{transition:none!important}}'
+  ].join('\n');
+  return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">' +
+    '<title>Нераспределённые заявки</title><script src="https://telegram.org/js/telegram-web-app.js"></script>' +
+    '<style>' + css + '</style></head><body>' +
+    '<div class="bg" aria-hidden="true"><i></i><i></i><i></i></div>' +
+    '<header class="top"><h1>Нераспределённые</h1><span id="count">…</span></header>' +
+    '<div class="bar glass"><input id="q" type="search" placeholder="Поиск: название, ИНН, телефон" autocomplete="off"><button id="old" type="button" title="Скрыть заявки старше 30 дней">Скрыть старые</button></div>' +
+    '<main id="list"></main>' +
+    '<script>(' + requestsClient.toString() + ')();</script></body></html>';
+}
+
 function setupHandoff(app) {
   ensureTables().catch(function (e) { console.error('handoff tables error:', e.message); });
   const bot = require('../bot/instance');
@@ -351,8 +544,13 @@ function setupHandoff(app) {
         audit = (await pool.query('SELECT * FROM audits WHERE order_id=$1 ORDER BY created_at DESC LIMIT 1', [orderId])).rows[0] || null;
       }
       var lawyers = (await pool.query("SELECT tg_id, name FROM staff WHERE role='lawyer' ORDER BY name")).rows;
+      var request = null, reqId = parseInt(req.query.request_id) || 0;
+      if (reqId) {
+        var rq = (await pool.query('SELECT id, text, created_at FROM reports WHERE id=$1', [reqId])).rows[0];
+        if (rq) request = { id: rq.id, text: rq.text, created_at: rq.created_at, f: parseRequest(rq.text) };
+      }
       res.json({
-        ok: true, lawyers: lawyers,
+        ok: true, lawyers: lawyers, request: request,
         report: audit ? { src: 'a', id: audit.id, text: audit.text, created_at: audit.created_at, order_id: audit.order_id } : null,
         order: order ? {
           id: order.id, org: order.object_name || '', client: order.owner_name || '',
@@ -386,13 +584,14 @@ function setupHandoff(app) {
       if (audit && audit.text && !d.audit_text_manual) d.audit_text = audit.text;
       var c = (await pool.query(
         `INSERT INTO cases (order_id, lawyer_tg_id, lawyer_name, checklist_key, org, inn, client, phone, address,
-          region, kind, service, priority, comment, audit_text, total, created_by, contacts)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
+          region, kind, service, priority, comment, audit_text, total, created_by, contacts, request_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING *`,
         [d.order_id || null, lawyer.tg_id, lawyer.name, d.checklist_key, d.org, d.inn, d.client, d.phone, d.address,
-          d.region, d.kind, d.service, d.priority, d.comment, d.audit_text, total, d.tg_user_id || null, JSON.stringify(contacts)]
+          d.region, d.kind, d.service, d.priority, d.comment, d.audit_text, total, d.tg_user_id || null, JSON.stringify(contacts), parseInt(d.request_id) || null]
       )).rows[0];
 
       var text = caseText(c);
+      var reqRow = c.request_id ? (await pool.query('SELECT chat_id, msg_ids, first_id FROM reports WHERE id=$1', [c.request_id])).rows[0] : null;
 
       // 1) Чат «Заявки по клиенту»: файлы аудитора + карточка
       var CLIENTS = process.env.CLIENTS_CHAT_ID;
@@ -401,10 +600,17 @@ function setupHandoff(app) {
           try { await bot.telegram.callApi('copyMessages', { chat_id: CLIENTS, from_chat_id: audit.chat_id, message_ids: audit.msg_ids.map(Number) }); }
           catch (e) { console.error('copy to clients chat:', e.message); }
         }
-        await bot.telegram.sendMessage(CLIENTS, text, { parse_mode: 'HTML' });
+        var opts = { parse_mode: 'HTML' };
+        if (reqRow && String(reqRow.chat_id) === String(CLIENTS)) opts.reply_to_message_id = Number(reqRow.first_id);
+        try { await bot.telegram.sendMessage(CLIENTS, text, opts); }
+        catch (e) { delete opts.reply_to_message_id; await bot.telegram.sendMessage(CLIENTS, text, opts); }
       }
 
-      // 2) Юристу в личку: файлы + карточка + кнопка чек-листа
+      // 2) Юристу в личку: исходная заявка, файлы аудитора, карточка + кнопка чек-листа
+      if (reqRow && reqRow.msg_ids && reqRow.msg_ids.length) {
+        try { await bot.telegram.callApi('copyMessages', { chat_id: lawyer.tg_id, from_chat_id: reqRow.chat_id, message_ids: reqRow.msg_ids.map(Number).sort(function (x, y) { return x - y; }) }); }
+        catch (e) { console.error('copy request to lawyer:', e.message); }
+      }
       if (audit && audit.msg_ids && audit.msg_ids.length) {
         try { await bot.telegram.callApi('copyMessages', { chat_id: lawyer.tg_id, from_chat_id: audit.chat_id, message_ids: audit.msg_ids.map(Number) }); }
         catch (e) { console.error('copy to lawyer:', e.message); }
@@ -510,12 +716,14 @@ var BASE_CSS = [
 ].join('\n');
 
 function handoffClient() {
-  var tg = window.Telegram.WebApp; tg.ready(); tg.expand();
+  var tg = (window.Telegram && window.Telegram.WebApp) || { ready: function () {}, expand: function () {}, close: function () { history.back(); }, showAlert: function (m, cb) { alert(m); if (cb) cb(); }, initDataUnsafe: {} };
+  tg.ready(); tg.expand();
   var scheme = tg.colorScheme || (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
   document.documentElement.dataset.theme = scheme;
   try { tg.setHeaderColor(scheme === 'dark' ? '#070B16' : '#E8EEF6'); tg.setBackgroundColor(scheme === 'dark' ? '#070B16' : '#E8EEF6'); } catch (e) {}
   var Q = new URLSearchParams(location.search);
   var orderId = Q.get('order_id') || '';
+  var requestId = Q.get('request_id') || '';
   var S = { lawyer: null, region: 'МСК', kind: 'Общепит', service: 'Получение', priority: 'обычный' };
   var REP = null; // выбранный отчёт {src,id,text}
   function $(i) { return document.getElementById(i); }
@@ -666,7 +874,7 @@ function handoffClient() {
   $('rq').oninput = function () { clearTimeout(timer); timer = setTimeout(search, 250); };
   $('rq').onfocus = function () { if (!$('results').children.length) search(); };
 
-  fetch('/api/handoff/prefill?order_id=' + orderId).then(function (r) { return r.json(); }).then(function (d) {
+  fetch('/api/handoff/prefill?order_id=' + orderId + '&request_id=' + requestId).then(function (r) { return r.json(); }).then(function (d) {
     var L = $('lawyers');
     if (!d.lawyers.length) { var w = document.createElement('span'); w.className = 'warn'; w.textContent = 'Нет зарегистрированных юристов. Пусть нажмут /start в боте.'; L.appendChild(w); }
     d.lawyers.forEach(function (x) {
@@ -685,6 +893,24 @@ function handoffClient() {
       mark('region', d.order.region); mark('kind', d.order.kind);
       if (d.report) choose(d.report);
       else if (d.order.address) { $('rq').value = d.order.address.split(',').slice(-2).join(' '); search(); }
+    } else if (d.request) {
+      var F = d.request.f || {};
+      $('sub').textContent = 'Заявка от ' + new Date(d.request.created_at).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' });
+      ['org', 'inn', 'address', 'comment'].forEach(function (k) { if (F[k]) $(k).value = F[k]; });
+      if (!F.address && F.city) $('address').value = F.city;
+      if (F.client || F.phone) addContact({ name: F.client || '', phone: F.phone || '' });
+      fillFrom(d.request.text);
+      mark('region', F.region || 'МСК'); mark('kind', F.kind || 'Общепит');
+      mark('service', F.service || 'Получение');
+      mark('priority', F.priority || 'обычный');
+      if (/Коммент\S*\s+аудитора/i.test(d.request.text)) {
+        // отчёт аудитора уже внутри заявки
+        choose({ src: 'r', id: d.request.id, text: d.request.text, created_at: d.request.created_at, kind: 'report' });
+      } else {
+        var qv = F.inn || (F.org || '').replace(/^(ООО|ИП|АО)\s*/i, '').replace(/["«»]/g, '') || (F.address || '').split(',').slice(-2).join(' ');
+        if (qv) { $('rq').value = qv; search(); }
+      }
+      return;
     } else { $('sub').textContent = 'Новый клиент'; mark('region', 'МСК'); mark('kind', 'Общепит'); }
     mark('service', 'Получение'); mark('priority', 'обычный');
   });
@@ -695,7 +921,7 @@ function handoffClient() {
     var b = $('go'); b.disabled = true; b.textContent = 'Отправляем...';
     try {
       var r = await fetch('/api/handoff', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
-        order_id: orderId ? parseInt(orderId) : null, lawyer_tg_id: S.lawyer, region: S.region, kind: S.kind, service: S.service, priority: S.priority,
+        order_id: orderId ? parseInt(orderId) : null, request_id: requestId ? parseInt(requestId) : null, lawyer_tg_id: S.lawyer, region: S.region, kind: S.kind, service: S.service, priority: S.priority,
         org: $('org').value.trim(), inn: $('inn').value.trim(), contacts: readContacts(),
         address: $('address').value.trim(), comment: $('comment').value.trim(),
         report_src: REP ? REP.src : null, report_id: REP ? REP.id : null, audit_text: REP ? REP.text : '',
@@ -1357,4 +1583,4 @@ function checklistPage(c, L) {
     '</body></html>';
 }
 
-module.exports = { setupHandoff: setupHandoff, saveAudit: saveAudit, setupReportsBot: setupReportsBot, setupReportsWeb: setupReportsWeb };
+module.exports = { setupHandoff: setupHandoff, saveAudit: saveAudit, setupReportsBot: setupReportsBot, setupReportsWeb: setupReportsWeb, setupRequestsWeb: setupRequestsWeb };
