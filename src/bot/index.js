@@ -21,7 +21,7 @@ function setupBot() {
        const roles = { manager: 'Менеджер', lawyer: 'Юрист', auditor: 'Аудитор' };
     const zamer = Markup.button.webApp('📋 Заявка на замер', WEBAPP_URL + '/form');
     let kb;
-    if (me.role === 'manager') kb = [[zamer], [Markup.button.webApp('⚖️ Передать юристу', WEBAPP_URL + '/handoff')]];
+    if (me.role === 'manager') kb = [[zamer], [Markup.button.webApp('📥 Нераспределённые', WEBAPP_URL + '/requests')], [Markup.button.webApp('⚖️ Передать юристу', WEBAPP_URL + '/handoff')]];
     else if (me.role === 'lawyer') kb = [[zamer], ['📂 Мои клиенты']];
     else kb = [[Markup.button.webApp('🔍 Отчёт аудитора', WEBAPP_URL + '/audit')]];
     await ctx.reply('👋 ' + me.name + ' (' + roles[me.role] + ')\n\nВыбери действие:', Markup.keyboard(kb).resize());
