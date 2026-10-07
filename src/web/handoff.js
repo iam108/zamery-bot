@@ -464,6 +464,23 @@ function setupHandoff(app) {
     } catch (e) { console.error(e); res.json({ ok: false, error: e.message }); }
   });
 
+  // Запрос недостающих документов: в «Заявки по клиенту» и менеджеру
+  app.post('/api/checklist/request', async function (req, res) {
+    try {
+      var c = (await pool.query('SELECT * FROM cases WHERE id=$1', [parseInt(req.body.case_id)])).rows[0];
+      if (!c) return res.json({ ok: false, error: 'Клиент не найден' });
+      var list = (req.body.missing || []).map(function (x) { return String(x).slice(0, 200); }).slice(0, 40);
+      if (!list.length) return res.json({ ok: false, error: 'Список пуст' });
+      var msg = '📨 <b>Запросить документы у клиента</b>\n🏢 ' + esc(c.org) + (c.inn ? ' · ИНН ' + esc(c.inn) : '') + '\n\n' +
+        list.map(function (x) { return '• ' + esc(x); }).join('\n') +
+        '\n\n⚖️ ' + esc(req.body.by || c.lawyer_name) + '\n#заявка' + c.id;
+      var sent = 0;
+      if (process.env.CLIENTS_CHAT_ID) { try { await bot.telegram.sendMessage(process.env.CLIENTS_CHAT_ID, msg, { parse_mode: 'HTML' }); sent++; } catch (e) { console.error(e.message); } }
+      if (c.created_by && String(c.created_by) !== String(c.lawyer_tg_id)) { try { await bot.telegram.sendMessage(c.created_by, msg, { parse_mode: 'HTML' }); sent++; } catch (e) { console.error(e.message); } }
+      res.json({ ok: sent > 0, error: sent ? null : 'Не удалось отправить' });
+    } catch (e) { console.error(e); res.json({ ok: false, error: e.message }); }
+  });
+
   app.get('/handoff', function (req, res) { res.send(handoffPage()); });
 
   app.get('/checklist', async function (req, res) {
@@ -843,12 +860,14 @@ function checklistClient() {
     if (it.t === 'k' || it.t === 'flag') return !!(v && v.s);
     if (it.t === 'term') return !!(v && v.from && v.to);
     if (it.t === 'sig') return !!(v && v.at);
+    if (it.t === 'docs') return !!(v && v.m && it.o.every(function (x) { return v.m[x]; }));
     return v !== undefined && v !== '';
   }
   function isProblem(it) {
     var v = D[it.id];
     if (it.t === 'k') return !!(v && v.s === 'bad');
     if (it.t === 'flag') return !!(v && v.s === 'yes');
+    if (it.t === 'docs') return !!(v && ((v.m && it.o.some(function (x) { return v.m[x] === 'bad'; })) || String(v.other || '').trim()));
     if (it.t === 'term') { var m = termMonths(v); return m != null && m < 12; }
     return false;
   }
@@ -897,15 +916,25 @@ function checklistClient() {
     L.sections.forEach(function (s, si) {
       var items = s.i.filter(visible);
       if (!items.length) return;
-      var g = group('s' + si, s.t, items, s.red);
+      var g = group('s' + si, s.t, items, s.red, s.skip ? { mode: s.skip, label: s.skipLabel, items: items } : null);
       items.forEach(function (it) { g.body.appendChild(renderItem(it)); });
       root.appendChild(g.box);
     });
+    var cm = el('section', 'glass grp');
+    var ch = el('div', 'gh'); ch.appendChild(el('span', 'gt', 'Комментарий')); cm.appendChild(ch);
+    var cb = el('div', 'gb'); var cr = el('div', 'row col');
+    var ta = el('textarea', 'note plain'); ta.rows = 3; ta.placeholder = 'Заметки юриста по клиенту';
+    ta.value = D._comment || '';
+    ta.oninput = function () { D._comment = ta.value; changed(); };
+    cr.appendChild(ta); cb.appendChild(cr); cm.appendChild(cb);
+    root.appendChild(cm);
+
     window.scrollTo(0, y);
     summary();
   }
+  function alertMsg(m) { if (tg && tg.showAlert) tg.showAlert(m); else alert(m); }
 
-  function group(key, title, items, red) {
+  function group(key, title, items, red, skip) {
     var box = el('section', 'glass grp' + (red ? ' red' : ''));
     box.id = 'g-' + key;
     var head = el('button', 'gh');
@@ -918,6 +947,24 @@ function checklistClient() {
       var cnt = el('span', 'gc' + (done === items.length ? ' full' : ''), done + '/' + items.length);
       if (probs) head.appendChild(el('span', 'gp', String(probs)));
       head.appendChild(cnt);
+    }
+    if (skip) {
+      var sk = el('span', 'skip', skip.label || 'Пропустить');
+      sk.setAttribute('role', 'button');
+      sk.onclick = function (e) {
+        e.stopPropagation();
+        skip.items.forEach(function (it) {
+          if (it.t === 'flag' && !(D[it.id] && D[it.id].s)) D[it.id] = { s: 'no', c: '', by: ME, at: today() };
+          if (it.t === 'k' && !(D[it.id] && D[it.id].s)) D[it.id] = { s: skip.mode === 'no' ? 'ok' : 'na', c: '', by: ME, at: today() };
+          if (it.t === 'docs') {
+            D[it.id] = D[it.id] || {}; D[it.id].m = Object.assign({}, D[it.id].m || {});
+            it.o.forEach(function (doc) { if (!D[it.id].m[doc]) D[it.id].m[doc] = 'ok'; });
+            D[it.id].by = ME; D[it.id].at = today();
+          }
+        });
+        OPEN[key] = false; haptic('ok'); render(); changed();
+      };
+      if (!items.every(resolved)) head.appendChild(sk);
     }
     var chev = el('span', 'chev');
     head.appendChild(chev);
@@ -956,6 +1003,46 @@ function checklistClient() {
         haptic(x === 'yes' ? 'warn' : null); redraw();
       }, 'tri flagseg'));
       if (fs === 'yes') w.appendChild(note(it, 'Номер записи, дата, кем наложено'));
+    }
+
+    if (it.t === 'docs') {
+      w.classList.add('col');
+      var dv = v || {}, mark = dv.m || {};
+      var missing = it.o.filter(function (doc) { return mark[doc] === 'bad'; });
+      var answered = it.o.filter(function (doc) { return mark[doc]; }).length;
+      if (missing.length) w.classList.add('st-bad'); else if (answered === it.o.length) w.classList.add('st-ok');
+      var list = el('div', 'doclist');
+      it.o.forEach(function (doc) {
+        var dr = el('div', 'docrow' + (mark[doc] === 'bad' ? ' lack' : ''));
+        dr.appendChild(el('div', 'docname', doc));
+        dr.appendChild(segmented([['ok', 'Есть'], ['bad', 'Нет']], mark[doc], function (x) {
+          D[it.id] = D[it.id] || {}; D[it.id].m = Object.assign({}, D[it.id].m || {});
+          if (x) D[it.id].m[doc] = x; else delete D[it.id].m[doc];
+          D[it.id].by = ME; D[it.id].at = today();
+          haptic(x === 'bad' ? 'warn' : null); redraw();
+        }, 'tri'));
+        list.appendChild(dr);
+      });
+      w.appendChild(list);
+      var other = el('input', 'inp'); other.placeholder = 'Ещё не хватает (через запятую)'; other.value = dv.other || '';
+      other.oninput = function () { D[it.id] = D[it.id] || {}; D[it.id].other = other.value; changed(); };
+      other.onchange = function () { redraw(); };
+      w.appendChild(other);
+      var extra = String(dv.other || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean);
+      if (missing.length || extra.length) {
+        var req = el('button', 'sign reqbtn', dv.reqAt ? 'Запрошено ' + dv.reqAt + ' — запросить ещё раз' : 'Запросить недостающие (' + (missing.length + extra.length) + ')'); req.type = 'button';
+        req.onclick = async function () {
+          req.disabled = true; req.textContent = 'Отправляю…';
+          try {
+            var r = await fetch('/api/checklist/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ case_id: CASE.id, missing: missing.concat(extra), by: ME }) });
+            var j = await r.json();
+            if (!j.ok) throw new Error(j.error || 'Ошибка');
+            D[it.id].reqAt = today(); haptic('ok'); redraw();
+            alertMsg('Запрос отправлен в чат «Заявки по клиенту» и менеджеру');
+          } catch (e) { req.disabled = false; req.textContent = 'Запросить недостающие'; alertMsg('Не отправилось: ' + e.message); }
+        };
+        w.appendChild(req);
+      }
     }
 
     if (it.t === 'r') {
@@ -1031,6 +1118,10 @@ function checklistClient() {
       var v = D[it.id];
       if (it.t === 'k' && v && v.s === 'bad') probs.push({ l: it.l, c: v.c, flag: false });
       if (it.t === 'flag' && v && v.s === 'yes') probs.push({ l: it.l, c: v.c, flag: true });
+      if (it.t === 'docs' && v && isProblem(it)) {
+        var ml = it.o.filter(function (x) { return v.m && v.m[x] === 'bad'; }).concat(String(v.other || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean));
+        probs.push({ l: 'Не хватает документов', c: ml.join(', ') + (v.reqAt ? ' (запрошено ' + v.reqAt + ')' : ''), flag: false });
+      }
       if (it.t === 'term') { var m = termMonths(v); if (m != null && m < 12) probs.push({ l: 'Срок договора меньше года', c: m + ' мес., ставка 16,5%', flag: false }); }
     });
     return { total: items.length, done: done, probs: probs };
@@ -1102,7 +1193,16 @@ function checklistClient() {
       if (j.ok) setSt('ok', 'Сохранено'); else setSt('err', 'Не сохранено — повторите');
     } catch (e) { setSt('err', 'Нет связи — не сохранено'); }
   }
-  document.getElementById('printBtn').onclick = function () { window.print(); };
+  document.getElementById('printBtn').onclick = function () {
+    // Внутри Telegram печать не работает — открываем версию для печати в браузере (там «Сохранить как PDF»)
+    var url = location.origin + '/checklist?case_id=' + CASE.id + '&print=1';
+    if (tg && tg.openLink && tg.initData) { flush(); tg.openLink(url); }
+    else window.print();
+  };
+  if (/[?&]print=1/.test(location.search)) {
+    Object.keys(OPEN).forEach(function (k) { OPEN[k] = true; });
+    setTimeout(function () { window.print(); }, 700);
+  }
 
   render();
   setSt('ok', 'Сохранено');
@@ -1193,6 +1293,17 @@ function checklistPage(c, L) {
     '.meta.signed{font-size:14px;color:var(--ok);font-weight:600}',
     '.link{background:none;border:0;color:var(--ink2);font:inherit;font-size:13px;text-decoration:underline;margin-left:10px;cursor:pointer}',
     '.sign{border:0;border-radius:12px;padding:10px 16px;font:inherit;font-weight:600;color:#fff;background:var(--accent);cursor:pointer}',
+    '.reqbtn{margin-top:10px;width:100%}.reqbtn:disabled{opacity:.6}',
+    '.skip{font-size:12.5px;font-weight:650;color:var(--accent);background:color-mix(in srgb,var(--accent) 14%,transparent);padding:5px 10px;border-radius:999px;cursor:pointer;white-space:nowrap}',
+    '.doclist{margin:-2px 0 10px}',
+    '.docrow{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--hair)}',
+    '.docrow:last-child{border-bottom:0}',
+    '.docname{flex:1;font-size:14.5px;line-height:1.3}',
+    '.docrow.lack .docname{color:var(--bad);font-weight:600}',
+    '.misslist{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}',
+    '.miss{border:1px solid var(--hair);background:var(--well);color:var(--ink);font:inherit;font-size:13px;padding:7px 11px;border-radius:10px;cursor:pointer;text-align:left}',
+    '.miss.on{background:color-mix(in srgb,var(--bad) 16%,transparent);border-color:color-mix(in srgb,var(--bad) 50%,transparent);color:var(--bad);font-weight:600}',
+    '.note.plain{border-color:transparent;margin-top:0}',
     // нижняя панель
     '.dock{position:fixed;left:12px;right:12px;bottom:max(12px,env(safe-area-inset-bottom));z-index:6;border-radius:999px;display:flex;align-items:center;gap:10px;padding:8px 8px 8px 18px;background:var(--glass2)}',
     '.st{flex:1;font-size:13px;color:var(--ink2);display:flex;align-items:center;gap:7px}',
@@ -1204,7 +1315,8 @@ function checklistPage(c, L) {
     // печать
     '@media print{',
     ' html,body{background:#fff!important;color:#000;padding:0;font-size:11px}',
-    ' .field,.dock,#capsule .pbad,.chev,.link,.sign{display:none!important}',
+    ' .field,.dock,#capsule .pbad,.chev,.link,.sign,.skip{display:none!important}',
+    ' .docrow{padding:2px 0}.docname{font-size:11px}.docrow.lack .docname{color:#000;text-decoration:underline}',
     ' .glass{background:#fff!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important;box-shadow:none!important;border:1px solid #bbb}',
     ' .glass:before{display:none}',
     ' #capsule{position:static;border-radius:6px;padding:4px 8px;margin:6px 0}',
