@@ -157,6 +157,7 @@ res.json({ ok: true, id: order.id });
   const { auditForm } = require('./audit-form');
   app.get('/audit', (req, res) => res.send(auditForm()));
     require('./handoff').setupHandoff(app);
+    require('./handoff').setupReportsWeb(app, upload);
 }
 
 function loginPage(error = '') {
