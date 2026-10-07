@@ -98,7 +98,7 @@ function folder(items) { return { t: 'Папка «подача»', i: items.map
 
 var LISTS = {
   MSK_OBSH: {
-    title: 'ОБЩЕПИТ · Москва · получение / продление',
+    title: 'Общепит в Москве: получение и продление',
     passport: passport(BUILDING),
     sections: [
       FLAGS, DOGOVOR(false),
@@ -113,7 +113,7 @@ var LISTS = {
     ]
   },
   MSK_MAG: {
-    title: 'МАГАЗИН · Москва · получение / продление',
+    title: 'Магазин в Москве: получение и продление',
     passport: passport(AREA),
     sections: [
       FLAGS, DOGOVOR(false),
@@ -127,7 +127,7 @@ var LISTS = {
     ]
   },
   MO_OBSH: {
-    title: 'ОБЩЕПИТ · МО · получение / продление',
+    title: 'Общепит в Подмосковье: получение и продление',
     passport: passport(BUILDING),
     sections: [
       FLAGS, DOGOVOR(true),
@@ -143,7 +143,7 @@ var LISTS = {
     ]
   },
   MO_MAG: {
-    title: 'МАГАЗИН · МО · получение / продление',
+    title: 'Магазин в Подмосковье: получение и продление',
     passport: passport(AREA),
     sections: [
       FLAGS, DOGOVOR(true),
@@ -158,7 +158,7 @@ var LISTS = {
     ]
   },
   MO_MAG_RE: {
-    title: 'МАГАЗИН · МО · переоформление',
+    title: 'Магазин в Подмосковье: переоформление',
     passport: passport(AREA),
     sections: [
       { t: 'Что переоформляем', i: [k('Юр. адрес'), k('Смена КПП'), k('Электронная почта'), k('Добавление объекта'), k('Исключение объекта'), k('Изменение адреса'), f('Другое')] },
