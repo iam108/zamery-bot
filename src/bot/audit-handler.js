@@ -1,5 +1,6 @@
 const { getOrderById } = require('../db/queries');
 const { saveAudit } = require('../web/handoff');
+const { esc } = require('./formatter');
 
 // Отчёты, которые уже обрабатываются или отправлены (защита от дубля при повторной отправке)
 const seenSubmits = new Map();
@@ -38,32 +39,36 @@ async function handleAuditReportInner(ctx, data) {
     : 'аудитор';
 
   var zonesText = 'Нет';
+  var zonesPlain = 'Нет';
+  if (data.zones && data.zones.length > 0) {
+    zonesPlain = data.zones.map(function (z) { return '• ' + z.name + (z.dist ? ' — ' + z.dist + ' м' : '') + (z.info ? ' (' + z.info + ')' : ''); }).join('\n');
+  }
   if (data.zones && data.zones.length > 0) {
     zonesText = data.zones.map(function(z) {
-      var line = '• ' + z.name;
-      if (z.dist) line += ' — ' + z.dist + ' м';
-      if (z.info) line += '\n  ' + z.info;
+      var line = '• ' + esc(z.name);
+      if (z.dist) line += ' — ' + esc(z.dist) + ' м';
+      if (z.info) line += '\n  ' + esc(z.info);
       return line;
     }).join('\n');
   }
 
   var y = '✅';
   var n = '—';
-  var header = '🔍 *Отчёт аудитора*';
-  if (data.order_id) header += ' по заявке *#' + data.order_id + '*';
+  var header = '🔍 <b>Отчёт аудитора</b>';
+  if (data.order_id) header += ' по заявке <b>#' + esc(data.order_id) + '</b>';
 
   var lines = [header, ''];
   // Короткий текст для юриста (без Markdown)
   var plain = [];
 
   if (data.object_category === 'tobacco') {
-    lines.push('🚬 *Тип: Табак*', '');
-    lines.push('*Торговый объект:*');
+    lines.push('🚬 <b>Тип: Табак</b>', '');
+    lines.push('<b>Торговый объект:</b>');
     lines.push((data.chk_shop ? y : n) + ' Объект является магазином или павильоном');
     lines.push((data.chk_address ? y : n) + ' Объект соответствует заявленному адресу');
     lines.push((data.chk_area ? y : n) + ' Площадь не менее 5 м²');
     lines.push('');
-    lines.push('*Торговый зал:*');
+    lines.push('<b>Торговый зал:</b>');
     lines.push((data.chk_no_display ? y : n) + ' Нет открытой выкладки табачной продукции');
     lines.push((data.chk_price_list ? y : n) + ' Есть перечень продукции с ценами');
     lines.push((data.chk_price_format ? y : n) + ' Перечень в установленном формате');
@@ -72,19 +77,19 @@ async function handleAuditReportInner(ctx, data) {
     lines.push((data.chk_marking ? y : n) + ' Есть маркировка товара');
     lines.push((data.chk_cash ? y : n) + ' Есть установленная касса');
     lines.push('');
-    lines.push('*Ассортимент:*');
+    lines.push('<b>Ассортимент:</b>');
     lines.push((data.chk_no_single ? y : n) + ' Нет поштучной продажи сигарет');
     lines.push((data.chk_no_unpack ? y : n) + ' Нет продукции без потребительской упаковки');
     lines.push((data.chk_no_banned ? y : n) + ' Нет насвая, снюса и запрещённой продукции');
     lines.push((data.chk_no_chew ? y : n) + ' Нет запрещённой никотинсодержащей продукции для жевания/нюханья');
     lines.push((data.chk_nicotine_limit ? y : n) + ' Никотинсодержащие жидкости в пределах нормы');
   } else {
-    lines.push('🏢 *Здание:* ' + (data.building_type || '—'));
-    lines.push('📐 *Границы:* ' + (data.boundaries || '—'));
-    lines.push('📋 *БТИ:* ' + (data.bti === 'Да' ? y + ' Подходит' : '❌ Не подходит'));
-    lines.push('🔧 *ТО:* ' + (data.to || '—'));
+    lines.push('🏢 <b>Здание:</b> ' + esc(data.building_type || '—'));
+    lines.push('📐 <b>Границы:</b> ' + esc(data.boundaries || '—'));
+    lines.push('📋 <b>БТИ:</b> ' + (data.bti === 'Да' ? y + ' Подходит' : '❌ Не подходит'));
+    lines.push('🔧 <b>ТО:</b> ' + esc(data.to || '—'));
     lines.push('');
-    lines.push('*Планировка и границы:*');
+    lines.push('<b>Планировка и границы:</b>');
     lines.push((data.chk_bti_match ? y : n) + ' Фактическая планировка соответствует БТИ');
     lines.push((data.chk_hall ? y : n) + ' Торговый зал / зал обслуживания определён');
     lines.push((data.chk_storage ? y : n) + ' Подсобные и складские помещения определены');
@@ -96,11 +101,11 @@ async function handleAuditReportInner(ctx, data) {
   }
 
   lines.push('');
-  lines.push('🚫 *Зоны:*');
+  lines.push('🚫 <b>Зоны:</b>');
   lines.push(zonesText);
-  plain.push('Зоны: ' + zonesText);
+  plain.push('Зоны: ' + zonesPlain);
 
-  if (data.nearby) { lines.push(''); lines.push('👁 *На заметку:* ' + data.nearby); plain.push('На заметку: ' + data.nearby); }
+  if (data.nearby) { lines.push(''); lines.push('👁 <b>На заметку:</b> ' + esc(data.nearby)); plain.push('На заметку: ' + data.nearby); }
 
   var extras = [];
   if (data.veranda) extras.push('🏗 Веранда');
@@ -110,17 +115,17 @@ async function handleAuditReportInner(ctx, data) {
   if (data.is_owner) extras.push('🔑 Собственник');
   if (extras.length > 0) {
     lines.push('');
-    lines.push('*Доп. характеристики:*');
+    lines.push('<b>Доп. характеристики:</b>');
     extras.forEach(function(e) { lines.push('✅ ' + e); });
     plain.push('Доп.: ' + extras.join(', '));
   }
 
-  if (data.video_url) { lines.push(''); lines.push('🎥 *Видео:* ' + data.video_url); plain.push('Видео: ' + data.video_url); }
+  if (data.video_url) { lines.push(''); lines.push('🎥 <b>Видео:</b> ' + esc(data.video_url)); plain.push('Видео: ' + data.video_url); }
 
   lines.push('');
-  lines.push('📝 *Итог:* ' + data.conclusion);
+  lines.push('📝 <b>Итог:</b> ' + esc(data.conclusion));
   lines.push('');
-  lines.push('👤 _Аудитор: ' + actor + '_');
+  lines.push('👤 <i>Аудитор: ' + esc(actor) + '</i>');
   plain.push('Итог: ' + data.conclusion);
 
   var text = lines.join('\n');
@@ -145,18 +150,18 @@ async function handleAuditReportInner(ctx, data) {
           type: 'photo',
           media: { source: Buffer.from(p.data, 'base64') },
           caption: i === 0 ? text : undefined,
-          parse_mode: i === 0 ? 'Markdown' : undefined,
+          parse_mode: i === 0 ? 'HTML' : undefined,
         };
       });
       var msgs = await tgRetry(function () { return tg.sendMediaGroup(GROUP_ID, media, replyToMsgId ? { reply_to_message_id: replyToMsgId } : {}); });
       msgs.forEach(function(m) { sentIds.push(m.message_id); });
     } catch (e) {
       console.error('media group error:', e.message);
-      var m1 = await tgRetry(function () { return tg.sendMessage(GROUP_ID, text, { parse_mode: 'Markdown', reply_to_message_id: replyToMsgId || undefined }); });
+      var m1 = await tgRetry(function () { return tg.sendMessage(GROUP_ID, text, { parse_mode: 'HTML', reply_to_message_id: replyToMsgId || undefined }); });
       sentIds.push(m1.message_id);
     }
   } else {
-    var m2 = await tgRetry(function () { return tg.sendMessage(GROUP_ID, text, { parse_mode: 'Markdown', reply_to_message_id: replyToMsgId || undefined }); });
+    var m2 = await tgRetry(function () { return tg.sendMessage(GROUP_ID, text, { parse_mode: 'HTML', reply_to_message_id: replyToMsgId || undefined }); });
     sentIds.push(m2.message_id);
   }
 

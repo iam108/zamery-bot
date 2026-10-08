@@ -8,52 +8,117 @@ function setupBot() {
   const GROUP_ID = process.env.GROUP_CHAT_ID;
   const WEBAPP_URL = process.env.WEBAPP_URL;
   require('../web/handoff').setupReportsBot(bot);
-   bot.start(async (ctx) => {
-    const pool = require('../db/pool');
-    const me = (await pool.query('SELECT * FROM staff WHERE tg_id=$1', [ctx.from.id])).rows[0];
-    if (!me) {
-      return ctx.reply('👋 Привет! Кто вы в команде?', Markup.inlineKeyboard([
-        [Markup.button.callback('👔 Менеджер', 'role:manager')],
-        [Markup.button.callback('⚖️ Юрист', 'role:lawyer')],
-        [Markup.button.callback('🔍 Аудитор', 'role:auditor')],
-      ]));
-    }
-       const roles = { manager: 'Менеджер', lawyer: 'Юрист', auditor: 'Аудитор' };
+  const pool = require('../db/pool');
+  const { ensureStaff } = require('../web/auth');
+  const { esc } = require('./formatter');
+  const ROLES = { manager: 'Менеджер', lawyer: 'Юрист', auditor: 'Аудитор' };
+  const roleKb = () => Markup.inlineKeyboard([
+    [Markup.button.callback('👔 Менеджер', 'role:manager')],
+    [Markup.button.callback('⚖️ Юрист', 'role:lawyer')],
+    [Markup.button.callback('🔍 Аудитор', 'role:auditor')],
+  ]);
+  const adminIds = () => String(process.env.ADMIN_TG_IDS || '').split(/[\s,;]+/).filter(Boolean);
+
+  // Кто одобряет: ADMIN_TG_IDS из Railway, а если не задано — все одобренные менеджеры
+  async function approvers() {
+    const ids = adminIds();
+    if (ids.length) return ids;
+    const { rows } = await pool.query("SELECT tg_id FROM staff WHERE role='manager' AND approved = true");
+    return rows.map(r => String(r.tg_id));
+  }
+  async function getMe(id) {
+    await ensureStaff();
+    return (await pool.query('SELECT * FROM staff WHERE tg_id=$1', [id])).rows[0];
+  }
+
+  bot.start(async (ctx) => {
+    if (ctx.chat.type !== 'private') return;
+    const me = await getMe(ctx.from.id);
+    if (!me) return ctx.reply('👋 Привет! Кто вы в команде?', roleKb());
+    if (!me.approved) return ctx.reply('⏳ Заявка на доступ (' + (ROLES[me.requested_role || me.role] || '') + ') ждёт одобрения. Как только её одобрят, я напишу.');
     const zamer = Markup.button.webApp('📋 Заявка на замер', WEBAPP_URL + '/form');
-          let kb;
+    let kb;
     const requestsBtn = Markup.button.webApp('📥 Нераспределённые', WEBAPP_URL + '/requests');
     const handoffBtn = Markup.button.webApp('⚖️ Передать юристу', WEBAPP_URL + '/handoff');
     if (me.role === 'manager') kb = [[requestsBtn], [zamer, handoffBtn]];
     else if (me.role === 'lawyer') kb = [[requestsBtn], [zamer, '📂 Мои клиенты']];
     else kb = [[Markup.button.webApp('🔍 Отчёт аудитора', WEBAPP_URL + '/audit')]];
-    await ctx.reply('👋 ' + me.name + ' (' + roles[me.role] + ')\n\nВыбери действие:', Markup.keyboard(kb).resize());
+    const pending = me.requested_role && me.requested_role !== me.role ? '\n⏳ Запрос на роль «' + ROLES[me.requested_role] + '» ждёт одобрения.' : '';
+    await ctx.reply('👋 ' + me.name + ' (' + ROLES[me.role] + ')' + pending + '\n\nВыбери действие:', Markup.keyboard(kb).resize());
   });
-  bot.action(/^role:(\w+)$/, async (ctx) => {
-    const pool = require('../db/pool');
+
+  bot.action(/^role:(manager|lawyer|auditor)$/, async (ctx) => {
     const role = ctx.match[1];
-    const name = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ');
-    await pool.query(
-      'INSERT INTO staff (tg_id, name, username, role) VALUES ($1,$2,$3,$4) ON CONFLICT (tg_id) DO UPDATE SET name=$2, username=$3, role=$4',
-      [ctx.from.id, name, ctx.from.username || null, role]
-    );
-    const roles = { manager: 'Менеджер', lawyer: 'Юрист', auditor: 'Аудитор' };
-    await ctx.editMessageText('✅ Вы зарегистрированы как: ' + roles[role] + '\n\nНажмите /start');
+    const uid = String(ctx.from.id);
+    const name = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ') || 'Без имени';
+    const me = await getMe(ctx.from.id);
+    const list = await approvers();
+    const isAdmin = adminIds().indexOf(uid) !== -1;
+    const anyApproved = (await pool.query('SELECT 1 FROM staff WHERE approved = true LIMIT 1')).rows.length > 0;
+
+    // Админ — сразу. Самый первый сотрудник в пустой базе — тоже сразу (иначе некому одобрять)
+    if (isAdmin || (!anyApproved && !list.length)) {
+      await pool.query(
+        'INSERT INTO staff (tg_id, name, username, role, approved, requested_role) VALUES ($1,$2,$3,$4,true,NULL) ON CONFLICT (tg_id) DO UPDATE SET name=$2, username=$3, role=$4, approved=true, requested_role=NULL',
+        [ctx.from.id, name, ctx.from.username || null, role]);
+      await ctx.editMessageText('✅ Вы зарегистрированы как: ' + ROLES[role] + '\n\nНажмите /start');
+      return ctx.answerCbQuery();
+    }
+    if (me && me.approved && me.role === role) {
+      await ctx.editMessageText('У вас уже роль «' + ROLES[role] + '». Нажмите /start');
+      return ctx.answerCbQuery();
+    }
+    if (me) await pool.query('UPDATE staff SET name=$2, username=$3, requested_role=$4 WHERE tg_id=$1', [ctx.from.id, name, ctx.from.username || null, role]);
+    else await pool.query('INSERT INTO staff (tg_id, name, username, role, approved, requested_role) VALUES ($1,$2,$3,$4,false,$4)', [ctx.from.id, name, ctx.from.username || null, role]);
+
+    const text = '🙋 <b>' + (me && me.approved ? 'Смена роли' : 'Новый сотрудник') + '</b>\n' + esc(name) + (ctx.from.username ? ' (@' + esc(ctx.from.username) + ')' : '') +
+      (me && me.approved ? '\nСейчас: ' + ROLES[me.role] : '') + '\nПросит роль: <b>' + ROLES[role] + '</b>';
+    const kb = { inline_keyboard: [[{ text: '✅ Одобрить', callback_data: 'ap:' + uid }, { text: '❌ Отклонить', callback_data: 'rj:' + uid }]] };
+    let sent = 0;
+    for (const id of list) {
+      if (id === uid) continue;
+      try { await ctx.telegram.sendMessage(id, text, { parse_mode: 'HTML', reply_markup: kb }); sent++; } catch (e) { console.error('approve notify:', e.message); }
+    }
+    await ctx.editMessageText(sent
+      ? '⏳ Запрос на роль «' + ROLES[role] + '» отправлен на одобрение. Я напишу, когда его одобрят.'
+      : '⏳ Запрос сохранён, но отправить его на одобрение некому. Попросите администратора открыть бота.');
+    await ctx.answerCbQuery();
+  });
+
+  bot.action(/^(ap|rj):(\d+)$/, async (ctx) => {
+    const list = await approvers();
+    if (list.indexOf(String(ctx.from.id)) === -1) return ctx.answerCbQuery('Одобрять может только администратор', { show_alert: true });
+    const uid = ctx.match[2];
+    const u = (await pool.query('SELECT * FROM staff WHERE tg_id=$1', [uid])).rows[0];
+    if (!u || !u.requested_role) {
+      await ctx.editMessageText('Запрос уже обработан.');
+      return ctx.answerCbQuery();
+    }
+    const who = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ');
+    const wanted = ROLES[u.requested_role];
+    if (ctx.match[1] === 'ap') {
+      await pool.query('UPDATE staff SET role=requested_role, approved=true, requested_role=NULL WHERE tg_id=$1', [uid]);
+      await ctx.editMessageText('✅ ' + u.name + ' — ' + wanted + '. Одобрил(а): ' + who);
+      try { await ctx.telegram.sendMessage(uid, '✅ Доступ открыт: ' + wanted + '. Нажмите /start'); } catch (e) {}
+    } else {
+      if (u.approved) await pool.query('UPDATE staff SET requested_role=NULL WHERE tg_id=$1', [uid]);
+      else await pool.query('DELETE FROM staff WHERE tg_id=$1', [uid]);
+      await ctx.editMessageText('❌ ' + u.name + ' — запрос на роль «' + wanted + '» отклонён. ' + who);
+      try { await ctx.telegram.sendMessage(uid, '❌ Запрос на роль «' + wanted + '» отклонён.'); } catch (e) {}
+    }
     await ctx.answerCbQuery();
   });
 
   bot.command('role', async (ctx) => {
-    await ctx.reply('Сменить роль:', Markup.inlineKeyboard([
-      [Markup.button.callback('👔 Менеджер', 'role:manager')],
-      [Markup.button.callback('⚖️ Юрист', 'role:lawyer')],
-      [Markup.button.callback('🔍 Аудитор', 'role:auditor')],
-    ]));
+    if (ctx.chat.type !== 'private') return;
+    await ctx.reply('Сменить роль (нужно одобрение администратора):', roleKb());
   });
 
   bot.command('stats', async (ctx) => {
     try {
       const s = await getStats();
       await ctx.reply(
-        '*📊 Статистика заявок*\n\n' +
+        '<b>📊 Статистика заявок</b>\n\n' +
         '🆕 Новые: ' + s.new_count + '\n' +
         '🔧 В работе: ' + s.in_progress_count + '\n' +
         '✅ Выполнены: ' + s.done_count + '\n' +
@@ -61,7 +126,7 @@ function setupBot() {
         '⚠️ Просрочены: ' + s.overdue_count + '\n' +
         '─────────────\n' +
         '📁 Всего: ' + s.total_count,
-        { parse_mode: 'Markdown' }
+        { parse_mode: 'HTML' }
       );
     } catch (err) {
       console.error('stats error:', err);
@@ -99,7 +164,7 @@ function setupBot() {
 
       const text = formatOrderMessage(order);
       const msg = await ctx.telegram.sendMessage(GROUP_ID, text, {
-        parse_mode: 'Markdown',
+        parse_mode: 'HTML',
         reply_markup: {
           inline_keyboard: [[
             { text: '🔧 Взять в работу', callback_data: 'status:in_progress:' + order.id },
@@ -134,10 +199,10 @@ function setupBot() {
     }
   });
 
-  bot.action(/^status:(\w+):(\d+)$/, async (ctx) => {
+  bot.action(/^status:(new|in_progress|done|cancelled):(\d+)$/, async (ctx) => {
     const newStatus = ctx.match[1];
     const orderId = ctx.match[2];
-    const actor = ctx.from.username || String(ctx.from.id);
+    const actor = ctx.from.username ? '@' + ctx.from.username : [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ') || String(ctx.from.id);
 
     try {
       const order = await updateOrderStatus(parseInt(orderId), newStatus, actor);
@@ -164,12 +229,12 @@ function setupBot() {
       }
 
       await ctx.editMessageText(text, {
-        parse_mode: 'Markdown',
+        parse_mode: 'HTML',
         reply_markup: buttons.length ? { inline_keyboard: buttons } : undefined,
       });
 
       const labels = { in_progress: 'взял в работу', done: 'закрыл', cancelled: 'отменил' };
-      await ctx.answerCbQuery(STATUS_EMOJI[newStatus] + ' @' + actor + ' ' + (labels[newStatus] || newStatus));
+      await ctx.answerCbQuery(STATUS_EMOJI[newStatus] + ' ' + (ctx.from.username ? '@' + ctx.from.username : (ctx.from.first_name || '')) + ' ' + (labels[newStatus] || newStatus));
 
     } catch (err) {
       console.error('callback error:', err);
@@ -181,16 +246,12 @@ bot.on(['photo', 'document'], async (ctx) => {
   if (ctx.chat.type !== 'private') return;
   
   try {
-    const { getOrders, getOrderById } = require('../db/queries');
-    // Берём последнюю заявку этого пользователя
-    const { orders } = await getOrders({ limit: 1, offset: 0 });
-    const userOrders = orders.filter(o => String(o.submitted_by) === String(ctx.from.id));
-    
-    if (userOrders.length === 0) {
-      return ctx.reply('Нет активных заявок для прикрепления файлов.');
-    }
-    
-    const order = userOrders[0];
+    const me = await getMe(ctx.from.id);
+    if (!me || !me.approved) return ctx.reply('Нет доступа. Нажмите /start.');
+    // Последняя открытая заявка этого пользователя
+    const order = (await pool.query(
+      "SELECT * FROM orders WHERE submitted_by=$1 AND status NOT IN ('done','cancelled') ORDER BY created_at DESC LIMIT 1", [ctx.from.id])).rows[0];
+    if (!order) return ctx.reply('Нет открытых заявок, к которым можно прикрепить файл.');
     const replyTo = order.telegram_msg_id;
     
     const caption = '📎 Файл к заявке #' + order.id;
@@ -231,7 +292,8 @@ bot.on(['photo', 'document'], async (ctx) => {
   bot.hears('📂 Мои клиенты', (ctx) => showCases(ctx));
   bot.command('cases', (ctx) => showCases(ctx));
   async function showCases(ctx) {
-    const pool = require('../db/pool');
+    const me = await getMe(ctx.from.id);
+    if (!me || !me.approved) return ctx.reply('Нет доступа. Нажмите /start.');
     const { rows } = await pool.query(
            "SELECT id, org, done, total, data->>'_stage' AS stage FROM cases WHERE lawyer_tg_id=$1 AND COALESCE(data->>'_stage', '') <> 'Архив' ORDER BY created_at DESC LIMIT 30",
       [ctx.from.id]

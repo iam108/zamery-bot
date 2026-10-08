@@ -27,7 +27,7 @@ async function main() {
   });
 
   const bot = setupBot();
-  await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+  await bot.telegram.deleteWebhook({ drop_pending_updates: false });
   bot.launch();
   console.log('Bot started polling');
 

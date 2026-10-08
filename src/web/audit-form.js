@@ -6,6 +6,7 @@ function auditForm() {
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>Отчёт аудитора</title>
 <script src="https://telegram.org/js/telegram-web-app.js"><\/script>
+<script src="/auth.js"><\/script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--tg-theme-bg-color,#0f172a);color:var(--tg-theme-text-color,#f1f5f9);padding:16px 16px 120px}
@@ -180,8 +181,8 @@ textarea:focus,input:focus{border-color:var(--tg-theme-button-color,#6366f1)}
 </div>
 
 <script>
-var tg = window.Telegram.WebApp;
-tg.ready(); tg.expand();
+var tg = (window.Telegram && window.Telegram.WebApp) || { ready: function () {}, expand: function () {}, close: function () {}, showAlert: function (m) { alert(m); }, HapticFeedback: { notificationOccurred: function () {} }, initDataUnsafe: {} };
+try { tg.ready(); tg.expand(); } catch (e) {}
 var orderId = new URLSearchParams(window.location.search).get('order_id') || '';
 // Один id на отчёт: при повторной отправке сервер не создаст дубль
 var submitId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);

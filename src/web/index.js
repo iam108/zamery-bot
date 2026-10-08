@@ -4,6 +4,12 @@ const path = require('path');
 const { getOrders, getOrderById, updateOrderStatus, getOrderLogs, getStats, createOrder, addLog, setTelegramMsgId } = require('../db/queries');
 const multer = require('multer');
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function (ch) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch];
+  });
+}
+
 function setupWeb(app) {
   
 app.use(express.json({ limit: '50mb' }));
@@ -17,6 +23,8 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
     saveUninitialized: false,
     cookie: { maxAge: 86400000 },
   }));
+
+  require('./auth').setupAuth(app);
 
   const requireAuth = (req, res, next) => {
     if (req.session.auth) return next();
@@ -45,7 +53,7 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
   });
 
   app.get('/admin/order/:id', requireAuth, async (req, res) => {
-    const order = await getOrderById(req.params.id);
+    const order = await getOrderById(parseInt(req.params.id) || 0);
     if (!order) return res.status(404).send('Заявка не найдена');
     const logs = await getOrderLogs(order.id);
     res.send(orderDetailPage(order, logs));
@@ -53,7 +61,8 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
   app.post('/admin/api/status', requireAuth, async (req, res) => {
     const { id, status } = req.body;
-    const order = await updateOrderStatus(id, status, 'admin-web');
+    if (['new', 'in_progress', 'done', 'cancelled'].indexOf(status) === -1) return res.status(400).json({ ok: false });
+    const order = await updateOrderStatus(parseInt(id), status, 'admin-web');
     res.json({ ok: true, order });
   });
 
@@ -62,14 +71,19 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
     try {
       const data = req.body;
       const files = req.files || [];
+      data.submitted_by = req.tgUser.id;
+      data.has_video = data.has_video === true || data.has_video === 'true';
+      if (!String(data.address || '').trim() || !String(data.owner_name || '').trim() || !String(data.object_type || '').trim()) {
+        return res.json({ ok: false, error: 'Заполните адрес, владельца и тип объекта' });
+      }
       const order = await createOrder(data);
-      await addLog(order.id, 'created', String(data.tg_user_id || 'web'), 'Заявка создана через Mini App');
+      await addLog(order.id, 'created', req.staff.name, 'Заявка создана через Mini App');
 
       const { formatOrderMessage } = require('../bot/formatter');
       const botInstance = require('../bot/instance');
       const text = formatOrderMessage(order);
       const msg = await botInstance.telegram.sendMessage(process.env.GROUP_CHAT_ID, text, {
-        parse_mode: 'Markdown',
+        parse_mode: 'HTML',
         reply_markup: { inline_keyboard: [[
           { text: '🔧 Взять в работу', callback_data: 'status:in_progress:' + order.id },
           { text: '✅ Готово', callback_data: 'status:done:' + order.id },
@@ -86,12 +100,12 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
       if (att.mimetype && att.mimetype.indexOf('pdf') !== -1) {
         await botInstance.telegram.sendDocument(process.env.GROUP_CHAT_ID,
           { source: buf, filename: att.originalname },
-          { caption: '📎 ' + att.originalname, reply_to_message_id: msg.message_id }
+          { caption: '📎 ' + String(att.originalname || 'файл').slice(0, 200), reply_to_message_id: msg.message_id }
         );
       } else {
         await botInstance.telegram.sendPhoto(process.env.GROUP_CHAT_ID,
           { source: buf },
-          { caption: '📎 ' + att.originalname, reply_to_message_id: msg.message_id }
+          { caption: '📎 ' + String(att.originalname || 'файл').slice(0, 200), reply_to_message_id: msg.message_id }
         );
       }
     } catch(fileErr) {
@@ -112,10 +126,9 @@ res.json({ ok: true, id: order.id });
   try {
     const data = req.body;
     const { handleAuditReport } = require('../bot/audit-handler');
-    const { Telegraf } = require('telegraf');
-    const botInstance = new Telegraf(process.env.BOT_TOKEN);
+    const botInstance = require('../bot/instance');
     const fakeCtx = {
-      from: { id: data.tg_user_id, username: null, first_name: 'аудитор' },
+      from: { id: req.tgUser.id, username: req.tgUser.username || null, first_name: req.staff.name },
       telegram: botInstance.telegram,
       reply: async () => {},
     };
@@ -201,17 +214,17 @@ function adminPage({ orders, stats, status, search, page, totalPages, total }) {
     const d = o.deadline ? new Date(o.deadline).toLocaleDateString('ru-RU') : '—';
     const created = new Date(o.created_at).toLocaleDateString('ru-RU', { day:'numeric', month:'short' });
     const isOverdue = o.deadline && new Date(o.deadline) < new Date() && !['done','cancelled'].includes(o.status);
-    return `<tr onclick="location='/admin/order/${o.id}'" style="cursor:pointer">
-      <td><strong>#${o.id}</strong></td><td>${o.owner_name}</td>
-      <td style="max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${o.address}</td>
-      <td>${o.object_type}</td>
+    return `<tr onclick="location='/admin/order/${parseInt(o.id)}'" style="cursor:pointer">
+      <td><strong>#${o.id}</strong></td><td>${esc(o.owner_name)}</td>
+      <td style="max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(o.address)}</td>
+      <td>${esc(o.object_type)}</td>
       <td style="color:${isOverdue ? '#f87171' : 'inherit'}">${d}</td>
       <td><span class="badge" style="background:${statusColors[o.status]}20;color:${statusColors[o.status]};border:1px solid ${statusColors[o.status]}40">${statusLabels[o.status]}</span></td>
       <td style="color:#64748b;font-size:12px">${created}</td>
     </tr>`;
   }).join('');
   const pager = totalPages > 1 ? Array.from({length:totalPages},(_,i)=>i+1)
-    .map(p=>`<a href="?status=${status}&search=${encodeURIComponent(search)}&page=${p}" class="${p===page?'active':''}">${p}</a>`).join('') : '';
+    .map(p=>`<a href="?status=${encodeURIComponent(status)}&search=${encodeURIComponent(search)}&page=${p}" class="${p===page?'active':''}">${p}</a>`).join('') : '';
   return `<!DOCTYPE html><html lang="ru"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Замеры — Панель</title>
@@ -258,8 +271,8 @@ function adminPage({ orders, stats, status, search, page, totalPages, total }) {
     ${statusOptions.map(o=>`<a href="?status=${o.value}&search=${encodeURIComponent(search)}&page=1" class="${status===o.value?'active':''}">${o.label}</a>`).join('')}
   </div>
   <form class="search-row" method="GET" action="/admin">
-    <input name="search" placeholder="Поиск по адресу, имени, контакту..." value="${search}">
-    <input type="hidden" name="status" value="${status}">
+    <input name="search" placeholder="Поиск по адресу, имени, контакту..." value="${esc(search)}">
+    <input type="hidden" name="status" value="${esc(status)}">
     <input type="hidden" name="page" value="1">
     <button type="submit">Найти</button>
   </form>
@@ -281,11 +294,11 @@ function orderDetailPage(order, logs) {
   const created = new Date(order.created_at).toLocaleString('ru-RU');
   const logRows = logs.map(l => {
     const t = new Date(l.created_at).toLocaleString('ru-RU');
-    return `<div class="log-row"><span class="log-time">${t}</span><span class="log-actor">${l.actor}</span><span class="log-action">${l.details||l.action}</span></div>`;
+    return `<div class="log-row"><span class="log-time">${t}</span><span class="log-actor">${esc(l.actor)}</span><span class="log-action">${esc(l.details||l.action)}</span></div>`;
   }).join('') || '<div style="color:#64748b;padding:16px">Нет записей</div>';
   return `<!DOCTYPE html><html lang="ru"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Заявка #${order.id}</title>
+<title>Заявка #${esc(order.id)}</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;color:#f1f5f9}
@@ -308,14 +321,14 @@ function orderDetailPage(order, logs) {
 <div class="main">
   <div class="card">
     <h2>Данные заявки</h2>
-    <div class="field"><span class="field-label">Адрес</span><span>${order.address}</span></div>
-    <div class="field"><span class="field-label">Чей объект</span><span>${order.owner_name}</span></div>
-    <div class="field"><span class="field-label">Тип</span><span>${order.object_type}</span></div>
-    ${order.object_name?`<div class="field"><span class="field-label">Название</span><span>${order.object_name}</span></div>`:''}
+    <div class="field"><span class="field-label">Адрес</span><span>${esc(order.address)}</span></div>
+    <div class="field"><span class="field-label">Чей объект</span><span>${esc(order.owner_name)}</span></div>
+    <div class="field"><span class="field-label">Тип</span><span>${esc(order.object_type)}</span></div>
+    ${order.object_name?`<div class="field"><span class="field-label">Название</span><span>${esc(order.object_name)}</span></div>`:''}
     <div class="field"><span class="field-label">Видео</span><span>${order.has_video?'✅ Да':'— Нет'}</span></div>
-    ${order.zones_info?`<div class="field"><span class="field-label">Зоны</span><span>${order.zones_info}</span></div>`:''}
+    ${order.zones_info?`<div class="field"><span class="field-label">Зоны</span><span>${esc(order.zones_info)}</span></div>`:''}
     <div class="field"><span class="field-label">Крайний срок</span><span>${deadline}</span></div>
-    ${order.contacts?`<div class="field"><span class="field-label">Контакты</span><span>${order.contacts}</span></div>`:''}
+    ${order.contacts?`<div class="field"><span class="field-label">Контакты</span><span>${esc(order.contacts)}</span></div>`:''}
     <div class="field"><span class="field-label">Статус</span>
       <span class="badge" style="background:${statusColors[order.status]}20;color:${statusColors[order.status]};border:1px solid ${statusColors[order.status]}40">${statusLabels[order.status]}</span>
     </div>
@@ -334,7 +347,7 @@ function orderDetailPage(order, logs) {
 </div>
 <script>
 async function setStatus(status) {
-  const r = await fetch('/admin/api/status', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id: ${order.id}, status }) });
+  const r = await fetch('/admin/api/status', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id: ${parseInt(order.id)}, status }) });
   if (r.ok) location.reload();
 }
 </script></body></html>`;
@@ -346,6 +359,7 @@ function miniAppForm() {
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>Новая заявка</title>
 <script src="https://telegram.org/js/telegram-web-app.js"><\/script>
+<script src="/auth.js"><\/script>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--tg-theme-bg-color,#0f172a);color:var(--tg-theme-text-color,#f1f5f9);padding:16px 16px 100px}
@@ -478,7 +492,7 @@ formData.append('has_video', document.getElementById('has_video').checked);
 formData.append('zones_info', document.getElementById('zones_info').value.trim());
 formData.append('deadline', document.getElementById('deadline').value || '');
 formData.append('contacts', document.getElementById('contacts').value.trim());
-formData.append('tg_user_id', tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user.id : '');
+formData.append('tg_user_id', tgUserId());
 attachedFiles.slice(0,5).forEach(function(f) {
   formData.append('files', f, f.name);
 });
@@ -490,7 +504,7 @@ var r = await fetch('/api/order', {
     if (result.ok) {
       btn.textContent = '✅ Заявка отправлена!';
 if (attachedFiles.length > 0) {
-    tg.showAlert('Заявка #' + result.id + ' принята! Теперь отправь файлы прямо в этот чат.');
+    tg.showAlert('Заявка #' + result.id + ' принята, файлы прикреплены.', function () { tg.close(); });
 } else {
   setTimeout(function() { tg.close(); }, 1500);
 }
@@ -527,7 +541,7 @@ function statsPage({ byMonth, byType }) {
   const typeRows = byType.map(r => {
     const pct = r.total > 0 ? Math.round(r.done / r.total * 100) : 0;
     return `<tr>
-      <td>${r.object_type || '—'}</td>
+      <td>${esc(r.object_type || '—')}</td>
       <td style="font-weight:600">${r.total}</td>
       <td style="color:#22c55e">${r.done}</td>
       <td>
@@ -596,8 +610,8 @@ function objectsPage({ objects, search }) {
     const name = o.object_name || '—';
     const params = new URLSearchParams({ address: o.address, name: o.object_name || '' });
     return `<tr onclick="location='/admin/objects/detail?${params}'" style="cursor:pointer">
-      <td><strong>${name}</strong><div style="font-size:12px;color:#64748b;margin-top:2px">${o.address}</div></td>
-      <td>${o.object_type || '—'}</td>
+      <td><strong>${esc(name)}</strong><div style="font-size:12px;color:#64748b;margin-top:2px">${esc(o.address)}</div></td>
+      <td>${esc(o.object_type || '—')}</td>
       <td style="text-align:center"><span style="background:#6366f120;color:#6366f1;border:1px solid #6366f140;padding:3px 10px;border-radius:20px;font-size:13px">${o.visits}</span></td>
       <td style="color:#22c55e">${o.done_count}</td>
       <td style="color:#64748b;font-size:12px">${last}</td>
@@ -638,7 +652,7 @@ function objectsPage({ objects, search }) {
 </div>
 <div class="main">
   <form class="search-row" method="GET" action="/admin/objects">
-    <input name="search" placeholder="Поиск по названию, адресу, контакту..." value="${search}" autofocus>
+    <input name="search" placeholder="Поиск по названию, адресу, контакту..." value="${esc(search)}" autofocus>
     <button type="submit">Найти</button>
   </form>
   <div class="table-wrap">
@@ -657,18 +671,18 @@ function objectDetailPage({ orders, address, name }) {
   const rows = orders.map(o => {
     const d = new Date(o.created_at).toLocaleDateString('ru-RU', { day:'numeric', month:'short', year:'numeric' });
     const deadline = o.deadline ? new Date(o.deadline).toLocaleDateString('ru-RU') : '—';
-    return `<tr onclick="location='/admin/order/${o.id}'" style="cursor:pointer">
+    return `<tr onclick="location='/admin/order/${parseInt(o.id)}'" style="cursor:pointer">
       <td><strong>#${o.id}</strong></td>
       <td style="color:#64748b;font-size:13px">${d}</td>
       <td>${deadline}</td>
-      <td>${o.contacts || '—'}</td>
+      <td>${esc(o.contacts || '—')}</td>
       <td><span style="background:${statusColors[o.status]}20;color:${statusColors[o.status]};border:1px solid ${statusColors[o.status]}40;padding:3px 10px;border-radius:20px;font-size:12px">${statusLabels[o.status]}</span></td>
     </tr>`;
   }).join('');
 
   return `<!DOCTYPE html><html lang="ru"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${name || address} — Замеры</title>
+<title>${esc(name || address)} — Замеры</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;color:#f1f5f9;min-height:100vh}
@@ -689,12 +703,12 @@ function objectDetailPage({ orders, address, name }) {
 </style></head><body>
 <div class="topbar">
   <a href="/admin/objects">← Объекты</a>
-  <h1>${name || address}</h1>
+  <h1>${esc(name || address)}</h1>
 </div>
 <div class="main">
   <div class="meta">
-    <div style="font-size:16px;font-weight:600">${name || '—'}</div>
-    <div class="addr">📍 ${address}</div>
+    <div style="font-size:16px;font-weight:600">${esc(name || '—')}</div>
+    <div class="addr">📍 ${esc(address)}</div>
     <div class="count">${orders.length}</div>
     <div class="count-label">визитов всего</div>
   </div>

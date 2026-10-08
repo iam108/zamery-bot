@@ -570,7 +570,7 @@ function requestsPage() {
   ].join('\n');
   return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">' +
     '<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">' +
-    '<title>Нераспределённые заявки</title><script src="https://telegram.org/js/telegram-web-app.js"></script>' +
+    '<title>Нераспределённые заявки</title><script src="https://telegram.org/js/telegram-web-app.js"></script><script src="/auth.js"></script>' +
     '<style>' + css + '</style></head><body>' +
     '<div class="bg" aria-hidden="true"><i></i><i></i><i></i></div>' +
     '<header class="top"><h1>Нераспределённые</h1><span id="count">…</span></header>' +
@@ -808,7 +808,7 @@ function printPage(c, L) {
 
   return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
     '<title>Чек-лист — ' + esc(c.org) + '</title><style>' + css + '</style></head><body>' +
-    '<div class="bar"><button type="button" onclick="window.print()">Печать / Сохранить PDF</button><a href="?case_id=' + c.id + '&print=1" style="color:#2F6BFF">Компактная версия (1 лист)</a></div>' +
+    '<div class="bar"><button type="button" onclick="window.print()">Печать / Сохранить PDF</button><a href="?case_id=' + c.id + '&print=1' + (c._sigqs || '') + '" style="color:#2F6BFF">Компактная версия (1 лист)</a></div>' +
     '<main class="sheet">' +
     '<div class="kicker">Чек-лист юриста · ' + esc(L.title) + '</div>' +
     '<h1>' + esc(c.org) + '</h1>' +
@@ -955,7 +955,7 @@ function printCompact(c, L) {
   return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
     '<title>Чек-лист — ' + esc(c.org) + '</title><style>' + css + '</style></head><body>' +
     '<div class="bar"><button type="button" onclick="window.print()">Печать / Сохранить PDF</button>' +
-    '<a href="?case_id=' + c.id + '&print=full">Подробная версия (2–3 листа)</a></div>' +
+    '<a href="?case_id=' + c.id + '&print=full' + (c._sigqs || '') + '">Подробная версия (2–3 листа)</a></div>' +
     '<main class="sheet">' +
     '<div class="top"><h1>' + esc(c.org) + '</h1><div class="kick">Чек-лист юриста<br>' + esc(L.title) + '</div></div>' +
     '<div class="meta">' + meta + '</div>' +
@@ -968,6 +968,23 @@ function printCompact(c, L) {
     '<div class="sign"><div>Юрист: ' + esc(c.lawyer_name || '') + '</div><div>Подпись</div><div>Дата</div></div>' +
     '<div class="foot"><span>#заявка' + c.id + '</span><span>✓ ок · ✗ проблема · – не применимо · ☐ не заполнено</span><span>Сформировано ' + ruDate(mskToday()) + '</span></div>' +
     '</main><script>setTimeout(function(){try{window.print()}catch(e){}},600);</script></body></html>';
+}
+
+
+// Загрузочная страница чек-листа: берёт подпись Telegram и запрашивает сам чек-лист
+function checklistBoot(caseId) {
+  return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">' +
+    '<title>Чек-лист</title><script src="https://telegram.org/js/telegram-web-app.js"></script><script src="/auth.js"></script>' +
+    '<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;font:15px -apple-system,BlinkMacSystemFont,sans-serif;color:#5B6B82;background:#E8EEF6;padding:24px;text-align:center}' +
+    '@media (prefers-color-scheme:dark){body{background:#070B16;color:#93A0B5}}</style></head>' +
+    '<body><div id="m">Загружаю чек-лист…</div><script>' +
+    '(function(){var tg=window.Telegram&&window.Telegram.WebApp;try{tg.ready();tg.expand()}catch(e){}' +
+    'fetch("/checklist/view?case_id=' + (parseInt(caseId) || 0) + '",{method:"POST"}).then(function(r){return r.text().then(function(t){return{ok:r.ok,t:t}})})' +
+    '.then(function(x){if(!x.ok){var e="Нет доступа";try{e=JSON.parse(x.t).error||e}catch(_){};if(x.t&&x.t.charAt(0)!=="{")e=x.t;document.getElementById("m").textContent=e;return}' +
+    'document.open();document.write(x.t);document.close()})' +
+    '.catch(function(){document.getElementById("m").textContent="Нет связи. Закройте и откройте чек-лист ещё раз."})})();' +
+    '</script></body></html>';
 }
 
 function setupHandoff(app) {
@@ -985,7 +1002,7 @@ function setupHandoff(app) {
         order = (await pool.query('SELECT * FROM orders WHERE id=$1', [orderId])).rows[0] || null;
         audit = (await pool.query('SELECT * FROM audits WHERE order_id=$1 ORDER BY created_at DESC LIMIT 1', [orderId])).rows[0] || null;
       }
-      var lawyers = (await pool.query("SELECT tg_id, name FROM staff WHERE role='lawyer' ORDER BY name")).rows;
+      var lawyers = (await pool.query("SELECT tg_id, name FROM staff WHERE role='lawyer' AND approved = true ORDER BY name")).rows;
       var request = null, reqId = parseInt(req.query.request_id) || 0;
       if (reqId) {
         var rq = (await pool.query('SELECT id, text, created_at FROM reports WHERE id=$1', [reqId])).rows[0];
@@ -1009,7 +1026,7 @@ function setupHandoff(app) {
   app.post('/api/handoff', async function (req, res) {
     try {
       var d = req.body;
-      var lawyer = (await pool.query('SELECT * FROM staff WHERE tg_id=$1', [d.lawyer_tg_id])).rows[0];
+      var lawyer = (await pool.query("SELECT * FROM staff WHERE tg_id=$1 AND role='lawyer' AND approved = true", [d.lawyer_tg_id])).rows[0];
       if (!lawyer) return res.json({ ok: false, error: 'Юрист не найден. Он должен нажать /start в боте и выбрать роль «Юрист».' });
       if (d.kind === 'Табак') d.checklist_key = null; else d.checklist_key = pickChecklist(d.region, d.kind, d.service);
       var contacts = Array.isArray(d.contacts) ? d.contacts.filter(function (x) { return x && (x.name || x.phone || x.tg); }).slice(0, 10) : [];
@@ -1029,7 +1046,7 @@ function setupHandoff(app) {
           region, kind, service, priority, comment, audit_text, total, created_by, contacts, request_id)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING *`,
         [d.order_id || null, lawyer.tg_id, lawyer.name, d.checklist_key, d.org, d.inn, d.client, d.phone, d.address,
-          d.region, d.kind, d.service, d.priority, d.comment, d.audit_text, total, d.tg_user_id || null, JSON.stringify(contacts), parseInt(d.request_id) || null]
+          d.region, d.kind, d.service, d.priority, d.comment, d.audit_text, total, req.tgUser.id, JSON.stringify(contacts), parseInt(d.request_id) || null]
       )).rows[0];
 
       var text = caseText(c);
@@ -1142,7 +1159,7 @@ function setupHandoff(app) {
       if (!list.length) return res.json({ ok: false, error: 'Список пуст' });
       var msg = '📨 <b>Запросить документы у клиента</b>\n🏢 ' + esc(c.org) + (c.inn ? ' · ИНН ' + esc(c.inn) : '') + '\n\n' +
         list.map(function (x) { return '• ' + esc(x); }).join('\n') +
-        '\n\n⚖️ ' + esc(req.body.by || c.lawyer_name) + '\n#заявка' + c.id;
+        '\n\n⚖️ ' + esc(req.staff.name || c.lawyer_name) + '\n#заявка' + c.id;
       var sent = 0;
       if (process.env.CLIENTS_CHAT_ID) { try { await bot.telegram.sendMessage(process.env.CLIENTS_CHAT_ID, msg, { parse_mode: 'HTML' }); sent++; } catch (e) { console.error(e.message); } }
       if (c.created_by && String(c.created_by) !== String(c.lawyer_tg_id)) { try { await bot.telegram.sendMessage(c.created_by, msg, { parse_mode: 'HTML' }); sent++; } catch (e) { console.error(e.message); } }
@@ -1152,12 +1169,32 @@ function setupHandoff(app) {
 
   app.get('/handoff', function (req, res) { res.send(handoffPage()); });
 
+  var auth = require('./auth');
+
   app.get('/checklist', async function (req, res) {
+    var caseId = parseInt(req.query.case_id) || 0;
+    if (req.query.print) {
+      // Версия для печати открывается в обычном браузере — по подписанной ссылке
+      if (!auth.checkCaseSig(caseId, req.query.exp, req.query.sig)) return res.status(403).send('Ссылка для печати устарела. Нажмите «Печать» в чек-листе ещё раз.');
+      var c = (await pool.query('SELECT * FROM cases WHERE id=$1', [caseId])).rows[0];
+      if (!c || !c.checklist_key) return res.send('Чек-лист не найден');
+      c._sigqs = '&exp=' + encodeURIComponent(req.query.exp) + '&sig=' + encodeURIComponent(req.query.sig);
+      if (req.query.print === 'full') return res.send(printPage(c, LISTS[c.checklist_key]));
+      return res.send(printCompact(c, LISTS[c.checklist_key]));
+    }
+    res.send(checklistBoot(caseId));
+  });
+
+  // Сам чек-лист отдаётся только сотруднику (проверка подписи Telegram — в auth.js)
+  app.post('/checklist/view', async function (req, res) {
     var c = (await pool.query('SELECT * FROM cases WHERE id=$1', [parseInt(req.query.case_id) || 0])).rows[0];
-    if (!c || !c.checklist_key) return res.send('Чек-лист не найден');
-    if (req.query.print === 'full') return res.send(printPage(c, LISTS[c.checklist_key]));
-    if (req.query.print) return res.send(printCompact(c, LISTS[c.checklist_key]));
+    if (!c || !c.checklist_key) return res.status(404).send('Чек-лист не найден');
     res.send(checklistPage(c, LISTS[c.checklist_key]));
+  });
+
+  app.post('/api/checklist/printlink', function (req, res) {
+    var id = parseInt(req.body.case_id) || 0;
+    res.json({ ok: true, url: (process.env.WEBAPP_URL || '') + '/checklist?case_id=' + id + '&print=1&' + auth.signCase(id, 24) });
   });
 }
 
@@ -1483,7 +1520,7 @@ function handoffPage() {
 
   return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">' +
     '<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">' +
-    '<title>Передать юристу</title><script src="https://telegram.org/js/telegram-web-app.js"></script>' +
+    '<title>Передать юристу</title><script src="https://telegram.org/js/telegram-web-app.js"></script><script src="/auth.js"></script>' +
     '<style>' + css + '</style></head><body>' +
     '<div class="field-bg" aria-hidden="true"><i></i><i></i><i></i></div>' +
     '<a id="back" class="back" href="/requests" hidden>‹ К списку заявок</a>' +
@@ -1960,9 +1997,14 @@ function checklistClient() {
   document.getElementById('st').onclick = function () { failCount = 0; flush(); };
   document.getElementById('printBtn').onclick = function () {
     // Внутри Telegram печать не работает — открываем версию для печати в браузере (там «Сохранить как PDF»)
-    var url = location.origin + '/checklist?case_id=' + CASE.id + '&print=1';
-    if (tg && tg.openLink && tg.initData) { failCount = 0; flush(); tg.openLink(url); }
-    else { flush(); location.href = url; }
+    failCount = 0; flush();
+    fetch('/api/checklist/printlink', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ case_id: CASE.id }) })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (!j.ok) throw new Error(j.error || 'нет доступа');
+        if (tg && tg.openLink && tg.initData) tg.openLink(j.url); else location.href = j.url;
+      })
+      .catch(function (e) { alertMsg('Не удалось открыть печать: ' + e.message); });
   };
   if (/[?&]print=1/.test(location.search)) {
     Object.keys(OPEN).forEach(function (k) { OPEN[k] = true; });
@@ -2115,7 +2157,7 @@ function checklistPage(c, L) {
 
   return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">' +
     '<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">' +
-    '<title>Чек-лист — ' + esc(c.org) + '</title><script src="https://telegram.org/js/telegram-web-app.js"></script>' +
+    '<title>Чек-лист — ' + esc(c.org) + '</title><script src="https://telegram.org/js/telegram-web-app.js"></script><script src="/auth.js"></script>' +
     '<style>' + css + '</style></head><body>' +
     '<div class="field" aria-hidden="true"><i></i><i></i><i></i></div>' +
     '<header class="top"><div class="kicker">' + esc(L.title) + '</div><h1>' + esc(c.org) + '</h1><div class="facts">' + facts + '</div></header>' +
