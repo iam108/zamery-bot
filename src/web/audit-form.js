@@ -183,6 +183,9 @@ textarea:focus,input:focus{border-color:var(--tg-theme-button-color,#6366f1)}
 var tg = window.Telegram.WebApp;
 tg.ready(); tg.expand();
 var orderId = new URLSearchParams(window.location.search).get('order_id') || '';
+// Один id на отчёт: при повторной отправке сервер не создаст дубль
+var submitId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 var currentCat = 'catering';
 var checks = {};
 
@@ -260,7 +263,9 @@ function toBase64(file) {
 async function submitForm() {
   var conclusion = document.getElementById('conclusion').value.trim();
   if (!conclusion) { document.getElementById('conclusion').style.borderColor = '#f87171'; return; }
-  var btn = document.getElementById('submit-btn'); btn.disabled = true; btn.textContent = 'Отправляем...';
+  var btn = document.getElementById('submit-btn');
+  if (btn.disabled) return; // защита от двойного нажатия
+  btn.disabled = true; btn.textContent = 'Готовлю фото...';
 
   var zones = [];
   document.querySelectorAll('.zone-item').forEach(function(z) {
@@ -292,26 +297,40 @@ async function submitForm() {
     photos: photos,
     conclusion: conclusion,
     tg_user_id: tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user.id : null,
+    submit_id: submitId,
   };
 
   // Добавляем все чекбоксы
   Object.keys(checks).forEach(function(k) { payload[k] = checks[k]; });
 
-  try {
-    var r = await fetch('/api/audit', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    var result = await r.json();
-    if (result.ok) {
-      btn.textContent = '✅ Отчёт отправлен!';
-      setTimeout(function() { tg.close(); }, 1500);
-    } else { throw new Error(result.error || 'Ошибка сервера'); }
-  } catch(e) {
-    btn.disabled = false; btn.textContent = 'Отправить отчёт';
-    alert('Ошибка: ' + e.message);
+  var body = JSON.stringify(payload);
+  var waits = [0, 8000, 15000, 30000];
+  var lastErr = '';
+  for (var attempt = 0; attempt < waits.length; attempt++) {
+    if (waits[attempt]) {
+      for (var s = waits[attempt] / 1000; s > 0; s--) { btn.textContent = 'Сервер занят, повтор через ' + s + ' с…'; await sleep(1000); }
+    }
+    btn.textContent = attempt ? 'Отправляем ещё раз…' : 'Отправляем...';
+    try {
+      var r = await fetch('/api/audit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body });
+      var text = await r.text();
+      var result = null;
+      try { result = JSON.parse(text); } catch (pe) { result = null; }
+      if (result && result.ok) {
+        btn.textContent = '✅ Отчёт отправлен!';
+        try { tg.HapticFeedback.notificationOccurred('success'); } catch (he) {}
+        setTimeout(function() { tg.close(); }, 1500);
+        return;
+      }
+      lastErr = result ? (result.error || 'Ошибка сервера') : ('Сервер ответил: ' + (text || r.status).toString().slice(0, 80));
+      var busy = r.status === 429 || r.status >= 500 || !result || /429|rate|too many|timeout/i.test(lastErr);
+      if (!busy) break; // ошибка не из-за нагрузки — повторять бессмысленно
+    } catch (e) {
+      lastErr = 'Нет связи: ' + e.message;
+    }
   }
+  btn.disabled = false; btn.textContent = 'Отправить отчёт';
+  tg.showAlert('Отчёт не отправлен. ' + lastErr + ' Данные остались в форме — попробуйте ещё раз через минуту.');
 }
 <\/script>
 </body></html>`;
