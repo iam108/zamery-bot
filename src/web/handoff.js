@@ -579,9 +579,87 @@ function requestsPage() {
     '<script>(' + requestsClient.toString() + ')();</script></body></html>';
 }
 
+
+// ── Срок решения после подачи: Москва 15 рабочих дней, Подмосковье 10 ─────
+// Нерабочие праздничные дни (производственный календарь РФ). Выходные сб/вс учитываются автоматически.
+var HOLIDAYS = {
+  2026: ['01-01', '01-02', '01-05', '01-06', '01-07', '01-08', '01-09', '02-23', '03-09', '05-01', '05-11', '06-12', '11-04', '12-31'],
+  2027: ['01-01', '01-04', '01-05', '01-06', '01-07', '01-08', '02-23', '03-08', '05-03', '05-10', '06-14', '11-04']
+};
+var DEFAULT_HOLIDAYS = ['01-01', '01-02', '01-03', '01-04', '01-05', '01-06', '01-07', '01-08', '02-23', '03-08', '05-01', '05-09', '06-12', '11-04'];
+function isWorkday(d) {
+  var wd = d.getUTCDay();
+  if (wd === 0 || wd === 6) return false;
+  var key = ('0' + (d.getUTCMonth() + 1)).slice(-2) + '-' + ('0' + d.getUTCDate()).slice(-2);
+  return (HOLIDAYS[d.getUTCFullYear()] || DEFAULT_HOLIDAYS).indexOf(key) === -1;
+}
+// date — 'YYYY-MM-DD'; срок считается со следующего дня после подачи
+function addWorkdays(dateStr, n) {
+  var d = new Date(dateStr + 'T00:00:00Z');
+  var left = n;
+  while (left > 0) { d.setUTCDate(d.getUTCDate() + 1); if (isWorkday(d)) left--; }
+  return d.toISOString().slice(0, 10);
+}
+function workdaysBetween(fromStr, toStr) {
+  var a = new Date(fromStr + 'T00:00:00Z'), b = new Date(toStr + 'T00:00:00Z'), n = 0;
+  if (b <= a) return 0;
+  while (a < b) { a.setUTCDate(a.getUTCDate() + 1); if (isWorkday(a)) n++; }
+  return n;
+}
+function decisionDays(region) { return region === 'МО' ? 10 : 15; }
+function mskToday() { return new Date(Date.now() + 3 * 3600 * 1000).toISOString().slice(0, 10); }
+function mskHour() { return new Date(Date.now() + 3 * 3600 * 1000).getUTCHours(); }
+function ruDate(s) { return s ? s.slice(8, 10) + '.' + s.slice(5, 7) + '.' + s.slice(0, 4) : ''; }
+function ruShort(s) { return s ? s.slice(8, 10) + '.' + s.slice(5, 7) : ''; }
+
+async function ensureDeadlines() {
+  await pool.query(`
+    ALTER TABLE cases ADD COLUMN IF NOT EXISTS submitted_on DATE;
+    ALTER TABLE cases ADD COLUMN IF NOT EXISTS decision_due DATE;
+    ALTER TABLE cases ADD COLUMN IF NOT EXISTS reminded_on DATE;
+  `);
+}
+
+function startDecisionReminders(bot) {
+  ensureDeadlines().catch(function (e) { console.error('deadline columns:', e.message); });
+  async function tick() {
+    try {
+      if (mskHour() < 9) return; // напоминаем с 9:00 по Москве
+      var today = mskToday();
+      if (!isWorkday(new Date(today + 'T00:00:00Z'))) return; // в выходные не тревожим
+      var rows = (await pool.query(
+        "SELECT * FROM cases WHERE decision_due IS NOT NULL AND decision_due <= $1::date " +
+        "AND (reminded_on IS NULL OR reminded_on < $1::date) " +
+        "AND COALESCE(data->>'_stage', '') IN ('Подано', 'Выездная проверка')", [today])).rows;
+      for (var i = 0; i < rows.length; i++) {
+        var c = rows[i];
+        var due = c.decision_due instanceof Date ? c.decision_due.toISOString().slice(0, 10) : String(c.decision_due).slice(0, 10);
+        var sub = c.submitted_on instanceof Date ? c.submitted_on.toISOString().slice(0, 10) : String(c.submitted_on || '').slice(0, 10);
+        var late = workdaysBetween(due, today);
+        var when = late === 0 ? 'срок сегодня' : 'срок был ' + ruDate(due) + ', прошло ' + late + ' раб. ' + (late === 1 ? 'день' : late < 5 ? 'дня' : 'дней');
+        var text = '⏰ <b>Проверить решение</b>\n🏢 ' + esc(c.org) + (c.inn ? ' · ИНН ' + esc(c.inn) : '') +
+          '\n📤 Подано ' + ruDate(sub) + ' · ' + when + '\n⚖️ ' + esc(c.lawyer_name) + '\n#заявка' + c.id;
+        try {
+          await bot.telegram.sendMessage(c.lawyer_tg_id, text + '\n\nКогда решение будет — поставьте этап «Решение получено».', {
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: [[{ text: '📋 Открыть чек-лист', web_app: { url: process.env.WEBAPP_URL + '/checklist?case_id=' + c.id } }]] }
+          });
+        } catch (e) { console.error('reminder DM:', e.message); }
+        if (!c.reminded_on && process.env.CLIENTS_CHAT_ID) {
+          try { await bot.telegram.sendMessage(process.env.CLIENTS_CHAT_ID, text, { parse_mode: 'HTML' }); } catch (e) { console.error('reminder chat:', e.message); }
+        }
+        await pool.query('UPDATE cases SET reminded_on=$1 WHERE id=$2', [today, c.id]);
+      }
+    } catch (e) { console.error('decision reminders:', e.message); }
+  }
+  setTimeout(tick, 60 * 1000);
+  setInterval(tick, 10 * 60 * 1000);
+}
+
 function setupHandoff(app) {
   ensureTables().catch(function (e) { console.error('handoff tables error:', e.message); });
   const bot = require('../bot/instance');
+  startDecisionReminders(bot);
   const WEBAPP_URL = process.env.WEBAPP_URL;
 
   // Данные для предзаполнения формы
@@ -714,13 +792,30 @@ function setupHandoff(app) {
         }
       }
       // Смена этапа
+      var due = null;
+      if (data._stage === 'Подано' && old._stage !== 'Подано') {
+        // Подано: дата подачи — сегодня (или указанная юристом), срок решения по рабочим дням
+        var subOn = /^\d{4}-\d{2}-\d{2}$/.test(data._submittedOn || '') ? data._submittedOn : mskToday();
+        due = addWorkdays(subOn, decisionDays(c.region));
+        data._submittedOn = subOn; data._decisionDue = due;
+        await pool.query('UPDATE cases SET data=$1, submitted_on=$2, decision_due=$3, reminded_on=NULL WHERE id=$4', [data, subOn, due, id]);
+      } else if (data._stage === 'Подано' && data._submittedOn && data._submittedOn !== old._submittedOn) {
+        // юрист поправил дату подачи — пересчитываем срок
+        due = addWorkdays(data._submittedOn, decisionDays(c.region));
+        data._decisionDue = due;
+        await pool.query('UPDATE cases SET data=$1, submitted_on=$2, decision_due=$3, reminded_on=NULL WHERE id=$4', [data, data._submittedOn, due, id]);
+      }
       if (data._stage && data._stage !== old._stage && CLIENTS) {
-        try { await bot.telegram.sendMessage(CLIENTS, '📌 <b>' + esc(c.org) + '</b>: ' + esc(data._stage) + '\n⚖️ ' + esc(c.lawyer_name) + '\n#заявка' + c.id, { parse_mode: 'HTML' }); } catch (e) { console.error(e.message); }
+        var stageMsg = data._stage === 'Подано'
+          ? '📤 <b>Заявление подано</b>\n🏢 ' + esc(c.org) + (c.inn ? ' · ИНН ' + esc(c.inn) : '') +
+            '\n🗓 Решение ожидается до <b>' + ruDate(data._decisionDue) + '</b> (' + decisionDays(c.region) + ' раб. дней, ' + (c.region === 'МО' ? 'Подмосковье' : 'Москва') + ')'
+          : '📌 <b>' + esc(c.org) + '</b>: ' + esc(data._stage);
+        try { await bot.telegram.sendMessage(CLIENTS, stageMsg + '\n⚖️ ' + esc(c.lawyer_name) + '\n#заявка' + c.id, { parse_mode: 'HTML' }); } catch (e) { console.error(e.message); }
       }
       if (nowDone && !c.completed_at && CLIENTS) {
         await bot.telegram.sendMessage(CLIENTS, '✅ <b>Чек-лист выполнен</b>\n🏢 ' + esc(c.org) + '\n⚖️ ' + esc(c.lawyer_name) + '\n#заявка' + c.id, { parse_mode: 'HTML' });
       }
-      res.json({ ok: true });
+      res.json({ ok: true, submittedOn: data._submittedOn || null, decisionDue: data._decisionDue || null });
     } catch (e) { console.error(e); res.json({ ok: false, error: e.message }); }
   });
 
@@ -1190,8 +1285,32 @@ function checklistClient() {
 
     var stage = group('stage', 'Этап', null);
     var st = el('div', 'row col');
-    st.appendChild(segmented(CFG.stages, D._stage || CFG.stages[0], function (v) { D._stage = v || CFG.stages[0]; haptic(); render(); changed(); }, 'wrap'));
+    st.appendChild(segmented(CFG.stages, D._stage || CFG.stages[0], function (v) {
+      D._stage = v || CFG.stages[0];
+      if (D._stage === 'Подано' && !D._submittedOn) { D._submittedOn = mskToday(); }
+      if (D._submittedOn) D._decisionDue = addWorkdays(D._submittedOn, decisionDays(CASE.region));
+      haptic(); render(); changed();
+    }, 'wrap'));
     stage.body.appendChild(st);
+    // Срок решения после подачи
+    if (D._submittedOn && (D._stage === 'Подано' || D._stage === 'Выездная проверка')) {
+      var dl = el('div', 'row col deadline');
+      var lab = el('label', 'cap'); lab.appendChild(el('span', null, 'Дата подачи'));
+      var din = el('input', 'inp'); din.type = 'date'; din.value = D._submittedOn; din.max = mskToday();
+      din.onchange = function () {
+        if (!din.value) return;
+        D._submittedOn = din.value; D._decisionDue = addWorkdays(din.value, decisionDays(CASE.region));
+        render(); changed();
+      };
+      lab.appendChild(din); dl.appendChild(lab);
+      var due = D._decisionDue || addWorkdays(D._submittedOn, decisionDays(CASE.region));
+      var today = mskToday(), left = workdaysBetween(today, due), late = workdaysBetween(due, today);
+      var info = due > today ? 'через ' + left + ' раб. ' + (left === 1 ? 'день' : left < 5 ? 'дня' : 'дней')
+        : due === today ? 'сегодня' : 'просрочено на ' + late + ' раб. ' + (late === 1 ? 'день' : late < 5 ? 'дня' : 'дней');
+      var m = el('div', 'meta' + (due <= today ? ' warn' : ''), 'Решение ожидается до ' + ruDate(due) + ' — ' + info + ' (' + decisionDays(CASE.region) + ' раб. дней, ' + (CASE.region === 'МО' ? 'Подмосковье' : 'Москва') + '). ' + (due > today ? 'В день срока бот напомнит.' : 'Бот напоминает каждое утро, пока не будет «Решение получено».'));
+      dl.appendChild(m);
+      stage.body.appendChild(dl);
+    }
     root.appendChild(stage.box);
 
     var pass = group('passport', 'Паспорт объекта', L.passport.filter(visible));
@@ -1669,7 +1788,7 @@ function checklistPage(c, L) {
 
   var cfg = {
     list: L, data: c.data || {}, stages: STAGES,
-    caseInfo: { id: c.id, service: c.service, lawyer: c.lawyer_name }
+    caseInfo: { id: c.id, service: c.service, lawyer: c.lawyer_name, region: c.region }
   };
 
   var facts = [
@@ -1690,7 +1809,9 @@ function checklistPage(c, L) {
     '<div id="probs" class="glass" hidden></div>' +
     '<main id="list"></main>' +
     '<div class="dock glass"><span id="st" class="st"></span><button id="printBtn" class="pbtn" type="button">Печать</button></div>' +
-    '<script>window.__CFG=' + json(cfg) + ';(' + checklistClient.toString() + ')();</script>' +
+    '<script>var HOLIDAYS=' + json(HOLIDAYS) + ';var DEFAULT_HOLIDAYS=' + json(DEFAULT_HOLIDAYS) + ';' +
+    [isWorkday, addWorkdays, workdaysBetween, decisionDays, mskToday, ruDate].map(function (f) { return f.toString(); }).join('\n') +
+    '\nwindow.__CFG=' + json(cfg) + ';(' + checklistClient.toString() + ')();</script>' +
     '</body></html>';
 }
 
