@@ -483,7 +483,7 @@ function requestsClient() {
       $('list').classList.remove('loading');
       $('count').textContent = d.ok ? d.total : '—';
       var box = $('list'); box.innerHTML = '';
-      if (!d.ok) { box.appendChild(el('div', 'empty', 'Ошибка загрузки')); return; }
+      if (!d.ok) { box.appendChild(el('div', 'empty', d.error || 'Ошибка загрузки')); return; }
       if (!d.items.length) { box.appendChild(el('div', 'empty', $('q').value ? 'Ничего не найдено' : 'Все заявки распределены')); return; }
       d.items.forEach(function (it) {
         var f = it.f || {};

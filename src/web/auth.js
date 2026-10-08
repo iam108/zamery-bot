@@ -42,11 +42,25 @@ function checkInitData(initData) {
   } catch (e) { return null; }
 }
 
+// Личный ключ сотрудника для кнопок клавиатуры внизу чата:
+// Telegram не передаёт подпись пользователя мини-приложениям, открытым такими кнопками
+function userKey(uid) {
+  return crypto.createHmac('sha256', crypto.createHash('sha256').update('staffkey:' + (process.env.BOT_TOKEN || '')).digest())
+    .update(String(uid)).digest('hex').slice(0, 32);
+}
+function keyQuery(uid) { return 'u=' + encodeURIComponent(uid) + '&k=' + userKey(uid); }
+function checkUserKey(uid, key) {
+  if (!uid || !key || !/^\d+$/.test(String(uid))) return null;
+  const calc = userKey(uid);
+  if (calc.length !== String(key).length || !crypto.timingSafeEqual(Buffer.from(calc), Buffer.from(String(key)))) return null;
+  return { id: parseInt(uid) };
+}
+
 // Только одобренные сотрудники
 async function requireStaff(req, res, next) {
   try {
     await ensureStaff();
-    const user = checkInitData(req.get('X-Tg-Init'));
+    const user = checkInitData(req.get('X-Tg-Init')) || checkUserKey(req.get('X-Tg-U'), req.get('X-Tg-K'));
     if (!user) return res.status(401).json({ ok: false, error: 'Нет доступа. Закройте и откройте форму заново через бота.' });
     const staff = (await pool.query('SELECT * FROM staff WHERE tg_id=$1 AND approved = true', [user.id])).rows[0];
     if (!staff) return res.status(403).json({ ok: false, error: 'Нет доступа. Нажмите /start в боте и дождитесь одобрения.' });
@@ -73,10 +87,14 @@ function checkCaseSig(caseId, exp, sig) {
 }
 
 // Подключается на страницах мини-приложения: добавляет подпись Telegram к каждому запросу к нашему серверу
+// Ключ из ссылки запоминается на время сессии, чтобы переходы внутри приложения (список → форма) тоже работали
 const CLIENT_JS = "(function(){var f=window.fetch;if(!f||f.__tg)return;" +
+  "var q=new URLSearchParams(location.search),ku=q.get('u'),kk=q.get('k');" +
+  "try{if(ku&&kk){sessionStorage.setItem('tg_u',ku);sessionStorage.setItem('tg_k',kk)}else{ku=sessionStorage.getItem('tg_u');kk=sessionStorage.getItem('tg_k')}}catch(e){}" +
   "var w=function(u,o){o=o||{};try{var tg=window.Telegram&&window.Telegram.WebApp;var d=tg&&tg.initData;" +
   "var s=typeof u==='string'?u:(u&&u.url)||'';" +
-  "if(d&&(s.charAt(0)==='/'||s.indexOf(location.origin)===0)){var h=new Headers(o.headers||{});h.set('X-Tg-Init',d);o.headers=h;}}catch(e){}" +
+  "if(s.charAt(0)==='/'||s.indexOf(location.origin)===0){var h=new Headers(o.headers||{});" +
+  "if(d)h.set('X-Tg-Init',d);if(ku&&kk){h.set('X-Tg-U',ku);h.set('X-Tg-K',kk)}o.headers=h;}}catch(e){}" +
   "return f.call(this,u,o)};w.__tg=1;window.fetch=w;})();";
 
 function setupAuth(app) {
@@ -89,4 +107,4 @@ function setupAuth(app) {
   });
 }
 
-module.exports = { setupAuth, requireStaff, checkInitData, signCase, checkCaseSig, ensureStaff };
+module.exports = { setupAuth, requireStaff, checkInitData, signCase, checkCaseSig, ensureStaff, keyQuery };

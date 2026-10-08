@@ -36,13 +36,15 @@ function setupBot() {
     const me = await getMe(ctx.from.id);
     if (!me) return ctx.reply('👋 Привет! Кто вы в команде?', roleKb());
     if (!me.approved) return ctx.reply('⏳ Заявка на доступ (' + (ROLES[me.requested_role || me.role] || '') + ') ждёт одобрения. Как только её одобрят, я напишу.');
-    const zamer = Markup.button.webApp('📋 Заявка на замер', WEBAPP_URL + '/form');
+    // Кнопки клавиатуры не получают подпись Telegram — добавляем личный ключ сотрудника
+    const kq = '?' + require('../web/auth').keyQuery(ctx.from.id);
+    const zamer = Markup.button.webApp('📋 Заявка на замер', WEBAPP_URL + '/form' + kq);
     let kb;
-    const requestsBtn = Markup.button.webApp('📥 Нераспределённые', WEBAPP_URL + '/requests');
-    const handoffBtn = Markup.button.webApp('⚖️ Передать юристу', WEBAPP_URL + '/handoff');
+    const requestsBtn = Markup.button.webApp('📥 Нераспределённые', WEBAPP_URL + '/requests' + kq);
+    const handoffBtn = Markup.button.webApp('⚖️ Передать юристу', WEBAPP_URL + '/handoff' + kq);
     if (me.role === 'manager') kb = [[requestsBtn], [zamer, handoffBtn]];
     else if (me.role === 'lawyer') kb = [[requestsBtn], [zamer, '📂 Мои клиенты']];
-    else kb = [[Markup.button.webApp('🔍 Отчёт аудитора', WEBAPP_URL + '/audit')]];
+    else kb = [[Markup.button.webApp('🔍 Отчёт аудитора', WEBAPP_URL + '/audit' + kq)]];
     const pending = me.requested_role && me.requested_role !== me.role ? '\n⏳ Запрос на роль «' + ROLES[me.requested_role] + '» ждёт одобрения.' : '';
     await ctx.reply('👋 ' + me.name + ' (' + ROLES[me.role] + ')' + pending + '\n\nВыбери действие:', Markup.keyboard(kb).resize());
   });
