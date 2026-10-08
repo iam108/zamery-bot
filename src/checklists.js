@@ -21,7 +21,7 @@ var ZHILOE = { building: 'Жилое' };
 var PRODL = { svc: 'Продление' };
 
 var FLAGS = {
-  t: 'Красные флаги ЕГРН', red: true, skip: 'no', skipLabel: 'Флагов нет',
+  t: 'Красные флаги ЕГРН', red: true, skip: 'no', skipLabel: 'Пропустить',
   i: [
     flag('fl_zapret', 'Запрет регистрационных действий без личного участия собственника'),
     flag('fl_arrest', 'Арест'),
