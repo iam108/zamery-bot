@@ -1,7 +1,37 @@
 const { getOrderById } = require('../db/queries');
 const { saveAudit } = require('../web/handoff');
 
+// Отчёты, которые уже обрабатываются или отправлены (защита от дубля при повторной отправке)
+const seenSubmits = new Map();
+
+// Telegram иногда просит подождать (429 Too Many Requests) — ждём указанное время и повторяем
+async function tgRetry(fn) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try { return await fn(); }
+    catch (e) {
+      const wait = e && e.response && e.response.parameters && e.response.parameters.retry_after;
+      if (!wait || attempt === 3) throw e;
+      console.log('Telegram просит подождать ' + wait + ' с');
+      await new Promise(function (r) { setTimeout(r, (wait + 1) * 1000); });
+    }
+  }
+}
+
 async function handleAuditReport(ctx, data) {
+  const GROUP_ID = process.env.GROUP_CHAT_ID;
+  if (data.submit_id) {
+    const prev = seenSubmits.get(data.submit_id);
+    if (prev) return prev; // этот же отчёт уже отправлен или отправляется — ждём результат, второй раз не шлём
+    const job = handleAuditReportInner(ctx, data);
+    seenSubmits.set(data.submit_id, job);
+    job.catch(function () { seenSubmits.delete(data.submit_id); });
+    setTimeout(function () { seenSubmits.delete(data.submit_id); }, 30 * 60 * 1000);
+    return job;
+  }
+  return handleAuditReportInner(ctx, data);
+}
+
+async function handleAuditReportInner(ctx, data) {
   const GROUP_ID = process.env.GROUP_CHAT_ID;
   const actor = ctx.from
     ? (ctx.from.username ? '@' + ctx.from.username : ctx.from.first_name)
@@ -118,15 +148,15 @@ async function handleAuditReport(ctx, data) {
           parse_mode: i === 0 ? 'Markdown' : undefined,
         };
       });
-      var msgs = await tg.sendMediaGroup(GROUP_ID, media, replyToMsgId ? { reply_to_message_id: replyToMsgId } : {});
+      var msgs = await tgRetry(function () { return tg.sendMediaGroup(GROUP_ID, media, replyToMsgId ? { reply_to_message_id: replyToMsgId } : {}); });
       msgs.forEach(function(m) { sentIds.push(m.message_id); });
     } catch (e) {
       console.error('media group error:', e.message);
-      var m1 = await tg.sendMessage(GROUP_ID, text, { parse_mode: 'Markdown', reply_to_message_id: replyToMsgId || undefined });
+      var m1 = await tgRetry(function () { return tg.sendMessage(GROUP_ID, text, { parse_mode: 'Markdown', reply_to_message_id: replyToMsgId || undefined }); });
       sentIds.push(m1.message_id);
     }
   } else {
-    var m2 = await tg.sendMessage(GROUP_ID, text, { parse_mode: 'Markdown', reply_to_message_id: replyToMsgId || undefined });
+    var m2 = await tgRetry(function () { return tg.sendMessage(GROUP_ID, text, { parse_mode: 'Markdown', reply_to_message_id: replyToMsgId || undefined }); });
     sentIds.push(m2.message_id);
   }
 
@@ -139,10 +169,10 @@ async function handleAuditReport(ctx, data) {
 
   // Кнопка передачи юристу
   if (data.order_id) {
-    await tg.sendMessage(GROUP_ID, '⚖️ Заявка #' + data.order_id + ' готова к передаче юристу', {
+    await tgRetry(function () { return tg.sendMessage(GROUP_ID, '⚖️ Заявка #' + data.order_id + ' готова к передаче юристу', {
       reply_to_message_id: sentIds[0],
       reply_markup: { inline_keyboard: [[{ text: '⚖️ Передать юристу', callback_data: 'handoff:' + data.order_id }]] },
-    });
+    }); });
   }
 
   if (ctx.reply) await ctx.reply('✅ Отчёт отправлен в группу!');
