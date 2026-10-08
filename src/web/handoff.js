@@ -514,6 +514,15 @@ function requestsClient() {
     });
   }
   $('q').oninput = function () { clearTimeout(timer); timer = setTimeout(load, 250); };
+  var doneOrg = new URLSearchParams(location.search).get('done');
+  if (doneOrg !== null) {
+    var t = el('div', 'toast glass', '✅ ' + (doneOrg || 'Заявка') + ' — передано юристу');
+    document.body.appendChild(t);
+    setTimeout(function () { t.classList.add('out'); }, 2600);
+    setTimeout(function () { t.remove(); }, 3100);
+    history.replaceState(null, '', '/requests');
+  }
+  try { tg.BackButton.hide(); } catch (e) {}
   $('old').onclick = function () {
     var go = function () {
       fetch('/api/requests/dismiss', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ older_days: 30 }) })
@@ -555,6 +564,8 @@ function requestsPage() {
     '.go{flex:1;background:var(--accent);color:#fff}.hide{background:var(--well);color:var(--ink2)}',
     '.empty{text-align:center;color:var(--ink2);padding:40px 0;font-size:15px}',
     '#list.loading{opacity:.5}',
+    '.toast{position:fixed;left:14px;right:14px;bottom:max(16px,env(safe-area-inset-bottom));z-index:9;border-radius:16px;padding:13px 16px;font-size:14.5px;font-weight:600;background:var(--glass2);transition:opacity .4s,transform .4s}',
+    '.toast.out{opacity:0;transform:translateY(10px)}',
     '@media (prefers-reduced-motion:reduce){*{transition:none!important}}'
   ].join('\n');
   return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">' +
@@ -767,6 +778,10 @@ function handoffClient() {
   var Q = new URLSearchParams(location.search);
   var orderId = Q.get('order_id') || '';
   var requestId = Q.get('request_id') || '';
+  if (requestId) {
+    $('back').hidden = false;
+    try { tg.BackButton.show(); tg.BackButton.onClick(function () { location.href = '/requests'; }); } catch (e) {}
+  }
   var S = { lawyer: null, region: 'МСК', kind: 'Общепит', service: 'Получение', priority: 'обычный' };
   var REP = null; // выбранный отчёт {src,id,text}
   function $(i) { return document.getElementById(i); }
@@ -971,7 +986,10 @@ function handoffClient() {
         tg_user_id: tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user.id : null }) });
       var j = await r.json(); if (!j.ok) throw new Error(j.error || 'Ошибка');
       b.textContent = '✅ Передано';
-      if (j.warn) tg.showAlert(j.warn, function () { tg.close(); }); else setTimeout(function () { tg.close(); }, 1200);
+      try { tg.HapticFeedback.notificationOccurred('success'); } catch (e) {}
+      // Из списка заявок — возвращаемся к списку, иначе закрываем
+      var after = requestId ? function () { location.href = '/requests?done=' + encodeURIComponent($('org').value.trim()); } : function () { tg.close(); };
+      if (j.warn) tg.showAlert(j.warn, after); else setTimeout(after, requestId ? 700 : 1200);
     } catch (e) { b.disabled = false; b.textContent = 'Передать юристу'; tg.showAlert('Ошибка: ' + e.message); }
   };
 }
@@ -995,6 +1013,9 @@ function handoffPage() {
     '.glass:before{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;background:linear-gradient(180deg,rgba(255,255,255,.35),rgba(255,255,255,0) 38%)}',
     '[data-theme=dark] .glass:before{background:linear-gradient(180deg,rgba(255,255,255,.08),rgba(255,255,255,0) 40%)}',
     '.top{padding:18px 4px 14px}',
+    '.back{display:inline-block;margin-top:14px;padding:7px 12px 7px 10px;border-radius:999px;background:var(--glass2);border:1px solid var(--edge);color:var(--accent);font-size:14px;font-weight:600;text-decoration:none}',
+    '.back[hidden]{display:none}',
+    '.back + .top{padding-top:10px}',
     '.kicker{font-size:13px;color:var(--ink2);font-weight:500}',
     'h1{font-size:28px;line-height:1.1;font-weight:700;letter-spacing:-.025em;margin-top:4px}',
     '.grp{border-radius:22px;margin-bottom:12px;padding:14px 16px 16px}',
@@ -1054,6 +1075,7 @@ function handoffPage() {
     '<title>Передать юристу</title><script src="https://telegram.org/js/telegram-web-app.js"></script>' +
     '<style>' + css + '</style></head><body>' +
     '<div class="field-bg" aria-hidden="true"><i></i><i></i><i></i></div>' +
+    '<a id="back" class="back" href="/requests" hidden>‹ К списку заявок</a>' +
     '<header class="top"><div class="kicker" id="sub">Загрузка…</div><h1>Передать юристу</h1></header>' +
 
     '<section class="glass grp"><h2>Отчёт аудитора</h2>' +
