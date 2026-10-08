@@ -233,13 +233,13 @@ bot.on(['photo', 'document'], async (ctx) => {
   async function showCases(ctx) {
     const pool = require('../db/pool');
     const { rows } = await pool.query(
-      'SELECT id, org, done, total FROM cases WHERE lawyer_tg_id=$1 AND completed_at IS NULL ORDER BY created_at DESC LIMIT 20',
+           "SELECT id, org, done, total, data->>'_stage' AS stage FROM cases WHERE lawyer_tg_id=$1 AND COALESCE(data->>'_stage', '') <> 'Архив' ORDER BY created_at DESC LIMIT 30",
       [ctx.from.id]
     );
     if (!rows.length) return ctx.reply('У вас нет открытых клиентов 🎉');
     await ctx.reply('📂 Ваши клиенты в работе:', {
       reply_markup: { inline_keyboard: rows.map(function(c) {
-        return [{ text: c.org + ' — ' + c.done + '/' + c.total, web_app: { url: WEBAPP_URL + '/checklist?case_id=' + c.id } }];
+                return [{ text: c.org + ' · ' + (c.stage || 'Сбор документов') + ' · ' + c.done + '/' + c.total, web_app: { url: WEBAPP_URL + '/checklist?case_id=' + c.id } }];
       }) },
     });
   }
