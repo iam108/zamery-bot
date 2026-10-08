@@ -656,6 +656,320 @@ function startDecisionReminders(bot) {
   setInterval(tick, 10 * 60 * 1000);
 }
 
+
+// ── Версия для печати: чистый документ A4 ─────────────────────────────
+function printPage(c, L) {
+  var D = c.data || {};
+  function visible(it) {
+    if (!it.when) return true;
+    return Object.keys(it.when).every(function (key) {
+      if (key === 'svc') return c.service === it.when.svc;
+      return D[key] === undefined || D[key] === it.when[key];
+    });
+  }
+  function resolved(it) {
+    var v = D[it.id];
+    if (it.t === 'k' || it.t === 'flag') return !!(v && v.s);
+    if (it.t === 'docs') return !!(v && v.m && it.o.every(function (x) { return v.m[x]; }));
+    return v !== undefined && v !== '' && v !== null;
+  }
+  var BOX = '<span class="box"></span>';
+  function mark(it) {
+    var v = D[it.id];
+    if (it.t === 'k') {
+      if (!v || !v.s) return { m: BOX, c: '' };
+      if (v.s === 'ok') return { m: '<span class="ok">✓ Ок</span>', c: '' };
+      if (v.s === 'na') return { m: '<span class="na">Н/П</span>', c: '' };
+      return { m: '<span class="bad">✗ Проблема</span>', c: esc(v.c || ''), bad: true };
+    }
+    if (it.t === 'flag') {
+      if (!v || !v.s) return { m: BOX, c: '' };
+      if (v.s === 'no') return { m: '<span class="ok">Нет</span>', c: '' };
+      return { m: '<span class="bad">✗ Есть</span>', c: esc(v.c || ''), bad: true };
+    }
+    if (it.t === 'r' || it.t === 'p') return { m: v ? '<b>' + esc(v) + '</b>' : '<span class="choices">' + it.o.map(function (o) { return '<span>' + BOX + ' ' + esc(o) + '</span>'; }).join('') + '</span>', c: '' };
+    if (it.t === 'f' || it.t === 'd') return { m: v ? '<b>' + esc(v) + '</b>' : '<span class="line"></span>', c: '' };
+    return { m: '', c: '' };
+  }
+
+  var total = 0, done = 0, probs = [];
+  function count(it) {
+    if (!visible(it)) return;
+    total++; if (resolved(it)) done++;
+    var v = D[it.id];
+    if ((it.t === 'k' && v && v.s === 'bad') || (it.t === 'flag' && v && v.s === 'yes')) probs.push({ l: it.l, c: v.c, flag: it.t === 'flag' });
+    if (it.t === 'docs' && v) {
+      var miss = it.o.filter(function (x) { return v.m && v.m[x] === 'bad'; }).concat(String(v.other || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean));
+      if (miss.length) probs.push({ l: 'Не хватает документов', c: miss.join(', ') + (v.reqAt ? ' (запрошено ' + v.reqAt + ')' : '') });
+    }
+  }
+  L.passport.forEach(count);
+  L.sections.forEach(function (s) { s.i.forEach(count); });
+
+  // Шапка
+  var contacts = (Array.isArray(c.contacts) && c.contacts.length ? c.contacts : [{ name: c.client, phone: c.phone }])
+    .map(function (x) { return [x.name, x.phone, x.tg ? (String(x.tg).charAt(0) === '@' ? x.tg : '@' + x.tg) : ''].filter(Boolean).map(esc).join(', '); })
+    .filter(Boolean).join('<br>');
+  var meta = [
+    ['ИНН', c.inn ? esc(c.inn) : ''],
+    ['Адрес', esc(c.address || '')],
+    ['Объект', esc([c.kind, c.region === 'МО' ? 'Подмосковье' : c.region === 'МСК' ? 'Москва' : c.region, c.service].filter(Boolean).join(' · '))],
+    ['Клиент', contacts],
+    ['Юрист', esc(c.lawyer_name || '')],
+    ['Этап', esc(D._stage || 'Сбор документов')],
+    ['Подано', D._submittedOn ? ruDate(D._submittedOn) + (D._decisionDue ? ' &nbsp;·&nbsp; решение ожидается до <b>' + ruDate(D._decisionDue) + '</b>' : '') : '']
+  ].filter(function (x) { return x[1]; })
+    .map(function (x) { return '<tr><th>' + x[0] + '</th><td>' + x[1] + '</td></tr>'; }).join('');
+
+  var probsHtml = probs.length ? '<section class="probs"><h2>Требует внимания (' + probs.length + ')</h2><ul>' +
+    probs.map(function (p) { return '<li>' + (p.flag ? '<b>Красный флаг:</b> ' : '') + '<b>' + esc(p.l) + '</b>' + (p.c ? ' — ' + esc(p.c) : '') + '</li>'; }).join('') + '</ul></section>' : '';
+
+  var passport = L.passport.filter(visible).map(function (it) {
+    var m = mark(it); return '<tr><td class="lbl">' + esc(it.l) + '</td><td>' + m.m + '</td></tr>';
+  }).join('');
+
+  var n = 0;
+  var sections = L.sections.map(function (s) {
+    var items = s.i.filter(visible);
+    if (!items.length) return '';
+    var rows = items.map(function (it) {
+      if (it.t === 'docs') {
+        var v = D[it.id] || {}, mm = v.m || {};
+        var dr = it.o.map(function (doc) {
+          n++;
+          var st = mm[doc] === 'ok' ? '<span class="ok">✓ Есть</span>' : mm[doc] === 'bad' ? '<span class="bad">✗ Нет</span>' : BOX;
+          return '<tr class="' + (mm[doc] === 'bad' ? 'isbad' : '') + '"><td class="n">' + n + '</td><td>' + esc(doc) + '</td><td class="m">' + st + '</td><td></td></tr>';
+        }).join('');
+        var other = String(v.other || '').trim();
+        if (other) { n++; dr += '<tr class="isbad"><td class="n">' + n + '</td><td>Ещё не хватает: ' + esc(other) + '</td><td class="m"><span class="bad">✗ Нет</span></td><td>' + (v.reqAt ? 'запрошено ' + esc(v.reqAt) : '') + '</td></tr>'; }
+        return dr;
+      }
+      n++;
+      var v = D[it.id];
+      if (it.t === 'r' || it.t === 'f' || it.t === 'd') {
+        // Значение или варианты — на обе правые колонки
+        var val;
+        if (it.t === 'r') val = v ? '<b>' + esc(v) + '</b>' : '<span class="choices">' + it.o.map(function (o) { return '<span>' + BOX + ' ' + esc(o) + '</span>'; }).join('') + '</span>';
+        else val = v ? '<b>' + esc(v) + '</b>' : '<span class="line wide"></span>';
+        return '<tr><td class="n">' + n + '</td><td>' + esc(it.l) + '</td><td colspan="2">' + val + '</td></tr>';
+      }
+      var m = mark(it);
+      return '<tr class="' + (m.bad ? 'isbad' : '') + '"><td class="n">' + n + '</td><td>' + esc(it.l) + '</td><td class="m">' + m.m + '</td><td>' + m.c + '</td></tr>';
+    }).join('');
+    return '<section class="sec' + (s.red ? ' red' : '') + '"><h2>' + esc(s.t) + '</h2><table class="grid"><colgroup><col class="cn"><col><col class="cm"><col class="cc"></colgroup>' +
+      '<thead><tr><th>№</th><th>Пункт</th><th>Отметка</th><th>Комментарий</th></tr></thead><tbody>' + rows + '</tbody></table></section>';
+  }).join('');
+
+  var comment = D._comment ? '<section class="sec"><h2>Комментарий юриста</h2><div class="note">' + esc(D._comment).replace(/\n/g, '<br>') + '</div></section>' : '';
+  var printed = ruDate(mskToday());
+
+  var css = [
+    '@page{size:A4;margin:14mm 13mm 16mm}',
+    '*{box-sizing:border-box;margin:0;padding:0}',
+    'body{font:10pt/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;color:#111;background:#f2f3f5}',
+    '.sheet{max-width:210mm;margin:0 auto;background:#fff;padding:14mm 13mm;min-height:297mm}',
+    '.bar{position:sticky;top:0;z-index:5;display:flex;gap:10px;align-items:center;justify-content:center;padding:10px;background:#f2f3f5}',
+    '.bar button{font:inherit;font-size:15px;font-weight:600;border:0;border-radius:10px;padding:11px 20px;background:#2F6BFF;color:#fff;cursor:pointer}',
+    '.bar span{font-size:13px;color:#555}',
+    '.kicker{font-size:9pt;color:#666;text-transform:none;letter-spacing:0}',
+    'h1{font-size:18pt;line-height:1.15;margin:2px 0 8px;letter-spacing:-.01em}',
+    '.meta{border-collapse:collapse;width:100%;margin-bottom:8px}',
+    '.meta th{width:26mm;text-align:left;font-weight:600;color:#555;padding:2px 8px 2px 0;vertical-align:top}',
+    '.meta td{padding:2px 0;vertical-align:top}',
+    '.sum{display:flex;gap:16px;align-items:center;border-top:1.5pt solid #111;border-bottom:.5pt solid #bbb;padding:5px 0;margin:6px 0 10px;font-weight:600}',
+    '.sum .p{color:#c62828}',
+    '.probs{border:1.2pt solid #c62828;border-radius:4px;padding:6px 10px;margin-bottom:10px;break-inside:avoid}',
+    '.probs h2{font-size:10.5pt;color:#c62828;margin-bottom:3px}',
+    '.probs ul{padding-left:16px}.probs li{margin:1px 0}',
+    'h2{font-size:11pt;margin:0 0 4px}',
+    '.sec{margin-top:8px;break-inside:avoid-page}',
+    '.sec.red h2{color:#c62828}',
+    '.kv{border-collapse:collapse;width:100%}.kv td{border-bottom:.5pt solid #ddd;padding:3px 4px}.kv td.lbl{width:45%;color:#333}',
+    '.grid{border-collapse:collapse;width:100%;table-layout:fixed}',
+    '.grid col.cn{width:7mm}.grid col.cm{width:30mm}.grid col.cc{width:52mm}',
+    '.grid th{font-size:8.5pt;font-weight:600;color:#666;text-align:left;border-bottom:1pt solid #111;padding:2px 4px}',
+    '.grid td{border-bottom:.5pt solid #ddd;padding:2.5px 4px;vertical-align:top;word-wrap:break-word}',
+    '.grid td.n{color:#888;font-size:8.5pt}',
+    '.grid tr{break-inside:avoid}',
+    '.grid tr.isbad td{background:#fdecec}',
+    '.ok{color:#1b7f4b;font-weight:600}.bad{color:#c62828;font-weight:700}.na{color:#777}',
+    '.box{display:inline-block;width:9pt;height:9pt;border:.8pt solid #444;vertical-align:-1pt}',
+    '.opts{color:#888;font-size:8.5pt}',
+    '.line{display:inline-block;width:40mm;border-bottom:.6pt solid #444;height:10pt}',
+    '.line.wide{width:70mm}',
+    '.choices{display:flex;flex-wrap:wrap;gap:2px 12px}.choices span{white-space:nowrap}',
+    '.note{border:.5pt solid #ccc;border-radius:3px;padding:6px 8px;min-height:14mm}',
+    '.sign{display:flex;gap:18mm;margin-top:14mm;font-size:10pt}',
+    '.sign div{flex:1;border-top:.6pt solid #444;padding-top:3px;color:#555}',
+    '.foot{margin-top:8mm;font-size:8pt;color:#888;display:flex;justify-content:space-between}',
+    '@media print{body{background:#fff}.bar{display:none}.sheet{padding:0;min-height:0;max-width:none}}',
+    '@media screen and (max-width:700px){.sheet{padding:16px 14px}}'
+  ].join('\n');
+
+  return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<title>Чек-лист — ' + esc(c.org) + '</title><style>' + css + '</style></head><body>' +
+    '<div class="bar"><button type="button" onclick="window.print()">Печать / Сохранить PDF</button><a href="?case_id=' + c.id + '&print=1" style="color:#2F6BFF">Компактная версия (1 лист)</a></div>' +
+    '<main class="sheet">' +
+    '<div class="kicker">Чек-лист юриста · ' + esc(L.title) + '</div>' +
+    '<h1>' + esc(c.org) + '</h1>' +
+    '<table class="meta">' + meta + '</table>' +
+    '<div class="sum"><span>Заполнено ' + done + ' из ' + total + '</span>' + (probs.length ? '<span class="p">Проблем: ' + probs.length + '</span>' : '<span>Проблем нет</span>') + '</div>' +
+    probsHtml +
+    '<section class="sec"><h2>Паспорт объекта</h2><table class="kv">' + passport + '</table></section>' +
+    sections + comment +
+    '<div class="sign"><div>Юрист: ' + esc(c.lawyer_name || '') + '</div><div>Подпись</div><div>Дата</div></div>' +
+    '<div class="foot"><span>#заявка' + c.id + '</span><span>Сформировано ' + printed + '</span></div>' +
+    '</main>' +
+    '<script>setTimeout(function(){try{window.print()}catch(e){}},600);</script>' +
+    '</body></html>';
+}
+
+
+// ── Компактная версия для печати: всё на одном листе A4 ────────────────
+function printCompact(c, L) {
+  var D = c.data || {};
+  function visible(it) {
+    if (!it.when) return true;
+    return Object.keys(it.when).every(function (key) {
+      if (key === 'svc') return c.service === it.when.svc;
+      return D[key] === undefined || D[key] === it.when[key];
+    });
+  }
+  function resolved(it) {
+    var v = D[it.id];
+    if (it.t === 'k' || it.t === 'flag') return !!(v && v.s);
+    if (it.t === 'docs') return !!(v && v.m && it.o.every(function (x) { return v.m[x]; }));
+    return v !== undefined && v !== '' && v !== null;
+  }
+  var OK = '<i class="s ok">✓</i>', BAD = '<i class="s bad">✗</i>', NA = '<i class="s na">–</i>', BOX = '<i class="s box"></i>';
+  var total = 0, done = 0, probs = [];
+
+  function line(it) {
+    var v = D[it.id];
+    total++; if (resolved(it)) done++;
+    if (it.t === 'k') {
+      if (!v || !v.s) return '<li>' + BOX + esc(it.l) + '</li>';
+      if (v.s === 'ok') return '<li>' + OK + esc(it.l) + '</li>';
+      if (v.s === 'na') return '<li class="dim">' + NA + esc(it.l) + '</li>';
+      probs.push({ l: it.l, c: v.c });
+      return '<li class="pb">' + BAD + '<b>' + esc(it.l) + '</b>' + (v.c ? ' — ' + esc(v.c) : '') + '</li>';
+    }
+    if (it.t === 'flag') {
+      if (!v || !v.s) return '<li>' + BOX + esc(it.l) + '</li>';
+      if (v.s === 'no') return '<li>' + OK + esc(it.l) + ': нет</li>';
+      probs.push({ l: it.l, c: v.c, flag: true });
+      return '<li class="pb">' + BAD + '<b>' + esc(it.l) + ': ЕСТЬ</b>' + (v.c ? ' — ' + esc(v.c) : '') + '</li>';
+    }
+    if (it.t === 'r') {
+      if (v) return '<li>' + OK + esc(it.l) + ': <b>' + esc(v) + '</b></li>';
+      return '<li>' + BOX + esc(it.l) + ': <span class="opt">' + it.o.map(esc).join(' / ') + '</span></li>';
+    }
+    if (it.t === 'f' || it.t === 'd') {
+      if (v) return '<li>' + OK + esc(it.l) + ': <b>' + esc(v) + '</b></li>';
+      return '<li>' + BOX + esc(it.l) + ': <span class="ln"></span></li>';
+    }
+    if (it.t === 'docs') {
+      var mm = (v && v.m) || {};
+      var miss = [];
+      var out = it.o.map(function (doc) {
+        if (mm[doc] === 'ok') return '<li>' + OK + esc(doc) + '</li>';
+        if (mm[doc] === 'bad') { miss.push(doc); return '<li class="pb">' + BAD + '<b>' + esc(doc) + '</b> — нет</li>'; }
+        return '<li>' + BOX + esc(doc) + '</li>';
+      }).join('');
+      var other = String((v && v.other) || '').trim();
+      if (other) { miss = miss.concat(other.split(',').map(function (x) { return x.trim(); }).filter(Boolean)); out += '<li class="pb">' + BAD + '<b>Ещё нет:</b> ' + esc(other) + '</li>'; }
+      if (miss.length) probs.push({ l: 'Не хватает документов', c: miss.join(', ') + (v.reqAt ? ' (запрошено ' + v.reqAt + ')' : '') });
+      return out;
+    }
+    return '';
+  }
+
+  // Паспорт — одной строкой
+  var pass = L.passport.filter(visible).map(function (it) {
+    total++; if (resolved(it)) done++;
+    var v = D[it.id];
+    return v ? esc(it.l) + ': <b>' + esc(v) + '</b>' : esc(it.l) + ': ☐ ' + it.o.map(esc).join(' / ');
+  }).join(' &nbsp;·&nbsp; ');
+
+  var secs = L.sections.map(function (s) {
+    var items = s.i.filter(visible);
+    if (!items.length) return '';
+    return '<section' + (s.red ? ' class="red"' : '') + '><h3>' + esc(s.t) + '</h3><ul>' + items.map(line).join('') + '</ul></section>';
+  }).join('');
+
+  var contacts = (Array.isArray(c.contacts) && c.contacts.length ? c.contacts : [{ name: c.client, phone: c.phone }])
+    .map(function (x) { return [x.name, x.phone, x.tg ? (String(x.tg).charAt(0) === '@' ? x.tg : '@' + x.tg) : ''].filter(Boolean).map(esc).join(', '); })
+    .filter(Boolean).join('; ');
+  var meta = [
+    ['ИНН', esc(c.inn || '—')],
+    ['Объект', esc([c.kind, c.region === 'МО' ? 'Подмосковье' : c.region === 'МСК' ? 'Москва' : c.region, c.service].filter(Boolean).join(' · '))],
+    ['Адрес', esc(c.address || '—')],
+    ['Юрист', esc(c.lawyer_name || '')],
+    ['Клиент', contacts || '—'],
+    ['Этап', esc(D._stage || 'Сбор документов') + (D._submittedOn ? ' · подано ' + ruDate(D._submittedOn) + (D._decisionDue ? ', решение до <b>' + ruDate(D._decisionDue) + '</b>' : '') : '')]
+  ].map(function (x) { return '<div><span>' + x[0] + '</span>' + x[1] + '</div>'; }).join('');
+
+  var probsHtml = probs.length
+    ? '<div class="probs"><b>Требует внимания:</b> ' + probs.map(function (p) { return (p.flag ? '🚩 ' : '') + '<b>' + esc(p.l) + '</b>' + (p.c ? ' (' + esc(p.c) + ')' : ''); }).join('; ') + '</div>'
+    : '<div class="probs okb">Проблем не выявлено</div>';
+
+  var css = [
+    '@page{size:A4;margin:9mm 10mm}',
+    '*{box-sizing:border-box;margin:0;padding:0}',
+    'body{font:7.9pt/1.28 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;color:#111;background:#f2f3f5}',
+    '.sheet{width:190mm;max-width:100%;margin:0 auto;background:#fff;padding:8mm}',
+    '.bar{position:sticky;top:0;z-index:5;display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;justify-content:center;padding:10px;background:#f2f3f5;font:14px -apple-system,sans-serif}',
+    '.bar button{font:inherit;font-weight:600;border:0;border-radius:10px;padding:10px 18px;background:#2F6BFF;color:#fff;cursor:pointer}',
+    '.bar a{color:#2F6BFF}',
+    '.top{display:flex;justify-content:space-between;align-items:baseline;gap:10px;border-bottom:1.4pt solid #111;padding-bottom:3px;margin-bottom:4px}',
+    'h1{font-size:13.5pt;letter-spacing:-.01em;line-height:1.1}',
+    '.kick{font-size:7.5pt;color:#555;text-align:right}',
+    '.meta{display:grid;grid-template-columns:1fr 1fr;gap:1px 14px;margin-bottom:4px}',
+    '.meta div span{display:inline-block;width:12mm;color:#666;font-weight:600}',
+    '.sum{display:flex;gap:12px;font-weight:700;font-size:8.2pt;margin:3px 0}',
+    '.sum .p{color:#c62828}',
+    '.probs{border:1pt solid #c62828;border-radius:3px;padding:3px 6px;margin:0 1px 4px 0}',
+    '.probs.okb{border-color:#1b7f4b;color:#1b7f4b;font-weight:600}',
+    '.pass{border-bottom:.5pt solid #bbb;padding:2px 0 3px;margin-bottom:4px}',
+    '.pass > span{color:#666;font-weight:600;margin-right:4px}',
+    '.cols{column-count:2;column-gap:7mm}',
+    'section{break-inside:avoid;margin:0 0 4px}',
+    'h3{font-size:8.2pt;margin:0 0 1px;border-bottom:.5pt solid #bbb;padding-bottom:1px}',
+    'section.red h3{color:#c62828}',
+    'ul{list-style:none}',
+    'li{padding:.6px 0 .6px 12px;position:relative}',
+    'li .s{position:absolute;left:0;top:.6px;font-style:normal;width:9px;text-align:center;font-weight:700}',
+    '.s.ok{color:#1b7f4b}.s.bad{color:#c62828}.s.na{color:#999}',
+    '.s.box{display:inline-block;width:7pt;height:7pt;border:.7pt solid #444;top:2px}',
+    'li.dim{color:#888}',
+    'li.pb{color:#a11}',
+    '.opt{color:#777}',
+    '.ln{display:inline-block;width:28mm;border-bottom:.5pt solid #555;height:8pt;vertical-align:bottom}',
+    '.cm{border:.5pt solid #bbb;border-radius:3px;padding:3px 6px;margin-top:3px}',
+    '.sign{display:flex;gap:10mm;margin-top:7mm}',
+    '.sign div{flex:1;border-top:.5pt solid #444;padding-top:1px;color:#555;font-size:7.5pt}',
+    '.foot{display:flex;justify-content:space-between;color:#999;font-size:6.8pt;margin-top:3mm}',
+    '@media print{body{background:#fff}.bar{display:none}.sheet{padding:0;width:auto}}'
+  ].join('\n');
+
+  return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<title>Чек-лист — ' + esc(c.org) + '</title><style>' + css + '</style></head><body>' +
+    '<div class="bar"><button type="button" onclick="window.print()">Печать / Сохранить PDF</button>' +
+    '<a href="?case_id=' + c.id + '&print=full">Подробная версия (2–3 листа)</a></div>' +
+    '<main class="sheet">' +
+    '<div class="top"><h1>' + esc(c.org) + '</h1><div class="kick">Чек-лист юриста<br>' + esc(L.title) + '</div></div>' +
+    '<div class="meta">' + meta + '</div>' +
+    '<div class="sum"><span>Заполнено ' + done + ' из ' + total + '</span>' + (probs.length ? '<span class="p">Проблем: ' + probs.length + '</span>' : '') + '</div>' +
+    probsHtml +
+    '<div class="pass"><span>Паспорт:</span>' + pass + '</div>' +
+    '<div class="cols">' + secs +
+    (D._comment ? '<section><h3>Комментарий юриста</h3><div class="cm">' + esc(D._comment).replace(/\n/g, '<br>') + '</div></section>' : '') +
+    '</div>' +
+    '<div class="sign"><div>Юрист: ' + esc(c.lawyer_name || '') + '</div><div>Подпись</div><div>Дата</div></div>' +
+    '<div class="foot"><span>#заявка' + c.id + '</span><span>✓ ок · ✗ проблема · – не применимо · ☐ не заполнено</span><span>Сформировано ' + ruDate(mskToday()) + '</span></div>' +
+    '</main><script>setTimeout(function(){try{window.print()}catch(e){}},600);</script></body></html>';
+}
+
 function setupHandoff(app) {
   ensureTables().catch(function (e) { console.error('handoff tables error:', e.message); });
   const bot = require('../bot/instance');
@@ -841,6 +1155,8 @@ function setupHandoff(app) {
   app.get('/checklist', async function (req, res) {
     var c = (await pool.query('SELECT * FROM cases WHERE id=$1', [parseInt(req.query.case_id) || 0])).rows[0];
     if (!c || !c.checklist_key) return res.send('Чек-лист не найден');
+    if (req.query.print === 'full') return res.send(printPage(c, LISTS[c.checklist_key]));
+    if (req.query.print) return res.send(printCompact(c, LISTS[c.checklist_key]));
     res.send(checklistPage(c, LISTS[c.checklist_key]));
   });
 }
@@ -1646,7 +1962,7 @@ function checklistClient() {
     // Внутри Telegram печать не работает — открываем версию для печати в браузере (там «Сохранить как PDF»)
     var url = location.origin + '/checklist?case_id=' + CASE.id + '&print=1';
     if (tg && tg.openLink && tg.initData) { failCount = 0; flush(); tg.openLink(url); }
-    else window.print();
+    else { flush(); location.href = url; }
   };
   if (/[?&]print=1/.test(location.search)) {
     Object.keys(OPEN).forEach(function (k) { OPEN[k] = true; });
