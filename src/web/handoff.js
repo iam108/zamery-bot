@@ -1453,11 +1453,15 @@ function checklistClient() {
 
   // ── Сохранение ────────────────────────────────────────
   var timer = null, refresh = null;
+  var LKEY = 'zamery_cl_' + CASE.id;
+  function backup() { try { localStorage.setItem(LKEY, JSON.stringify({ t: Date.now(), d: D })); } catch (e) {} }
+  function dropBackup() { try { localStorage.removeItem(LKEY); } catch (e) {} }
   function changed() {
+    backup();
     setSt('saving', 'Сохраняю…');
     summary();
     clearTimeout(refresh); refresh = setTimeout(refreshCounters, 250);
-    clearTimeout(timer); timer = setTimeout(flush, 700);
+    clearTimeout(timer); timer = setTimeout(flush, 1200);
   }
   function refreshCounters() {
     // Обновляем счётчики в заголовках разделов без полной перерисовки
@@ -1471,23 +1475,58 @@ function checklistClient() {
       if (gp) { if (probs) gp.textContent = probs; else gp.remove(); }
     });
   }
-  function setSt(cls, t) { var s = document.getElementById('st'); s.className = 'st ' + cls; s.textContent = t; }
+  function setSt(cls, t) {
+    var s = document.getElementById('st'); s.className = 'st ' + cls; s.textContent = t;
+    // Пока есть несохранённое — Telegram переспросит перед закрытием
+    try { if (cls === 'ok') tg.disableClosingConfirmation(); else tg.enableClosingConfirmation(); } catch (e) {}
+  }
+
+  // Один запрос за раз; всё, что изменилось во время отправки, уйдёт следующим запросом.
+  // При отказе сервера (лимит, обрыв связи) — повтор с паузой 3 → 6 → 12 → 24 → 30 с, пока не сохранится.
+  var inFlight = false, dirty = false, failCount = 0, retryTimer = null, countdown = null;
   async function flush() {
     clearTimeout(timer);
+    if (inFlight) { dirty = true; return; }
+    clearTimeout(retryTimer); clearInterval(countdown);
+    inFlight = true; dirty = false;
     var s = stats();
+    var ok = false, why = '';
     try {
       var r = await fetch('/api/checklist/save', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
         body: JSON.stringify({ case_id: CASE.id, data: D, done: s.done, total: s.total })
       });
-      var j = await r.json();
-      if (j.ok) setSt('ok', 'Сохранено'); else setSt('err', 'Не сохранено — повторите');
-    } catch (e) { setSt('err', 'Нет связи — не сохранено'); }
+      var txt = await r.text(), j = null;
+      try { j = JSON.parse(txt); } catch (pe) {}
+      ok = !!(j && j.ok);
+      if (!ok) why = j ? (j.error || 'ошибка сервера') : (r.status === 429 || /rate/i.test(txt) ? 'сервер занят' : 'сервер не ответил');
+    } catch (e) { why = 'нет связи'; }
+    inFlight = false;
+    if (ok) {
+      failCount = 0;
+      if (dirty) { setSt('saving', 'Сохраняю…'); timer = setTimeout(flush, 400); }
+      else { dropBackup(); setSt('ok', 'Сохранено'); }
+      return;
+    }
+    failCount++;
+    var wait = Math.min(30, 3 * Math.pow(2, failCount - 1));
+    var left = wait;
+    setSt('err', 'Не сохранено (' + why + '), повтор через ' + left + ' с');
+    countdown = setInterval(function () {
+      left--;
+      if (left > 0) setSt('err', 'Не сохранено (' + why + '), повтор через ' + left + ' с');
+    }, 1000);
+    retryTimer = setTimeout(function () { clearInterval(countdown); setSt('saving', 'Сохраняю…'); flush(); }, wait * 1000);
   }
+  // Свернули Telegram или закрыли чек-лист — сохраняем сразу
+  document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') flush(); });
+  window.addEventListener('pagehide', function () { flush(); });
+  // Тап по статусу — сохранить прямо сейчас
+  document.getElementById('st').onclick = function () { failCount = 0; flush(); };
   document.getElementById('printBtn').onclick = function () {
     // Внутри Telegram печать не работает — открываем версию для печати в браузере (там «Сохранить как PDF»)
     var url = location.origin + '/checklist?case_id=' + CASE.id + '&print=1';
-    if (tg && tg.openLink && tg.initData) { flush(); tg.openLink(url); }
+    if (tg && tg.openLink && tg.initData) { failCount = 0; flush(); tg.openLink(url); }
     else window.print();
   };
   if (/[?&]print=1/.test(location.search)) {
@@ -1495,8 +1534,15 @@ function checklistClient() {
     setTimeout(function () { window.print(); }, 700);
   }
 
+  // Если в прошлый раз закрыли до сохранения — восстанавливаем отметки с телефона и досохраняем
+  var restored = false;
+  try {
+    var bk = JSON.parse(localStorage.getItem(LKEY) || 'null');
+    if (bk && bk.d && Date.now() - bk.t < 7 * 24 * 3600 * 1000) { D = bk.d; restored = true; }
+  } catch (e) {}
   render();
-  setSt('ok', 'Сохранено');
+  if (restored) { setSt('saving', 'Восстановлены несохранённые отметки, сохраняю…'); setTimeout(flush, 300); }
+  else setSt('ok', 'Сохранено');
 }
 
 function checklistPage(c, L) {
@@ -1599,7 +1645,7 @@ function checklistPage(c, L) {
     '.dock{position:fixed;left:12px;right:12px;bottom:max(12px,env(safe-area-inset-bottom));z-index:6;border-radius:999px;display:flex;align-items:center;gap:10px;padding:8px 8px 8px 18px;background:var(--glass2)}',
     '.st{flex:1;font-size:13px;color:var(--ink2);display:flex;align-items:center;gap:7px}',
     '.st:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--ok)}',
-    '.st.saving:before{background:var(--warn)}.st.err{color:var(--bad)}.st.err:before{background:var(--bad)}',
+    '.st.saving:before{background:var(--warn)}.st.err{color:var(--bad);cursor:pointer}.st.err:before{background:var(--bad)}',
     '.pbtn{border:0;border-radius:999px;padding:11px 18px;font:inherit;font-weight:600;font-size:14px;color:var(--ink);background:var(--well);cursor:pointer}',
     'button:focus-visible,.inp:focus-visible{outline:2px solid var(--accent);outline-offset:2px}',
     '@media (prefers-reduced-motion:reduce){*{transition:none!important}}',
