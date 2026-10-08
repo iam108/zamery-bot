@@ -429,8 +429,14 @@ function miniAppForm() {
   <button class="submit-btn" id="submit-btn" onclick="submitForm()">Отправить заявку</button>
 </div>
 <script>
-var tg = window.Telegram.WebApp;
-tg.ready(); tg.expand();
+var tg = (window.Telegram && window.Telegram.WebApp) || {
+  ready: function () {}, expand: function () {}, close: function () {},
+  showAlert: function (m) { alert(m); }, initDataUnsafe: {}
+};
+try { tg.ready(); tg.expand(); } catch (e) {}
+function tgUserId() {
+  try { return tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user.id : ''; } catch (e) { return ''; }
+}
 function toggleVideo(e) {
   if (e) e.stopPropagation();
   var cb = document.getElementById('has_video');
