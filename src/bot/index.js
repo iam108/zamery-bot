@@ -38,6 +38,7 @@ function setupBot() {
     if (!me.approved) return ctx.reply('⏳ Заявка на доступ (' + (ROLES[me.requested_role || me.role] || '') + ') ждёт одобрения. Как только её одобрят, я напишу.');
     // Кнопки клавиатуры не получают подпись Telegram — добавляем личный ключ сотрудника
     const kq = '?' + require('../web/auth').keyQuery(ctx.from.id);
+    console.log('/start keyboard with key for', ctx.from.id, me.role);
     const zamer = Markup.button.webApp('📋 Заявка на замер', WEBAPP_URL + '/form' + kq);
     let kb;
     const requestsBtn = Markup.button.webApp('📥 Нераспределённые', WEBAPP_URL + '/requests' + kq);

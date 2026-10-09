@@ -60,8 +60,15 @@ function checkUserKey(uid, key) {
 async function requireStaff(req, res, next) {
   try {
     await ensureStaff();
-    const user = checkInitData(req.get('X-Tg-Init')) || checkUserKey(req.get('X-Tg-U'), req.get('X-Tg-K'));
-    if (!user) return res.status(401).json({ ok: false, error: 'Нет доступа. Закройте и откройте форму заново через бота.' });
+    const rawInit = req.get('X-Tg-Init') || '';
+    const rawU = req.get('X-Tg-U') || '', rawK = req.get('X-Tg-K') || '';
+    const user = checkInitData(rawInit) || checkUserKey(rawU, rawK);
+    if (!user) {
+      // Диагностика: что именно пришло от телефона
+      const code = 'подпись: ' + (!rawInit ? 'нет' : 'неверная') + ', ключ: ' + (!rawU ? 'нет' : 'неверный');
+      console.log('auth 401', req.method, req.originalUrl.split('?')[0], '|', code, '| init len', rawInit.length, '| u', rawU, '| ua', (req.get('User-Agent') || '').slice(0, 60));
+      return res.status(401).json({ ok: false, error: 'Нет доступа (' + code + '). Напишите боту /start и откройте кнопкой из новой клавиатуры.' });
+    }
     const staff = (await pool.query('SELECT * FROM staff WHERE tg_id=$1 AND approved = true', [user.id])).rows[0];
     if (!staff) return res.status(403).json({ ok: false, error: 'Нет доступа. Нажмите /start в боте и дождитесь одобрения.' });
     req.tgUser = user;
