@@ -1963,7 +1963,7 @@ function checklistClient() {
     setSt('saving', 'Сохраняю…');
     summary();
     clearTimeout(refresh); refresh = setTimeout(refreshCounters, 250);
-    clearTimeout(timer); timer = setTimeout(flush, 1200);
+    clearTimeout(timer); timer = setTimeout(flush, 2500);
   }
   function refreshCounters() {
     // Обновляем счётчики в заголовках разделов без полной перерисовки
@@ -1986,18 +1986,23 @@ function checklistClient() {
   // Один запрос за раз; всё, что изменилось во время отправки, уйдёт следующим запросом.
   // При отказе сервера (лимит, обрыв связи) — повтор с паузой 3 → 6 → 12 → 24 → 30 с, пока не сохранится.
   var inFlight = false, dirty = false, failCount = 0, retryTimer = null, countdown = null;
+  var lastSaved = JSON.stringify(D), retryAfter = 0;
   async function flush() {
     clearTimeout(timer);
     if (inFlight) { dirty = true; return; }
     clearTimeout(retryTimer); clearInterval(countdown);
-    inFlight = true; dirty = false;
     var s = stats();
+    var body = JSON.stringify({ case_id: CASE.id, data: D, done: s.done, total: s.total });
+    var snapshot = JSON.stringify(D);
+    if (snapshot === lastSaved) { dropBackup(); setSt('ok', 'Сохранено'); return; } // ничего не изменилось — не нагружаем сервер
+    inFlight = true; dirty = false;
     var ok = false, why = '';
     try {
       var r = await fetch('/api/checklist/save', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
-        body: JSON.stringify({ case_id: CASE.id, data: D, done: s.done, total: s.total })
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: body
       });
+      retryAfter = parseInt(r.headers.get('Retry-After')) || 0;
       var txt = await r.text(), j = null;
       try { j = JSON.parse(txt); } catch (pe) {}
       ok = !!(j && j.ok);
@@ -2005,13 +2010,13 @@ function checklistClient() {
     } catch (e) { why = 'нет связи'; }
     inFlight = false;
     if (ok) {
-      failCount = 0;
+      failCount = 0; lastSaved = snapshot;
       if (dirty) { setSt('saving', 'Сохраняю…'); timer = setTimeout(flush, 400); }
       else { dropBackup(); setSt('ok', 'Сохранено'); }
       return;
     }
     failCount++;
-    var wait = Math.min(30, 3 * Math.pow(2, failCount - 1));
+    var wait = Math.max(Math.min(retryAfter, 120), Math.min(40, 5 * Math.pow(2, failCount - 1)));
     var left = wait;
     setSt('err', 'Не сохранено (' + why + '), повтор через ' + left + ' с');
     countdown = setInterval(function () {
