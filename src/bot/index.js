@@ -8,6 +8,7 @@ function setupBot() {
   const GROUP_ID = process.env.GROUP_CHAT_ID;
   const WEBAPP_URL = process.env.WEBAPP_URL;
   require('../web/handoff').setupReportsBot(bot);
+  require('./egrn').setupEgrn(bot);
   const pool = require('../db/pool');
   const { ensureStaff } = require('../web/auth');
   const { esc } = require('./formatter');
@@ -43,7 +44,7 @@ function setupBot() {
     let kb;
     const requestsBtn = Markup.button.webApp('📥 Нераспределённые', WEBAPP_URL + '/requests' + kq);
     const handoffBtn = Markup.button.webApp('⚖️ Передать юристу', WEBAPP_URL + '/handoff' + kq);
-    if (me.role === 'manager') kb = [[requestsBtn], [zamer, handoffBtn]];
+    if (me.role === 'manager') kb = [[requestsBtn], [zamer, handoffBtn], ['📄 Выписка ЕГРН']];
     else if (me.role === 'lawyer') kb = [[requestsBtn], [zamer, '📂 Мои клиенты']];
     else kb = [[Markup.button.webApp('🔍 Отчёт аудитора', WEBAPP_URL + '/audit' + kq)]];
     const pending = me.requested_role && me.requested_role !== me.role ? '\n⏳ Запрос на роль «' + ROLES[me.requested_role] + '» ждёт одобрения.' : '';
