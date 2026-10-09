@@ -92,6 +92,20 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
       
             await setTelegramMsgId(order.id, msg.message_id);
 
+      // Выписка ЕГРН: есть — прикладываем к заявке для аудитора, нет — заказываем (придёт ответом на заявку)
+      if (data.cad_num) {
+        try {
+          const egrn = await require('../bot/egrn').attachOrOrder({
+            cad: data.cad_num, label: [data.owner_name, data.object_name].filter(Boolean).join(' · '),
+            order: !!data.egrn_order, orderedBy: req.tgUser.id, orderedName: req.staff.name,
+            targets: [{ chat: Number(process.env.GROUP_CHAT_ID), reply: msg.message_id }],
+            note: 'Для заявки на замер #' + order.id,
+          });
+          const notes = { attached: '📄 Выписка ЕГРН приложена к заявке', ordered: '⏳ Выписка ЕГРН заказана — придёт ответом на заявку', waiting: '⏳ Выписка ЕГРН уже в работе — придёт ответом на заявку' };
+          if (notes[egrn.result]) await botInstance.telegram.sendMessage(process.env.GROUP_CHAT_ID, notes[egrn.result] + ' (' + egrn.cad + ')', { reply_to_message_id: msg.message_id, disable_notification: true });
+        } catch (e) { console.error('egrn for order:', e.message); }
+      }
+
      if (files.length > 0) {
   for (var i = 0; i < files.length; i++) {
     var att = files[i];
@@ -419,6 +433,17 @@ function miniAppForm() {
   </div>
 </div>
 <div class="field">
+  <label>Кадастровый номер (для выписки ЕГРН)</label>
+  <input id="cad_num" type="text" inputmode="decimal" placeholder="77:17:0120316:38939">
+  <div class="toggle-row" onclick="toggleEgrn(event)" style="cursor:pointer;margin-top:8px">
+    <span style="font-size:14px">📄 Заказать выписку, если её ещё нет</span>
+    <label class="toggle" onclick="event.stopPropagation()">
+      <input type="checkbox" id="egrn_order" checked>
+      <span class="slider"></span>
+    </label>
+  </div>
+</div>
+<div class="field">
   <label>Информация о зонах</label>
   <textarea id="zones_info" placeholder="Описание зон, площадь, особенности..."></textarea>
 </div>
@@ -450,6 +475,11 @@ var tg = (window.Telegram && window.Telegram.WebApp) || {
 try { tg.ready(); tg.expand(); } catch (e) {}
 function tgUserId() {
   try { return tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user.id : ''; } catch (e) { return ''; }
+}
+function toggleEgrn(e) {
+  if (e) e.stopPropagation();
+  var cb = document.getElementById('egrn_order');
+  cb.checked = !cb.checked;
 }
 function toggleVideo(e) {
   if (e) e.stopPropagation();
@@ -493,6 +523,8 @@ formData.append('zones_info', document.getElementById('zones_info').value.trim()
 formData.append('deadline', document.getElementById('deadline').value || '');
 formData.append('contacts', document.getElementById('contacts').value.trim());
 formData.append('tg_user_id', tgUserId());
+formData.append('cad_num', document.getElementById('cad_num').value.trim());
+formData.append('egrn_order', document.getElementById('egrn_order').checked ? '1' : '');
 attachedFiles.slice(0,5).forEach(function(f) {
   formData.append('files', f, f.name);
 });

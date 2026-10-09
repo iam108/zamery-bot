@@ -1089,8 +1089,9 @@ function setupHandoff(app) {
         }
         var opts = { parse_mode: 'HTML' };
         if (reqRow && String(reqRow.chat_id) === String(CLIENTS)) opts.reply_to_message_id = Number(reqRow.first_id);
-        try { await bot.telegram.sendMessage(CLIENTS, text, opts); }
-        catch (e) { delete opts.reply_to_message_id; await bot.telegram.sendMessage(CLIENTS, text, opts); }
+        var cardMsg = null;
+        try { cardMsg = await bot.telegram.sendMessage(CLIENTS, text, opts); }
+        catch (e) { delete opts.reply_to_message_id; cardMsg = await bot.telegram.sendMessage(CLIENTS, text, opts); }
         if (reqRow && String(reqRow.chat_id) === String(CLIENTS)) {
           try { await bot.telegram.editMessageReplyMarkup(CLIENTS, Number(reqRow.first_id), undefined, { inline_keyboard: [[{ text: '✅ Передано: ' + lawyer.name, callback_data: 'noop' }]] }); }
           catch (e) { /* заявка опубликована другим ботом — кнопку не поменять */ }
@@ -1109,13 +1110,29 @@ function setupHandoff(app) {
       var kb = c.checklist_key
         ? { inline_keyboard: [[{ text: '📋 Открыть чек-лист', web_app: { url: WEBAPP_URL + '/checklist?case_id=' + c.id } }]] }
         : undefined;
+      var lawyerMsg = null, dmWarn = null;
       try {
-        await bot.telegram.sendMessage(lawyer.tg_id, '🆕 <b>У вас новый клиент</b>\n\n' + text, { parse_mode: 'HTML', reply_markup: kb });
+        lawyerMsg = await bot.telegram.sendMessage(lawyer.tg_id, '🆕 <b>У вас новый клиент</b>\n\n' + text, { parse_mode: 'HTML', reply_markup: kb });
       } catch (e) {
         console.error('lawyer DM:', e.message);
-        return res.json({ ok: true, id: c.id, warn: 'Карточка отправлена в чат, но юрист не получил личное сообщение — пусть нажмёт /start в боте.' });
+        dmWarn = 'Карточка отправлена в чат, но юрист не получил личное сообщение — пусть нажмёт /start в боте.';
       }
-      res.json({ ok: true, id: c.id });
+
+      // 3) Выписка ЕГРН: есть — прикладываем юристу и в «Заявки по клиенту», нет — заказываем и доставим, когда будет готова
+      var egrnNote = '';
+      if (d.cad_num) {
+        try {
+          var targets = [];
+          if (lawyerMsg) targets.push({ chat: Number(lawyer.tg_id), reply: lawyerMsg.message_id });
+          if (CLIENTS && cardMsg) targets.push({ chat: Number(CLIENTS), reply: cardMsg.message_id });
+          var eg = await require('../bot/egrn').attachOrOrder({
+            cad: d.cad_num, label: d.org, order: !!d.egrn_order, orderedBy: req.tgUser.id, orderedName: req.staff.name,
+            targets: targets, note: 'Для клиента ' + d.org + ' (юрист ' + lawyer.name + ')',
+          });
+          egrnNote = { attached: 'Выписка ЕГРН приложена.', ordered: 'Выписка ЕГРН заказана — придёт юристу и в «Заявки по клиенту».', waiting: 'Выписка ЕГРН уже в работе — придёт юристу и в «Заявки по клиенту».' }[eg.result] || '';
+        } catch (e) { console.error('egrn for handoff:', e.message); egrnNote = 'Выписку ЕГРН заказать не удалось: ' + e.message; }
+      }
+      res.json({ ok: true, id: c.id, warn: [dmWarn, egrnNote].filter(Boolean).join(' ') || undefined });
     } catch (e) { console.error('api/handoff error:', e); res.json({ ok: false, error: e.message }); }
   });
 
@@ -1369,6 +1386,7 @@ function handoffClient() {
     function set(id, v) { if (v && !$(id).value.trim()) $(id).value = v.replace(/^[\s:]+/, '').trim(); }
     function grab(re) { var m = t.match(re); return m ? m[1].trim() : ''; }
     set('inn', grab(/ИНН[^\d\n]*(\d{10,12})/i));
+    set('cad_num', (t.match(/\b\d{2}:\d{2}:\d{6,7}:\d{1,9}\b/) || [''])[0]);
     var owner = grab(/(?:Чей объект|Наименование организации)\s*:\s*:?\s*([^\n]+)/i) || grab(/^\s*((?:ООО|ИП|АО|ПАО|ЗАО)\s*[^\n]*)/im);
     var oname = grab(/Название(?: объекта)?\s*:\s*([^\n]+)/i);
     set('org', owner && oname && owner.indexOf(oname) === -1 ? owner + ' (' + oname + ')' : owner || oname);
@@ -1463,6 +1481,7 @@ function handoffClient() {
       var r = await fetch('/api/handoff', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
         order_id: orderId ? parseInt(orderId) : null, request_id: requestId ? parseInt(requestId) : null, lawyer_tg_id: S.lawyer, region: S.region, kind: S.kind, service: S.service, priority: S.priority,
         org: $('org').value.trim(), inn: $('inn').value.trim(), contacts: readContacts(),
+        cad_num: $('cad_num').value.trim(), egrn_order: $('egrn_order').checked,
         address: $('address').value.trim(), comment: $('comment').value.trim(),
         report_src: REP ? REP.src : null, report_id: REP ? REP.id : null, audit_text: REP ? REP.text : '',
         tg_user_id: tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user.id : null }) });
@@ -1539,6 +1558,7 @@ function handoffPage() {
     '.ct input{padding:10px 12px;font-size:14px;background:var(--glass2)}',
     '.ct .c-name{grid-column:1/-1;padding-right:40px;font-weight:600}',
     '.c-x{top:13px;right:13px}',
+    '.egrn{display:flex;align-items:center;gap:8px;margin-top:8px;font-size:13.5px;color:var(--ink2)}.egrn input{width:18px;height:18px;padding:0;accent-color:var(--accent)}',
     '.addc{width:100%;padding:11px;border-radius:14px;border:1.5px dashed color-mix(in srgb,var(--accent) 45%,transparent);background:none;color:var(--accent);font:inherit;font-size:14px;font-weight:600;cursor:pointer}',
     // нижняя панель
     '.dock{position:fixed;left:12px;right:12px;bottom:max(12px,env(safe-area-inset-bottom));z-index:6;border-radius:999px;padding:7px;background:var(--glass2)}',
@@ -1568,6 +1588,8 @@ function handoffPage() {
     '<section class="glass grp"><h2>Клиент</h2>' +
     '<div class="f"><label class="lbl" for="org">Организация <span class="req">*</span></label><input id="org" placeholder="ООО «Название»"></div>' +
     '<div class="f"><label class="lbl" for="inn">ИНН</label><input id="inn" inputmode="numeric" placeholder="10 или 12 цифр"></div>' +
+    '<div class="f"><label class="lbl" for="cad_num">Кадастровый номер</label><input id="cad_num" inputmode="decimal" placeholder="77:17:0120316:38939">' +
+    '<label class="egrn"><input type="checkbox" id="egrn_order" checked> Заказать выписку ЕГРН, если её ещё нет</label></div>' +
     '<div class="f"><label class="lbl" for="address">Адрес</label><textarea id="address" rows="2" style="min-height:56px"></textarea></div>' +
     '<div class="f"><span class="lbl">Контакты</span><div id="contacts"></div>' +
     '<button type="button" id="add-contact" class="addc">+ Добавить контакт</button></div>' +

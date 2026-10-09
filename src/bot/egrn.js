@@ -11,6 +11,8 @@ const TYPES = {
 // Кадастровый номер: 77:17:0120316:38939 (квартал 6–7 цифр, номер 1–9 цифр)
 const CAD_RE = /\b\d{2}:\d{2}:\d{6,7}:\d{1,9}\b/g;
 const MAX_POLL_HOURS = 72;
+const TYPE_DOC = 'kvarmrusxmlpdf'; // выписка об объекте
+let tgApi = null; // bot.telegram — задаётся в setupEgrn, нужен и формам (заявка на замер, передача юристу)
 
 let ready = null;
 function ensureTables() {
@@ -35,6 +37,8 @@ function ensureTables() {
         created_at    TIMESTAMPTZ DEFAULT NOW(),
         updated_at    TIMESTAMPTZ DEFAULT NOW()
       );
+      ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS deliver JSONB DEFAULT '[]';
+      ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS file_msgs JSONB DEFAULT '[]';
       CREATE TABLE IF NOT EXISTS egrn_pending (
         id         SERIAL PRIMARY KEY,
         cad_num    TEXT NOT NULL,
@@ -158,19 +162,17 @@ function setupEgrn(bot) {
   const CHAT = function () { return process.env.EGRN_CHAT_ID; };
   const waitInput = {}; // userId → время ожидания строки с кадастровым номером
 
-  async function isManager(uid) {
+  async function canOrder(uid, chatId) {
+    if (CHAT() && String(chatId) === String(CHAT())) return true; // участник чата выписок
     const admins = String(process.env.ADMIN_TG_IDS || '').split(/[\s,;]+/);
     if (admins.indexOf(String(uid)) !== -1) return true;
-    const s = (await pool.query("SELECT 1 FROM staff WHERE tg_id=$1 AND approved = true AND role='manager'", [uid])).rows[0];
+    const s = (await pool.query('SELECT 1 FROM staff WHERE tg_id=$1 AND approved = true', [uid])).rows[0];
     return !!s;
   }
   function nameOf(from) { return [from.first_name, from.last_name].filter(Boolean).join(' ') || from.username || String(from.id); }
 
   function orderButtons(pid) {
-    return [
-      { text: '📄 Об объекте', callback_data: 'eg:' + pid + ':kv' },
-      { text: '🔁 О переходе прав', callback_data: 'eg:' + pid + ':et' },
-    ];
+    return [{ text: '📄 Заказать выписку', callback_data: 'eg:' + pid + ':kv' }];
   }
 
   async function offer(ctx, items, chatId, srcMsgId, intro) {
@@ -196,31 +198,33 @@ function setupEgrn(bot) {
         const items = parseCads(text);
         if (!items.length) return ctx.reply('Не нашёл кадастровый номер. Формат: 77:17:0120316:38939 - ООО Скандинавия');
         delete waitInput[ctx.from.id];
-        return offer(ctx, items, ctx.chat.id, ctx.message.message_id, 'Какую выписку заказать?' + (configured() ? '' : '\n⚠️ Заказ не настроен: нет доступов к API в Railway.'));
+        return offer(ctx, items, ctx.chat.id, ctx.message.message_id, 'Заказать выписку об объекте?' + (configured() ? '' : '\n⚠️ Заказ не настроен: нет доступов к API в Railway.'));
       }
       // 2) сообщение в чате выписок
       if (CHAT() && String(ctx.chat.id) === String(CHAT()) && text) {
         const items = parseCads(text);
-        if (items.length) await offer(ctx, items, ctx.chat.id, ctx.message.message_id, 'Заказать выписку? (только для менеджеров)');
+        if (items.length) await offer(ctx, items, ctx.chat.id, ctx.message.message_id, 'Заказать выписку об объекте?');
       }
     } catch (e) { console.error('egrn message:', e.message); }
     return next();
   });
 
+  tgApi = bot.telegram;
   bot.hears('📄 Выписка ЕГРН', async function (ctx) {
-    if (!(await isManager(ctx.from.id))) return ctx.reply('Заказывать выписки могут только менеджеры.');
+    if (!(await canOrder(ctx.from.id, ctx.chat.id))) return ctx.reply('Нет доступа. Нажмите /start.');
     waitInput[ctx.from.id] = Date.now();
     await ctx.reply('Пришлите кадастровый номер и организацию, как в чате выписок:\n<code>77:17:0120316:38939 - ООО Скандинавия</code>\n\nМожно несколько строк — по одной на объект.', { parse_mode: 'HTML' });
   });
 
   // ── Нажатие «Заказать»
-  bot.action(/^eg:(\d+):(kv|et)(:force)?$/, async function (ctx) {
+  bot.action(/^eg:(\d+):(kv)(:force)?$/, async function (ctx) {
     try {
-      if (!(await isManager(ctx.from.id))) return ctx.answerCbQuery('Заказывать выписки могут только менеджеры', { show_alert: true });
+      const cbChat = ctx.callbackQuery && ctx.callbackQuery.message && ctx.callbackQuery.message.chat ? ctx.callbackQuery.message.chat.id : ctx.from.id;
+      if (!(await canOrder(ctx.from.id, cbChat))) return ctx.answerCbQuery('Нет доступа к заказу выписок', { show_alert: true });
       if (!configured()) return ctx.answerCbQuery('Нет доступов к API ЕГРН в Railway (EGRN_TOKEN, EGRN_DECLARANT_ID)', { show_alert: true });
       const p = (await pool.query('SELECT * FROM egrn_pending WHERE id=$1', [ctx.match[1]])).rows[0];
       if (!p) return ctx.answerCbQuery('Кнопка устарела, пришлите номер ещё раз', { show_alert: true });
-      const typeDoc = ctx.match[2] === 'kv' ? 'kvarmrusxmlpdf' : 'etrparmrusxmlpdf';
+      const typeDoc = TYPE_DOC;
 
       // Уже заказывали за 30 дней?
       if (!ctx.match[3]) {
@@ -229,7 +233,7 @@ function setupEgrn(bot) {
           [p.cad_num, typeDoc])).rows[0];
         if (prev) {
           await ctx.answerCbQuery();
-          return ctx.reply('Эту выписку уже заказывали ' + new Date(prev.created_at).toLocaleDateString('ru-RU') + ' (' + (prev.ordered_name || '') + '), статус: ' + (prev.status_text || prev.status) + '. Заказать ещё раз?', {
+          return ctx.reply('Выписку по ' + p.cad_num + ' уже заказывали ' + new Date(prev.created_at).toLocaleDateString('ru-RU') + ' (' + (prev.ordered_name || '') + '), статус: ' + (prev.status_text || prev.status) + '. Заказать ещё раз?', {
             reply_markup: { inline_keyboard: [[{ text: 'Да, заказать ещё раз', callback_data: 'eg:' + p.id + ':' + ctx.match[2] + ':force' }]] },
           });
         }
@@ -247,7 +251,7 @@ function setupEgrn(bot) {
       catch (e) { delete opts.reply_to_message_id; msg = await ctx.telegram.sendMessage(target, cardText(o), opts); }
       await pool.query('UPDATE egrn_orders SET status_msg_id=$1 WHERE id=$2', [msg.message_id, o.id]);
       if (String(target) !== String(ctx.from.id)) {
-        try { await ctx.telegram.sendMessage(ctx.from.id, '⏳ Выписка ' + TYPES[typeDoc].short + ' по ' + p.cad_num + ' заказана (№' + idSt + '). Пришлю, когда будет готова.'); } catch (e) {}
+        try { await ctx.telegram.sendMessage(ctx.from.id, '⏳ Выписка по ' + p.cad_num + ' заказана (№' + idSt + '). Пришлю, когда будет готова.'); } catch (e) {}
       }
       try { await ctx.editMessageReplyMarkup({ inline_keyboard: [[{ text: '✅ Заказано: ' + nameOf(ctx.from), callback_data: 'noop' }]] }); } catch (e) {}
     } catch (e) {
@@ -303,20 +307,25 @@ function setupEgrn(bot) {
           continue;
         }
         let sent = 0;
+        const fileMsgs = [];
+        const caption = '📄 Выписка ЕГРН ' + o.cad_num + (o.label ? ' — ' + o.label : '');
         for (const u of urls.slice(0, 6)) {
           try {
             const f = await download(u);
-            const caption = (TYPES[o.type_doc] ? TYPES[o.type_doc].icon : '📄') + ' ' + o.cad_num + (o.label ? ' — ' + o.label : '');
             const extra = { caption: caption.slice(0, 1000) };
             if (o.status_msg_id) extra.reply_to_message_id = Number(o.status_msg_id);
-            await bot.telegram.sendDocument(o.chat_id, { source: f.buf, filename: f.name }, extra);
-            if (String(o.ordered_by) !== String(o.chat_id)) {
-              try { await bot.telegram.sendDocument(o.ordered_by, { source: f.buf, filename: f.name }, { caption: caption.slice(0, 1000) }); } catch (e) {}
-            }
+            const m = await bot.telegram.sendDocument(o.chat_id, { source: f.buf, filename: f.name }, extra);
+            if (m && m.message_id) fileMsgs.push({ chat: Number(o.chat_id), id: m.message_id });
             sent++;
           } catch (e) { console.error('egrn file:', e.message); }
         }
-        if (sent) await pool.query('UPDATE egrn_orders SET files_sent=$1 WHERE id=$2', [sent, o.id]);
+        if (sent) {
+          await pool.query('UPDATE egrn_orders SET files_sent=$1, file_msgs=$2 WHERE id=$3', [sent, JSON.stringify(fileMsgs), o.id]);
+          // копии: заказавшему и туда, куда выписку ждут (заявка на замер, юрист, «Заявки по клиенту»)
+          const targets = (Array.isArray(o.deliver) ? o.deliver : []).slice();
+          if (String(o.ordered_by) !== String(o.chat_id) && !targets.some(function (t) { return String(t.chat) === String(o.ordered_by); })) targets.push({ chat: Number(o.ordered_by) });
+          await copyFiles(fileMsgs, targets);
+        }
       } catch (e) {
         console.error('egrn status', o.id_statement, e.message);
         await pool.query('UPDATE egrn_orders SET error=$1, polls=polls+1 WHERE id=$2', [e.message.slice(0, 300), o.id]);
@@ -327,4 +336,54 @@ function setupEgrn(bot) {
   setInterval(poll, 3 * 60 * 1000);
 }
 
-module.exports = { setupEgrn, parseCads, readStatus, findFileUrls, findReq };
+async function copyFiles(fileMsgs, targets) {
+  if (!tgApi) return 0;
+  let n = 0;
+  for (const t of targets) {
+    for (const fm of fileMsgs) {
+      try {
+        await tgApi.callApi('copyMessage', Object.assign({ chat_id: t.chat, from_chat_id: fm.chat, message_id: fm.id },
+          t.reply ? { reply_parameters: { message_id: Number(t.reply), allow_sending_without_reply: true } } : {}));
+        n++;
+      } catch (e) { console.error('egrn copy:', e.message); }
+    }
+  }
+  return n;
+}
+
+// Для форм «Заявка на замер» и «Передать юристу»:
+// есть свежая выписка — прикладываем сразу; нет и разрешён заказ — заказываем и доставим, когда будет готова.
+// targets: [{ chat, reply }]
+async function attachOrOrder(opts) {
+  const cad = (String(opts.cad || '').match(CAD_RE) || [])[0];
+  if (!cad) return { result: 'none' };
+  await ensureTables();
+  const prev = (await pool.query(
+    "SELECT * FROM egrn_orders WHERE cad_num=$1 AND type_doc=$2 AND status <> 'failed' AND created_at > NOW() - INTERVAL '30 days' ORDER BY id DESC LIMIT 1",
+    [cad, TYPE_DOC])).rows[0];
+  if (prev && prev.files_sent > 0 && Array.isArray(prev.file_msgs) && prev.file_msgs.length) {
+    await copyFiles(prev.file_msgs, opts.targets || []);
+    return { result: 'attached', cad: cad };
+  }
+  if (prev && prev.status !== 'failed' && prev.files_sent >= 0) {
+    // уже заказана и ещё не готова — просто добавляем получателей
+    const merged = (Array.isArray(prev.deliver) ? prev.deliver : []).concat(opts.targets || []);
+    await pool.query('UPDATE egrn_orders SET deliver=$1 WHERE id=$2', [JSON.stringify(merged), prev.id]);
+    return { result: 'waiting', cad: cad };
+  }
+  if (!opts.order || !configured()) return { result: 'none', cad: cad };
+  const idSt = await apiOrder(cad, TYPE_DOC);
+  const target = process.env.EGRN_CHAT_ID || opts.orderedBy;
+  const o = (await pool.query(
+    "INSERT INTO egrn_orders (cad_num, label, type_doc, ordered_by, ordered_name, id_statement, status, status_text, chat_id, deliver) VALUES ($1,$2,$3,$4,$5,$6,'ordered','заказана',$7,$8) RETURNING *",
+    [cad, opts.label || '', TYPE_DOC, opts.orderedBy, opts.orderedName || '', idSt, target, JSON.stringify(opts.targets || [])])).rows[0];
+  if (tgApi && target) {
+    try {
+      const m = await tgApi.sendMessage(target, cardText(o, opts.note ? esc(opts.note) : ''), { parse_mode: 'HTML' });
+      await pool.query('UPDATE egrn_orders SET status_msg_id=$1 WHERE id=$2', [m.message_id, o.id]);
+    } catch (e) { console.error('egrn card:', e.message); }
+  }
+  return { result: 'ordered', cad: cad, id: idSt };
+}
+
+module.exports = { setupEgrn, parseCads, readStatus, findFileUrls, findReq, attachOrOrder, CAD_RE };
