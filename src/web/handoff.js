@@ -358,7 +358,9 @@ function setupReportsWeb(app, upload) {
 
 // ── Заявки по клиенту: нераспределённые ───────────────────────────────
 var REQ_RE = 'Новая форма заполнена|Наименование организации|ИНН[^0-9]{0,6}[0-9]{10}';
-var NOT_REQ_RE = 'Клиент передан юристу|Чек-лист выполнен|Красный флаг|Запросить документы|Заявка не распределена';
+// Служебные сообщения нашего бота — только по заголовку в начале сообщения,
+// иначе выпадали настоящие заявки со словами «запросить документы» в комментарии
+var NOT_REQ_RE = '^[^А-Яа-яЁёA-Za-z0-9]*(Клиент передан юристу|У вас новый клиент|Чек-лист выполнен|Красный флаг ЕГРН|Запросить документы у клиента|Заявление подано|Проверить решение|Заявка не распределена)';
 
 function parseRequest(text) {
   var t = String(text || '');
@@ -367,18 +369,41 @@ function parseRequest(text) {
   f.client = grab(/Имя клиента\s*:([^\n]*)/i) || grab(/Клиент\s*:([^\n+\d]*)/i);
   f.phone = grab(/Номер\s*:([^\n]*)/i) || (t.match(/\+?[78][\s\-()]*\d{3}[\s\-()]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}/) || [''])[0];
   f.org = grab(/Наименование организации\s*:([^\n]*)/i);
-  if (!f.org) { var m = t.match(/^\s*((?:ООО|ИП|АО|ПАО|ЗАО)\s*[^\n]*)/im); if (m) f.org = m[1].trim(); }
+  if (!f.org) {
+    // все юрлица из текста: «ИП Залевич», «ООО ХУКА ЗИЛАРТ»…
+    var orgs = (t.match(/^[ \t]*(?:ООО|ИП|АО|ПАО|ЗАО)[ \t]*[^\n]+/gim) || []).map(function (x) { return x.trim(); });
+    if (orgs.length) f.org = orgs.filter(function (x, i) { return orgs.indexOf(x) === i; }).join(', ');
+  }
   f.inn = grab(/ИНН[^\d\n]*(\d{10,12})/i);
   f.city = grab(/Город\s*:([^\n]*)/i);
   f.address = grab(/Адрес лицензирования\s*:([^\n]*)/i) || grab(/Адрес\s*:([^\n]*)/i);
   var kind = grab(/Вид объекта\s*:([^\n]*)/i) || t.slice(0, 200);
-  f.kind = /табак/i.test(kind) ? 'Табак' : /магазин|розниц/i.test(kind) ? 'Магазин' : /общепит|кафе|бар|ресторан/i.test(kind) ? 'Общепит' : '';
+  // Вид: слово «табак» → табак; явно указанный общепит/магазин важнее ключевых слов;
+  // иначе табак узнаём по ХМ / Хука Маркет / вейп / никотин (кальянные — это общепит)
+  var TOBACCO = /табак|хука[ -]?маркет|hookah[ -]?market|вейп|никотин|(^|[^А-Яа-яЁёA-Za-z])ХМ([^А-Яа-яЁёA-Za-z]|$)/i;
+  if (/табак/i.test(kind)) f.kind = 'Табак';
+  else if (/общепит/i.test(kind)) f.kind = 'Общепит';
+  else if (/магазин|розниц/i.test(kind) && !TOBACCO.test(t)) f.kind = 'Магазин';
+  else if (TOBACCO.test(t)) f.kind = 'Табак';
+  else f.kind = /магазин|розниц/i.test(kind) ? 'Магазин' : /общепит|кафе|бар|ресторан|кальян/i.test(kind) ? 'Общепит' : '';
   var svc = grab(/Услуга\s*:([^\n]*)/i) || t.slice(0, 200);
   f.service = /переоформ/i.test(svc) ? 'Переоформление' : /продлен/i.test(svc) ? 'Продление' : /получен/i.test(svc) ? 'Получение' : '';
   var where = (f.city + ' ' + f.address).toLowerCase();
-  f.region = /московская обл|городской округ/.test(where) ? 'МО' : /москва/.test(where) ? 'МСК' : (f.city ? 'МО' : '');
+  var NB = '[^А-Яа-яЁёA-Za-z]';
+  var hasSpb = new RegExp('(^|' + NB + ')(спб|питер)(' + NB + '|$)|санкт', 'i').test(t);
+  var hasMsk = new RegExp('(^|' + NB + ')мск(' + NB + '|$)', 'i').test(t);
+  var hasMo = new RegExp('(^|' + NB + ')мо(' + NB + '|$)', '').test(t) || /московская обл|городской округ/i.test(t);
+  f.region = /московская обл|городской округ/.test(where) ? 'МО' : /москва/.test(where) ? 'МСК'
+    : hasMsk ? 'МСК' : hasMo ? 'МО' : hasSpb ? 'СПб' : (f.city ? 'МО' : '');
+  if (hasSpb && f.region !== 'СПб') f.regions = [f.region, 'СПб'].join(' + ');
+
+  // Несколько объектов: строки вида «ХМ МСК «Адрес»» или с адресом в кавычках
+  var objs = (t.match(/^[ \t]*(?:ХМ|ТТ|Объект|Магазин|Кафе|Бар)[ \t]+[^\n]*[«"][^\n]*$/gim) || []).map(function (x) { return x.trim(); });
+  if (objs.length > 1) f.objects = objs;
   f.priority = /горящ|срочно/i.test(t) ? '🔥 горящий' : '';
   var comment = [];
+  if (f.objects) comment.push('Объекты (' + f.objects.length + '):\n' + f.objects.map(function (x) { return '• ' + x; }).join('\n'));
+  var aud = grab(/Аудит\s*:([^\n]*)/i); if (aud) comment.push('Аудит: ' + aud);
   var com = grab(/Комментари[ий]\s*:([^\n]*)/i); if (com) comment.push(com);
   var osob = grab(/Особые услуги\s*:([^\n]*)/i); if (osob) comment.push('Особые услуги: ' + osob);
   var tech = grab(/Техническое описание\s*:([^\n]*)/i); if (tech) comment.push('Техническое описание: ' + tech);
@@ -493,7 +518,9 @@ function requestsClient() {
         top.appendChild(el('div', 'date', fmt(it.created_at)));
         card.appendChild(top);
         var chips = el('div', 'chips');
-        [f.kind, f.region === 'МО' ? 'Подмосковье' : f.region === 'МСК' ? 'Москва' : '', f.service].filter(Boolean).forEach(function (c) { chips.appendChild(el('span', 'chip', c)); });
+        var rl = { 'МО': 'Подмосковье', 'МСК': 'Москва', 'СПб': 'Санкт-Петербург' };
+        [f.kind, f.regions ? f.regions.split(' + ').map(function (x) { return rl[x] || x; }).join(' + ') : rl[f.region] || '', f.service,
+          f.objects ? 'Объектов: ' + f.objects.length : ''].filter(Boolean).forEach(function (c) { chips.appendChild(el('span', 'chip' + (c === 'Табак' ? ' tob' : ''), c)); });
         if (f.priority) chips.appendChild(el('span', 'chip hot', 'Горящий'));
         card.appendChild(chips);
         var lines = [f.inn ? 'ИНН ' + f.inn : '', f.address || f.city || '', [f.client, f.phone].filter(Boolean).join(', ')].filter(Boolean);
@@ -558,6 +585,7 @@ function requestsPage() {
     '.chips{display:flex;flex-wrap:wrap;gap:5px;margin:8px 0 6px}',
     '.chip{font-size:12px;font-weight:600;padding:3px 9px;border-radius:8px;background:var(--well);color:var(--ink2)}',
     '.chip.hot{background:color-mix(in srgb,var(--bad) 16%,transparent);color:var(--bad)}',
+    '.chip.tob{background:color-mix(in srgb,#B7791F 18%,transparent);color:#B7791F}',
     '.line{font-size:14px;color:var(--ink2);line-height:1.4}',
     '.acts{display:flex;gap:8px;margin-top:12px}',
     '.acts button{border:0;border-radius:12px;font:inherit;font-size:14.5px;font-weight:600;padding:11px 14px;cursor:pointer}',
@@ -1347,7 +1375,8 @@ function handoffClient() {
     list.forEach(function (c) { addContact(c); });
     var tp = grab(/(?:Тип|Вид объекта)\s*:\s*([^\n]+)/i);
     var head = (tp + ' ' + t.slice(0, 300));
-    if (/табак/i.test(head)) mark('kind', 'Табак'); else if (/магазин|розниц/i.test(head)) mark('kind', 'Магазин'); else if (/общепит/i.test(head)) mark('kind', 'Общепит');
+    var TOB = /табак|хука[ -]?маркет|hookah[ -]?market|вейп|никотин|(^|[^А-Яа-яЁёA-Za-z])ХМ([^А-Яа-яЁёA-Za-z]|$)/i;
+    if (/табак/i.test(head)) mark('kind', 'Табак'); else if (/общепит/i.test(head)) mark('kind', 'Общепит'); else if (TOB.test(t)) mark('kind', 'Табак'); else if (/магазин|розниц/i.test(head)) mark('kind', 'Магазин');
     if (/переоформ/i.test(head)) mark('service', 'Переоформление'); else if (/продлен/i.test(head)) mark('service', 'Продление'); else if (/получен/i.test(head)) mark('service', 'Получение');
     if (/московская обл|городской округ/i.test(t)) mark('region', 'МО'); else if (/москва/i.test(head)) mark('region', 'МСК');
   }
@@ -1406,7 +1435,8 @@ function handoffClient() {
       if (!F.address && F.city) $('address').value = F.city;
       if (F.client || F.phone) addContact({ name: F.client || '', phone: F.phone || '' });
       fillFrom(d.request.text);
-      mark('region', F.region || 'МСК'); mark('kind', F.kind || 'Общепит');
+      mark('region', F.region === 'МО' ? 'МО' : 'МСК'); mark('kind', F.kind || 'Общепит');
+      if (F.region === 'СПб' || F.regions) $('sub').textContent += ' · есть объект в Санкт-Петербурге';
       mark('service', F.service || 'Получение');
       mark('priority', F.priority || 'обычный');
       if (/Коммент\S*\s+аудитора/i.test(d.request.text)) {
