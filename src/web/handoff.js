@@ -1122,6 +1122,10 @@ function setupHandoff(app) {
   // Сохранение чек-листа
   app.post('/api/checklist/save', async function (req, res) {
     try {
+      if (!req.body || typeof req.body !== 'object' || !req.body.case_id) {
+        console.log('checklist save: пустое тело', req.get('Content-Type'), req.get('Content-Length'));
+        return res.status(400).json({ ok: false, error: 'Пустой запрос (тип ' + (req.get('Content-Type') || '—') + ')' });
+      }
       var id = parseInt(req.body.case_id);
       var c = (await pool.query('SELECT * FROM cases WHERE id=$1', [id])).rows[0];
       if (!c) return res.json({ ok: false, error: 'not found' });
@@ -2006,7 +2010,13 @@ function checklistClient() {
       var txt = await r.text(), j = null;
       try { j = JSON.parse(txt); } catch (pe) {}
       ok = !!(j && j.ok);
-      if (!ok) why = j ? (j.error || 'ошибка сервера') : (r.status === 429 || /rate/i.test(txt) ? 'сервер занят' : 'сервер не ответил');
+      if (!ok) {
+        // Показываем настоящую причину: код ответа и начало текста
+        var snippet = String(txt || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80);
+        why = j ? (j.error || 'ошибка сервера') + ' [' + r.status + ']'
+          : (r.status === 429 || /^rate limited/i.test(snippet) ? 'сервер занят' : 'ошибка') + ' [' + r.status + (snippet ? ': ' + snippet : '') + ']';
+        console.log('save failed', r.status, txt.slice(0, 500));
+      }
     } catch (e) { why = 'нет связи'; }
     inFlight = false;
     if (ok) {
