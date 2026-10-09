@@ -741,7 +741,7 @@ function printPage(c, L) {
   var meta = [
     ['ИНН', c.inn ? esc(c.inn) : ''],
     ['Адрес', esc(c.address || '')],
-    ['Объект', esc([c.kind, c.region === 'МО' ? 'Подмосковье' : c.region === 'МСК' ? 'Москва' : c.region, c.service].filter(Boolean).join(' · '))],
+    ['Объект', esc([c.kind, ({ 'МО': 'Подмосковье', 'МСК': 'Москва', 'СПб': 'Санкт-Петербург' }[c.region] || c.region), c.service].filter(Boolean).join(' · '))],
     ['Клиент', contacts],
     ['Юрист', esc(c.lawyer_name || '')],
     ['Этап', esc(D._stage || 'Сбор документов')],
@@ -930,7 +930,7 @@ function printCompact(c, L) {
     .filter(Boolean).join('; ');
   var meta = [
     ['ИНН', esc(c.inn || '—')],
-    ['Объект', esc([c.kind, c.region === 'МО' ? 'Подмосковье' : c.region === 'МСК' ? 'Москва' : c.region, c.service].filter(Boolean).join(' · '))],
+    ['Объект', esc([c.kind, ({ 'МО': 'Подмосковье', 'МСК': 'Москва', 'СПб': 'Санкт-Петербург' }[c.region] || c.region), c.service].filter(Boolean).join(' · '))],
     ['Адрес', esc(c.address || '—')],
     ['Юрист', esc(c.lawyer_name || '')],
     ['Клиент', contacts || '—'],
@@ -1056,7 +1056,7 @@ function setupHandoff(app) {
       var d = req.body;
       var lawyer = (await pool.query("SELECT * FROM staff WHERE tg_id=$1 AND role='lawyer' AND approved = true", [d.lawyer_tg_id])).rows[0];
       if (!lawyer) return res.json({ ok: false, error: 'Юрист не найден. Он должен нажать /start в боте и выбрать роль «Юрист».' });
-      if (d.kind === 'Табак') d.checklist_key = null; else d.checklist_key = pickChecklist(d.region, d.kind, d.service);
+      d.checklist_key = pickChecklist(d.region, d.kind, d.service);
       var contacts = Array.isArray(d.contacts) ? d.contacts.filter(function (x) { return x && (x.name || x.phone || x.tg); }).slice(0, 10) : [];
       if (contacts.length) { d.client = d.client || contacts[0].name || ''; d.phone = d.phone || contacts[0].phone || ''; }
       var picked = null;
@@ -1171,7 +1171,7 @@ function setupHandoff(app) {
       if (data._stage && data._stage !== old._stage && CLIENTS) {
         var stageMsg = data._stage === 'Подано'
           ? '📤 <b>Заявление подано</b>\n🏢 ' + esc(c.org) + (c.inn ? ' · ИНН ' + esc(c.inn) : '') +
-            '\n🗓 Решение ожидается до <b>' + ruDate(data._decisionDue) + '</b> (' + decisionDays(c.region) + ' раб. дней, ' + (c.region === 'МО' ? 'Подмосковье' : 'Москва') + ')'
+            '\n🗓 Решение ожидается до <b>' + ruDate(data._decisionDue) + '</b> (' + decisionDays(c.region) + ' раб. дней, ' + ({ 'МО': 'Подмосковье', 'СПб': 'Санкт-Петербург' }[c.region] || 'Москва') + ')'
           : '📌 <b>' + esc(c.org) + '</b>: ' + esc(data._stage);
         try { await bot.telegram.sendMessage(CLIENTS, stageMsg + '\n⚖️ ' + esc(c.lawyer_name) + '\n#заявка' + c.id, { parse_mode: 'HTML' }); } catch (e) { console.error(e.message); }
       }
@@ -1439,7 +1439,7 @@ function handoffClient() {
       if (!F.address && F.city) $('address').value = F.city;
       if (F.client || F.phone) addContact({ name: F.client || '', phone: F.phone || '' });
       fillFrom(d.request.text);
-      mark('region', F.region === 'МО' ? 'МО' : 'МСК'); mark('kind', F.kind || 'Общепит');
+      mark('region', F.region === 'МО' || F.region === 'СПб' ? F.region : 'МСК'); mark('kind', F.kind || 'Общепит');
       if (F.region === 'СПб' || F.regions) $('sub').textContent += ' · есть объект в Санкт-Петербурге';
       mark('service', F.service || 'Получение');
       mark('priority', F.priority || 'обычный');
@@ -1574,7 +1574,7 @@ function handoffPage() {
     '</section>' +
 
     '<section class="glass grp"><h2>Лицензия</h2>' +
-    '<div class="f"><span class="lbl">Регион</span>' + seg('region', [['МСК', 'Москва'], ['МО', 'Подмосковье']]) + '</div>' +
+    '<div class="f"><span class="lbl">Регион</span>' + seg('region', [['МСК', 'Москва'], ['МО', 'Подмосковье'], ['СПб', 'Санкт-Петербург']]) + '</div>' +
     '<div class="f"><span class="lbl">Вид объекта</span>' + seg('kind', [['Общепит', 'Общепит'], ['Магазин', 'Магазин'], ['Табак', 'Табак']]) + '</div>' +
     '<div class="f"><span class="lbl">Услуга</span>' + seg('service', [['Получение', 'Получение'], ['Продление', 'Продление'], ['Переоформление', 'Переоформление']]) + '</div>' +
     '<div class="f"><span class="lbl">Приоритет</span>' + seg('priority', [['обычный', 'Обычный'], ['🔥 горящий', 'Горящий']]) + '</div>' +
@@ -1694,7 +1694,7 @@ function checklistClient() {
       var today = mskToday(), left = workdaysBetween(today, due), late = workdaysBetween(due, today);
       var info = due > today ? 'через ' + left + ' раб. ' + (left === 1 ? 'день' : left < 5 ? 'дня' : 'дней')
         : due === today ? 'сегодня' : 'просрочено на ' + late + ' раб. ' + (late === 1 ? 'день' : late < 5 ? 'дня' : 'дней');
-      var m = el('div', 'meta' + (due <= today ? ' warn' : ''), 'Решение ожидается до ' + ruDate(due) + ' — ' + info + ' (' + decisionDays(CASE.region) + ' раб. дней, ' + (CASE.region === 'МО' ? 'Подмосковье' : 'Москва') + '). ' + (due > today ? 'В день срока бот напомнит.' : 'Бот напоминает каждое утро, пока не будет «Решение получено».'));
+      var m = el('div', 'meta' + (due <= today ? ' warn' : ''), 'Решение ожидается до ' + ruDate(due) + ' — ' + info + ' (' + decisionDays(CASE.region) + ' раб. дней, ' + ({ 'МО': 'Подмосковье', 'СПб': 'Санкт-Петербург' }[CASE.region] || 'Москва') + '). ' + (due > today ? 'В день срока бот напомнит.' : 'Бот напоминает каждое утро, пока не будет «Решение получено».'));
       dl.appendChild(m);
       stage.body.appendChild(dl);
     }
