@@ -107,15 +107,91 @@ function findReq(j, idReq) {
   return found || j;
 }
 
+function statusList(item) {
+  const raw = item && item.status;
+  if (Array.isArray(raw)) return raw;
+  if (raw && typeof raw === 'object') return Object.keys(raw).map(function (k) { return raw[k]; }).filter(function (x) { return x && typeof x === 'object' && (x.type || x.statusDescription); });
+  return [];
+}
+
 function readStatus(item) {
-  const st = Array.isArray(item && item.status) ? item.status : [];
+  const st = statusList(item);
   const types = st.map(function (s) { return String(s.type || '') + ' ' + String(s.statusDescription || ''); }).join(' | ');
-  const done = /processed|выполнено/i.test(types);
+  const done = /processed|выполнено/i.test(types) || findEmbeddedFiles(item).length > 0; // файл в ответе = выписка готова
   const failed = !done && /reject|error|fail|cancel|denied|отказ|ошибк|отклон/i.test(types);
   // самый свежий статус — с наибольшим id_status
   const last = st.slice().sort(function (a, b) { return (b.id_status || 0) - (a.id_status || 0); })[0];
   const human = last ? String(last.statusDescription || last.type || '').replace(/^в статусе\s*/i, '').replace(/['"«»]/g, '') : 'отправлена';
   return { done: done, failed: failed, text: human, kuvd: last && last.kuvdNumbers };
+}
+
+// Файлы прямо в ответе: base64 ZIP (UEsDB…) или PDF (JVBER…), обычно в status.file
+function findEmbeddedFiles(item) {
+  const out = [];
+  (function walk(o, key) {
+    if (o == null) return;
+    if (typeof o === 'string') {
+      const t = o.replace(/\s+/g, '');
+      if (t.length > 200 && /^(UEsDB|UEsFB|JVBER)/.test(t)) out.push({ key: key || 'file', b64: t });
+      return;
+    }
+    if (typeof o === 'object') Object.keys(o).forEach(function (k) { walk(o[k], k); });
+  })(item, '');
+  return out;
+}
+
+// Минимальная распаковка ZIP (stored / deflate) — центральный каталог
+function unzip(buf) {
+  const zlib = require('zlib');
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= Math.max(0, buf.length - 65557); i--) { if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; } }
+  if (eocd < 0) throw new Error('не ZIP');
+  const count = buf.readUInt16LE(eocd + 10);
+  let p = buf.readUInt32LE(eocd + 16);
+  const files = [];
+  for (let n = 0; n < count; n++) {
+    if (buf.readUInt32LE(p) !== 0x02014b50) break;
+    const method = buf.readUInt16LE(p + 10), csize = buf.readUInt32LE(p + 20);
+    const nlen = buf.readUInt16LE(p + 28), elen = buf.readUInt16LE(p + 30), clen = buf.readUInt16LE(p + 32);
+    const lho = buf.readUInt32LE(p + 42);
+    const name = buf.slice(p + 46, p + 46 + nlen).toString('utf8');
+    const lnlen = buf.readUInt16LE(lho + 26), lelen = buf.readUInt16LE(lho + 28);
+    const start = lho + 30 + lnlen + lelen;
+    const comp = buf.slice(start, start + csize);
+    let data = null;
+    if (method === 0) data = comp; else if (method === 8) data = zlib.inflateRawSync(comp);
+    if (data && !/\/$/.test(name)) files.push({ name: name, data: data });
+    p += 46 + nlen + elen + clen;
+  }
+  return files;
+}
+
+// Из ответа → файлы для отправки: PDF из архива (+ сам архив с XML на случай, если PDF нет)
+function extractDocs(item, cad) {
+  const docs = [];
+  const base = String(cad || 'vypiska').replace(/:/g, '-');
+  findEmbeddedFiles(item).forEach(function (f, i) {
+    const buf = Buffer.from(f.b64, 'base64');
+    if (/^JVBER/.test(f.b64)) { docs.push({ name: 'ЕГРН_' + base + (i ? '_' + i : '') + '.pdf', buf: buf, kind: 'pdf' }); return; }
+    try {
+      const files = unzip(buf);
+      const pdfs = files.filter(function (x) { return /\.pdf$/i.test(x.name); });
+      pdfs.forEach(function (x, j) { docs.push({ name: 'ЕГРН_' + base + (pdfs.length > 1 ? '_' + (j + 1) : '') + '.pdf', buf: x.data, kind: 'pdf' }); });
+      const xml = files.find(function (x) { return /\.xml$/i.test(x.name); });
+      if (xml) docs.push({ name: 'ЕГРН_' + base + '.xml', buf: xml.data, kind: 'xml' });
+      if (!pdfs.length) docs.push({ name: 'ЕГРН_' + base + '.zip', buf: buf, kind: 'zip' });
+    } catch (e) {
+      docs.push({ name: 'ЕГРН_' + base + '.zip', buf: buf, kind: 'zip' });
+    }
+  });
+  return docs;
+}
+
+// Убрать base64 из ответа перед сохранением в базу (чтобы /egrn_debug был читаемым)
+function stripB64(item) {
+  return JSON.parse(JSON.stringify(item, function (k, v) {
+    return typeof v === 'string' && v.length > 200 && /^(UEsDB|UEsFB|JVBER)/.test(v) ? '<файл base64, ' + v.length + ' символов>' : v;
+  }));
 }
 
 // Все ссылки на файлы в ответе — формат файлов в документации не описан, поэтому ищем везде
@@ -284,7 +360,8 @@ function setupEgrn(bot) {
         const st = readStatus(item);
         const newStatus = st.failed ? 'failed' : st.done ? 'done' : 'ordered';
         const changed = newStatus !== o.status || st.text !== o.status_text;
-        await pool.query('UPDATE egrn_orders SET status=$1, status_text=$2, raw=$3, polls=polls+1, updated_at=NOW() WHERE id=$4', [newStatus, st.text, item, o.id]);
+        await pool.query('UPDATE egrn_orders SET status=$1, status_text=$2, raw=$3, polls=polls+1, updated_at=NOW() WHERE id=$4', [newStatus, st.done && !/выполн/i.test(st.text) ? 'готова' : st.text, stripB64(item), o.id]);
+        if (st.done && !/выполн/i.test(st.text)) st.text = 'готова';
         Object.assign(o, { status: newStatus, status_text: st.text, polls: o.polls + 1 });
         if (changed && o.status_msg_id) {
           try { await bot.telegram.editMessageText(o.chat_id, Number(o.status_msg_id), undefined, cardText(o), { parse_mode: 'HTML' }); } catch (e) {}
@@ -296,8 +373,9 @@ function setupEgrn(bot) {
         }
         if (newStatus !== 'done') continue;
 
-        const urls = findFileUrls(item);
-        if (!urls.length) {
+        const embedded = extractDocs(item, o.cad_num);
+        const urls = embedded.length ? [] : findFileUrls(item);
+        if (!embedded.length && !urls.length) {
           // файлы иногда появляются не сразу — ждём ещё несколько опросов
           if (o.polls >= 10) {
             await pool.query("UPDATE egrn_orders SET files_sent = -1, error='файлы не найдены в ответе API' WHERE id=$1", [o.id]);
@@ -309,6 +387,16 @@ function setupEgrn(bot) {
         let sent = 0;
         const fileMsgs = [];
         const caption = '📄 Выписка ЕГРН ' + o.cad_num + (o.label ? ' — ' + o.label : '');
+        // PDF — в чат; XML и архив — тоже в чат, но без звука, для архива и будущего разбора
+        for (const d of embedded) {
+          try {
+            const extra = { caption: d.kind === 'pdf' ? caption.slice(0, 1000) : (d.kind === 'xml' ? 'XML ' + o.cad_num : 'Архив ' + o.cad_num), disable_notification: d.kind !== 'pdf' };
+            if (o.status_msg_id) extra.reply_to_message_id = Number(o.status_msg_id);
+            const m = await bot.telegram.sendDocument(o.chat_id, { source: d.buf, filename: d.name }, extra);
+            if (m && m.message_id && d.kind !== 'xml') fileMsgs.push({ chat: Number(o.chat_id), id: m.message_id });
+            if (d.kind === 'pdf' || d.kind === 'zip') sent++;
+          } catch (e) { console.error('egrn file:', e.message); }
+        }
         for (const u of urls.slice(0, 6)) {
           try {
             const f = await download(u);
@@ -386,4 +474,4 @@ async function attachOrOrder(opts) {
   return { result: 'ordered', cad: cad, id: idSt };
 }
 
-module.exports = { setupEgrn, parseCads, readStatus, findFileUrls, findReq, attachOrOrder, CAD_RE };
+module.exports = { setupEgrn, parseCads, readStatus, findFileUrls, findReq, attachOrOrder, CAD_RE, extractDocs, unzip, stripB64 };
