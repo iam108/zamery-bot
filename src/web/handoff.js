@@ -142,6 +142,14 @@ function setupReportsBot(bot) {
     }
   });
   bot.action('noop', function (ctx) { return ctx.answerCbQuery(); });
+  bot.action(/^rmd:(\d+)$/, async function (ctx) {
+    try {
+      await pool.query('UPDATE case_reminders SET done = true WHERE id=$1', [ctx.match[1]]);
+      var who = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ');
+      try { await ctx.editMessageReplyMarkup({ inline_keyboard: [[{ text: '✅ Сделано · ' + who, callback_data: 'noop' }]] }); } catch (e) {}
+      await ctx.answerCbQuery('Отмечено');
+    } catch (e) { await ctx.answerCbQuery('Не получилось: ' + e.message.slice(0, 100), { show_alert: true }); }
+  });
   bot.on('message', async function (ctx, next) {
     var cid = String(ctx.chat.id);
     if (cid === String(process.env.GROUP_CHAT_ID) || cid === String(process.env.CLIENTS_CHAT_ID)) {
@@ -645,12 +653,50 @@ async function ensureDeadlines() {
     ALTER TABLE cases ADD COLUMN IF NOT EXISTS submitted_on DATE;
     ALTER TABLE cases ADD COLUMN IF NOT EXISTS decision_due DATE;
     ALTER TABLE cases ADD COLUMN IF NOT EXISTS reminded_on DATE;
+    CREATE TABLE IF NOT EXISTS case_reminders (
+      id           SERIAL PRIMARY KEY,
+      case_id      INT NOT NULL,
+      remind_on    DATE NOT NULL,
+      text         TEXT NOT NULL,
+      created_by   BIGINT,
+      created_name TEXT,
+      sent_at      TIMESTAMPTZ,
+      done         BOOLEAN DEFAULT false,
+      created_at   TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
+}
+
+// Напоминания юриста по клиенту: в 9:00 по Москве, только в личку (юристу клиента и тому, кто поставил)
+async function sendCaseReminders(bot) {
+  if (mskHour() < 9) return;
+  var today = mskToday();
+  var rows = (await pool.query(
+    'SELECT r.*, c.org, c.inn, c.lawyer_tg_id, c.lawyer_name FROM case_reminders r JOIN cases c ON c.id = r.case_id ' +
+    'WHERE r.done = false AND r.sent_at IS NULL AND r.remind_on <= $1::date ORDER BY r.remind_on, r.id', [today])).rows;
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    var due = r.remind_on instanceof Date ? r.remind_on.toISOString().slice(0, 10) : String(r.remind_on).slice(0, 10);
+    var text = '⏰ <b>Напоминание</b>\n🏢 ' + esc(r.org) + (r.inn ? ' · ИНН ' + esc(r.inn) : '') + '\n\n' + esc(r.text) +
+      '\n\n<i>' + (due < today ? 'на ' + ruDate(due) + ' · ' : '') + 'поставил(а) ' + esc(r.created_name || '') + '</i>';
+    var kb = { inline_keyboard: [[
+      { text: '📋 Открыть чек-лист', web_app: { url: process.env.WEBAPP_URL + '/checklist?case_id=' + r.case_id } },
+      { text: '✅ Сделано', callback_data: 'rmd:' + r.id }
+    ]] };
+    var to = [String(r.lawyer_tg_id)];
+    if (r.created_by && to.indexOf(String(r.created_by)) === -1) to.push(String(r.created_by));
+    for (var j = 0; j < to.length; j++) {
+      try { await bot.telegram.sendMessage(to[j], text, { parse_mode: 'HTML', reply_markup: kb }); }
+      catch (e) { console.error('case reminder DM', to[j], e.message); }
+    }
+    await pool.query('UPDATE case_reminders SET sent_at = NOW() WHERE id = $1', [r.id]);
+  }
 }
 
 function startDecisionReminders(bot) {
   ensureDeadlines().catch(function (e) { console.error('deadline columns:', e.message); });
   async function tick() {
+    try { await sendCaseReminders(bot); } catch (e) { console.error('case reminders:', e.message); }
     try {
       if (mskHour() < 9) return; // напоминаем с 9:00 по Москве
       var today = mskToday();
@@ -1241,6 +1287,28 @@ function setupHandoff(app) {
     res.send(checklistPage(c, LISTS[c.checklist_key]));
   });
 
+  app.get('/api/checklist/reminders', async function (req, res) {
+    try {
+      var rows = (await pool.query('SELECT id, remind_on, text, created_name, sent_at FROM case_reminders WHERE case_id=$1 AND done = false ORDER BY remind_on, id', [parseInt(req.query.case_id) || 0])).rows;
+      res.json({ ok: true, items: rows.map(function (r) { return { id: r.id, date: (r.remind_on instanceof Date ? r.remind_on.toISOString() : String(r.remind_on)).slice(0, 10), text: r.text, by: r.created_name, sent: !!r.sent_at }; }) });
+    } catch (e) { console.error(e); res.json({ ok: false, error: e.message }); }
+  });
+  app.post('/api/checklist/reminders', async function (req, res) {
+    try {
+      var id = parseInt(req.body.case_id) || 0, date = String(req.body.date || ''), text = String(req.body.text || '').trim().slice(0, 300);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.json({ ok: false, error: 'Укажите дату' });
+      if (!text) return res.json({ ok: false, error: 'Напишите, о чём напомнить' });
+      if (!(await pool.query('SELECT 1 FROM cases WHERE id=$1', [id])).rows.length) return res.json({ ok: false, error: 'Клиент не найден' });
+      var r = (await pool.query('INSERT INTO case_reminders (case_id, remind_on, text, created_by, created_name) VALUES ($1,$2,$3,$4,$5) RETURNING id',
+        [id, date, text, req.tgUser.id, req.staff.name])).rows[0];
+      res.json({ ok: true, id: r.id });
+    } catch (e) { console.error(e); res.json({ ok: false, error: e.message }); }
+  });
+  app.post('/api/checklist/reminders/done', async function (req, res) {
+    try { await pool.query('UPDATE case_reminders SET done = true WHERE id=$1', [parseInt(req.body.id) || 0]); res.json({ ok: true }); }
+    catch (e) { console.error(e); res.json({ ok: false, error: e.message }); }
+  });
+
   app.post('/api/checklist/printlink', function (req, res) {
     var id = parseInt(req.body.case_id) || 0;
     res.json({ ok: true, url: (process.env.WEBAPP_URL || '') + '/checklist?case_id=' + id + '&print=1&' + auth.signCase(id, 24) });
@@ -1626,6 +1694,18 @@ function checklistClient() {
     ? [tg.initDataUnsafe.user.first_name, tg.initDataUnsafe.user.last_name].filter(Boolean).join(' ')
     : CASE.lawyer;
   var root = document.getElementById('list');
+  var REM = null; // напоминания по клиенту (с сервера)
+  var REM_PRESETS = [
+    ['Проверить регистрацию договора аренды в Росреестре', 7],
+    ['Уточнить у клиента готовность ремонта', 3],
+    ['Выездная оценка завтра: доверенность и памятка клиенту', 1],
+    ['Проверить, подписал ли клиент документы', 1]
+  ];
+  function isoPlus(days) { var d = new Date(mskToday() + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); }
+  function loadReminders() {
+    fetch('/api/checklist/reminders?case_id=' + CASE.id).then(function (r) { return r.json(); })
+      .then(function (j) { if (j.ok) { REM = j.items; render(); } }).catch(function () {});
+  }
 
   function haptic(kind) {
     try {
@@ -1691,6 +1771,60 @@ function checklistClient() {
   function render() {
     var y = window.scrollY;
     root.innerHTML = '';
+
+    // ⏰ Напоминания — в 9:00 по Москве в личку
+    var rg = group('rem', '⏰ Напоминания' + (REM && REM.length ? ' (' + REM.length + ')' : ''), null);
+    if (REM === null) rg.body.appendChild(el('div', 'row meta', 'Загружаю…'));
+    else {
+      REM.forEach(function (r) {
+        var row = el('div', 'row remrow' + (r.date <= mskToday() ? ' due' : ''));
+        var tx = el('div', 'line');
+        tx.appendChild(el('div', 'lbl', r.text));
+        tx.appendChild(el('div', 'meta', ruDate(r.date) + (r.date < mskToday() ? ' · просрочено' : r.date === mskToday() ? ' · сегодня' : '') + (r.sent ? ' · отправлено' : ' · придёт в 9:00') + (r.by ? ' · ' + r.by : '')));
+        row.appendChild(tx);
+        var x = el('button', 'remx', '✓'); x.type = 'button'; x.title = 'Сделано — убрать';
+        x.onclick = function () {
+          x.disabled = true;
+          fetch('/api/checklist/reminders/done', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: r.id }) })
+            .then(function (q) { return q.json(); }).then(function (j) { if (j.ok) { REM = REM.filter(function (z) { return z.id !== r.id; }); haptic('ok'); render(); } else { x.disabled = false; alertMsg(j.error || 'Ошибка'); } })
+            .catch(function () { x.disabled = false; alertMsg('Нет связи'); });
+        };
+        row.appendChild(x);
+        rg.body.appendChild(row);
+      });
+      var add = el('div', 'row col');
+      var chips = el('div', 'seg wrap');
+      var txt = el('input', 'inp'); txt.placeholder = 'О чём напомнить'; txt.maxLength = 300;
+      var dt = el('input', 'inp'); dt.type = 'date'; dt.min = mskToday(); dt.value = isoPlus(1);
+      REM_PRESETS.forEach(function (pr) {
+        var b = el('button', 'sg', pr[0].replace(/^(Проверить|Уточнить у клиента) /, '').replace(/:.*$/, '')); b.type = 'button';
+        b.onclick = function () { txt.value = pr[0]; dt.value = isoPlus(pr[1]); haptic(); };
+        chips.appendChild(b);
+      });
+      add.appendChild(chips);
+      var two = el('div', 'two remadd');
+      two.appendChild(txt); two.appendChild(dt);
+      add.appendChild(two);
+      var go = el('button', 'sign', '+ Напомнить'); go.type = 'button';
+      go.onclick = function () {
+        if (!txt.value.trim()) { txt.focus(); return; }
+        if (!dt.value) { dt.focus(); return; }
+        go.disabled = true; go.textContent = 'Сохраняю…';
+        fetch('/api/checklist/reminders', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ case_id: CASE.id, date: dt.value, text: txt.value.trim() }) })
+          .then(function (q) { return q.json(); })
+          .then(function (j) {
+            if (!j.ok) throw new Error(j.error || 'Ошибка');
+            REM.push({ id: j.id, date: dt.value, text: txt.value.trim(), by: ME, sent: false });
+            REM.sort(function (a, b) { return a.date < b.date ? -1 : a.date > b.date ? 1 : a.id - b.id; });
+            haptic('ok'); render();
+          })
+          .catch(function (e) { go.disabled = false; go.textContent = '+ Напомнить'; alertMsg('Не сохранилось: ' + e.message); });
+      };
+      add.appendChild(go);
+      add.appendChild(el('div', 'meta', 'Придёт в 9:00 по Москве в личку: юристу клиента и вам.'));
+      rg.body.appendChild(add);
+    }
+    root.appendChild(rg.box);
 
     var stage = group('stage', 'Этап', null);
     var st = el('div', 'row col');
@@ -2085,6 +2219,7 @@ function checklistClient() {
     if (bk && bk.d && Date.now() - bk.t < 7 * 24 * 3600 * 1000) { D = bk.d; restored = true; }
   } catch (e) {}
   render();
+  loadReminders();
   if (restored) { setSt('saving', 'Восстановлены несохранённые отметки, сохраняю…'); setTimeout(flush, 300); }
   else setSt('ok', 'Сохранено');
 }
@@ -2175,6 +2310,10 @@ function checklistPage(c, L) {
     '.link{background:none;border:0;color:var(--ink2);font:inherit;font-size:13px;text-decoration:underline;margin-left:10px;cursor:pointer}',
     '.sign{border:0;border-radius:12px;padding:10px 16px;font:inherit;font-weight:600;color:#fff;background:var(--accent);cursor:pointer}',
     '.reqbtn{margin-top:10px;width:100%}.reqbtn:disabled{opacity:.6}',
+    '.remrow{flex-wrap:nowrap}.remrow.due:before{background:var(--warn)}',
+    '.remx{flex-shrink:0;width:34px;height:34px;border-radius:17px;border:0;background:var(--well);color:var(--ok);font-size:16px;font-weight:700;cursor:pointer}',
+    '.remadd{margin:8px 0}.remadd .inp:first-child{flex:2}.remadd .inp:last-child{flex:1;min-width:0}',
+    '.sign:disabled{opacity:.6}',
     '.skip{font-size:12.5px;font-weight:650;color:var(--accent);background:color-mix(in srgb,var(--accent) 14%,transparent);padding:5px 10px;border-radius:999px;cursor:pointer;white-space:nowrap}',
     '.doclist{margin:-2px 0 10px}',
     '.docrow{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--hair)}',
