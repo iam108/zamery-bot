@@ -1701,6 +1701,81 @@ function checklistClient() {
     ['Выездная оценка завтра: доверенность и памятка клиенту', 1],
     ['Проверить, подписал ли клиент документы', 1]
   ];
+  // Поиск пункта чек-листа по названию раздела и пункта (части текста)
+  function findItem(sec, label) {
+    for (var i = 0; i < L.sections.length; i++) {
+      if (L.sections[i].t.toLowerCase().indexOf(sec.toLowerCase()) === -1) continue;
+      var it = L.sections[i].i.filter(function (x) { return !label || x.l.toLowerCase().indexOf(label.toLowerCase()) !== -1; })[0];
+      if (it) return it;
+    }
+    return null;
+  }
+  function kState(it) { var v = it && D[it.id]; return v && v.s; }
+  function ecpTasks() {
+    var t = [], stage = D._stage || CFG.stages[0];
+    var after = stage === 'Решение получено' || stage === 'Архив';
+    var submitted = stage !== CFG.stages[0];
+    if (!submitted) {
+      var rpn = findItem('Роспотребнадзор', 'подано');
+      if (rpn && visible(rpn) && kState(rpn) !== 'ok' && kState(rpn) !== 'na') t.push({ what: 'Подать уведомление в Роспотребнадзор', hint: 'ОКВЭД 56.10, адрес объекта' });
+      var ob = findItem('Обособленное подразделение', 'Обособка');
+      if (ob && D[ob.id] === 'Требуется') t.push({ what: 'Открыть обособленное подразделение в ФНС', hint: 'по адресу объекта' });
+      var kkt = ['Адрес совпадает', 'КПП соответствует', 'подакцизных'].map(function (l) { return findItem('ККТ', l); })
+        .filter(function (it) { return it && visible(it) && kState(it) !== 'ok' && kState(it) !== 'na'; });
+      var KKT_SHORT = [['Адрес', 'адрес'], ['КПП', 'КПП'], ['подакцизных', 'признак продажи подакцизных товаров']];
+      if (kkt.length) t.push({ what: 'Исправить карточку регистрации ККТ', hint: 'проверить: ' + kkt.map(function (it) { var m = KKT_SHORT.filter(function (x) { return it.l.indexOf(x[0]) !== -1; })[0]; return m ? m[1] : it.l; }).join(', ') + '; потом скачать новую карточку' });
+      var nal = findItem('Задолженность', 'Подтверждение');
+      if (nal && (!D[nal.id] || /Справка/.test(D[nal.id]))) t.push({ what: 'Заказать справку об отсутствии задолженности (ФНС)', hint: 'готовится несколько дней — лучше заказать заранее' });
+      t.push({ what: 'Подать заявление на лицензию', hint: CASE.region === 'МО' ? 'мосрег; после подачи клиенту придёт логин от «Проверок Подмосковья»' : 'Госуслуги / мос.ру' });
+    }
+    if (after) {
+      t.push({ what: 'Скачать решение о выдаче лицензии', hint: CASE.region === 'МО' ? 'мосрег → раздел «Заявления»' : 'личный кабинет мос.ру' });
+      t.push({ what: 'Заказать выписку из реестра лицензий', hint: 'придёт на почту' });
+    }
+    return t;
+  }
+  function ecpClientText(tasks) {
+    return 'Чтобы сделать всё за одно подключение, подготовьте, пожалуйста:\n' +
+      '• компьютер с ЭЦП генерального директора и установленный AnyDesk (или RuDesktop);\n' +
+      '• включённый вход по ЭЦП на Госуслугах ген. директора (Профиль → Безопасность → Вход с электронной подписью);\n' +
+      '• человека у компьютера, который сможет ввести пароли.\n\n' +
+      'Что сделаем за подключение:\n' + tasks.map(function (x) { return '• ' + x.what; }).join('\n') +
+      '\n\nНапишите, когда будет удобно подключиться.';
+  }
+  function copyText(text) {
+    try { if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(text).then(function () { return true; }, function () { return fallback(); }); } catch (e) {}
+    return Promise.resolve(fallback());
+    function fallback() {
+      try { var ta = document.createElement('textarea'); ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0'; document.body.appendChild(ta); ta.select(); var ok = document.execCommand('copy'); ta.remove(); return ok; } catch (e) { return false; }
+    }
+  }
+  function buildEcp() {
+    // 🖥 Подключение к ЭЦП клиента — что ещё сделать за одно подключение
+    var tasks = ecpTasks();
+    var eg = group('ecp', '🖥 Подключение к ЭЦП' + (tasks.length ? ' (' + tasks.length + ')' : ''), null);
+    if (OPEN.ecp === undefined && !tasks.length) eg.box.classList.add('closed');
+    if (!tasks.length) eg.body.appendChild(el('div', 'row meta', 'Сейчас на компьютере клиента делать нечего.'));
+    tasks.forEach(function (t) {
+      var r = el('div', 'row ecprow');
+      var tx = el('div', 'line'); tx.appendChild(el('div', 'lbl', t.what)); if (t.hint) tx.appendChild(el('div', 'meta', t.hint));
+      r.appendChild(el('span', 'ecpdot')); r.appendChild(tx);
+      eg.body.appendChild(r);
+    });
+    if (tasks.length) {
+      var cr = el('div', 'row col');
+      var cb = el('button', 'sign', '📋 Скопировать для клиента'); cb.type = 'button';
+      cb.onclick = function () {
+        copyText(ecpClientText(tasks)).then(function (ok) {
+          haptic('ok'); cb.textContent = ok ? '✓ Скопировано' : 'Не удалось скопировать';
+          setTimeout(function () { cb.textContent = '📋 Скопировать для клиента'; }, 1800);
+        });
+      };
+      cr.appendChild(cb);
+      eg.body.appendChild(cr);
+    }
+    return eg.box;
+  }
+  function updateEcp() { var old = document.getElementById('g-ecp'); if (old) old.replaceWith(buildEcp()); }
   function isoPlus(days) { var d = new Date(mskToday() + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); }
   function loadReminders() {
     fetch('/api/checklist/reminders?case_id=' + CASE.id).then(function (r) { return r.json(); })
@@ -1825,6 +1900,8 @@ function checklistClient() {
       rg.body.appendChild(add);
     }
     root.appendChild(rg.box);
+
+    root.appendChild(buildEcp());
 
     var stage = group('stage', 'Этап', null);
     var st = el('div', 'row col');
@@ -2119,6 +2196,7 @@ function checklistClient() {
   function backup() { try { localStorage.setItem(LKEY, JSON.stringify({ t: Date.now(), d: D })); } catch (e) {} }
   function dropBackup() { try { localStorage.removeItem(LKEY); } catch (e) {} }
   function changed() {
+    try { updateEcp(); } catch (e) {}
     backup();
     setSt('saving', 'Сохраняю…');
     summary();
@@ -2311,6 +2389,7 @@ function checklistPage(c, L) {
     '.sign{border:0;border-radius:12px;padding:10px 16px;font:inherit;font-weight:600;color:#fff;background:var(--accent);cursor:pointer}',
     '.reqbtn{margin-top:10px;width:100%}.reqbtn:disabled{opacity:.6}',
     '.remrow{flex-wrap:nowrap}.remrow.due:before{background:var(--warn)}',
+    '.ecprow{flex-wrap:nowrap;align-items:flex-start}.ecpdot{width:8px;height:8px;border-radius:50%;background:var(--accent);margin-top:7px;flex-shrink:0}',
     '.remx{flex-shrink:0;width:34px;height:34px;border-radius:17px;border:0;background:var(--well);color:var(--ok);font-size:16px;font-weight:700;cursor:pointer}',
     '.remadd{margin:8px 0}.remadd .inp:first-child{flex:2}.remadd .inp:last-child{flex:1;min-width:0}',
     '.sign:disabled{opacity:.6}',
