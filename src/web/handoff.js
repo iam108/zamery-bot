@@ -738,7 +738,7 @@ function printPage(c, L) {
     if (!it.when) return true;
     return Object.keys(it.when).every(function (key) {
       if (key === 'svc') return c.service === it.when.svc;
-      return D[key] === undefined || D[key] === it.when[key];
+      return (D[key] === undefined && !it.strict) || D[key] === it.when[key];
     });
   }
   function resolved(it) {
@@ -906,7 +906,7 @@ function printCompact(c, L) {
     if (!it.when) return true;
     return Object.keys(it.when).every(function (key) {
       if (key === 'svc') return c.service === it.when.svc;
-      return D[key] === undefined || D[key] === it.when[key];
+      return (D[key] === undefined && !it.strict) || D[key] === it.when[key];
     });
   }
   function resolved(it) {
@@ -1797,7 +1797,7 @@ function checklistClient() {
     if (!it.when) return true;
     return Object.keys(it.when).every(function (key) {
       if (key === 'svc') return CASE.service === it.when.svc;
-      return D[key] === undefined || D[key] === it.when[key];
+      return (D[key] === undefined && !it.strict) || D[key] === it.when[key];
     });
   }
   function termMonths(v) {
@@ -2077,7 +2077,11 @@ function checklistClient() {
 
     if (it.t === 'r') {
       w.classList.add('col');
-      w.appendChild(segmented(it.o, v, function (x) { D[it.id] = x; haptic(); redraw(); }, 'wrap'));
+      w.appendChild(segmented(it.o, v, function (x) {
+        D[it.id] = x; haptic();
+        var drives = L.sections.some(function (sec) { return sec.i.some(function (q) { return q.when && q.when[it.id] !== undefined; }); });
+        if (drives) { render(); changed(); } else redraw();
+      }, 'wrap'));
     }
 
     if (it.t === 'f' || it.t === 'd') {
