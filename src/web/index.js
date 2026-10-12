@@ -438,7 +438,7 @@ function miniAppForm() {
   <div class="toggle-row" onclick="toggleEgrn(event)" style="cursor:pointer;margin-top:8px">
     <span style="font-size:14px">📄 Заказать выписку, если её ещё нет</span>
     <label class="toggle" onclick="event.stopPropagation()">
-      <input type="checkbox" id="egrn_order" checked>
+      <input type="checkbox" id="egrn_order">
       <span class="slider"></span>
     </label>
   </div>

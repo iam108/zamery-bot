@@ -1657,7 +1657,7 @@ function handoffPage() {
     '<div class="f"><label class="lbl" for="org">Организация <span class="req">*</span></label><input id="org" placeholder="ООО «Название»"></div>' +
     '<div class="f"><label class="lbl" for="inn">ИНН</label><input id="inn" inputmode="numeric" placeholder="10 или 12 цифр"></div>' +
     '<div class="f"><label class="lbl" for="cad_num">Кадастровый номер</label><input id="cad_num" inputmode="decimal" placeholder="77:17:0120316:38939">' +
-    '<label class="egrn"><input type="checkbox" id="egrn_order" checked> Заказать выписку ЕГРН, если её ещё нет</label></div>' +
+    '<label class="egrn"><input type="checkbox" id="egrn_order"> Заказать выписку ЕГРН, если её ещё нет (готовая приложится сама)</label></div>' +
     '<div class="f"><label class="lbl" for="address">Адрес</label><textarea id="address" rows="2" style="min-height:56px"></textarea></div>' +
     '<div class="f"><span class="lbl">Контакты</span><div id="contacts"></div>' +
     '<button type="button" id="add-contact" class="addc">+ Добавить контакт</button></div>' +
