@@ -1170,12 +1170,12 @@ function setupHandoff(app) {
         try {
           var targets = [];
           if (lawyerMsg) targets.push({ chat: Number(lawyer.tg_id), reply: lawyerMsg.message_id });
-          if (CLIENTS && cardMsg) targets.push({ chat: Number(CLIENTS), reply: cardMsg.message_id });
+          // в «Заявки по клиенту» выписку не копируем — она живёт в чате выписок
           var eg = await require('../bot/egrn').attachOrOrder({
             cad: d.cad_num, label: d.org, order: !!d.egrn_order, orderedBy: req.tgUser.id, orderedName: req.staff.name,
             targets: targets, note: 'Для клиента ' + d.org + ' (юрист ' + lawyer.name + ')',
           });
-          egrnNote = { attached: 'Выписка ЕГРН приложена.', ordered: 'Выписка ЕГРН заказана — придёт юристу и в «Заявки по клиенту».', waiting: 'Выписка ЕГРН уже в работе — придёт юристу и в «Заявки по клиенту».' }[eg.result] || '';
+          egrnNote = { attached: 'Выписка ЕГРН приложена юристу.', ordered: 'Выписка ЕГРН заказана — придёт в чат выписок и юристу.', waiting: 'Выписка ЕГРН уже в работе — придёт в чат выписок и юристу.' }[eg.result] || '';
         } catch (e) { console.error('egrn for handoff:', e.message); egrnNote = 'Выписку ЕГРН заказать не удалось: ' + e.message; }
       }
       res.json({ ok: true, id: c.id, warn: [dmWarn, egrnNote].filter(Boolean).join(' ') || undefined });

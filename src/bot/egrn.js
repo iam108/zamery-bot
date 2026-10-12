@@ -178,7 +178,7 @@ function extractDocs(item, cad) {
       const pdfs = files.filter(function (x) { return /\.pdf$/i.test(x.name); });
       pdfs.forEach(function (x, j) { docs.push({ name: 'ЕГРН_' + base + (pdfs.length > 1 ? '_' + (j + 1) : '') + '.pdf', buf: x.data, kind: 'pdf' }); });
       const xml = files.find(function (x) { return /\.xml$/i.test(x.name); });
-      if (xml) docs.push({ name: 'ЕГРН_' + base + '.xml', buf: xml.data, kind: 'xml' });
+      // XML в чат не отправляем — нужен только PDF
       if (!pdfs.length) docs.push({ name: 'ЕГРН_' + base + '.zip', buf: buf, kind: 'zip' });
     } catch (e) {
       docs.push({ name: 'ЕГРН_' + base + '.zip', buf: buf, kind: 'zip' });
