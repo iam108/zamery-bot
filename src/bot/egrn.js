@@ -248,7 +248,23 @@ function setupEgrn(bot) {
   function nameOf(from) { return [from.first_name, from.last_name].filter(Boolean).join(' ') || from.username || String(from.id); }
 
   function orderButtons(pid) {
-    return [{ text: '📄 Заказать выписку', callback_data: 'eg:' + pid + ':kv' }];
+    return [{ text: '📄 Заказать выписку', callback_data: 'eg:' + pid + ':kv' }, { text: '✖️ Не нужно', callback_data: 'egx:' + pid }];
+  }
+
+  // Погасить кнопки только у этого номера: строку с кнопками pid заменяем надписью
+  async function closeRow(ctx, pid, label) {
+    try {
+      const msg = ctx.callbackQuery && ctx.callbackQuery.message;
+      const kb = msg && msg.reply_markup && msg.reply_markup.inline_keyboard;
+      if (!kb) return;
+      const re = new RegExp('^egx?:' + pid + '(:|$)');
+      let changed = false;
+      const rows = kb.map(function (row) {
+        if (row.some(function (b) { return b.callback_data && re.test(b.callback_data); })) { changed = true; return [{ text: label, callback_data: 'noop' }]; }
+        return row;
+      });
+      if (changed) await ctx.editMessageReplyMarkup({ inline_keyboard: rows });
+    } catch (e) { console.error('egrn closeRow:', e.message); }
   }
 
   async function offer(ctx, items, chatId, srcMsgId, intro) {
@@ -329,11 +345,22 @@ function setupEgrn(bot) {
       if (String(target) !== String(ctx.from.id)) {
         try { await ctx.telegram.sendMessage(ctx.from.id, '⏳ Выписка по ' + p.cad_num + ' заказана (№' + idSt + '). Пришлю, когда будет готова.'); } catch (e) {}
       }
-      try { await ctx.editMessageReplyMarkup({ inline_keyboard: [[{ text: '✅ Заказано: ' + nameOf(ctx.from), callback_data: 'noop' }]] }); } catch (e) {}
+      await closeRow(ctx, p.id, '✅ Заказано · ' + nameOf(ctx.from));
     } catch (e) {
       console.error('egrn order:', e.message);
       try { await ctx.answerCbQuery('Не удалось заказать: ' + e.message.slice(0, 150), { show_alert: true }); } catch (x) {}
     }
+  });
+
+  // «Не нужно» — гасим кнопки этого номера
+  bot.action(/^egx:(\d+)$/, async function (ctx) {
+    try {
+      const cbChat = ctx.callbackQuery && ctx.callbackQuery.message && ctx.callbackQuery.message.chat ? ctx.callbackQuery.message.chat.id : ctx.from.id;
+      if (!(await canOrder(ctx.from.id, cbChat))) return ctx.answerCbQuery('Нет доступа', { show_alert: true });
+      await pool.query('DELETE FROM egrn_pending WHERE id=$1', [ctx.match[1]]);
+      await closeRow(ctx, ctx.match[1], '✖️ Не заказываем · ' + nameOf(ctx.from));
+      await ctx.answerCbQuery('Не заказываем');
+    } catch (e) { try { await ctx.answerCbQuery('Ошибка: ' + e.message.slice(0, 100), { show_alert: true }); } catch (x) {} }
   });
 
   // Админу: сырой ответ API по заказу — чтобы разобраться с форматом
