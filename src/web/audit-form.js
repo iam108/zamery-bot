@@ -42,7 +42,9 @@ textarea:focus,input:focus{border-color:var(--tg-theme-button-color,#6366f1)}
 .file-label input{display:none}
 .file-count{font-size:13px;color:var(--tg-theme-hint-color,#64748b);margin-left:auto}
 .photos-preview{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
-.photos-preview img{width:72px;height:72px;object-fit:cover;border-radius:8px}
+.photos-preview img{width:72px;height:72px;object-fit:cover;border-radius:8px;display:block}
+.ph{position:relative}
+.ph-x{position:absolute;top:-6px;right:-6px;width:22px;height:22px;border-radius:11px;border:0;background:#f87171;color:#fff;font-size:12px;line-height:22px;padding:0;cursor:pointer}
 .required{color:#f87171}
 .hidden{display:none}
 .bottom{position:fixed;bottom:0;left:0;right:0;padding:12px 16px;background:var(--tg-theme-bg-color,#0f172a);border-top:1px solid #1e293b}
@@ -162,7 +164,7 @@ textarea:focus,input:focus{border-color:var(--tg-theme-button-color,#6366f1)}
 <div class="section">
   <div class="section-title">Фотоотчёт</div>
   <label class="file-label">
-    📷 Прикрепить фото
+    📷 Прикрепить фото (до 10, можно добавлять)
     <span class="file-count" id="photo-count">не выбрано</span>
     <input type="file" id="photos" accept="image/*" multiple onchange="previewPhotos(this)">
   </label>
@@ -238,11 +240,31 @@ function addZone() {
 function removeZone(id) { var el = document.getElementById(id); if (el) el.remove(); }
 
 var photoFiles = [];
+var MAX_PHOTOS = 10; // больше в один альбом Telegram не пускает
+// Повторный выбор добавляет фото к уже выбранным; у каждой миниатюры — ✕
 function previewPhotos(input) {
-  photoFiles = Array.from(input.files);
-  document.getElementById('photo-count').textContent = photoFiles.length + ' фото';
+  var added = Array.from(input.files || []);
+  var skipped = 0;
+  added.forEach(function(f) {
+    var dup = photoFiles.some(function(x) { return x.name === f.name && x.size === f.size; });
+    if (dup) return;
+    if (photoFiles.length >= MAX_PHOTOS) { skipped++; return; }
+    photoFiles.push(f);
+  });
+  input.value = ''; // чтобы можно было выбрать те же файлы снова после удаления
+  drawPhotos();
+  if (skipped) tg.showAlert('Можно прикрепить не больше ' + MAX_PHOTOS + ' фото. Лишние (' + skipped + ') не добавлены.');
+}
+function drawPhotos() {
+  document.getElementById('photo-count').textContent = photoFiles.length ? photoFiles.length + ' из ' + MAX_PHOTOS : 'не выбрано';
   var p = document.getElementById('photos-preview'); p.innerHTML = '';
-  photoFiles.slice(0,6).forEach(function(f) { var img = document.createElement('img'); img.src = URL.createObjectURL(f); p.appendChild(img); });
+  photoFiles.forEach(function(f, i) {
+    var w = document.createElement('div'); w.className = 'ph';
+    var img = document.createElement('img'); img.src = URL.createObjectURL(f); w.appendChild(img);
+    var x = document.createElement('button'); x.type = 'button'; x.className = 'ph-x'; x.textContent = '✕';
+    x.onclick = function() { photoFiles.splice(i, 1); drawPhotos(); };
+    w.appendChild(x); p.appendChild(w);
+  });
 }
 function toBase64(file) {
   return new Promise(function(res, rej) {
@@ -280,7 +302,7 @@ async function submitForm() {
   });
 
   var photos = [];
-  for (var i = 0; i < Math.min(photoFiles.length, 5); i++) {
+  for (var i = 0; i < Math.min(photoFiles.length, MAX_PHOTOS); i++) {
     photos.push({ data: await toBase64(photoFiles[i]), name: photoFiles[i].name });
   }
 
