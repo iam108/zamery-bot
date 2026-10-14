@@ -10,6 +10,10 @@ function esc(s) {
   });
 }
 
+// Недавние отправки заявок (номер отправки → результат), чтобы повтор не создавал дубль
+const recentOrders = new Map();
+setInterval(() => { if (recentOrders.size > 500) recentOrders.clear(); }, 60 * 60 * 1000).unref();
+
 function setupWeb(app) {
   
 app.use(express.json({ limit: '50mb' }));
@@ -68,13 +72,21 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
   // API для Mini App формы заявки
   app.post('/api/order', upload.array('files', 5), async (req, res) => {
+    const sid = String((req.body && req.body.submit_id) || '').slice(0, 40);
+    if (sid && recentOrders.has(sid)) {
+      const prev = recentOrders.get(sid);
+      if (prev === 'pending') return res.status(409).json({ ok: false, busy: true, error: 'Заявка уже отправляется' });
+      return res.json(prev); // эта заявка уже создана — второй раз не создаём
+    }
+    if (sid) recentOrders.set(sid, 'pending');
+    const finish = (body) => { if (sid) { if (body.ok) recentOrders.set(sid, body); else recentOrders.delete(sid); } return res.json(body); };
     try {
       const data = req.body;
       const files = req.files || [];
       data.submitted_by = req.tgUser.id;
       data.has_video = data.has_video === true || data.has_video === 'true';
       if (!String(data.address || '').trim() || !String(data.owner_name || '').trim() || !String(data.object_type || '').trim()) {
-        return res.json({ ok: false, error: 'Заполните адрес, владельца и тип объекта' });
+        return finish({ ok: false, error: 'Заполните адрес, владельца и тип объекта' });
       }
       const order = await createOrder(data);
       await addLog(order.id, 'created', req.staff.name, 'Заявка создана через Mini App');
@@ -128,10 +140,10 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
   }
 }
 
-res.json({ ok: true, id: order.id });
+finish({ ok: true, id: order.id });
 } catch (e) {
   console.error('api/order error:', e);
-  res.json({ ok: false, error: e.message });
+  finish({ ok: false, error: e.message });
 }
 });
 
@@ -487,6 +499,7 @@ function toggleVideo(e) {
   cb.checked = !cb.checked;
 }
 var attachedFiles = [];
+var submitId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 function previewFiles(input) {
   attachedFiles = Array.from(input.files);
   document.getElementById('file-count').textContent = attachedFiles.length + ' файл(ов)';
@@ -511,6 +524,7 @@ async function submitForm() {
   });
   if (!valid) return;
   var btn = document.getElementById('submit-btn');
+  if (btn.disabled) return;
   btn.disabled = true; btn.textContent = 'Отправляем...';
   try {
   var formData = new FormData();
@@ -528,22 +542,35 @@ formData.append('egrn_order', document.getElementById('egrn_order').checked ? '1
 attachedFiles.slice(0,5).forEach(function(f) {
   formData.append('files', f, f.name);
 });
-var r = await fetch('/api/order', {
-  method: 'POST',
-  body: formData,
-});
-    var result = await r.json();
-    if (result.ok) {
+formData.append('submit_id', submitId);
+var result = null, lastErr = '';
+var waits = [0, 8, 15, 30];
+for (var attempt = 0; attempt < waits.length; attempt++) {
+  for (var s = waits[attempt]; s > 0; s--) { btn.textContent = 'Сервер занят, повтор через ' + s + ' с…'; await new Promise(function (ok) { setTimeout(ok, 1000); }); }
+  btn.textContent = attempt ? 'Отправляем ещё раз…' : 'Отправляем...';
+  try {
+    var r = await fetch('/api/order', { method: 'POST', body: formData });
+    var txt = await r.text();
+    try { result = JSON.parse(txt); } catch (pe) { result = null; }
+    if (result && result.ok) break;
+    var snippet = String(txt || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80);
+    lastErr = result ? (result.error || 'ошибка сервера') + ' [' + r.status + ']' : 'сервер ответил ' + r.status + (snippet ? ': ' + snippet : '');
+    var retry = r.status === 429 || r.status === 409 || r.status >= 500 || !result || (result && result.busy);
+    if (!retry) break;
+  } catch (ne) { lastErr = 'нет связи (' + ne.message + ')'; }
+  result = null;
+}
+    if (result && result.ok) {
       btn.textContent = '✅ Заявка отправлена!';
 if (attachedFiles.length > 0) {
     tg.showAlert('Заявка #' + result.id + ' принята, файлы прикреплены.', function () { tg.close(); });
 } else {
   setTimeout(function() { tg.close(); }, 1500);
 }
-    } else { throw new Error(result.error || 'Ошибка сервера'); }
+    } else { throw new Error(lastErr || 'ошибка сервера'); }
   } catch(e) {
     btn.disabled = false; btn.textContent = 'Отправить заявку';
-    alert('Ошибка: ' + e.message);
+    tg.showAlert('Заявка не отправлена: ' + e.message + '. Данные остались в форме — попробуйте ещё раз.');
   }
 }
 <\/script></body></html>`;
