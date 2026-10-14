@@ -110,32 +110,28 @@ textarea:focus,input:focus{border-color:var(--tg-theme-button-color,#6366f1)}
 <!-- ТАБАК -->
 <div id="block-tobacco" class="hidden">
   <div class="section">
-    <div class="section-title">Торговый объект</div>
-    <div class="chk-row" onclick="toggleChk('chk_shop')"><div class="chk-box" id="chk_shop"></div><span class="chk-label">Объект является магазином или павильоном</span></div>
-    <div class="chk-row" onclick="toggleChk('chk_address')"><div class="chk-box" id="chk_address"></div><span class="chk-label">Объект соответствует заявленному адресу</span></div>
-    <div class="chk-row" onclick="toggleChk('chk_area')"><div class="chk-box" id="chk_area"></div><span class="chk-label">Площадь не менее 5 м²</span></div>
+    <div class="section-title">Адрес объекта</div>
+    <input type="text" id="t_address" placeholder="Город, улица, дом">
   </div>
   <div class="section">
-    <div class="section-title">Торговый зал</div>
-    <div class="chk-row" onclick="toggleChk('chk_no_display')"><div class="chk-box" id="chk_no_display"></div><span class="chk-label">Нет открытой выкладки табачной и никотинсодержащей продукции</span></div>
-    <div class="chk-row" onclick="toggleChk('chk_price_list')"><div class="chk-box" id="chk_price_list"></div><span class="chk-label">Есть перечень продукции с ценами</span></div>
-    <div class="chk-row" onclick="toggleChk('chk_price_format')"><div class="chk-box" id="chk_price_format"></div><span class="chk-label">Перечень выполнен в установленном формате</span></div>
-    <div class="chk-row" onclick="toggleChk('chk_no_ads')"><div class="chk-box" id="chk_no_ads"></div><span class="chk-label">Нет рекламы и изображений продукции</span></div>
-    <div class="chk-row" onclick="toggleChk('chk_on_demand')"><div class="chk-box" id="chk_on_demand"></div><span class="chk-label">Демонстрация только после ознакомления с перечнем и по требованию</span></div>
-    <div class="chk-row" onclick="toggleChk('chk_marking')"><div class="chk-box" id="chk_marking"></div><span class="chk-label">Есть маркировка товара</span></div>
-    <div class="chk-row" onclick="toggleChk('chk_cash')"><div class="chk-box" id="chk_cash"></div><span class="chk-label">Есть установленная касса</span></div>
+    <div class="section-title">1. Торговый зал</div>
+    <div class="chk-row" onclick="toggleChk('chk_t_no_display')"><div class="chk-box" id="chk_t_no_display"></div><span class="chk-label">В торговом зале отсутствует выкладка и демонстрация табачной продукции</span></div>
+    <div class="chk-row" onclick="toggleChk('chk_t_price_place')"><div class="chk-box" id="chk_t_price_place"></div><span class="chk-label">Есть место для размещения перечня табачной продукции с ценами</span></div>
+    <div class="chk-row" onclick="toggleChk('chk_t_photo_hall')"><div class="chk-box" id="chk_t_photo_hall"></div><span class="chk-label">Сделаны фотографии торгового зала и входа</span></div>
+    <div class="chk-row" onclick="toggleChk('chk_t_photo_shelves')"><div class="chk-box" id="chk_t_photo_shelves"></div><span class="chk-label">Сделаны фотографии стеллажей с продукцией и размещённых рядом ценников, перечней и рекламных материалов</span></div>
   </div>
   <div class="section">
-    <div class="section-title">Ассортимент</div>
-    <div class="chk-row" onclick="toggleChk('chk_no_single')"><div class="chk-box" id="chk_no_single"></div><span class="chk-label">Нет поштучной продажи сигарет</span></div>
-    <div class="chk-row" onclick="toggleChk('chk_no_unpack')"><div class="chk-box" id="chk_no_unpack"></div><span class="chk-label">Нет продукции без потребительской упаковки</span></div>
-    <div class="chk-row" onclick="toggleChk('chk_no_banned')"><div class="chk-box" id="chk_no_banned"></div><span class="chk-label">Нет насвая, снюса и запрещённой никотинсодержащей продукции</span></div>
-    <div class="chk-row" onclick="toggleChk('chk_no_chew')"><div class="chk-box" id="chk_no_chew"></div><span class="chk-label">Нет запрещённой продукции для жевания, сосания или нюханья</span></div>
-    <div class="chk-row" onclick="toggleChk('chk_nicotine_limit')"><div class="chk-box" id="chk_nicotine_limit"></div><span class="chk-label">Никотинсодержащие жидкости в пределах нормы по содержанию никотина</span></div>
+    <div class="section-title">2. Зоны запрета</div>
+    <div class="chk-row" onclick="toggleChk('chk_t_edu_checked')"><div class="chk-box" id="chk_t_edu_checked"></div><span class="chk-label">Проверено наличие образовательных организаций поблизости</span></div>
+    <div class="chk-row" onclick="toggleChk('chk_t_edu_measured')"><div class="chk-box" id="chk_t_edu_measured"></div><span class="chk-label">Если образовательная организация обнаружена, измерено расстояние до входа в магазин по кратчайшему пешеходному маршруту</span></div>
+    <div class="chk-row" onclick="toggleChk('chk_t_edu_photo')"><div class="chk-box" id="chk_t_edu_photo"></div><span class="chk-label">Сделаны фотографии входа в образовательную организацию</span></div>
+    <input type="text" id="t_edu_name" placeholder="Название образовательной организации" style="margin-top:4px">
+    <input type="text" id="t_edu_dist" inputmode="numeric" placeholder="Расстояние, м" style="margin-top:8px">
   </div>
 </div>
 
 <!-- ОБЩИЕ БЛОКИ -->
+<div id="block-common">
 <div class="section">
   <div class="section-title">Зоны (запрещённые объекты рядом)</div>
   <div id="zones-list"></div>
@@ -154,6 +150,8 @@ textarea:focus,input:focus{border-color:var(--tg-theme-button-color,#6366f1)}
   <div class="toggle-row" onclick="toggleCb('replan')"><span>🔨 Перепланировка</span><div class="toggle"><input type="checkbox" id="replan"><span class="slider"></span></div></div>
   <div class="toggle-row" onclick="toggleCb('passport')"><span>🛡 Паспорт безопасности</span><div class="toggle"><input type="checkbox" id="passport"><span class="slider"></span></div></div>
   <div class="toggle-row" onclick="toggleCb('owner')"><span>🔑 Собственник</span><div class="toggle"><input type="checkbox" id="owner"><span class="slider"></span></div></div>
+</div>
+
 </div>
 
 <div class="section">
@@ -176,6 +174,11 @@ textarea:focus,input:focus{border-color:var(--tg-theme-button-color,#6366f1)}
   <textarea id="conclusion" placeholder="Сделаем / под вопросом / не сделаем..."></textarea>
 </div>
 
+<div class="section" id="block-t-comment" style="display:none">
+  <div class="section-title">Комментарий</div>
+  <textarea id="t_comment" placeholder="Что важно знать юристу"></textarea>
+</div>
+
 <div class="bottom">
   <button class="submit-btn" id="submit-btn" onclick="submitForm()">Отправить отчёт</button>
 </div>
@@ -196,6 +199,8 @@ function selectCat(el) {
   currentCat = el.dataset.val;
   document.getElementById('block-catering-retail').classList.toggle('hidden', currentCat === 'tobacco');
   document.getElementById('block-tobacco').classList.toggle('hidden', currentCat !== 'tobacco');
+  document.getElementById('block-common').classList.toggle('hidden', currentCat === 'tobacco');
+  document.getElementById('block-t-comment').style.display = currentCat === 'tobacco' ? '' : 'none';
 }
 
 function selectRadio(el, group) {
@@ -297,6 +302,10 @@ async function submitForm() {
     video_url: document.getElementById('video-url').value.trim(),
     photos: photos,
     conclusion: conclusion,
+    t_address: (document.getElementById('t_address') || {}).value || '',
+    t_edu_name: (document.getElementById('t_edu_name') || {}).value || '',
+    t_edu_dist: (document.getElementById('t_edu_dist') || {}).value || '',
+    t_comment: (document.getElementById('t_comment') || {}).value || '',
     tg_user_id: tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user.id : null,
     submit_id: submitId,
   };

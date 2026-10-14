@@ -62,27 +62,22 @@ async function handleAuditReportInner(ctx, data) {
   var plain = [];
 
   if (data.object_category === 'tobacco') {
-    lines.push('🚬 <b>Тип: Табак</b>', '');
-    lines.push('<b>Торговый объект:</b>');
-    lines.push((data.chk_shop ? y : n) + ' Объект является магазином или павильоном');
-    lines.push((data.chk_address ? y : n) + ' Объект соответствует заявленному адресу');
-    lines.push((data.chk_area ? y : n) + ' Площадь не менее 5 м²');
+    lines.push('🚬 <b>Табак</b>' + (data.t_address ? ' · ' + esc(data.t_address) : ''), '');
+    lines.push('<b>1. Торговый зал</b>');
+    lines.push((data.chk_t_no_display ? y : n) + ' Нет выкладки и демонстрации табачной продукции');
+    lines.push((data.chk_t_price_place ? y : n) + ' Есть место для перечня табачной продукции с ценами');
+    lines.push((data.chk_t_photo_hall ? y : n) + ' Фото торгового зала и входа');
+    lines.push((data.chk_t_photo_shelves ? y : n) + ' Фото стеллажей, ценников, перечней и рекламы');
     lines.push('');
-    lines.push('<b>Торговый зал:</b>');
-    lines.push((data.chk_no_display ? y : n) + ' Нет открытой выкладки табачной продукции');
-    lines.push((data.chk_price_list ? y : n) + ' Есть перечень продукции с ценами');
-    lines.push((data.chk_price_format ? y : n) + ' Перечень в установленном формате');
-    lines.push((data.chk_no_ads ? y : n) + ' Нет рекламы и изображений продукции');
-    lines.push((data.chk_on_demand ? y : n) + ' Демонстрация только по требованию покупателя');
-    lines.push((data.chk_marking ? y : n) + ' Есть маркировка товара');
-    lines.push((data.chk_cash ? y : n) + ' Есть установленная касса');
-    lines.push('');
-    lines.push('<b>Ассортимент:</b>');
-    lines.push((data.chk_no_single ? y : n) + ' Нет поштучной продажи сигарет');
-    lines.push((data.chk_no_unpack ? y : n) + ' Нет продукции без потребительской упаковки');
-    lines.push((data.chk_no_banned ? y : n) + ' Нет насвая, снюса и запрещённой продукции');
-    lines.push((data.chk_no_chew ? y : n) + ' Нет запрещённой никотинсодержащей продукции для жевания/нюханья');
-    lines.push((data.chk_nicotine_limit ? y : n) + ' Никотинсодержащие жидкости в пределах нормы');
+    lines.push('<b>2. Зоны запрета</b>');
+    lines.push((data.chk_t_edu_checked ? y : n) + ' Проверено наличие образовательных организаций');
+    lines.push((data.chk_t_edu_measured ? y : n) + ' Измерено расстояние по кратчайшему пешеходному маршруту');
+    lines.push((data.chk_t_edu_photo ? y : n) + ' Фото входа в образовательную организацию');
+    if (data.t_edu_name || data.t_edu_dist) {
+      lines.push('🏫 ' + esc(data.t_edu_name || 'Образовательная организация') + (data.t_edu_dist ? ' — <b>' + esc(data.t_edu_dist) + ' м</b>' : ''));
+    }
+    plain.push('Табак' + (data.t_address ? ', ' + data.t_address : '') +
+      (data.t_edu_name || data.t_edu_dist ? '. Образовательная организация: ' + (data.t_edu_name || '—') + (data.t_edu_dist ? ', ' + data.t_edu_dist + ' м' : '') : '. Образовательных организаций не отмечено'));
   } else {
     lines.push('🏢 <b>Здание:</b> ' + esc(data.building_type || '—'));
     lines.push('📐 <b>Границы:</b> ' + esc(data.boundaries || '—'));
@@ -100,10 +95,12 @@ async function handleAuditReportInner(ctx, data) {
       ', БТИ: ' + (data.bti || '—') + ', ТО: ' + (data.to || '—'));
   }
 
+  if (data.object_category !== 'tobacco') {
   lines.push('');
   lines.push('🚫 <b>Зоны:</b>');
   lines.push(zonesText);
   plain.push('Зоны: ' + zonesPlain);
+  }
 
   if (data.nearby) { lines.push(''); lines.push('👁 <b>На заметку:</b> ' + esc(data.nearby)); plain.push('На заметку: ' + data.nearby); }
 
@@ -123,7 +120,8 @@ async function handleAuditReportInner(ctx, data) {
   if (data.video_url) { lines.push(''); lines.push('🎥 <b>Видео:</b> ' + esc(data.video_url)); plain.push('Видео: ' + data.video_url); }
 
   lines.push('');
-  lines.push('📝 <b>Итог:</b> ' + esc(data.conclusion));
+  lines.push((data.object_category === 'tobacco' ? '📝 <b>3. Итог:</b> ' : '📝 <b>Итог:</b> ') + esc(data.conclusion));
+  if (data.t_comment) { lines.push('💬 <b>Комментарий:</b> ' + esc(data.t_comment)); plain.push('Комментарий: ' + data.t_comment); }
   lines.push('');
   lines.push('👤 <i>Аудитор: ' + esc(actor) + '</i>');
   plain.push('Итог: ' + data.conclusion);
