@@ -43,6 +43,7 @@ function formatOrderMessage(order) {
   lines.push(STATUS_EMOJI[order.status] + ' <b>Статус:</b> ' + STATUS_LABEL[order.status]);
 
   const createdAt = format(new Date(order.created_at), 'd MMM HH:mm', { locale: ru });
+  if (order.submitted_name) lines.push('👤 <b>Заявку оставил(а):</b> ' + esc(order.submitted_name));
   lines.push('🕐 <i>Создана: ' + createdAt + '</i>');
 
   return lines.join('\n');

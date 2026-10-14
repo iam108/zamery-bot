@@ -29,6 +29,7 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
   }));
 
   require('./auth').setupAuth(app);
+  require('../db/pool').query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS submitted_name TEXT').catch((e) => console.error('orders.submitted_name:', e.message));
 
   const requireAuth = (req, res, next) => {
     if (req.session.auth) return next();
@@ -89,6 +90,9 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
         return finish({ ok: false, error: 'Заполните адрес, владельца и тип объекта' });
       }
       const order = await createOrder(data);
+      // кто оставил заявку — сохраняем с заявкой, чтобы имя не пропадало при смене статуса
+      order.submitted_name = req.staff.name;
+      try { await require('../db/pool').query('UPDATE orders SET submitted_name=$1 WHERE id=$2', [req.staff.name, order.id]); } catch (e) { console.error('submitted_name:', e.message); }
       await addLog(order.id, 'created', req.staff.name, 'Заявка создана через Mini App');
 
       const { formatOrderMessage } = require('../bot/formatter');
@@ -358,6 +362,7 @@ function orderDetailPage(order, logs) {
     <div class="field"><span class="field-label">Статус</span>
       <span class="badge" style="background:${statusColors[order.status]}20;color:${statusColors[order.status]};border:1px solid ${statusColors[order.status]}40">${statusLabels[order.status]}</span>
     </div>
+    ${order.submitted_name ? `<div class="field"><span class="field-label">Оставил(а)</span><span>${esc(order.submitted_name)}</span></div>` : ''}
     <div class="field"><span class="field-label">Создана</span><span style="color:#64748b;font-size:13px">${created}</span></div>
   </div>
   <div class="card">
