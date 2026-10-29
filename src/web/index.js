@@ -154,6 +154,8 @@ finish({ ok: true, id: order.id });
 }
 });
 
+  require('./audit-drafts').setupAuditDrafts(app);
+
   // API для отчёта аудитора
   app.get('/api/audit/prefill', async (req, res) => {
     try {
@@ -163,7 +165,8 @@ finish({ ok: true, id: order.id });
       if (!order) return res.status(404).json({ ok: false, error: 'Заявка не найдена' });
       const type = String(order.object_type || '').toLowerCase();
       const category = /табак/.test(type) ? 'tobacco' : /общепит/.test(type) ? 'catering' : /магазин/.test(type) ? 'retail' : 'other';
-      res.json({ ok: true, org: order.owner_name || order.object_name || '', address: order.address || '', object_category: category });
+      res.json({ ok: true, order_id: order.id, org: order.owner_name || order.object_name || '', object_name: order.object_name || '', address: order.address || '', object_category: category,
+        contacts: order.contacts || '', deadline: order.deadline || null, status: order.status || 'new' });
     } catch (e) {
       console.error('audit prefill:', e.message);
       res.status(500).json({ ok: false, error: 'Не удалось загрузить данные заявки' });
@@ -179,11 +182,17 @@ finish({ ok: true, id: order.id });
       telegram: botInstance.telegram,
       reply: async () => {},
     };
+    if (data.draft_id) {
+      const drafts = require('./audit-drafts');
+      const submit = require('./audit-submit').createAuditSubmitter(drafts, handleAuditReport);
+      return res.json(await submit(req.tgUser.id, data.draft_id, data.revision, fakeCtx));
+    }
+    if (data.schema_version === 3) return res.status(400).json({ ok: false, error: 'Сначала сохраните черновик новой формы.' });
     await handleAuditReport(fakeCtx, data);
     res.json({ ok: true });
   } catch (e) {
     console.error('api/audit error:', e);
-    res.json({ ok: false, error: e.message });
+    res.status(e.status || 400).json({ ok: false, error: e.message });
   }
 });
   // ── Stats page ───────────────────────────────────────────
@@ -215,7 +224,12 @@ finish({ ok: true, id: order.id });
   app.get('/form', (req, res) => res.send(miniAppForm()));
 
   const { auditForm } = require('./audit-form');
-  app.get('/audit', (req, res) => res.send(auditForm()));
+  const auditWizard = require('./audit-wizard');
+  app.get('/audit', (req, res) => res.send(auditWizard()));
+  app.get('/audit/legacy', (req, res) => res.send(auditForm()));
+  app.get('/audit-wizard.css', (req, res) => res.type('text/css').send(auditWizard.css()));
+  app.get('/audit-wizard-client.js', (req, res) => res.type('application/javascript').send(auditWizard.client()));
+  app.get('/audit-plan-editor.js', (req, res) => res.sendFile(require('path').join(__dirname, 'audit-plan-editor.js')));
     require('./handoff').setupHandoff(app);
     require('./handoff').setupReportsWeb(app, upload);
 }

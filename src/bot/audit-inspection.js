@@ -22,17 +22,17 @@ function validateInspection(data) {
   for (const [key, label] of [['org', 'организацию'], ['address', 'адрес объекта']]) {
     if (typeof p[key] !== 'string' || !p[key].trim()) throw new Error('Укажите ' + label + '.');
   }
-  const required = ['archive_available', 'alcohol_present', 'within_cadastral', 'all_entrances_checked', 'zones_checked'];
-  if (p.archive_available === 'Да') required.push('archive_match');
+  const required = ['alcohol_present', 'within_cadastral', 'all_entrances_checked', 'zones_checked'];
   if (p.service === 'Продление') {
-    required.push('licensed_boundaries_match');
+    required.push('archive_available', 'licensed_boundaries_match');
+    if (p.archive_available === 'Да') required.push('archive_match');
     if (p.alcohol_present !== 'Нет') required.push('alcohol_within_licensed');
   }
   for (const key of required) {
     if (!ANSWERS.includes(p[key])) throw new Error('Ответьте на вопросы проверки; если данных нет, выберите «Не проверено».');
   }
   for (const [key, value] of Object.entries(p)) {
-    if (typeof value !== 'string' || value.length > (['risks', 'structural_elements', 'plan_note'].includes(key) ? 2000 : 500)) {
+    if (typeof value !== 'string' || value.length > (['risks', 'structural_elements', 'plan_note', 'archive_url'].includes(key) ? 2000 : 500)) {
       throw new Error('Слишком длинное или некорректное поле проверки: ' + key);
     }
   }
@@ -43,10 +43,11 @@ function validateInspection(data) {
   for (const zone of data.zones || []) {
     if (!zone || typeof zone.name !== 'string' || !zone.name.trim()) throw new Error('Укажите название соседней организации.');
     for (const key of ['name', 'dist', 'license', 'info']) {
-      if (zone[key] != null && (typeof zone[key] !== 'string' || zone[key].length > 1000)) throw new Error('Проверьте данные соседней организации.');
+      if (zone[key] != null && (typeof zone[key] !== 'string' || zone[key].length > (data.schema_version === 3 ? 2000 : 1000))) throw new Error('Проверьте данные соседней организации.');
     }
   }
-  if (data.photos != null && (!Array.isArray(data.photos) || data.photos.length > 10)) throw new Error('Можно прикрепить до 10 изображений.');
+  const photoLimit = data.schema_version === 3 ? 60 : 10;
+  if (data.photos != null && (!Array.isArray(data.photos) || data.photos.length > photoLimit)) throw new Error('Можно прикрепить до ' + photoLimit + ' изображений.');
 }
 
 function buildInspectionReport(data) {
@@ -67,10 +68,12 @@ function buildInspectionReport(data) {
   field('Источник графики', p.plan_source);
   if (p.plan_note) field('Пояснение к графике', p.plan_note);
   field('Фактические конструктивные элементы', p.structural_elements);
-  field('Архив доступен', p.archive_available);
-  if (p.archive_available === 'Да') field('Совпадает с архивом', p.archive_match);
-  if (p.archive_available !== 'Да') warnings.push('Архивная сверка не выполнена: ' + p.archive_available.toLowerCase() + '.');
-  else if (p.archive_match !== 'Да') warnings.push('Совпадение с архивом: ' + p.archive_match.toLowerCase() + '.');
+  if (p.service === 'Продление') {
+    field('Архив доступен', p.archive_available);
+    if (p.archive_available === 'Да') field('Совпадает с архивом', p.archive_match);
+    if (p.archive_available !== 'Да') warnings.push('Архивная сверка не выполнена: ' + p.archive_available.toLowerCase() + '.');
+    else if (p.archive_match !== 'Да') warnings.push('Совпадение с архивом: ' + p.archive_match.toLowerCase() + '.');
+  }
   plain.push('');
   plain.push('АЛКОГОЛЬ И ГРАНИЦЫ');
   field('Алкоголь на объекте', p.alcohol_present);
@@ -104,8 +107,10 @@ function buildInspectionReport(data) {
   field('Состояние ремонта', p.repair_state);
   field('Риски и необходимые действия', p.risks);
   field('Видео осмотра', p.video_status);
-  const roles = new Set((data.photos || []).map(photo => photo.role));
-  field('План с цветной разметкой', roles.has('plan') ? 'Приложен' : 'Не приложен');
+  const roles = new Set([...(data.photos || []), ...(data.evidence || [])].map(photo => photo.role));
+  if (data.schema_version === 3) field('Представленный план', roles.has('plan') || roles.has('plan-source') ? 'Приложен' : 'Не приложен');
+  const markedPlan = data.schema_version === 3 ? (data.evidence || []).some(e => e.role === 'plan' && e.subject_id === 'annotation') : roles.has('plan');
+  field('План с цветной разметкой', markedPlan ? 'Приложен' : 'Не приложен');
   field('Карта организаций и входов', roles.has('map') ? 'Приложена' : 'Не приложена');
   plain.push('Разметка: сиреневый — заявленные границы; жёлтый — аренда; красный — зал обслуживания; зелёный — бар.');
   if (warnings.length) {

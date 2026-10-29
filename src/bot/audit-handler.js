@@ -4,6 +4,7 @@ const { esc } = require('./formatter');
 const { buildInspectionReport, validateInspection } = require('./audit-inspection');
 const { splitTelegramHtml, photoCaption } = require('./audit-delivery');
 const { createHash } = require('crypto');
+const { normalizeWorkflow, validateWorkflow, buildWorkflowReport } = require('./audit-workflow');
 
 // Отчёты, которые уже обрабатываются или отправлены (защита от дубля при повторной отправке)
 const seenSubmits = new Map();
@@ -22,26 +23,36 @@ async function tgRetry(fn) {
 }
 
 async function handleAuditReport(ctx, data) {
+  data = normalizeWorkflow(data);
   validateInspection(data);
-  if (data.photos && (!Array.isArray(data.photos) || data.photos.length > 10 ||
+  validateWorkflow(data);
+  const mediaLimit = data.schema_version === 3 ? 60 : 10;
+  if (data.photos && (!Array.isArray(data.photos) || data.photos.length > mediaLimit ||
     data.photos.some(function (p) { return !p || typeof p.data !== 'string' || !p.data; }))) {
-    throw new Error('Можно отправить до 10 корректных фотографий');
+    throw new Error('Можно отправить до ' + mediaLimit + ' корректных фотографий');
   }
+  if (data.documents && (!Array.isArray(data.documents) || data.documents.length > 60 || data.documents.some(p => !p || !(Buffer.isBuffer(p.source) && p.source.length || typeof p.data === 'string' && p.data) || !/^(image\/(jpeg|png|webp|gif|heic|heif|avif|tiff|bmp)|application\/pdf)$/.test(p.mime)))) throw new Error('Проверьте оригиналы приложенных документов.');
   const key = data.submit_id ? String(ctx.from && ctx.from.id || '') + ':' + data.submit_id : null;
   let progress = key && seenSubmits.get(key);
   // Keep only a digest, not full base64 images, during the retry window.
-  const signature = createHash('sha256').update(JSON.stringify(data)).digest('hex');
+  const digestData = data.documents ? { ...data, documents: data.documents.map(({ source, data: binary, ...meta }) => ({ ...meta, contentHash: createHash('sha256').update(source || Buffer.from(binary, 'base64')).digest('hex') })) } : data;
+  const signature = createHash('sha256').update(JSON.stringify(digestData)).digest('hex');
+  if (!progress && ctx.auditDelivery) {
+    const stored = await ctx.auditDelivery.load();
+    progress = key && seenSubmits.get(key) || (stored && stored.signature ? { ...stored, job: null } : null);
+  }
   if (progress && progress.signature !== signature) {
     throw new Error('Этот отчёт уже начал отправляться. Повторите без изменений или откройте новую форму для нового отчёта.');
   }
   if (!progress) {
-    progress = { signature, textIds: [], photoIds: [], saved: false, handoffSent: false, replied: false, job: null };
-    if (key) {
+    progress = { signature, textIds: [], photoIds: [], documentIds: [], saved: false, handoffSent: false, replied: false, job: null };
+  }
+  if (key && !seenSubmits.has(key)) {
       seenSubmits.set(key, progress);
       const timer = setTimeout(function () { seenSubmits.delete(key); }, 30 * 60 * 1000);
       if (timer.unref) timer.unref();
-    }
   }
+  progress.documentIds = progress.documentIds || [];
   if (progress.job) return progress.job;
   const job = handleAuditReportInner(ctx, data, progress);
   progress.job = job;
@@ -51,6 +62,12 @@ async function handleAuditReport(ctx, data) {
 
 async function handleAuditReportInner(ctx, data, progress) {
   validateInspection(data);
+  async function checkpoint() {
+    if (ctx.auditDelivery) {
+      const { signature, textIds, photoIds, documentIds, saved, handoffSent, replied } = progress;
+      await ctx.auditDelivery.save({ signature, textIds, photoIds, documentIds, saved, handoffSent, replied });
+    }
+  }
   const GROUP_ID = process.env.GROUP_CHAT_ID;
   const actor = ctx.from
     ? (ctx.from.username ? '@' + ctx.from.username : ctx.from.first_name)
@@ -81,6 +98,9 @@ async function handleAuditReportInner(ctx, data, progress) {
   var inspectionReport = buildInspectionReport(data);
   lines.push.apply(lines, inspectionReport.html);
   plain.push.apply(plain, inspectionReport.plain);
+  const workflowReport = buildWorkflowReport(data);
+  lines.push.apply(lines, workflowReport.html);
+  plain.push.apply(plain, workflowReport.plain);
 
   if (data.object_category === 'tobacco') {
     lines.push('🚬 <b>Табак</b>' + (data.t_address ? ' · ' + esc(data.t_address) : ''), '');
@@ -102,9 +122,10 @@ async function handleAuditReportInner(ctx, data, progress) {
   } else {
     lines.push('🏢 <b>Здание:</b> ' + esc(data.building_type || '—'));
     lines.push('📐 <b>Границы:</b> ' + esc(data.boundaries || '—'));
-    lines.push('📋 <b>БТИ:</b> ' + (data.bti === 'Да' ? y + ' Подходит' : data.bti === 'Нет' ? '❌ Не подходит' : '❓ Не проверено'));
+    lines.push(data.schema_version === 3 ? '📋 <b>Сверка с представленным планом:</b> ' + esc(data.bti || 'Не проверено') : '📋 <b>БТИ:</b> ' + (data.bti === 'Да' ? y + ' Подходит' : data.bti === 'Нет' ? '❌ Не подходит' : '❓ Не проверено'));
     lines.push('🔧 <b>ТО:</b> ' + esc(data.to || '—'));
     lines.push('');
+    if (data.schema_version !== 3) {
     lines.push('<b>Планировка и границы:</b>');
     lines.push((data.chk_bti_match ? y : n) + ' Фактическая планировка соответствует БТИ');
     lines.push((data.chk_hall ? y : n) + ' Торговый зал / зал обслуживания определён');
@@ -112,6 +133,7 @@ async function handleAuditReportInner(ctx, data, progress) {
     lines.push((data.chk_no_replan ? y : n) + ' Нет самовольных перепланировок');
     lines.push((data.chk_clear_borders ? y : n) + ' Границы объекта однозначно определимы');
     lines.push((data.chk_cadastr ? y : n) + ' Кадастровый номер не разделён (объект единый)');
+    }
     plain.push('Здание: ' + (data.building_type || '—') + ', границы: ' + (data.boundaries || '—') +
       ', БТИ: ' + (data.bti || '—') + ', ТО: ' + (data.to || '—'));
   }
@@ -166,22 +188,28 @@ async function handleAuditReportInner(ctx, data, progress) {
       parse_mode: 'HTML', reply_to_message_id: replyToMsgId || undefined,
     }); });
     progress.textIds.push(m.message_id);
+    await checkpoint();
   }
 
-  if (data.photos && data.photos.length && !progress.photoIds.length) {
+  if (data.photos && data.photos.length) {
     try {
-      if (data.photos.length === 1) {
-        const photo = data.photos[0];
+      for (let offset = progress.photoIds.length; offset < data.photos.length;) {
+        const batch = data.photos.slice(offset, offset + 10);
+      if (batch.length === 1) {
+        const photo = batch[0];
         const m = await tgRetry(function () { return tg.sendPhoto(GROUP_ID,
           { source: Buffer.from(photo.data, 'base64') },
           { caption: photoCaption(photo, data.order_id), reply_to_message_id: progress.textIds[0] }); });
         progress.photoIds.push(m.message_id);
       } else {
-        const media = data.photos.map(function (p) {
+        const media = batch.map(function (p) {
           return { type: 'photo', media: { source: Buffer.from(p.data, 'base64') }, caption: photoCaption(p, data.order_id) };
         });
         const msgs = await tgRetry(function () { return tg.sendMediaGroup(GROUP_ID, media, { reply_to_message_id: progress.textIds[0] }); });
         msgs.forEach(function (m) { progress.photoIds.push(m.message_id); });
+      }
+        offset = progress.photoIds.length;
+        await checkpoint();
       }
     } catch (e) {
       console.error('audit photos:', e.message);
@@ -189,10 +217,37 @@ async function handleAuditReportInner(ctx, data, progress) {
     }
   }
 
-  var sentIds = progress.textIds.concat(progress.photoIds);
+  if (data.documents && data.documents.length) {
+    try {
+      for (let offset = progress.documentIds.length; offset < data.documents.length;) {
+        const batch = data.documents.slice(offset, offset + 10);
+        const caption = file => {
+          const subject = (data.entrances || []).find(e => e.id === file.subject_id)?.label || (data.zones || []).find(z => z.id === file.subject_id)?.name || '';
+          return (photoCaption(file, data.order_id) + (subject ? ' · ' + subject : '') + '\n' + (file.name || 'Документ')).slice(0, 900);
+        };
+        if (batch.length === 1) {
+          const file = batch[0];
+          const m = await tgRetry(() => tg.sendDocument(GROUP_ID, { source: file.source || Buffer.from(file.data, 'base64'), filename: file.name }, { caption: caption(file), reply_to_message_id: progress.textIds[0] }));
+          progress.documentIds.push(m.message_id);
+        } else {
+          const media = batch.map(file => ({ type: 'document', media: { source: file.source || Buffer.from(file.data, 'base64'), filename: file.name }, caption: caption(file) }));
+          const msgs = await tgRetry(() => tg.sendMediaGroup(GROUP_ID, media, { reply_to_message_id: progress.textIds[0] }));
+          msgs.forEach(m => progress.documentIds.push(m.message_id));
+        }
+        offset = progress.documentIds.length;
+        await checkpoint();
+      }
+    } catch (e) {
+      console.error('audit originals:', e.message);
+      throw new Error('Отчёт отправлен частично: не все оригиналы доставлены. Повторите отправку без изменений — подтверждённые пакеты сохраняются.');
+    }
+  }
+
+  var sentIds = progress.textIds.concat(progress.photoIds, progress.documentIds);
   if (!progress.saved) {
     await saveAudit(data.order_id ? parseInt(data.order_id) : null, plain.join('\n'), GROUP_ID, sentIds, data);
     progress.saved = true;
+    await checkpoint();
   }
 
   if (data.order_id && !progress.handoffSent) {
@@ -202,11 +257,13 @@ async function handleAuditReportInner(ctx, data, progress) {
       reply_markup: { inline_keyboard: [[{ text: '⚖️ Передать юристу', callback_data: 'handoff:' + data.order_id }]] },
     }); });
     progress.handoffSent = true;
+    await checkpoint();
   }
 
   if (ctx.reply && !progress.replied) {
     await ctx.reply('✅ Отчёт' + (data.photos && data.photos.length ? ' и фото (' + data.photos.length + ')' : '') + ' отправлены в группу!');
     progress.replied = true;
+    await checkpoint();
   }
 
 }

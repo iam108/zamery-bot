@@ -72,3 +72,10 @@ test('order prefill and report selection preserve renewal through the client cal
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(context.S.service, 'Продление');
 });
+test('clearer video checklist wording retains the persisted identifier', () => {
+  const { LISTS } = require('../src/checklists');
+  const items = Object.values(LISTS).flatMap(list => list.sections.flatMap(section => section.i));
+  const renamed = items.filter(item => item.l === 'Доснять / переснять видео');
+  assert.ok(renamed.length > 0);
+  assert.ok(renamed.every(item => item.id === 'i2zx55f'));
+});

@@ -13,6 +13,8 @@ async function ensureTables() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
     ALTER TABLE audits ADD COLUMN IF NOT EXISTS report_data JSONB;
+    ALTER TABLE audits ADD COLUMN IF NOT EXISTS draft_id UUID;
+    CREATE UNIQUE INDEX IF NOT EXISTS audits_draft_id ON audits(draft_id);
     CREATE TABLE IF NOT EXISTS staff (
       tg_id      BIGINT PRIMARY KEY,
       name       TEXT NOT NULL,
@@ -45,9 +47,10 @@ async function saveAudit(orderId, text, chatId, msgIds, data) {
   const reportData = data ? Object.assign({}, data, { photos: (data.photos || []).map(function (p) {
     return { name: p.name || '', role: p.role || 'photo' };
   }) }) : null;
+  if (reportData && data.documents) reportData.documents = data.documents.map(({ data: binary, source, ...meta }) => meta);
   await pool.query(
-    'INSERT INTO audits (order_id, text, chat_id, msg_ids, report_data) VALUES ($1,$2,$3,$4,$5)',
-    [orderId || null, text, chatId, msgIds, reportData ? JSON.stringify(reportData) : null]
+    'INSERT INTO audits (order_id, text, chat_id, msg_ids, report_data, draft_id) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT(draft_id) DO NOTHING',
+    [orderId || null, text, chatId, msgIds, reportData ? JSON.stringify(reportData) : null, data && data.draft_id || null]
   );
 }
 

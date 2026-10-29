@@ -188,13 +188,13 @@ function setupBot() {
   bot.action(/^report:(\d+)$/, async (ctx) => {
     const orderId = ctx.match[1];
     const userId = ctx.from.id;
-    const auditUrl = WEBAPP_URL + '/audit?order_id=' + orderId;
+    const auditUrl = WEBAPP_URL + '/audit?order_id=' + orderId + '&' + require('../web/auth').keyQuery(userId);
 
     try {
       await ctx.telegram.sendMessage(userId,
-        '📋 Заполни отчёт по заявке #' + orderId + ':',
+        '🔍 Проверка по заявке #' + orderId + ': созвон, выезд, входы, зоны, помещение и план. Черновик можно продолжить после выезда.',
         Markup.inlineKeyboard([
-          Markup.button.webApp('🔍 Открыть форму отчёта', auditUrl),
+          Markup.button.webApp('🔍 Открыть проверку', auditUrl),
         ])
       );
       await ctx.answerCbQuery('Ссылка отправлена в личку 👆');
@@ -220,7 +220,7 @@ function setupBot() {
           { text: '✅ Готово', callback_data: 'status:done:' + orderId },
           { text: '❌ Отменить', callback_data: 'status:cancelled:' + orderId },
         ], [
-          { text: '📋 Написать отчёт', callback_data: 'report:' + orderId },
+          { text: '🔍 Продолжить проверку', callback_data: 'report:' + orderId },
         ]];
       } else if (newStatus === 'new') {
         buttons = [[
@@ -228,7 +228,7 @@ function setupBot() {
         ]];
       } else if (newStatus === 'done') {
         buttons = [[
-          { text: '📋 Написать отчёт', callback_data: 'report:' + orderId },
+          { text: '🔍 Открыть проверку', callback_data: 'report:' + orderId },
         ]];
       }
 
@@ -236,6 +236,14 @@ function setupBot() {
         parse_mode: 'HTML',
         reply_markup: buttons.length ? { inline_keyboard: buttons } : undefined,
       });
+
+      if (newStatus === 'in_progress') {
+        const auditUrl = WEBAPP_URL + '/audit?order_id=' + orderId + '&' + require('../web/auth').keyQuery(ctx.from.id);
+        await ctx.telegram.sendMessage(ctx.from.id,
+          '🔍 Заявка #' + orderId + ' в работе. Начните с контакта и согласования выезда; затем форма проведёт по входам, окружению, помещению и графике.',
+          Markup.inlineKeyboard([Markup.button.webApp('Начать проверку по шагам', auditUrl)])
+        ).catch(e => console.error('audit workflow link:', e.message));
+      }
 
       const labels = { in_progress: 'взял в работу', done: 'закрыл', cancelled: 'отменил' };
       await ctx.answerCbQuery(STATUS_EMOJI[newStatus] + ' ' + (ctx.from.username ? '@' + ctx.from.username : (ctx.from.first_name || '')) + ' ' + (labels[newStatus] || newStatus));

@@ -39,8 +39,9 @@ function splitTelegramHtml(html, limit = 3500) {
 }
 
 function photoCaption(photo, orderId) {
-  const label = { plan: 'План с разметкой', map: 'Карта и входы', photo: 'Фото объекта' }[photo.role] || 'Фото объекта';
-  return label + (orderId ? ' · отчёт по заявке #' + String(orderId).slice(0, 30) : ' · отчёт аудитора');
+  const label = { plan: 'План с разметкой', 'plan-source': 'Оригинал плана', map: 'Карта и входы', photo: 'Фото объекта', entrance: 'Вход объекта', exterior: 'Фасад и адресная табличка', zone: 'Соседняя организация', interior: 'Внутри помещения', act: 'Акт выездной оценки', document: 'Документ объекта' }[photo.role] || 'Материалы объекта';
+  const title = photo.role === 'plan' && photo.subject_id === 'source' ? 'Оригинал представленного плана' : label;
+  return title + (orderId ? ' · отчёт по заявке #' + String(orderId).slice(0, 30) : ' · отчёт аудитора');
 }
 
 module.exports = { splitTelegramHtml, photoCaption };

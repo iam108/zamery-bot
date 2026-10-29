@@ -47,7 +47,7 @@ function harness(options = {}) {
   let sequence = 1;
   const esc = text => String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const ctx = { from: { id: 10, username: 'auditor' }, telegram: {}, reply: async text => { calls.push({ method: 'reply', text }); } };
-  for (const method of ['sendMessage', 'sendPhoto', 'sendMediaGroup']) {
+  for (const method of ['sendMessage', 'sendPhoto', 'sendMediaGroup', 'sendDocument']) {
     ctx.telegram[method] = async (...args) => {
       calls.push({ method, args });
       if (options.fail) await options.fail(method, args);
@@ -64,6 +64,7 @@ function harness(options = {}) {
       } };
       if (name === './formatter') return { esc };
       if (name === './audit-delivery') return require('../src/bot/audit-delivery');
+      if (name === './audit-workflow') return require('../src/bot/audit-workflow');
       if (name === 'crypto') return require('node:crypto');
       if (name === './audit-inspection') return {
         validateInspection: data => { if (options.invalid) throw new Error('Заполните услугу'); },
@@ -159,4 +160,23 @@ test('changed payload cannot be mixed with partially delivered report', async ()
   const h = harness({ fail: async method => { if (method === 'sendPhoto') throw new Error('failure'); } });
   await assert.rejects(h.send(data({ photos: [photo('photo')] })), /фотографии/);
   await assert.rejects(h.send(data({ photos: [photo('photo')], conclusion: 'Изменено' })), /без изменений/);
+});
+
+test('original documents are batched beyond ten and resume durable checkpoints after restart', async () => {
+  let stored = {}, albums = 0;
+  const files = Array.from({ length: 23 }, (_, i) => ({ name: 'file-' + i + '.pdf', mime: 'application/pdf', role: 'document', source: Buffer.from('original-' + i) }));
+  const report = data({ schema_version: 3, workflow: { conclusion_status: 'insufficient' }, entrances: [], zones: [], documents: files });
+  const first = harness({ fail: async method => { if (method === 'sendMediaGroup' && ++albums === 2) throw new Error('temporary failure'); } });
+  first.ctx.auditDelivery = { load: async () => stored, save: async progress => { stored = JSON.parse(JSON.stringify(progress)); } };
+  await assert.rejects(first.send(report), /не все оригиналы/);
+  assert.equal(stored.documentIds.length, 10);
+  const second = harness();
+  second.ctx.auditDelivery = first.ctx.auditDelivery;
+  await second.send(report);
+  const resumedAlbums = second.calls.filter(c => c.method === 'sendMediaGroup');
+  assert.deepEqual(resumedAlbums.map(c => c.args[1].length), [10, 3]);
+  assert.ok(resumedAlbums.every(c => c.args[1].every(f => f.type === 'document')));
+  assert.equal(second.calls.filter(c => c.method === 'sendMessage').length, 1); // only handoff, report text already confirmed
+  assert.equal(stored.documentIds.length, 23);
+  assert.equal(second.saved.length, 1);
 });

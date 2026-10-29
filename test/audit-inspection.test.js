@@ -48,9 +48,18 @@ test('service and object identity cannot be silently omitted', () => {
 });
 
 test('archive mismatch is conditional and missing archive cannot be declared matching', () => {
-  const text = buildInspectionReport(report('Получение', { archive_available: 'Нет', archive_match: 'Да' })).plain.join('\n');
+  const text = buildInspectionReport(report('Продление', { archive_available: 'Нет', archive_match: 'Да' })).plain.join('\n');
   assert.match(text, /Архивная сверка не выполнена/);
   assert.doesNotMatch(text, /Совпадает с архивом: Да/);
+});
+
+test('acquisition has no mandatory previous archive or archive warning', () => {
+  const data = report('Получение');
+  delete data.inspection.archive_available;
+  delete data.inspection.archive_match;
+  assert.doesNotThrow(() => validateInspection(data));
+  const text = buildInspectionReport(data).plain.join('\n');
+  assert.doesNotMatch(text, /Архив доступен|Архивная сверка не выполнена|Совпадает с архивом/);
 });
 
 test('empty nearby list does not mean zones absent and no 25m threshold is inferred', () => {

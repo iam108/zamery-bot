@@ -72,6 +72,41 @@ async function migrate() {
         report_data JSONB
       );
       ALTER TABLE audits ADD COLUMN IF NOT EXISTS report_data JSONB;
+      ALTER TABLE audits ADD COLUMN IF NOT EXISTS draft_id UUID;
+      CREATE UNIQUE INDEX IF NOT EXISTS audits_draft_id ON audits(draft_id);
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS audit_drafts (
+        id UUID PRIMARY KEY,
+        author_tg_id BIGINT NOT NULL,
+        order_id INT,
+        revision INT NOT NULL DEFAULT 1,
+        data JSONB NOT NULL DEFAULT '{}',
+        delivery JSONB NOT NULL DEFAULT '{}',
+        submitting_revision INT,
+        submitted_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      ALTER TABLE audit_drafts ADD COLUMN IF NOT EXISTS delivery JSONB NOT NULL DEFAULT '{}';
+      CREATE UNIQUE INDEX IF NOT EXISTS audit_drafts_current
+        ON audit_drafts (author_tg_id, COALESCE(order_id, 0)) WHERE submitted_at IS NULL;
+      CREATE TABLE IF NOT EXISTS audit_evidence (
+        draft_id UUID NOT NULL REFERENCES audit_drafts(id),
+        id UUID NOT NULL,
+        name TEXT NOT NULL,
+        mime TEXT NOT NULL,
+        role TEXT NOT NULL,
+        subject_id TEXT NOT NULL DEFAULT '',
+        kind TEXT NOT NULL DEFAULT '',
+        bytes INT NOT NULL,
+        sha256 TEXT NOT NULL,
+        content BYTEA NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        deleted_at TIMESTAMPTZ,
+        PRIMARY KEY (draft_id, id)
+      );
     `);
 
     await client.query('COMMIT');
