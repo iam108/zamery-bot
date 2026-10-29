@@ -52,6 +52,15 @@ async function migrate() {
       CREATE INDEX IF NOT EXISTS idx_logs_order       ON logs(order_id);
     `);
 
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS web_sessions (
+        sid VARCHAR PRIMARY KEY,
+        sess JSON NOT NULL,
+        expire TIMESTAMP(6) NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS web_sessions_expire ON web_sessions (expire);
+    `);
+
     await client.query('COMMIT');
     console.log('✅ Миграции выполнены успешно');
   } catch (err) {

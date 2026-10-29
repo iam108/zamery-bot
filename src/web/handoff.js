@@ -85,8 +85,24 @@ function caseText(c) {
 
 
 // ── Отчёты из чата замеров: запоминание, поиск, импорт выгрузки ─────────
-async function ensureReports() {
-  await pool.query(`
+let reportsReady = null;
+function ensureReports() {
+  if (!reportsReady) {
+    reportsReady = initializeReports().catch(function (err) {
+      reportsReady = null;
+      throw err;
+    });
+  }
+  return reportsReady;
+}
+
+async function initializeReports() {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Один запуск DDL даже при одновременном старте нескольких контейнеров.
+    await client.query('SELECT pg_advisory_xact_lock(108, 1)');
+    await client.query(`
     CREATE TABLE IF NOT EXISTS reports (
       id         SERIAL PRIMARY KEY,
       chat_id    BIGINT,
@@ -102,7 +118,12 @@ async function ensureReports() {
     CREATE INDEX IF NOT EXISTS reports_chat_time ON reports (chat_id, created_at DESC);
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS reply_to BIGINT;
     CREATE INDEX IF NOT EXISTS reports_reply ON reports (chat_id, reply_to);
-  `);
+    `);
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally { client.release(); }
 }
 
 var MERGE_SEC = 180; // сообщения одного автора подряд в пределах 3 минут — один отчёт

@@ -1,5 +1,7 @@
 const express = require('express');
 const session = require('express-session');
+const PgSession = require('connect-pg-simple')(session);
+const pool = require('../db/pool');
 const path = require('path');
 const { getOrders, getOrderById, updateOrderStatus, getOrderLogs, getStats, createOrder, addLog, setTelegramMsgId } = require('../db/queries');
 const multer = require('multer');
@@ -22,6 +24,7 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
   app.use(express.static(path.join(__dirname, '../../public')));
 
   app.use(session({
+    store: new PgSession({ pool: pool, tableName: 'web_sessions' }),
     secret: process.env.SESSION_SECRET || 'zamery-secret-key',
     resave: false,
     saveUninitialized: false,
