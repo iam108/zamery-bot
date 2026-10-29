@@ -61,6 +61,19 @@ async function migrate() {
       CREATE INDEX IF NOT EXISTS web_sessions_expire ON web_sessions (expire);
     `);
 
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS audits (
+        id SERIAL PRIMARY KEY,
+        order_id INT,
+        text TEXT,
+        chat_id BIGINT,
+        msg_ids BIGINT[] DEFAULT '{}',
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        report_data JSONB
+      );
+      ALTER TABLE audits ADD COLUMN IF NOT EXISTS report_data JSONB;
+    `);
+
     await client.query('COMMIT');
     console.log('✅ Миграции выполнены успешно');
   } catch (err) {

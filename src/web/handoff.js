@@ -12,6 +12,7 @@ async function ensureTables() {
       msg_ids    BIGINT[] DEFAULT '{}',
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+    ALTER TABLE audits ADD COLUMN IF NOT EXISTS report_data JSONB;
     CREATE TABLE IF NOT EXISTS staff (
       tg_id      BIGINT PRIMARY KEY,
       name       TEXT NOT NULL,
@@ -39,10 +40,14 @@ async function ensureTables() {
   `);
 }
 
-async function saveAudit(orderId, text, chatId, msgIds) {
+async function saveAudit(orderId, text, chatId, msgIds, data) {
+  // Храним ответы формы и роли вложений; сами изображения остаются в Telegram.
+  const reportData = data ? Object.assign({}, data, { photos: (data.photos || []).map(function (p) {
+    return { name: p.name || '', role: p.role || 'photo' };
+  }) }) : null;
   await pool.query(
-    'INSERT INTO audits (order_id, text, chat_id, msg_ids) VALUES ($1,$2,$3,$4)',
-    [orderId || null, text, chatId, msgIds]
+    'INSERT INTO audits (order_id, text, chat_id, msg_ids, report_data) VALUES ($1,$2,$3,$4,$5)',
+    [orderId || null, text, chatId, msgIds, reportData ? JSON.stringify(reportData) : null]
   );
 }
 
@@ -191,6 +196,23 @@ function setupReportsBot(bot) {
 function isOrderCard(t) { return /^[^\wА-Яа-я]*(Новая заявка|Заявка\s*#\d+)/i.test(t || '') || /Чей объект\s*:/.test(t || ''); }
 function orderNum(t) { var m = String(t || '').match(/Заявка\s*#(\d+)/i); return m ? parseInt(m[1]) : null; }
 
+// Новые отчёты передают услугу явно; старые остаются доступны по тексту.
+function auditMetadata(a) {
+  var data = a && a.report_data;
+  if (typeof data === 'string') { try { data = JSON.parse(data); } catch (e) { data = null; } }
+  var inspection = data && data.inspection || {};
+  var allowed = ['Получение', 'Продление', 'Переоформление'];
+  var text = String(a && a.text || '');
+  var explicit = text.match(/(?:^|\n)\s*Услуга\s*:\s*(Получение|Продление|Переоформление)(?=\s|$|[.,;])/i);
+  var source = explicit ? explicit[1] : text.slice(0, 300);
+  var parsed = /переоформ/i.test(source) ? 'Переоформление' : /продлен/i.test(source) ? 'Продление' : /получен/i.test(source) ? 'Получение' : '';
+  return {
+    service: allowed.indexOf(inspection.service) !== -1 ? inspection.service : parsed,
+    org: typeof inspection.org === 'string' ? inspection.org : '',
+    address: typeof inspection.address === 'string' ? inspection.address : ''
+  };
+}
+
 // Поиск: по адресу, названию, ИНН, #номеру заявки — по всем словам сразу
 async function searchReports(q) {
   var words = String(q || '').toLowerCase().replace(/ё/g, 'е').split(/[\s,.;]+/).filter(function (w) { return w.length > 1 || /^\d+$/.test(w); }).slice(0, 6);
@@ -226,7 +248,7 @@ async function searchReports(q) {
 async function getReport(src, id) {
   if (src === 'a') {
     var a = (await pool.query('SELECT * FROM audits WHERE id=$1', [id])).rows[0];
-    return a ? { chat_id: a.chat_id, msg_ids: a.msg_ids, text: a.text, linked: 0 } : null;
+    return a ? { chat_id: a.chat_id, msg_ids: a.msg_ids, text: a.text, linked: 0, metadata: auditMetadata(a) } : null;
   }
   var r = (await pool.query('SELECT * FROM reports WHERE id=$1', [id])).rows[0];
   if (!r) return null;
@@ -242,7 +264,8 @@ async function getReport(src, id) {
     msg_ids: ids,
     extra: audits.filter(function (x) { return String(x.chat_id) === String(r.chat_id); }).reduce(function (acc, x) { return acc.concat((x.msg_ids || []).map(Number)); }, []),
     text: isOrderCard(r.text) ? (texts.join('\n\n') || '') : [r.text].concat(texts).join('\n\n'),
-    linked: replies.length + audits.length
+    linked: replies.length + audits.length,
+    metadata: auditMetadata(audits.length ? audits[audits.length - 1] : { text: [r.text].concat(texts).join('\n\n') })
   };
 }
 
@@ -319,7 +342,7 @@ function setupReportsWeb(app, upload) {
     try {
       var r = await getReport(req.query.src, parseInt(req.query.id));
       if (!r) return res.json({ ok: false });
-      res.json({ ok: true, text: r.text || '', files: (r.msg_ids || []).length + (r.extra || []).length });
+      res.json({ ok: true, text: r.text || '', metadata: r.metadata, files: (r.msg_ids || []).length + (r.extra || []).length });
     } catch (e) { console.error(e); res.json({ ok: false, error: e.message }); }
   });
 
@@ -1105,7 +1128,7 @@ function setupHandoff(app) {
       }
       res.json({
         ok: true, lawyers: lawyers, request: request,
-        report: audit ? { src: 'a', id: audit.id, text: audit.text, created_at: audit.created_at, order_id: audit.order_id } : null,
+        report: audit ? { src: 'a', id: audit.id, text: audit.text, created_at: audit.created_at, order_id: audit.order_id, metadata: auditMetadata(audit) } : null,
         order: order ? {
           id: order.id, org: order.object_name || '', client: order.owner_name || '',
           owner: order.owner_name || '', name: order.object_name || '', zones: order.zones_info || '',
@@ -1377,6 +1400,13 @@ function handoffClient() {
   function fmtDate(s) { var d = new Date(s); return ('0' + d.getDate()).slice(-2) + '.' + ('0' + (d.getMonth() + 1)).slice(-2) + '.' + String(d.getFullYear()).slice(2); }
   function preview(t) { return String(t || '').replace(/[*_`]/g, '').replace(/\s+/g, ' ').trim(); }
 
+  function applyReportMetadata(metadata) {
+    if (!metadata) return;
+    if (['Получение', 'Продление', 'Переоформление'].indexOf(metadata.service) !== -1) mark('service', metadata.service);
+    if (metadata.org && !$('org').value.trim()) $('org').value = metadata.org;
+    if (metadata.address && !$('address').value.trim()) $('address').value = metadata.address;
+  }
+
   function choose(it) {
     REP = it ? { src: it.src, id: it.id, text: it.text } : null;
     $('results').innerHTML = '';
@@ -1394,9 +1424,11 @@ function handoffClient() {
     }
     try { tg.HapticFeedback.selectionChanged(); } catch (e) {}
     fillFrom(it.text);
+    applyReportMetadata(it.metadata);
     fetch('/api/reports/get?src=' + it.src + '&id=' + it.id).then(function (r) { return r.json(); }).then(function (d) {
       if (!d.ok || !REP || REP.id !== it.id || REP.src !== it.src) return;
       if (d.text) { REP.text = d.text; $('chosen-text').textContent = preview(d.text); fillFrom(d.text); }
+      applyReportMetadata(d.metadata);
     });
   }
   // ── Контакты: несколько человек, у каждого имя, телефон, ник в Telegram
@@ -1488,7 +1520,9 @@ function handoffClient() {
     var head = (tp + ' ' + t.slice(0, 300));
     var TOB = /табак|хука[ -]?маркет|hookah[ -]?market|вейп|никотин|(^|[^А-Яа-яЁёA-Za-z])ХМ([^А-Яа-яЁёA-Za-z]|$)/i;
     if (/табак/i.test(head)) mark('kind', 'Табак'); else if (/общепит/i.test(head)) mark('kind', 'Общепит'); else if (TOB.test(t)) mark('kind', 'Табак'); else if (/магазин|розниц/i.test(head)) mark('kind', 'Магазин');
-    if (/переоформ/i.test(head)) mark('service', 'Переоформление'); else if (/продлен/i.test(head)) mark('service', 'Продление'); else if (/получен/i.test(head)) mark('service', 'Получение');
+    var explicitService = grab(/(?:^|\n)\s*Услуга\s*:\s*(Получение|Продление|Переоформление)(?=\s|$|[.,;])/i);
+    var serviceSource = explicitService || head;
+    if (/переоформ/i.test(serviceSource)) mark('service', 'Переоформление'); else if (/продлен/i.test(serviceSource)) mark('service', 'Продление'); else if (/получен/i.test(serviceSource)) mark('service', 'Получение');
     if (/московская обл|городской округ/i.test(t)) mark('region', 'МО'); else if (/москва/i.test(head)) mark('region', 'МСК');
   }
   $('chosen-x').onclick = function () { choose(null); $('rq').focus(); };
@@ -1521,6 +1555,7 @@ function handoffClient() {
   $('rq').onfocus = function () { if (!$('results').children.length) search(); };
 
   fetch('/api/handoff/prefill?order_id=' + orderId + '&request_id=' + requestId).then(function (r) { return r.json(); }).then(function (d) {
+    mark('service', S.service); mark('priority', S.priority);
     var L = $('lawyers');
     if (!d.lawyers.length) { var w = document.createElement('span'); w.className = 'warn'; w.textContent = 'Нет зарегистрированных юристов. Пусть нажмут /start в боте.'; L.appendChild(w); }
     d.lawyers.forEach(function (x) {
@@ -1548,7 +1583,7 @@ function handoffClient() {
       fillFrom(d.request.text);
       mark('region', F.region === 'МО' || F.region === 'СПб' ? F.region : 'МСК'); mark('kind', F.kind || 'Общепит');
       if (F.region === 'СПб' || F.regions) $('sub').textContent += ' · есть объект в Санкт-Петербурге';
-      mark('service', F.service || 'Получение');
+      mark('service', F.service || S.service);
       mark('priority', F.priority || 'обычный');
       if (/Коммент\S*\s+аудитора/i.test(d.request.text)) {
         // отчёт аудитора уже внутри заявки
@@ -1559,7 +1594,6 @@ function handoffClient() {
       }
       return;
     } else { $('sub').textContent = 'Новый клиент'; mark('region', 'МСК'); mark('kind', 'Общепит'); }
-    mark('service', 'Получение'); mark('priority', 'обычный');
   });
 
   window.send = async function () {

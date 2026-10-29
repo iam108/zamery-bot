@@ -1,4 +1,48 @@
 function auditForm() {
+  function field(id, label, placeholder, type) {
+    return '<label class="inspection-field" for="i_' + id + '">' + label +
+      '<input id="i_' + id + '" type="' + (type || 'text') + '" placeholder="' + (placeholder || '') + '"></label>';
+  }
+  function selectField(id, label, values, change) {
+    return '<label class="inspection-field" for="i_' + id + '">' + label +
+      '<select id="i_' + id + '"' + (change ? ' onchange="updateInspection()"' : '') + '><option value="">Выберите ответ</option>' +
+      values.map(function (v) { return '<option value="' + v + '">' + v + '</option>'; }).join('') + '</select></label>';
+  }
+  function tri(id, label, change) { return selectField(id, label, ['Да', 'Нет', 'Не проверено'], change); }
+  var inspectionHtml = '<div id="block-inspection">' +
+    '<div class="section"><div class="section-title">Объект и услуга</div>' +
+    field('org', 'Организация / название объекта *', 'ООО, ИП или название') +
+    field('address', 'Адрес объекта *', 'Город, улица, дом, помещение') +
+    field('visit_date', 'Дата осмотра', '', 'date') +
+    selectField('service', 'Услуга *', ['Получение', 'Продление', 'Переоформление'], true) + '</div>' +
+    '<div class="section"><div class="section-title">Алкоголь на объекте</div>' +
+    '<p class="inspection-note" id="alcohol-rule">Сначала выберите услугу.</p>' +
+    tri('alcohol_present', 'Есть ли алкоголь на объекте? *', true) +
+    '<div id="renewal-alcohol" class="hidden">' + tri('alcohol_within_licensed', 'Весь алкоголь находится в лицензированной зоне? *', true) + '</div>' +
+    '<p class="inspection-warning" id="alcohol-warning" aria-live="polite"></p></div>' +
+    '<div class="section"><div class="section-title">План, этаж и архив</div>' +
+    field('floor_plan', 'Этаж на плане', 'Например: подвал; если неизвестно — Не проверено') +
+    field('floor_actual', 'Фактический этаж', 'Например: подвал; если неизвестно — Не проверено') +
+    selectField('plan_source', 'Источник графики', ['ЕГРН', 'БТИ', 'Архив', 'Другое', 'Нет графики', 'Не проверено']) +
+    field('plan_note', 'Уточнение источника', 'Дата / номер документа, другое основание') +
+    tri('archive_available', 'Есть ли архивный план / материалы? *', true) +
+    '<div id="archive-match" class="hidden">' + tri('archive_match', 'Фактическая планировка совпадает с архивом? *') + '</div>' +
+    '<label class="inspection-field" for="i_structural_elements">Фактические конструктивные элементы<textarea id="i_structural_elements" placeholder="Стены, перегородки, колонны, проёмы; что отличается от плана"></textarea></label>' +
+    '<p class="inspection-note">На плане: сиреневый — заявляемые границы; жёлтый — аренда; красный — зал обслуживания; зелёный — бар.</p>' +
+    '<label class="file-label">📐 План с цветной разметкой<input type="file" id="inspection-plan" accept="image/*" multiple onchange="previewPhotos(this, \'plan\')"></label>' +
+    '<label class="file-label" style="margin-top:8px">🗺 Схема / карта соседних организаций и входов<input type="file" id="inspection-map" accept="image/*" multiple onchange="previewPhotos(this, \'map\')"></label>' +
+    '<p class="inspection-note">План, схема и обычные фото — до 10 изображений вместе. Все выбранные файлы видны в фотоотчёте ниже.</p></div>' +
+    '<div class="section"><div class="section-title">Границы и входы</div>' +
+    tri('within_cadastral', 'Объект находится в границах кадастрового помещения? *') +
+    '<div id="renewal-boundaries" class="hidden">' + tri('licensed_boundaries_match', 'Фактические границы соответствуют лицензированным? *') + '</div>' +
+    field('entrances_plan', 'Количество входов на плане', 'Число или Не проверено') +
+    field('entrances_actual', 'Количество фактических входов / выходов', 'Число или Не проверено') +
+    tri('all_entrances_checked', 'Осмотр проведён со всех входов? *') +
+    tri('zones_checked', 'Организации и ограничения поблизости проверены? *') + '</div>' +
+    '<div class="section"><div class="section-title">Состояние и риски</div>' +
+    selectField('video_status', 'Видео осмотра', ['Сделано', 'Не сделано', 'Не проверено']) +
+    field('repair_state', 'Состояние ремонта', 'Готово / идёт ремонт / что нужно завершить') +
+    '<label class="inspection-field" for="i_risks">Риски и действия до проверки<textarea id="i_risks" placeholder="Что выявлено и что нужно исправить; если рисков нет — укажите это"></textarea></label></div></div>';
   return `<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -29,7 +73,7 @@ h1{font-size:20px;font-weight:700;margin-bottom:4px;padding-top:8px}
 .chk-box.checked{background:var(--tg-theme-button-color,#6366f1);border-color:var(--tg-theme-button-color,#6366f1)}
 .chk-box.checked::after{content:'✓';color:#fff;font-size:14px;font-weight:700}
 .chk-label{font-size:14px;line-height:1.4}
-textarea,input[type=text],input[type=url]{width:100%;padding:12px 14px;background:var(--tg-theme-secondary-bg-color,#1e293b);border:1.5px solid transparent;border-radius:12px;color:var(--tg-theme-text-color,#f1f5f9);font-size:15px;outline:none;font-family:inherit}
+textarea,input[type=text],input[type=url],input[type=date],select{width:100%;padding:12px 14px;background:var(--tg-theme-secondary-bg-color,#1e293b);border:1.5px solid transparent;border-radius:12px;color:var(--tg-theme-text-color,#f1f5f9);font-size:15px;outline:none;font-family:inherit}
 textarea{resize:none;min-height:90px}
 textarea:focus,input:focus{border-color:var(--tg-theme-button-color,#6366f1)}
 .zone-item{background:var(--tg-theme-secondary-bg-color,#1e293b);border-radius:12px;padding:12px;margin-bottom:8px;position:relative}
@@ -44,7 +88,13 @@ textarea:focus,input:focus{border-color:var(--tg-theme-button-color,#6366f1)}
 .photos-preview{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
 .photos-preview img{width:72px;height:72px;object-fit:cover;border-radius:8px;display:block}
 .ph{position:relative}
+.ph-label{display:block;font-size:12px;margin-top:4px;color:var(--tg-theme-hint-color,#94a3b8)}
 .ph-x{position:absolute;top:-6px;right:-6px;width:22px;height:22px;border-radius:11px;border:0;background:#f87171;color:#fff;font-size:12px;line-height:22px;padding:0;cursor:pointer}
+.inspection-field{display:block;font-size:14px;margin-bottom:12px;line-height:1.45}
+.inspection-field input,.inspection-field select,.inspection-field textarea{display:block;margin-top:6px}
+.inspection-note{font-size:13px;line-height:1.5;color:var(--tg-theme-hint-color,#94a3b8);margin:8px 0 12px}
+.inspection-warning{font-size:14px;line-height:1.45;color:#fbbf24;margin-top:10px}
+select{appearance:auto}
 .required{color:#f87171}
 .hidden{display:none}
 .bottom{position:fixed;bottom:0;left:0;right:0;padding:12px 16px;background:var(--tg-theme-bg-color,#0f172a);border-top:1px solid #1e293b}
@@ -66,28 +116,33 @@ textarea:focus,input:focus{border-color:var(--tg-theme-button-color,#6366f1)}
   </div>
 </div>
 
+${inspectionHtml}
+
 <!-- ОБЩЕПИТ / МАГАЗИН -->
 <div id="block-catering-retail">
   <div class="section">
     <div class="section-title">Тип здания</div>
     <div class="radio-group" id="building-type">
-      <div class="radio-btn active" data-val="Жилое" onclick="selectRadio(this,'building-type')">🏠 Жилое</div>
+      <div class="radio-btn" data-val="Жилое" onclick="selectRadio(this,'building-type')">🏠 Жилое</div>
       <div class="radio-btn" data-val="Нежилое" onclick="selectRadio(this,'building-type')">🏢 Нежилое</div>
+      <div class="radio-btn" data-val="Не проверено" onclick="selectRadio(this,'building-type')">❓ Не проверено</div>
     </div>
   </div>
   <div class="section">
     <div class="section-title">Помещение в своих границах</div>
     <div class="radio-group" id="boundaries">
-      <div class="radio-btn active" data-val="Да" onclick="selectRadio(this,'boundaries')">✅ Да</div>
+      <div class="radio-btn" data-val="Да" onclick="selectRadio(this,'boundaries')">✅ Да</div>
       <div class="radio-btn" data-val="Нет" onclick="selectRadio(this,'boundaries')">❌ Нет</div>
       <div class="radio-btn" data-val="Под вопросом" onclick="selectRadio(this,'boundaries')">❓ Под вопросом</div>
+      <div class="radio-btn" data-val="Не проверено" onclick="selectRadio(this,'boundaries')">❓ Не проверено</div>
     </div>
   </div>
   <div class="section">
     <div class="section-title">БТИ подходит для лицензии</div>
     <div class="radio-group" id="bti">
-      <div class="radio-btn active" data-val="Да" onclick="selectRadio(this,'bti')">✅ Да</div>
+      <div class="radio-btn" data-val="Да" onclick="selectRadio(this,'bti')">✅ Да</div>
       <div class="radio-btn" data-val="Нет" onclick="selectRadio(this,'bti')">❌ Нет</div>
+      <div class="radio-btn" data-val="Не проверено" onclick="selectRadio(this,'bti')">❓ Не проверено</div>
     </div>
   </div>
   <div class="section">
@@ -95,7 +150,8 @@ textarea:focus,input:focus{border-color:var(--tg-theme-button-color,#6366f1)}
     <div class="radio-group" id="to">
       <div class="radio-btn" data-val="Нужно" onclick="selectRadio(this,'to')">🔧 Нужно</div>
       <div class="radio-btn" data-val="Не нужно" onclick="selectRadio(this,'to')">✅ Не нужно</div>
-      <div class="radio-btn active" data-val="Не обязательно" onclick="selectRadio(this,'to')">📌 Не обязательно</div>
+      <div class="radio-btn" data-val="Не обязательно" onclick="selectRadio(this,'to')">📌 Не обязательно</div>
+      <div class="radio-btn" data-val="Не проверено" onclick="selectRadio(this,'to')">❓ Не проверено</div>
     </div>
   </div>
   <div class="section">
@@ -135,9 +191,9 @@ textarea:focus,input:focus{border-color:var(--tg-theme-button-color,#6366f1)}
 <!-- ОБЩИЕ БЛОКИ -->
 <div id="block-common">
 <div class="section">
-  <div class="section-title">Зоны (запрещённые объекты рядом)</div>
+  <div class="section-title">Проверенные организации рядом</div>
   <div id="zones-list"></div>
-  <button class="add-zone" onclick="addZone()">+ Добавить зону</button>
+  <button class="add-zone" onclick="addZone()">+ Добавить организацию</button>
 </div>
 
 <div class="section">
@@ -194,15 +250,88 @@ var submitId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 var currentCat = 'catering';
 var checks = {};
+var detailSelections = {catering:{},retail:{},other:{'building-type':'Жилое',boundaries:'Да',bti:'Да',to:'Не обязательно'}};
+var inspectionFields = ['service','org','address','visit_date','floor_plan','floor_actual','plan_source','plan_note','structural_elements','archive_available','archive_match','alcohol_present','alcohol_within_licensed','within_cadastral','licensed_boundaries_match','entrances_plan','entrances_actual','all_entrances_checked','zones_checked','video_status','repair_state','risks'];
+function isAlcoholInspection() { return currentCat === 'catering' || currentCat === 'retail'; }
+function inspectionValue(name) { return document.getElementById('i_' + name).value.trim(); }
+function serializeInspection() {
+  if (!isAlcoholInspection()) return null;
+  var out = {};
+  inspectionFields.forEach(function (name) { out[name] = inspectionValue(name); });
+  if (out.archive_available !== 'Да') out.archive_match = '';
+  if (out.service !== 'Продление') {
+    out.alcohol_within_licensed = '';
+    out.licensed_boundaries_match = '';
+  } else if (out.alcohol_present === 'Нет') out.alcohol_within_licensed = '';
+  return out;
+}
+function updateInspection() {
+  var service = inspectionValue('service');
+  var present = inspectionValue('alcohol_present');
+  var renewal = service === 'Продление';
+  document.getElementById('renewal-alcohol').classList.toggle('hidden', !renewal || present === 'Нет' || !present);
+  document.getElementById('renewal-boundaries').classList.toggle('hidden', !renewal);
+  var archive = inspectionValue('archive_available') === 'Да';
+  document.getElementById('archive-match').classList.toggle('hidden', !archive);
+  if (!archive) document.getElementById('i_archive_match').value = '';
+  if (!renewal) {
+    document.getElementById('i_alcohol_within_licensed').value = '';
+    document.getElementById('i_licensed_boundaries_match').value = '';
+  } else if (present === 'Нет') document.getElementById('i_alcohol_within_licensed').value = '';
+  var rule = service === 'Получение' ? 'Для получения: на объекте не должно быть алкоголя.' : renewal ? 'Для продления: имеющийся алкоголь должен находиться в лицензированной зоне.' : service === 'Переоформление' ? 'Условия переоформления уточняются отдельно. Зафиксируйте фактическую ситуацию.' : 'Сначала выберите услугу.';
+  document.getElementById('alcohol-rule').textContent = rule;
+  var warning = '';
+  if (service === 'Получение' && present === 'Да') warning = 'Выявлен алкоголь: необходимо убрать его до проверки. Отметьте это в рисках и заключении.';
+  else if (renewal && present === 'Да' && inspectionValue('alcohol_within_licensed') === 'Нет') warning = 'Алкоголь находится за пределами лицензированной зоны: нужно переместить его в лицензированную зону до проверки.';
+  else if (present === 'Не проверено' || (renewal && present === 'Да' && inspectionValue('alcohol_within_licensed') === 'Не проверено')) warning = 'Размещение алкоголя не подтверждено. Нужна дополнительная проверка.';
+  document.getElementById('alcohol-warning').textContent = warning;
+}
+function validateInspection(inspection) {
+  if (!inspection) return '';
+  var required = {service:'Услуга',org:'Организация / название объекта',address:'Адрес объекта',archive_available:'Наличие архива',alcohol_present:'Наличие алкоголя',within_cadastral:'Границы кадастрового помещения',all_entrances_checked:'Осмотр со всех входов',zones_checked:'Проверка организаций поблизости'};
+  if (inspection.archive_available === 'Да') required.archive_match = 'Соответствие архиву';
+  if (inspection.service === 'Продление') {
+    required.licensed_boundaries_match = 'Лицензированные границы';
+    if (inspection.alcohol_present !== 'Нет') required.alcohol_within_licensed = 'Алкоголь в лицензированной зоне';
+  }
+  var missing = Object.keys(required).find(function (name) { return !inspection[name]; });
+  if (missing) { document.getElementById('i_' + missing).focus(); return 'Укажите: ' + required[missing] + '. Если сведений нет, выберите или напишите «Не проверено».'; }
+  var radios = {'building-type':'Тип здания',boundaries:'Помещение в своих границах',bti:'БТИ',to:'Техническое обследование'};
+  var empty = Object.keys(radios).find(function (name) { return !getRadioVal(name); });
+  return empty ? 'Укажите: ' + radios[empty] + '. Можно выбрать «Не проверено».' : '';
+}
+var localDate = new Date();
+document.getElementById('i_visit_date').value = localDate.getFullYear() + '-' + String(localDate.getMonth() + 1).padStart(2, '0') + '-' + String(localDate.getDate()).padStart(2, '0');
+updateInspection();
+if (orderId) {
+  fetch('/api/audit/prefill?order_id=' + encodeURIComponent(orderId)).then(function (response) { return response.json(); }).then(function (data) {
+    if (!data || !data.ok) return;
+    if (!inspectionValue('org')) document.getElementById('i_org').value = data.org || '';
+    if (!inspectionValue('address')) document.getElementById('i_address').value = data.address || '';
+    if (data.object_category && ['catering','retail','tobacco','other'].indexOf(data.object_category) !== -1) {
+      var category = document.querySelector('#obj-cat .radio-btn[data-val="' + data.object_category + '"]');
+      if (category) selectCat(category);
+    }
+    if (data.address && !document.getElementById('t_address').value) document.getElementById('t_address').value = data.address;
+  }).catch(function () {});
+}
 
 function selectCat(el) {
+  var groups = ['building-type','boundaries','bti','to'];
+  if (detailSelections[currentCat]) groups.forEach(function (group) { detailSelections[currentCat][group] = getRadioVal(group); });
   document.querySelectorAll('#obj-cat .radio-btn').forEach(function(b) { b.classList.remove('active'); });
   el.classList.add('active');
   currentCat = el.dataset.val;
+  document.getElementById('block-inspection').classList.toggle('hidden', !isAlcoholInspection());
   document.getElementById('block-catering-retail').classList.toggle('hidden', currentCat === 'tobacco');
   document.getElementById('block-tobacco').classList.toggle('hidden', currentCat !== 'tobacco');
   document.getElementById('block-common').classList.toggle('hidden', currentCat === 'tobacco');
   document.getElementById('block-t-comment').style.display = currentCat === 'tobacco' ? '' : 'none';
+  groups.forEach(function (group) {
+    document.querySelectorAll('#' + group + ' .radio-btn').forEach(function (button) {
+      button.classList.toggle('active', !!(detailSelections[currentCat] && detailSelections[currentCat][group] === button.dataset.val));
+    });
+  });
 }
 
 function selectRadio(el, group) {
@@ -234,7 +363,8 @@ function addZone() {
   div.className = 'zone-item'; div.id = id;
   div.innerHTML = '<button class="zone-remove" onclick="removeZone(\\'' + id + '\\')">×<\/button>' +
     '<div class="zone-row"><input type="text" placeholder="Объект (стоматология, школа...)" class="zone-name"><input type="text" placeholder="Метры" class="zone-dist"><\/div>' +
-    '<input type="text" placeholder="Доп. инфо (входы, лицензии, ИНН...)" style="width:100%" class="zone-info">';
+    '<input type="text" aria-label="Лицензия организации" placeholder="Лицензия: номер / не проверена" class="zone-license" style="margin-bottom:8px">' +
+    '<input type="text" aria-label="Уточнения по организации" placeholder="Доп. сведения: входы, ИНН, результаты проверки" style="width:100%" class="zone-info">';
   document.getElementById('zones-list').appendChild(div);
 }
 function removeZone(id) { var el = document.getElementById(id); if (el) el.remove(); }
@@ -242,13 +372,15 @@ function removeZone(id) { var el = document.getElementById(id); if (el) el.remov
 var photoFiles = [];
 var MAX_PHOTOS = 10; // больше в один альбом Telegram не пускает
 // Повторный выбор добавляет фото к уже выбранным; у каждой миниатюры — ✕
-function previewPhotos(input) {
+function previewPhotos(input, role) {
+  role = role || 'photo';
   var added = Array.from(input.files || []);
   var skipped = 0;
   added.forEach(function(f) {
-    var dup = photoFiles.some(function(x) { return x.name === f.name && x.size === f.size; });
-    if (dup) return;
+    var dup = photoFiles.find(function(x) { return x.name === f.name && x.size === f.size; });
+    if (dup) { if (role !== 'photo') dup.auditRole = role; return; }
     if (photoFiles.length >= MAX_PHOTOS) { skipped++; return; }
+    f.auditRole = role;
     photoFiles.push(f);
   });
   input.value = ''; // чтобы можно было выбрать те же файлы снова после удаления
@@ -263,7 +395,9 @@ function drawPhotos() {
     var img = document.createElement('img'); img.src = URL.createObjectURL(f); w.appendChild(img);
     var x = document.createElement('button'); x.type = 'button'; x.className = 'ph-x'; x.textContent = '✕';
     x.onclick = function() { photoFiles.splice(i, 1); drawPhotos(); };
-    w.appendChild(x); p.appendChild(w);
+    w.appendChild(x);
+    var label = document.createElement('span'); label.className = 'ph-label'; label.textContent = ({plan:'План',map:'Схема',photo:'Фото'})[f.auditRole || 'photo']; w.appendChild(label);
+    p.appendChild(w);
   });
 }
 function toBase64(file) {
@@ -289,6 +423,9 @@ function toBase64(file) {
 }
 
 async function submitForm() {
+  var inspection = serializeInspection();
+  var inspectionError = validateInspection(inspection);
+  if (inspectionError) { tg.showAlert(inspectionError); return; }
   var conclusion = document.getElementById('conclusion').value.trim();
   if (!conclusion) { document.getElementById('conclusion').style.borderColor = '#f87171'; return; }
   var btn = document.getElementById('submit-btn');
@@ -298,12 +435,18 @@ async function submitForm() {
   var zones = [];
   document.querySelectorAll('.zone-item').forEach(function(z) {
     var name = z.querySelector('.zone-name').value.trim();
-    if (name) zones.push({ name: name, dist: z.querySelector('.zone-dist').value.trim(), info: z.querySelector('.zone-info').value.trim() });
+    if (name) zones.push({ name: name, dist: z.querySelector('.zone-dist').value.trim(), info: z.querySelector('.zone-info').value.trim(), license: z.querySelector('.zone-license').value.trim() });
   });
 
   var photos = [];
-  for (var i = 0; i < Math.min(photoFiles.length, MAX_PHOTOS); i++) {
-    photos.push({ data: await toBase64(photoFiles[i]), name: photoFiles[i].name });
+  try {
+    for (var i = 0; i < Math.min(photoFiles.length, MAX_PHOTOS); i++) {
+      photos.push({ data: await toBase64(photoFiles[i]), name: photoFiles[i].name, role: isAlcoholInspection() ? (photoFiles[i].auditRole || 'photo') : 'photo' });
+    }
+  } catch (e) {
+    btn.disabled = false; btn.textContent = 'Отправить отчёт';
+    tg.showAlert('Не удалось подготовить фото. Удалите повреждённое изображение или выберите его заново. Данные отчёта остались в форме.');
+    return;
   }
 
   var payload = {
@@ -331,6 +474,8 @@ async function submitForm() {
     tg_user_id: tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user.id : null,
     submit_id: submitId,
   };
+
+  if (inspection) { payload.schema_version = 2; payload.inspection = inspection; }
 
   // Добавляем все чекбоксы
   Object.keys(checks).forEach(function(k) { payload[k] = checks[k]; });

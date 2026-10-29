@@ -1,6 +1,9 @@
 const { getOrderById } = require('../db/queries');
 const { saveAudit } = require('../web/handoff');
 const { esc } = require('./formatter');
+const { buildInspectionReport, validateInspection } = require('./audit-inspection');
+const { splitTelegramHtml, photoCaption } = require('./audit-delivery');
+const { createHash } = require('crypto');
 
 // Отчёты, которые уже обрабатываются или отправлены (защита от дубля при повторной отправке)
 const seenSubmits = new Map();
@@ -19,20 +22,35 @@ async function tgRetry(fn) {
 }
 
 async function handleAuditReport(ctx, data) {
-  const GROUP_ID = process.env.GROUP_CHAT_ID;
-  if (data.submit_id) {
-    const prev = seenSubmits.get(data.submit_id);
-    if (prev) return prev; // этот же отчёт уже отправлен или отправляется — ждём результат, второй раз не шлём
-    const job = handleAuditReportInner(ctx, data);
-    seenSubmits.set(data.submit_id, job);
-    job.catch(function () { seenSubmits.delete(data.submit_id); });
-    setTimeout(function () { seenSubmits.delete(data.submit_id); }, 30 * 60 * 1000);
-    return job;
+  validateInspection(data);
+  if (data.photos && (!Array.isArray(data.photos) || data.photos.length > 10 ||
+    data.photos.some(function (p) { return !p || typeof p.data !== 'string' || !p.data; }))) {
+    throw new Error('Можно отправить до 10 корректных фотографий');
   }
-  return handleAuditReportInner(ctx, data);
+  const key = data.submit_id ? String(ctx.from && ctx.from.id || '') + ':' + data.submit_id : null;
+  let progress = key && seenSubmits.get(key);
+  // Keep only a digest, not full base64 images, during the retry window.
+  const signature = createHash('sha256').update(JSON.stringify(data)).digest('hex');
+  if (progress && progress.signature !== signature) {
+    throw new Error('Этот отчёт уже начал отправляться. Повторите без изменений или откройте новую форму для нового отчёта.');
+  }
+  if (!progress) {
+    progress = { signature, textIds: [], photoIds: [], saved: false, handoffSent: false, replied: false, job: null };
+    if (key) {
+      seenSubmits.set(key, progress);
+      const timer = setTimeout(function () { seenSubmits.delete(key); }, 30 * 60 * 1000);
+      if (timer.unref) timer.unref();
+    }
+  }
+  if (progress.job) return progress.job;
+  const job = handleAuditReportInner(ctx, data, progress);
+  progress.job = job;
+  job.catch(function () { if (progress.job === job) progress.job = null; });
+  return job;
 }
 
-async function handleAuditReportInner(ctx, data) {
+async function handleAuditReportInner(ctx, data, progress) {
+  validateInspection(data);
   const GROUP_ID = process.env.GROUP_CHAT_ID;
   const actor = ctx.from
     ? (ctx.from.username ? '@' + ctx.from.username : ctx.from.first_name)
@@ -60,6 +78,9 @@ async function handleAuditReportInner(ctx, data) {
   var lines = [header, ''];
   // Короткий текст для юриста (без Markdown)
   var plain = [];
+  var inspectionReport = buildInspectionReport(data);
+  lines.push.apply(lines, inspectionReport.html);
+  plain.push.apply(plain, inspectionReport.plain);
 
   if (data.object_category === 'tobacco') {
     lines.push('🚬 <b>Табак</b>' + (data.t_address ? ' · ' + esc(data.t_address) : ''), '');
@@ -81,7 +102,7 @@ async function handleAuditReportInner(ctx, data) {
   } else {
     lines.push('🏢 <b>Здание:</b> ' + esc(data.building_type || '—'));
     lines.push('📐 <b>Границы:</b> ' + esc(data.boundaries || '—'));
-    lines.push('📋 <b>БТИ:</b> ' + (data.bti === 'Да' ? y + ' Подходит' : '❌ Не подходит'));
+    lines.push('📋 <b>БТИ:</b> ' + (data.bti === 'Да' ? y + ' Подходит' : data.bti === 'Нет' ? '❌ Не подходит' : '❓ Не проверено'));
     lines.push('🔧 <b>ТО:</b> ' + esc(data.to || '—'));
     lines.push('');
     lines.push('<b>Планировка и границы:</b>');
@@ -95,7 +116,7 @@ async function handleAuditReportInner(ctx, data) {
       ', БТИ: ' + (data.bti || '—') + ', ТО: ' + (data.to || '—'));
   }
 
-  if (data.object_category !== 'tobacco') {
+  if (data.object_category !== 'tobacco' && !inspectionReport.html.length) {
   lines.push('');
   lines.push('🚫 <b>Зоны:</b>');
   lines.push(zonesText);
@@ -139,46 +160,55 @@ async function handleAuditReportInner(ctx, data) {
   }
 
   var tg = ctx.telegram;
-  var sentIds = [];
+  var textParts = splitTelegramHtml(text);
+  for (let i = progress.textIds.length; i < textParts.length; i++) {
+    const m = await tgRetry(function () { return tg.sendMessage(GROUP_ID, textParts[i], {
+      parse_mode: 'HTML', reply_to_message_id: replyToMsgId || undefined,
+    }); });
+    progress.textIds.push(m.message_id);
+  }
 
-  if (data.photos && data.photos.length > 0) {
+  if (data.photos && data.photos.length && !progress.photoIds.length) {
     try {
-      var media = data.photos.map(function(p, i) {
-        return {
-          type: 'photo',
-          media: { source: Buffer.from(p.data, 'base64') },
-          caption: i === 0 ? text : undefined,
-          parse_mode: i === 0 ? 'HTML' : undefined,
-        };
-      });
-      var msgs = await tgRetry(function () { return tg.sendMediaGroup(GROUP_ID, media, replyToMsgId ? { reply_to_message_id: replyToMsgId } : {}); });
-      msgs.forEach(function(m) { sentIds.push(m.message_id); });
+      if (data.photos.length === 1) {
+        const photo = data.photos[0];
+        const m = await tgRetry(function () { return tg.sendPhoto(GROUP_ID,
+          { source: Buffer.from(photo.data, 'base64') },
+          { caption: photoCaption(photo, data.order_id), reply_to_message_id: progress.textIds[0] }); });
+        progress.photoIds.push(m.message_id);
+      } else {
+        const media = data.photos.map(function (p) {
+          return { type: 'photo', media: { source: Buffer.from(p.data, 'base64') }, caption: photoCaption(p, data.order_id) };
+        });
+        const msgs = await tgRetry(function () { return tg.sendMediaGroup(GROUP_ID, media, { reply_to_message_id: progress.textIds[0] }); });
+        msgs.forEach(function (m) { progress.photoIds.push(m.message_id); });
+      }
     } catch (e) {
-      console.error('media group error:', e.message);
-      var m1 = await tgRetry(function () { return tg.sendMessage(GROUP_ID, text, { parse_mode: 'HTML', reply_to_message_id: replyToMsgId || undefined }); });
-      sentIds.push(m1.message_id);
+      console.error('audit photos:', e.message);
+      throw new Error('Текст отчёта отправлен, но фотографии не доставлены. Повторите отправку — уже отправленный текст не продублируется.');
     }
-  } else {
-    var m2 = await tgRetry(function () { return tg.sendMessage(GROUP_ID, text, { parse_mode: 'HTML', reply_to_message_id: replyToMsgId || undefined }); });
-    sentIds.push(m2.message_id);
   }
 
-  // Сохраняем отчёт: текст + ID сообщений с файлами (файлы остаются в Telegram)
-  try {
-    await saveAudit(data.order_id ? parseInt(data.order_id) : null, plain.join('\n'), GROUP_ID, sentIds);
-  } catch (e) {
-    console.error('saveAudit error:', e.message);
+  var sentIds = progress.textIds.concat(progress.photoIds);
+  if (!progress.saved) {
+    await saveAudit(data.order_id ? parseInt(data.order_id) : null, plain.join('\n'), GROUP_ID, sentIds, data);
+    progress.saved = true;
   }
 
-  // Кнопка передачи юристу
-  if (data.order_id) {
-    await tgRetry(function () { return tg.sendMessage(GROUP_ID, '⚖️ Заявка #' + data.order_id + ' готова к передаче юристу', {
+  if (data.order_id && !progress.handoffSent) {
+    await tgRetry(function () { return tg.sendMessage(GROUP_ID,
+      '⚖️ Отчёт по заявке #' + data.order_id + ' добавлен — проверьте замечания перед передачей юристу', {
       reply_to_message_id: sentIds[0],
       reply_markup: { inline_keyboard: [[{ text: '⚖️ Передать юристу', callback_data: 'handoff:' + data.order_id }]] },
     }); });
+    progress.handoffSent = true;
   }
 
-  if (ctx.reply) await ctx.reply('✅ Отчёт отправлен в группу!');
+  if (ctx.reply && !progress.replied) {
+    await ctx.reply('✅ Отчёт' + (data.photos && data.photos.length ? ' и фото (' + data.photos.length + ')' : '') + ' отправлены в группу!');
+    progress.replied = true;
+  }
+
 }
 
 module.exports = { handleAuditReport };

@@ -155,6 +155,20 @@ finish({ ok: true, id: order.id });
 });
 
   // API для отчёта аудитора
+  app.get('/api/audit/prefill', async (req, res) => {
+    try {
+      const id = Number(req.query.order_id);
+      if (!Number.isSafeInteger(id) || id <= 0) return res.status(400).json({ ok: false, error: 'Некорректный номер заявки' });
+      const order = await getOrderById(id);
+      if (!order) return res.status(404).json({ ok: false, error: 'Заявка не найдена' });
+      const type = String(order.object_type || '').toLowerCase();
+      const category = /табак/.test(type) ? 'tobacco' : /общепит/.test(type) ? 'catering' : /магазин/.test(type) ? 'retail' : 'other';
+      res.json({ ok: true, org: order.owner_name || order.object_name || '', address: order.address || '', object_category: category });
+    } catch (e) {
+      console.error('audit prefill:', e.message);
+      res.status(500).json({ ok: false, error: 'Не удалось загрузить данные заявки' });
+    }
+  });
   app.post('/api/audit', async (req, res) => {
   try {
     const data = req.body;
