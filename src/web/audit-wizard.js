@@ -18,19 +18,17 @@ function auditWizard() {
   <div class="ambient ambient-two" aria-hidden="true"></div>
   <div class="audit-app" id="audit-app">
     <header class="app-header glass">
-      <div class="header-top"><a class="back-link" href="/requests">← Заявки</a><span class="eyebrow">АУДИТОР · АЛКОГОЛЬ</span><a class="legacy-link" href="/audit/legacy">Старая форма</a></div>
-      <div class="title-row"><div><h1>Выезд по шагам</h1><p id="object-title">Проверка объекта</p></div><span class="draft-pill" id="draft-id">Черновик</span></div>
+      <div class="header-top"><a class="back-link" href="/requests">← Заявки</a><span class="draft-pill" id="draft-id">Проверка</span></div>
+      <div class="title-row"><div><h1>Проверка объекта</h1><p id="object-title">Загружаю заявку менеджера…</p></div></div>
       <div class="save-row"><span id="save-state" role="status" aria-live="polite">Открываю черновик…</span><button type="button" class="text-button" id="save-now">Сохранить</button></div>
-      <div class="completion-row"><span id="completion-label">Заполнение проверки</span><span id="completion-value">0%</span></div>
-      <div class="completion-track" role="progressbar" aria-label="Заполнение проверки" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="completion"><div id="completion-bar"></div></div>
     </header>
     <section class="conflict-panel glass" id="conflict-panel" hidden role="alert"><h2>На сервере появилась другая версия</h2><p>Ваши изменения остались на этом устройстве. Сначала сохраните свою копию, затем загрузите серверную версию и перенесите нужные правки.</p><div class="action-row"><button type="button" class="button secondary" id="download-copy">Скачать мою копию</button><button type="button" class="button secondary" id="reload-server">Загрузить серверную</button></div></section>
     <section class="notice glass" id="app-notice" hidden role="status"></section>
     <nav class="steps" id="steps" aria-label="Этапы проверки"></nav>
-    <main class="step-content glass" id="step-content" aria-busy="true"><div class="loading"><span class="loading-dot"></span><h2>Подготавливаю проверку</h2><p>Можно начать на выезде и продолжить дома с того же места.</p></div></main>
-    <div class="app-footnote"><span>Процент отражает заполнение, а не соответствие требованиям.</span><span>Черновик можно дополнить после выезда.</span></div>
+    <main class="step-content glass" id="step-content" aria-busy="true"><div class="loading"><span class="loading-dot"></span><h2>Загружаю заявку</h2><p>Адрес, задача и документы придут от менеджера.</p></div></main>
+    <div class="app-footnote">Черновик сохраняется. Можно продолжить после выезда.</div>
   </div>
-  <footer class="bottom-bar glass"><div class="bottom-inner"><button type="button" class="button secondary" id="previous-step">← Назад</button><span id="step-counter">1 из 8</span><button type="button" class="button primary" id="next-step">Далее →</button></div></footer>
+  <footer class="bottom-bar glass"><div class="bottom-inner"><button type="button" class="button secondary" id="previous-step">← Назад</button><span id="step-counter">1 из 3</span><button type="button" class="button primary" id="next-step">Далее →</button></div></footer>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   <script src="/audit-plan-editor.js"><\/script>
   <script src="/audit-wizard-client.js"><\/script>

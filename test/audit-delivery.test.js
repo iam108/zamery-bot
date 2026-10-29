@@ -180,3 +180,52 @@ test('original documents are batched beyond ten and resume durable checkpoints a
   assert.equal(stored.documentIds.length, 23);
   assert.equal(second.saved.length, 1);
 });
+
+test('JSONB key reordering resumes a frozen UI4 packet without resending confirmed text or originals', { skip: !process.env.PGLITE_TEST_MODULE }, async () => {
+  const { PGlite } = require(process.env.PGLITE_TEST_MODULE);
+  const db = new PGlite();
+  try {
+    let stored = {};
+    const packet = require('../src/web/audit-packet').packetFromOrder({ id: 58, owner_name: 'Клиент', address: 'Москва, объект', service: 'Получение', object_type: 'Общепит алкоголь' }, [
+      { id: 'one', name: 'План.pdf', mime: 'application/pdf', role: 'plan', bytes: 3, sha256: 'first' },
+      { id: 'two', name: 'Выписка.pdf', mime: 'application/pdf', role: 'egrn', bytes: 3, sha256: 'second' },
+    ]);
+    const report = data({ schema_version: 3, ui_version: 4, workflow: { step: 2, conclusion_status: 'insufficient' }, inspection: {}, request_packet: packet, entrances: [], zones: [],
+      documents: [{ id: 'photo', name: 'Вход.pdf', mime: 'application/pdf', role: 'entrance', source: Buffer.from('ORIGINAL') }] });
+    const delivery = {
+      load: async () => stored,
+      save: async progress => { stored = (await db.query('SELECT $1::jsonb AS progress', [JSON.stringify({ ...progress, packet })])).rows[0].progress; },
+    };
+    const first = harness({ saveFailure: async () => { throw new Error('save unavailable after Telegram acknowledgements'); } });
+    first.ctx.auditDelivery = delivery;
+    await assert.rejects(first.send(report), /save unavailable/);
+    assert.equal(stored.textIds.length, 1); assert.equal(stored.documentIds.length, 1);
+    assert.notEqual(JSON.stringify(stored.packet), JSON.stringify(packet));
+    assert.deepEqual(stored.packet, packet);
+    const second = harness(); second.ctx.auditDelivery = delivery;
+    const retry = { ...report, request_packet: stored.packet };
+    await assert.rejects(second.send({ ...retry, request_packet: { ...stored.packet, address: 'Другой объект' } }), /без изменений/);
+    await assert.rejects(second.send({ ...retry, request_packet: { ...stored.packet, materials: [...stored.packet.materials].reverse() } }), /без изменений/);
+    await assert.rejects(second.send({ ...retry, documents: [{ ...report.documents[0], source: Buffer.from('CHANGED') }] }), /без изменений/);
+    assert.equal(second.calls.length, 0);
+    await second.send(retry);
+    assert.equal(second.calls.filter(call => call.method === 'sendDocument').length, 0);
+    assert.equal(second.calls.filter(call => call.method === 'sendMessage').length, 1); // only the handoff
+    assert.equal(second.saved.length, 1);
+  } finally { await db.close(); }
+});
+
+test('unchanged legacy checkpoint upgrades to canonical signature while changed payload stays rejected', async () => {
+  const { createHash } = require('node:crypto');
+  const report = data({ extra: { z: 1, a: 2 } });
+  const oldSignature = createHash('sha256').update(JSON.stringify(report)).digest('hex');
+  let stored = { signature: oldSignature, textIds: [101], photoIds: [], documentIds: [], saved: false, handoffSent: false, replied: false };
+  const h = harness();
+  h.ctx.auditDelivery = { load: async () => stored, save: async progress => { stored = JSON.parse(JSON.stringify(progress)); } };
+  await assert.rejects(h.send({ ...report, conclusion: 'Другой итог' }), /без изменений/);
+  assert.equal(h.calls.length, 0);
+  await h.send(report);
+  assert.notEqual(stored.signature, oldSignature);
+  assert.equal(h.calls.filter(call => call.method === 'sendMessage').length, 1);
+  assert.equal(h.saved.length, 1);
+});

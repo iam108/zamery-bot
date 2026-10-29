@@ -1,10 +1,12 @@
 const pool = require('./pool');
 
 async function createOrder(data) {
+  await require('../web/order-materials').ensureOrderMaterials();
   const { rows } = await pool.query(
     `INSERT INTO orders 
-      (address, owner_name, object_type, object_name, has_video, zones_info, deadline, contacts, submitted_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      (address, owner_name, object_type, object_name, has_video, zones_info, deadline, contacts, submitted_by, service, cad_num, archive_url, request_submit_id, request_signature)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+     ON CONFLICT(submitted_by,request_submit_id) DO NOTHING
      RETURNING *`,
     [
       data.address,
@@ -16,9 +18,18 @@ async function createOrder(data) {
       data.deadline || null,
       data.contacts || null,
       data.submitted_by || null,
+      data.service || null,
+      data.cad_num || null,
+      data.archive_url || null,
+      data.request_submit_id || null,
+      data.request_signature || null,
     ]
   );
-  return rows[0];
+  if (rows[0]) return rows[0];
+  const existing = (await pool.query('SELECT * FROM orders WHERE submitted_by=$1 AND request_submit_id=$2', [data.submitted_by, data.request_submit_id])).rows[0];
+  if (!existing) throw new Error('Не удалось сохранить заявку.');
+  if (existing.request_signature !== data.request_signature) throw new Error('Эта заявка уже сохранена с другими данными. Откройте новую форму для новой заявки.');
+  return existing;
 }
 
 async function getOrders({ status, search, limit = 50, offset = 0 } = {}) {
@@ -53,6 +64,16 @@ async function getOrders({ status, search, limit = 50, offset = 0 } = {}) {
 
 async function getOrderById(id) {
   const { rows } = await pool.query('SELECT * FROM orders WHERE id = $1', [id]);
+  return rows[0] || null;
+}
+
+async function updateOrderPacket(id, data) {
+  await require('../web/order-materials').ensureOrderMaterials();
+  const { rows } = await pool.query(`UPDATE orders SET address=$1,owner_name=$2,object_type=$3,object_name=$4,
+    has_video=$5,zones_info=$6,deadline=$7,contacts=$8,service=$9,cad_num=$10,archive_url=$11
+    WHERE id=$12 RETURNING *`, [data.address, data.owner_name, data.object_type, data.object_name || null,
+    data.has_video || false, data.zones_info || null, data.deadline || null, data.contacts || null,
+    data.service || null, data.cad_num || null, data.archive_url || null, id]);
   return rows[0] || null;
 }
 
@@ -158,7 +179,7 @@ async function getOrdersByObject(address, objectName) {
   return rows;
 }
 module.exports = { 
-  createOrder, getOrders, getOrderById, updateOrderStatus, 
+  createOrder, getOrders, getOrderById, updateOrderPacket, updateOrderStatus,
   setTelegramMsgId, addLog, getOrderLogs, getStats,
   getStatsByMonth, getStatsByType, searchObjects, getOrdersByObject
 };

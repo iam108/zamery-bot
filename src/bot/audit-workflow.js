@@ -8,6 +8,12 @@ function normalizeWorkflow(input) {
   if (input.schema_version !== 3) return input;
   const data = { ...input, inspection: { ...(input.inspection || {}) }, workflow: { ...(input.workflow || {}) } };
   const p = data.inspection;
+  if (data.ui_version === 4) {
+    const packet = data.request_packet || {};
+    p.region = 'МСК';
+    for (const key of ['org', 'address', 'service', 'archive_url']) if (packet[key] != null) p[key] = String(packet[key]);
+    if (p.service === 'Продление') p.archive_available = packet.archive_url || (packet.materials || []).some(f => f.role === 'archive') ? 'Да' : 'Нет';
+  }
   for (const key of ['alcohol_present', 'within_cadastral', 'all_entrances_checked', 'zones_checked']) if (!p[key]) p[key] = 'Не проверено';
   for (const key of ['building_type', 'boundaries', 'bti', 'to']) if (!data[key]) data[key] = 'Не проверено';
   if (p.service === 'Продление') {
@@ -19,11 +25,38 @@ function normalizeWorkflow(input) {
   }
   data.video_url = data.workflow.video_url || data.video_url || '';
   data.entrances = data.entrances || [];
-  data.zones = (data.zones || []).map(z => ({ ...z, status: z.status || 'pending' }));
+  data.zones = (data.zones || []).map((z, i) => ({ ...z, ...(data.ui_version === 4 && !String(z.name || '').trim() ? { name: 'Неустановленная организация ' + (i + 1) } : {}), status: z.status || 'pending' }));
   return data;
 }
 
+function simpleFollowupTasks(data) {
+  const p = data.inspection || {}, packet = data.request_packet || {}, tasks = [];
+  const evidence = [...(data.evidence || []), ...(packet.materials || [])];
+  const add = (id, label) => tasks.push({ id, label });
+  if (!data.entrances?.length) add('entrances', 'Добавить фотографии входов');
+  for (const entrance of data.entrances || []) {
+    if (['Нет доступа', 'Не осмотрен'].includes(entrance.access)) add('entrance:' + entrance.id, (entrance.label || 'Вход') + ': нужно досмотреть');
+    if (!evidence.some(e => e.subject_id === entrance.id && e.role === 'entrance')) add('entrance-photo:' + entrance.id, (entrance.label || 'Вход') + ': нет фотографии');
+  }
+  for (const zone of data.zones || []) {
+    if (zone.status === 'pending') add('zone:' + zone.id, (zone.name || 'Организация рядом') + ': уточнить ограничение');
+  }
+  for (const [key, label] of [['alcohol_present', 'Наличие алкоголя'], ['within_cadastral', 'Границы помещения'], ['all_entrances_checked', 'Все входы'], ['zones_checked', 'Окружение']]) if (!p[key] || p[key] === 'Не проверено') add(key, label + ': не проверено');
+  if (p.service === 'Продление') {
+    if (p.archive_available !== 'Да') add('archive-missing', 'Менеджер не передал архив предыдущей проверки');
+    else if (p.archive_match !== 'Да') add('archive', 'Сверить фактическую планировку с архивом');
+    if (p.licensed_boundaries_match !== 'Да') add('licensed-boundaries', 'Проверить лицензированные границы');
+    if (p.alcohol_present !== 'Нет' && p.alcohol_within_licensed !== 'Да') add('alcohol-zone', 'Проверить размещение алкоголя в лицензированных границах');
+  }
+  if (packet.video_required && (p.video_status !== 'Сделано' || !(data.workflow?.video_url || data.video_url))) add('video', 'Приложить видео, указанное в задании менеджера');
+  if (data.bti === 'Нет') add('plan-mismatch', 'Планировка отличается от представленной графики');
+  if (data.to === 'Нужно') add('technical-survey', 'Нужно техническое обследование');
+  if (!evidence.some(e => ['plan', 'plan-source', 'egrn'].includes(e.role))) add('plan', 'В заявке нет плана / ЕГРН — запросить у менеджера');
+  return tasks;
+}
+
 function followupTasks(data) {
+  if (data.ui_version === 4) return simpleFollowupTasks(data);
   const p = data.inspection || {}, w = data.workflow || {}, evidence = data.evidence || [];
   const tasks = [];
   const add = (id, label) => tasks.push({ id, label });
@@ -71,13 +104,13 @@ function validateWorkflow(data) {
   }
   for (const zone of data.zones) {
     if (!ZONE_STATUS[zone.status]) throw new Error('Укажите статус проверки соседней организации.');
-    if (zone.status !== 'pending' && (!(zone.resolution || '').trim() || !(zone.source || '').trim())) throw new Error('Добавьте основание и источник решения по организации «' + zone.name + '».');
+    if (zone.status !== 'pending' && !(zone.resolution || '').trim() && !(zone.source || '').trim()) throw new Error('Добавьте основание решения по организации «' + zone.name + '».');
     if (zone.entrance_id && !data.entrances.some(e => e.id === zone.entrance_id)) throw new Error('Выберите существующий вход для замера зоны.');
     if (zone.dist && zone.dist !== 'Не проверено' && !/^\d{1,6}(?:[.,]\d{1,2})?$/.test(zone.dist)) throw new Error('Расстояние: число в метрах или «Не проверено».');
   }
   for (const [key, value] of Object.entries(w)) {
     if (key === 'documents') { if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Проверьте список документов.'); continue; }
-    if (key === 'step') { if (!Number.isInteger(value) || value < 0 || value > 7) throw new Error('Некорректный этап проверки.'); continue; }
+    if (key === 'step') { if (!Number.isInteger(value) || value < 0 || value > (data.ui_version === 4 ? 2 : 7)) throw new Error('Некорректный этап проверки.'); continue; }
     if (typeof value !== 'string' || value.length > 6000) throw new Error('Слишком длинное или некорректное поле выезда: ' + key);
   }
   for (const url of [w.video_url, p.archive_url]) if (url && !/^https?:\/\/\S+$/i.test(url)) throw new Error('Для видео и архива укажите ссылку http или https.');
@@ -88,7 +121,7 @@ function validateWorkflow(data) {
   }
   if (w.conclusion_status === 'ready') {
     const tasks = followupTasks(data);
-    const adverse = data.zones.some(z => z.status === 'confirmed') || p.within_cadastral !== 'Да' || p.all_entrances_checked !== 'Да' || p.zones_checked !== 'Да' || data.boundaries !== 'Да' || data.bti === 'Нет' || data.to === 'Нужно' ||
+    const adverse = data.zones.some(z => z.status === 'confirmed') || p.within_cadastral !== 'Да' || p.all_entrances_checked !== 'Да' || p.zones_checked !== 'Да' || (data.ui_version !== 4 && (data.boundaries !== 'Да' || data.bti === 'Нет' || data.to === 'Нужно')) ||
       (p.service === 'Получение' && p.alcohol_present !== 'Нет') ||
       (p.service === 'Продление' && (p.licensed_boundaries_match !== 'Да' || (p.alcohol_present !== 'Нет' && p.alcohol_within_licensed !== 'Да')));
     if (tasks.length || adverse) throw new Error('Есть открытые вопросы или замечания. Уточните их либо выберите итог «Нужны действия», «Недостаточно данных» или «Выявлено препятствие».');
@@ -98,6 +131,7 @@ function validateWorkflow(data) {
 function buildWorkflowReport(data) {
   if (data.schema_version !== 3) return { plain: [], html: [] };
   validateWorkflow(data);
+  if (data.ui_version === 4) return buildSimpleReport(data);
   const w = data.workflow || {}, p = data.inspection || {}, plain = [];
   const field = (label, value) => plain.push(label + ': ' + (value || 'Не проверено'));
   plain.push('', 'ПОДГОТОВКА И ВЫЕЗД');
@@ -142,6 +176,42 @@ function buildWorkflowReport(data) {
   if (w.mitigation) field('Предлагаемая проработка / повторная проверка', w.mitigation);
   if (w.followup_notes) field('Результаты доработки', w.followup_notes);
   plain.push('Внутренний отчёт аудитора. Официальный акт выездной оценки прикладывается отдельно.');
+  return { plain, html: plain.map(esc) };
+}
+
+function buildSimpleReport(data) {
+  const packet = data.request_packet || {}, p = data.inspection || {}, w = data.workflow || {}, plain = [];
+  const field = (label, value) => { if (value) plain.push(label + ': ' + value); };
+  plain.push('', 'ЗАДАНИЕ ИЗ ЗАЯВКИ');
+  field('Контакт', packet.contacts);
+  field('Срок', packet.deadline);
+  field('Задача менеджера', packet.zones_info);
+  if (packet.materials?.length) field('Документы заявки', packet.materials.map(f => f.name).join('; '));
+  if (p.service === 'Продление') field('Архив предыдущей проверки', packet.archive_url || (packet.materials || []).filter(f => f.role === 'archive').map(f => f.name).join('; '));
+  plain.push('', 'НА ОБЪЕКТЕ');
+  for (const entrance of data.entrances || []) {
+    plain.push('• ' + (entrance.label || 'Вход'));
+    field('Примечание', [entrance.location, entrance.notes, entrance.access].filter(Boolean).join(' · '));
+  }
+  for (const z of data.zones || []) {
+    plain.push('• ' + z.name + ' — ' + ZONE_STATUS[z.status]);
+    field('Расстояние', z.dist ? z.dist + ' м' : '');
+    field('Как измерено', [z.method, z.points].filter(Boolean).join(' · '));
+    field('Наблюдения', z.info);
+    field('Результат проверки', z.resolution);
+    field('Источник', z.source);
+  }
+  if (data.plan?.annotations?.length) field('Отметки на плане', String(data.plan.annotations.length));
+  field('Основание определения стен', data.plan?.wall_basis);
+  if (['Да', 'Нет'].includes(data.bti)) field('Планировка совпадает с графикой', data.bti);
+  if (['Нужно', 'Не нужно', 'Не обязательно'].includes(data.to)) field('Техническое обследование', data.to);
+  field('Видео', w.video_url);
+  plain.push('', 'ИТОГ');
+  field('Результат аудитора', CONCLUSIONS[w.conclusion_status]);
+  const tasks = simpleFollowupTasks(data);
+  if (tasks.length) { plain.push('Осталось уточнить:'); tasks.forEach(t => plain.push('• ' + t.label)); }
+  field('Доработка', w.followup_notes);
+  field('Предлагаемые действия', w.mitigation);
   return { plain, html: plain.map(esc) };
 }
 

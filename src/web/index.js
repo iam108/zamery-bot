@@ -3,7 +3,7 @@ const session = require('express-session');
 const PgSession = require('connect-pg-simple')(session);
 const pool = require('../db/pool');
 const path = require('path');
-const { getOrders, getOrderById, updateOrderStatus, getOrderLogs, getStats, createOrder, addLog, setTelegramMsgId } = require('../db/queries');
+const { getOrders, getOrderById, updateOrderStatus, getOrderLogs, getStats } = require('../db/queries');
 const multer = require('multer');
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 function esc(s) {
@@ -11,10 +11,6 @@ function esc(s) {
     return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch];
   });
 }
-
-// Недавние отправки заявок (номер отправки → результат), чтобы повтор не создавал дубль
-const recentOrders = new Map();
-setInterval(() => { if (recentOrders.size > 500) recentOrders.clear(); }, 60 * 60 * 1000).unref();
 
 function setupWeb(app) {
   
@@ -74,85 +70,11 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
     res.json({ ok: true, order });
   });
 
-  // API для Mini App формы заявки
-  app.post('/api/order', upload.array('files', 5), async (req, res) => {
-    const sid = String((req.body && req.body.submit_id) || '').slice(0, 40);
-    if (sid && recentOrders.has(sid)) {
-      const prev = recentOrders.get(sid);
-      if (prev === 'pending') return res.status(409).json({ ok: false, busy: true, error: 'Заявка уже отправляется' });
-      return res.json(prev); // эта заявка уже создана — второй раз не создаём
-    }
-    if (sid) recentOrders.set(sid, 'pending');
-    const finish = (body) => { if (sid) { if (body.ok) recentOrders.set(sid, body); else recentOrders.delete(sid); } return res.json(body); };
-    try {
-      const data = req.body;
-      const files = req.files || [];
-      data.submitted_by = req.tgUser.id;
-      data.has_video = data.has_video === true || data.has_video === 'true';
-      if (!String(data.address || '').trim() || !String(data.owner_name || '').trim() || !String(data.object_type || '').trim()) {
-        return finish({ ok: false, error: 'Заполните адрес, владельца и тип объекта' });
-      }
-      const order = await createOrder(data);
-      // кто оставил заявку — сохраняем с заявкой, чтобы имя не пропадало при смене статуса
-      order.submitted_name = req.staff.name;
-      try { await require('../db/pool').query('UPDATE orders SET submitted_name=$1 WHERE id=$2', [req.staff.name, order.id]); } catch (e) { console.error('submitted_name:', e.message); }
-      await addLog(order.id, 'created', req.staff.name, 'Заявка создана через Mini App');
+  // Общий пакет менеджера: новая заявка или дополнение существующей.
+  require('./manager-orders').setupManagerOrders(app);
 
-      const { formatOrderMessage } = require('../bot/formatter');
-      const botInstance = require('../bot/instance');
-      const text = formatOrderMessage(order);
-      const msg = await botInstance.telegram.sendMessage(process.env.GROUP_CHAT_ID, text, {
-        parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: [[
-          { text: '🔧 Взять в работу', callback_data: 'status:in_progress:' + order.id },
-          { text: '✅ Готово', callback_data: 'status:done:' + order.id },
-        ]]}
-      });
-      
-            await setTelegramMsgId(order.id, msg.message_id);
-
-      // Выписка ЕГРН: есть — прикладываем к заявке для аудитора, нет — заказываем (придёт ответом на заявку)
-      if (data.cad_num) {
-        try {
-          const egrn = await require('../bot/egrn').attachOrOrder({
-            cad: data.cad_num, label: [data.owner_name, data.object_name].filter(Boolean).join(' · '),
-            order: !!data.egrn_order, orderedBy: req.tgUser.id, orderedName: req.staff.name,
-            targets: [{ chat: Number(process.env.GROUP_CHAT_ID), reply: msg.message_id }],
-            note: 'Для заявки на замер #' + order.id,
-          });
-          const notes = { unavailable: '⚠️ Доставка ранее заказанной выписки ЕГРН остановлена. Проверьте её в кабинете https://armrus.org — повторный заказ не создан', attached: '📄 Выписка ЕГРН приложена к заявке', ordered: '⏳ Выписка ЕГРН заказана — придёт ответом на заявку', waiting: '⏳ Выписка ЕГРН уже в работе — придёт ответом на заявку' };
-          if (notes[egrn.result]) await botInstance.telegram.sendMessage(process.env.GROUP_CHAT_ID, notes[egrn.result] + ' (' + egrn.cad + ')', { reply_to_message_id: msg.message_id, disable_notification: true });
-        } catch (e) { console.error('egrn for order:', e.message); }
-      }
-
-     if (files.length > 0) {
-  for (var i = 0; i < files.length; i++) {
-    var att = files[i];
-    var buf = att.buffer;
-    try {
-      if (att.mimetype && att.mimetype.indexOf('pdf') !== -1) {
-        await botInstance.telegram.sendDocument(process.env.GROUP_CHAT_ID,
-          { source: buf, filename: att.originalname },
-          { caption: '📎 ' + String(att.originalname || 'файл').slice(0, 200), reply_to_message_id: msg.message_id }
-        );
-      } else {
-        await botInstance.telegram.sendPhoto(process.env.GROUP_CHAT_ID,
-          { source: buf },
-          { caption: '📎 ' + String(att.originalname || 'файл').slice(0, 200), reply_to_message_id: msg.message_id }
-        );
-      }
-    } catch(fileErr) {
-      console.error('file send error:', fileErr.message);
-    }
-  }
-}
-
-finish({ ok: true, id: order.id });
-} catch (e) {
-  console.error('api/order error:', e);
-  finish({ ok: false, error: e.message });
-}
-});
+  require('./order-materials').setupOrderMaterials(app);
+  require('./order-archive').setupOrderArchive(app);
 
   require('./audit-drafts').setupAuditDrafts(app);
 
@@ -161,12 +83,20 @@ finish({ ok: true, id: order.id });
     try {
       const id = Number(req.query.order_id);
       if (!Number.isSafeInteger(id) || id <= 0) return res.status(400).json({ ok: false, error: 'Некорректный номер заявки' });
+      const materialStore = require('./order-materials');
+      await materialStore.ensureOrderMaterials();
       const order = await getOrderById(id);
       if (!order) return res.status(404).json({ ok: false, error: 'Заявка не найдена' });
       const type = String(order.object_type || '').toLowerCase();
-      const category = /табак/.test(type) ? 'tobacco' : /общепит/.test(type) ? 'catering' : /магазин/.test(type) ? 'retail' : 'other';
+      const category = /табак/.test(type) ? 'tobacco' : /общепит/.test(type) ? 'catering' : /магазин|рознич|торговл/.test(type) ? 'retail' : 'other';
+      const materials = await materialStore.listOrderMaterials(order.id);
       res.json({ ok: true, order_id: order.id, org: order.owner_name || order.object_name || '', object_name: order.object_name || '', address: order.address || '', object_category: category,
-        contacts: order.contacts || '', deadline: order.deadline || null, status: order.status || 'new' });
+        service: order.service || '', region: 'МСК', cad_num: order.cad_num || '', archive_url: order.service === 'Продление' ? order.archive_url || '' : '',
+        zones_info: order.zones_info || '', has_video: !!order.has_video, video_required: !!order.has_video, contacts: order.contacts || '', deadline: order.deadline || null,
+        status: order.status || 'new', materials, materials_download_url: '/api/audit/orders/' + order.id + '/materials/download-all',
+        archive_download_url: order.service === 'Продление' ? (materials.some(file => file.role === 'archive') ? '/api/audit/orders/' + order.id + '/materials/download-all?role=archive' : order.archive_url ? '/api/audit/orders/' + order.id + '/archive/download' : '') : '',
+        can_edit_packet: req.staff.role === 'manager' || String(order.submitted_by) === String(req.tgUser.id),
+        manager_edit_url: '/form?order_id=' + order.id, telegram_msg_id: order.telegram_msg_id || null });
     } catch (e) {
       console.error('audit prefill:', e.message);
       res.status(500).json({ ok: false, error: 'Не удалось загрузить данные заявки' });
@@ -184,7 +114,7 @@ finish({ ok: true, id: order.id });
     };
     if (data.draft_id) {
       const drafts = require('./audit-drafts');
-      const submit = require('./audit-submit').createAuditSubmitter(drafts, handleAuditReport);
+      const submit = require('./audit-submit').createAuditSubmitter(drafts, handleAuditReport, { loadPacket: require('./audit-packet').loadAuditPacket });
       return res.json(await submit(req.tgUser.id, data.draft_id, data.revision, fakeCtx));
     }
     if (data.schema_version === 3) return res.status(400).json({ ok: false, error: 'Сначала сохраните черновик новой формы.' });
@@ -382,6 +312,7 @@ function orderDetailPage(order, logs) {
 <div class="main">
   <div class="card">
     <h2>Данные заявки</h2>
+    <p style="margin-bottom:16px"><a href="/form?order_id=${parseInt(order.id)}" style="color:#a5b4fc">Данные и документы заявки →</a></p>
     <div class="field"><span class="field-label">Адрес</span><span>${esc(order.address)}</span></div>
     <div class="field"><span class="field-label">Чей объект</span><span>${esc(order.owner_name)}</span></div>
     <div class="field"><span class="field-label">Тип</span><span>${esc(order.object_type)}</span></div>
@@ -445,7 +376,10 @@ function miniAppForm() {
   .submit-btn{width:100%;padding:15px;background:var(--tg-theme-button-color,#6366f1);color:var(--tg-theme-button-text-color,#fff);border:none;border-radius:14px;font-size:16px;font-weight:600;cursor:pointer}
   .submit-btn:disabled{opacity:.5}
 </style></head><body>
-<h1>📋 Новая заявка</h1>
+<h1 id="form-heading">📋 Заявка на выезд · Москва</h1>
+<p style="font-size:14px;line-height:1.5;margin-bottom:20px;color:var(--tg-theme-hint-color,#94a3b8)">Заполняет менеджер. Данные и все приложенные документы автоматически получит аудитор.</p>
+<p id="packet-status" role="status" style="font-size:14px;line-height:1.5;margin-bottom:16px" hidden></p>
+<button id="packet-retry" type="button" onclick="loadExistingPacket()" style="padding:10px 14px;margin-bottom:16px" hidden>Повторить загрузку</button>
 <div class="field">
   <label>Адрес объекта <span class="required">*</span></label>
   <input id="address" type="text" placeholder="Город, улица, дом">
@@ -458,7 +392,7 @@ function miniAppForm() {
 </div>
 <div class="field">
   <label>Тип объекта <span class="required">*</span></label>
-  <select id="object_type">
+  <select id="object_type" onchange="updateService()">
     <option value="">— выбрать —</option>
     <option value="Общепит алкоголь">🍺 Общепит алкоголь</option>
     <option value="Розничная торговля">🛒 Розничная торговля</option>
@@ -466,6 +400,21 @@ function miniAppForm() {
     <option value="Другое">📦 Другое</option>
 </select>
   <div class="err" id="err-object_type">Выберите тип</div>
+</div>
+<div class="field" id="service-field">
+  <label for="service">Услуга <span class="required">*</span></label>
+  <select id="service" onchange="updateService()">
+    <option value="">— выбрать —</option>
+    <option>Получение</option><option>Продление</option><option>Переоформление</option>
+  </select>
+  <div class="err" id="err-service">Выберите услугу</div>
+</div>
+<div class="field" id="archive-field" style="display:none">
+  <label for="archive_url">Архив объекта для продления</label>
+  <input id="archive_url" type="url" maxlength="2000" placeholder="Ссылка на папку или файл объекта в Яндекс Диске">
+  <p style="font-size:13px;line-height:1.5;color:var(--tg-theme-hint-color,#94a3b8);margin-top:7px">Добавьте ссылку именно этого объекта или прикрепите архивные материалы ниже с назначением «Архив». Аудитор получит их вместе с заявкой.</p>
+  <a href="https://disk.360.yandex.ru/d/RPoUCOS6PFusPQ" target="_blank" rel="noopener noreferrer" style="display:inline-block;margin-top:8px;color:var(--tg-theme-link-color,#7bb5ff)">Открыть общий архив ↗</a>
+  <div class="err" id="err-archive_url">Для продления нужна ссылка на архив объекта или файл с назначением «Архив»</div>
 </div>
 <div class="field">
   <label>Название объекта</label>
@@ -493,7 +442,7 @@ function miniAppForm() {
 </div>
 <div class="field">
   <label>Информация о зонах</label>
-  <textarea id="zones_info" placeholder="Описание зон, площадь, особенности..."></textarea>
+  <textarea id="zones_info" placeholder="Что проверить на выезде, известные организации рядом, особенности объекта" maxlength="4000"></textarea>
 </div>
 <div class="field">
   <label>Крайний срок</label>
@@ -501,14 +450,16 @@ function miniAppForm() {
 </div>
 <div class="field">
   <label>Контакты и доп. информация</label>
-  <textarea id="contacts" placeholder="Телефон, имя контакта, сумма, примечания..."></textarea>
+  <textarea id="contacts" placeholder="Имя и телефон человека на объекте, комментарий менеджера" maxlength="4000"></textarea>
 </div>
 <div class="field">
-  <label>Документы и фото</label>
+  <label>Пакет документов аудитору</label>
+  <p style="font-size:13px;line-height:1.5;color:var(--tg-theme-hint-color,#94a3b8);margin-bottom:8px">План, выписка ЕГРН, материалы прошлого продления и другие документы. До 20 файлов, каждый до 12 МБ, всего до 100 МБ. Аудитор сможет скачать всё одним ZIP.</p>
+  <div id="existing-files" style="margin-bottom:10px"></div>
   <label class="toggle-row" style="cursor:pointer;justify-content:flex-start;gap:12px">
     <span>📎 Прикрепить файлы</span>
     <span class="file-count" id="file-count" style="color:var(--tg-theme-hint-color,#64748b);font-size:13px">не выбрано</span>
-    <input type="file" id="attachments" accept="image/*,.pdf" multiple style="display:none" onchange="previewFiles(this)">
+    <input type="file" id="attachments" accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.zip" multiple style="display:none" onchange="previewFiles(this)">
   </label>
   <div id="files-preview" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px"></div>
 </div>
@@ -535,22 +486,87 @@ function toggleVideo(e) {
   cb.checked = !cb.checked;
 }
 var attachedFiles = [];
+var existingFiles = [];
+var editOrderId = new URLSearchParams(location.search).get('order_id');
+var packetReady = !editOrderId, packetCanEdit = !editOrderId;
 var submitId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+function enablePacketEditing(enabled) {
+  document.querySelectorAll('input,select,textarea').forEach(function(el){el.disabled=!enabled;});
+  document.getElementById('submit-btn').disabled = !enabled;
+}
+async function downloadExistingFile(file, button) {
+  var label = button.textContent; button.disabled=true;button.textContent='Скачиваем…';
+  try {
+    var response=await fetch(file.url); if(!response.ok) { var failure=await response.json(); throw new Error(failure.error || 'Не удалось скачать документ.'); }
+    var blob=await response.blob(), url=URL.createObjectURL(blob), link=document.createElement('a');
+    link.href=url;link.download=file.name;document.body.appendChild(link);link.click();link.remove();setTimeout(function(){URL.revokeObjectURL(url);},60000);
+  } catch(e) { tg.showAlert(e.message); }
+  finally {button.disabled=false;button.textContent=label;}
+}
+function renderExistingFiles() {
+  var box=document.getElementById('existing-files');box.innerHTML='';
+  if(!existingFiles.length) return;
+  var note=document.createElement('p');note.textContent='Уже в заявке · '+existingFiles.length+' файл(ов). Повторно прикреплять не нужно.';note.style.cssText='font-size:13px;line-height:1.5;margin:10px 0';box.appendChild(note);
+  existingFiles.forEach(function(file){
+    var button=document.createElement('button');button.type='button';button.textContent='↓ '+file.name;button.style.cssText='display:block;text-align:left;overflow-wrap:anywhere;width:100%;padding:12px;border:0;border-radius:10px;background:var(--tg-theme-secondary-bg-color,#1e293b);color:var(--tg-theme-link-color,#7bb5ff);margin-bottom:6px;font-size:14px';button.onclick=function(){downloadExistingFile(file,button);};box.appendChild(button);
+  });
+}
+async function loadExistingPacket() {
+  if(!editOrderId) return;
+  packetReady=false;packetCanEdit=false;enablePacketEditing(false);
+  var status=document.getElementById('packet-status');status.hidden=false;status.textContent='Загружаем заявку #'+editOrderId+'…';document.getElementById('packet-retry').hidden=true;
+  document.getElementById('form-heading').textContent='📋 Заявка #'+editOrderId+' · Москва';
+  document.getElementById('submit-btn').textContent='Сохранить изменения';
+  try {
+    var response=await fetch('/api/order/'+encodeURIComponent(editOrderId)), data=await response.json();
+    if(!response.ok || !data.ok) throw new Error(data.error || 'Не удалось открыть заявку.');
+    var order=data.order;
+    ['address','owner_name','object_type','object_name','service','cad_num','archive_url','zones_info','contacts'].forEach(function(id){
+      var field=document.getElementById(id),value=order[id] || '';
+      if(field.tagName === 'SELECT' && value && !Array.from(field.options).some(function(option){return option.value===value;})) {var option=document.createElement('option');option.value=value;option.textContent=value;field.appendChild(option);}
+      field.value=value;
+    });
+    document.getElementById('deadline').value=order.deadline ? String(order.deadline).slice(0,10) : '';
+    document.getElementById('has_video').checked=!!order.has_video;
+    document.getElementById('egrn_order').checked=false;
+    existingFiles=data.materials || [];renderExistingFiles();renderFiles();updateService();
+    packetReady=true;packetCanEdit=!!data.can_edit;enablePacketEditing(packetCanEdit);
+    status.textContent=packetCanEdit ? 'Изменения попадут в эту же заявку. Можно добавить документы — сохранённые файлы останутся в пакете аудитора.' : 'Просмотр заявки. Дополнить её может автор или менеджер.';
+  } catch(e) { status.textContent=e.message;document.getElementById('packet-retry').hidden=false; }
+}
+function updateService() {
+  var other = /табак|другое/i.test(document.getElementById('object_type').value);
+  document.getElementById('service-field').style.display = other ? 'none' : '';
+  document.getElementById('archive-field').style.display = !other && document.getElementById('service').value === 'Продление' ? '' : 'none';
+}
+function materialRole(name) { return /егрн|egrn|выписк/i.test(name) ? 'egrn' : /архив|archive/i.test(name) ? 'archive' : /план|график|бти|bti|plan/i.test(name) ? 'plan' : 'document'; }
 function previewFiles(input) {
-  attachedFiles = Array.from(input.files);
-  document.getElementById('file-count').textContent = attachedFiles.length + ' файл(ов)';
-  var p = document.getElementById('files-preview'); p.innerHTML = '';
-  attachedFiles.forEach(function(f) {
-    var tag = document.createElement('div');
-    tag.style.cssText = 'padding:6px 10px;background:var(--tg-theme-secondary-bg-color,#1e293b);border-radius:8px;font-size:12px;color:var(--tg-theme-hint-color,#64748b)';
-    tag.textContent = f.name.length > 20 ? f.name.substring(0,20)+'...' : f.name;
-    p.appendChild(tag);
+  var incoming = Array.from(input.files || []); input.value = '';
+  var total = attachedFiles.reduce(function(n,f) { return n + f.size; }, existingFiles.reduce(function(n,f){return n+f.bytes;},0));
+  for (var f of incoming) {
+    if (attachedFiles.some(function(old) { return old.name === f.name && old.size === f.size && old.lastModified === f.lastModified; })) continue;
+    if (f.size > 12*1024*1024 || total + f.size > 100*1024*1024 || attachedFiles.length+existingFiles.length >= 20) { tg.showAlert('До 20 файлов: каждый не больше 12 МБ, общий объём до 100 МБ, включая уже сохранённые. Файл «' + f.name + '» не добавлен.'); continue; }
+    f.materialRole = materialRole(f.name); attachedFiles.push(f); total += f.size;
+  }
+  renderFiles();
+}
+function renderFiles() {
+  document.getElementById('file-count').textContent = attachedFiles.length ? attachedFiles.length + ' файл(ов)' : 'не выбрано';
+  var p = document.getElementById('files-preview'); p.innerHTML = ''; p.style.display = 'block';
+  attachedFiles.forEach(function(f,index) {
+    var tag = document.createElement('div'); tag.style.cssText = 'padding:12px;background:var(--tg-theme-secondary-bg-color,#1e293b);border-radius:12px;font-size:13px;margin-top:8px';
+    var name = document.createElement('div'); name.textContent = f.name; name.style.cssText = 'overflow-wrap:anywhere;margin-bottom:7px'; tag.appendChild(name);
+    var select = document.createElement('select'); select.setAttribute('aria-label','Назначение файла '+f.name); select.style.cssText='font-size:14px;padding:9px;margin-bottom:7px';
+    [['plan','План / графика'],['egrn','Выписка ЕГРН'],['archive','Архив прошлого продления'],['document','Другой документ / фото']].forEach(function(item) { var option = document.createElement('option'); option.value=item[0]; option.textContent=item[1]; select.appendChild(option); });
+    select.value=f.materialRole; select.onchange=function(){f.materialRole=select.value;}; tag.appendChild(select);
+    var remove = document.createElement('button'); remove.type='button'; remove.textContent='Убрать файл'; remove.style.cssText='border:0;background:none;color:#f87171;font:inherit;padding:6px 0'; remove.onclick=function(){attachedFiles.splice(index,1);renderFiles();};tag.appendChild(remove);p.appendChild(tag);
   });
 }
 function fileToBase64(file) {
   return new Promise(function(res) { var r = new FileReader(); r.onload = function() { res(r.result.split(',')[1]); }; r.readAsDataURL(file); });
 }
 async function submitForm() {
+  if(!packetReady || !packetCanEdit) return;
   var valid = true;
   ['address','owner_name','object_type'].forEach(function(id) {
     var el = document.getElementById(id);
@@ -558,6 +574,12 @@ async function submitForm() {
     if (!el.value.trim()) { err.classList.add('show'); el.style.borderColor='#f87171'; valid=false; }
     else { err.classList.remove('show'); el.style.borderColor='transparent'; }
   });
+  var alcohol = !/табак|другое/i.test(document.getElementById('object_type').value);
+  var service = alcohol ? document.getElementById('service').value : '';
+  var serviceError = document.getElementById('err-service');
+  serviceError.classList.toggle('show', alcohol && !service); if (alcohol && !service) valid = false;
+  var archiveMissing = service === 'Продление' && !document.getElementById('archive_url').value.trim() && !attachedFiles.some(function(f){return f.materialRole === 'archive';}) && !existingFiles.some(function(f){return f.role === 'archive';});
+  document.getElementById('err-archive_url').classList.toggle('show', archiveMissing); if (archiveMissing) valid=false;
   if (!valid) return;
   var btn = document.getElementById('submit-btn');
   if (btn.disabled) return;
@@ -568,6 +590,9 @@ formData.append('address', document.getElementById('address').value.trim());
 formData.append('owner_name', document.getElementById('owner_name').value.trim());
 formData.append('object_type', document.getElementById('object_type').value);
 formData.append('object_name', document.getElementById('object_name').value.trim());
+formData.append('service', service);
+formData.append('archive_url', service === 'Продление' ? document.getElementById('archive_url').value.trim() : '');
+formData.append('file_roles', JSON.stringify(attachedFiles.map(function(f){return f.materialRole || 'document';})));
 formData.append('has_video', document.getElementById('has_video').checked);
 formData.append('zones_info', document.getElementById('zones_info').value.trim());
 formData.append('deadline', document.getElementById('deadline').value || '');
@@ -575,7 +600,7 @@ formData.append('contacts', document.getElementById('contacts').value.trim());
 formData.append('tg_user_id', tgUserId());
 formData.append('cad_num', document.getElementById('cad_num').value.trim());
 formData.append('egrn_order', document.getElementById('egrn_order').checked ? '1' : '');
-attachedFiles.slice(0,5).forEach(function(f) {
+attachedFiles.forEach(function(f) {
   formData.append('files', f, f.name);
 });
 formData.append('submit_id', submitId);
@@ -585,7 +610,7 @@ for (var attempt = 0; attempt < waits.length; attempt++) {
   for (var s = waits[attempt]; s > 0; s--) { btn.textContent = 'Сервер занят, повтор через ' + s + ' с…'; await new Promise(function (ok) { setTimeout(ok, 1000); }); }
   btn.textContent = attempt ? 'Отправляем ещё раз…' : 'Отправляем...';
   try {
-    var r = await fetch('/api/order', { method: 'POST', body: formData });
+    var r = await fetch('/api/order'+(editOrderId ? '/'+encodeURIComponent(editOrderId) : ''), { method: 'POST', body: formData });
     var txt = await r.text();
     try { result = JSON.parse(txt); } catch (pe) { result = null; }
     if (result && result.ok) break;
@@ -597,6 +622,11 @@ for (var attempt = 0; attempt < waits.length; attempt++) {
   result = null;
 }
     if (result && result.ok) {
+      if (result.warning) { btn.disabled = false; btn.textContent = 'Повторить доставку'; tg.showAlert(result.warning); return; }
+      if(editOrderId) {
+        attachedFiles=[];submitId=Date.now().toString(36)+Math.random().toString(36).slice(2,8);
+        await loadExistingPacket();tg.showAlert('Заявка #'+result.id+' обновлена. Пакет документов доступен аудитору.');return;
+      }
       btn.textContent = '✅ Заявка отправлена!';
 if (attachedFiles.length > 0) {
     tg.showAlert('Заявка #' + result.id + ' принята, файлы прикреплены.', function () { tg.close(); });
@@ -605,10 +635,11 @@ if (attachedFiles.length > 0) {
 }
     } else { throw new Error(lastErr || 'ошибка сервера'); }
   } catch(e) {
-    btn.disabled = false; btn.textContent = 'Отправить заявку';
+    btn.disabled = false; btn.textContent = editOrderId ? 'Сохранить изменения' : 'Отправить заявку';
     tg.showAlert('Заявка не отправлена: ' + e.message + '. Данные остались в форме — попробуйте ещё раз.');
   }
 }
+if(editOrderId) loadExistingPacket();
 <\/script></body></html>`;
 }
 function statsPage({ byMonth, byType }) {
@@ -815,4 +846,4 @@ function objectDetailPage({ orders, address, name }) {
   </div>
 </div></body></html>`;
 }
-module.exports = { setupWeb };
+module.exports = { setupWeb, miniAppForm };

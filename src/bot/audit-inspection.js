@@ -16,7 +16,7 @@ function validateInspection(data) {
   if (!SERVICES.includes(p.service)) throw new Error('Выберите услугу: получение, продление или переоформление.');
   if (typeof data.conclusion !== 'string' || !data.conclusion.trim()) throw new Error('Укажите итог аудитора.');
   const choices = { building_type: ['Жилое', 'Нежилое', 'Не проверено'], boundaries: ['Да', 'Нет', 'Под вопросом', 'Не проверено'], bti: ANSWERS, to: ['Нужно', 'Не нужно', 'Не обязательно', 'Не проверено'] };
-  for (const [key, options] of Object.entries(choices)) {
+  for (const [key, options] of Object.entries(data.ui_version === 4 ? {} : choices)) {
     if (!options.includes(data[key])) throw new Error('Ответьте на вопросы о здании, границах, БТИ и ТО; можно выбрать «Не проверено».');
   }
   for (const [key, label] of [['org', 'организацию'], ['address', 'адрес объекта']]) {
@@ -56,7 +56,7 @@ function buildInspectionReport(data) {
   const p = data.inspection;
   const plain = [];
   const warnings = [];
-  function field(label, value) { plain.push(label + ': ' + (value || 'Не указано')); }
+  function field(label, value) { if (data.ui_version === 4 && !value) return; plain.push(label + ': ' + (value || 'Не указано')); }
   field('Организация', p.org);
   field('Адрес', p.address);
   field('Дата осмотра', p.visit_date);
@@ -98,17 +98,17 @@ function buildInspectionReport(data) {
   if (p.all_entrances_checked !== 'Да') warnings.push('Проверка со всех входов: ' + p.all_entrances_checked.toLowerCase() + '.');
   if (p.zones_checked !== 'Да') warnings.push('Проверка соседних организаций: ' + p.zones_checked.toLowerCase() + '.');
   if (/^\d+$/.test(p.entrances_plan) && /^\d+$/.test(p.entrances_actual) && Number(p.entrances_plan) !== Number(p.entrances_actual)) warnings.push('Количество входов на плане и фактически различается — уточните схему.');
-  for (const zone of data.zones || []) {
+  for (const zone of data.ui_version === 4 ? [] : data.zones || []) {
     plain.push('• ' + zone.name + (zone.dist ? ' — ' + zone.dist + ' м' : ' — расстояние не указано') +
       (zone.license ? '; лицензия: ' + zone.license : '; сведения о лицензии не указаны') + (zone.info ? '; ' + zone.info : ''));
   }
-  if (!(data.zones || []).length) plain.push('Соседние организации не перечислены; это само по себе не означает отсутствие зон ограничений.');
+  if (!(data.zones || []).length) plain.push(data.ui_version === 4 && p.zones_checked === 'Да' ? 'Организации с замечаниями не отмечены.' : 'Соседние организации не перечислены; это само по себе не означает отсутствие зон ограничений.');
   plain.push('');
   field('Состояние ремонта', p.repair_state);
   field('Риски и необходимые действия', p.risks);
   field('Видео осмотра', p.video_status);
-  const roles = new Set([...(data.photos || []), ...(data.evidence || [])].map(photo => photo.role));
-  if (data.schema_version === 3) field('Представленный план', roles.has('plan') || roles.has('plan-source') ? 'Приложен' : 'Не приложен');
+  const roles = new Set([...(data.photos || []), ...(data.evidence || []), ...(data.request_packet?.materials || [])].map(photo => photo.role));
+  if (data.schema_version === 3) field('Представленный план / ЕГРН', roles.has('plan') || roles.has('plan-source') || roles.has('egrn') ? 'Приложен' : 'Не приложен');
   const markedPlan = data.schema_version === 3 ? (data.evidence || []).some(e => e.role === 'plan' && e.subject_id === 'annotation') : roles.has('plan');
   field('План с цветной разметкой', markedPlan ? 'Приложен' : 'Не приложен');
   field('Карта организаций и входов', roles.has('map') ? 'Приложена' : 'Не приложена');

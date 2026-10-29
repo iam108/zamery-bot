@@ -34,10 +34,13 @@ function formatOrderMessage(order) {
   ];
 
   if (order.object_name) lines.push('🏷 <b>Название:</b> ' + esc(order.object_name));
-  lines.push('🎥 <b>Видео:</b> ' + (order.has_video ? 'Да' : 'Нет'));
-  if (order.zones_info) lines.push('📐 <b>Зоны:</b> ' + esc(order.zones_info));
+  if (order.service) lines.push('📋 <b>Услуга:</b> ' + esc(order.service));
+  if (order.cad_num) lines.push('📄 <b>Кадастровый номер:</b> ' + esc(order.cad_num));
+  if (order.service === 'Продление' && order.archive_url) lines.push('🗂 <b>Архив объекта:</b> ' + esc(order.archive_url));
+  lines.push('🎥 <b>Нужно видео:</b> ' + (order.has_video ? 'Да' : 'Нет'));
+  if (order.zones_info) lines.push('📐 <b>Задача и известные зоны:</b> ' + esc(String(order.zones_info).slice(0, 800)));
   lines.push('⏰ <b>Крайний срок:</b> ' + deadline);
-  if (order.contacts) lines.push('📞 <b>Контакты:</b> ' + esc(order.contacts));
+  if (order.contacts) lines.push('📞 <b>Контакты:</b> ' + esc(String(order.contacts).slice(0, 700)));
 
   lines.push('');
   lines.push(STATUS_EMOJI[order.status] + ' <b>Статус:</b> ' + STATUS_LABEL[order.status]);

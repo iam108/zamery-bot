@@ -45,6 +45,8 @@ async function migrate() {
       );
     `);
 
+    await client.query(require('../web/order-materials').DDL);
+
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_orders_status    ON orders(status);
       CREATE INDEX IF NOT EXISTS idx_orders_deadline  ON orders(deadline);

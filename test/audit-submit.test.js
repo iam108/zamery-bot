@@ -129,3 +129,46 @@ test('one delivery lock excludes a concurrent sender while tenant and revision c
   assert.equal(deliveries, 1);
   assert.equal(h.state.locked, false);
 });
+
+test('simple form uses the manager packet and freezes it across a delivery retry', async () => {
+  const fileId = randomUUID();
+  const h = harness({ ui_version: 4, workflow: { step: 2, conclusion_status: 'insufficient' },
+    request_packet: { org: 'Подменённый клиент', address: 'Подменённый адрес', service: 'Продление', materials: [{ id: fileId }] } });
+  let loads = 0;
+  const packet = { org: 'Клиент менеджера', address: 'Москва, адрес из заявки', service: 'Продление',
+    materials: [{ id: fileId, role: 'archive', name: 'Акт.pdf' }] };
+  const loadPacket = async (orderId, ids) => {
+    loads++;
+    assert.equal(orderId, 58);
+    assert.deepEqual(ids, [fileId]);
+    return packet;
+  };
+  const first = createAuditSubmitter(h.drafts, async (ctx, data) => {
+    assert.equal(data.inspection.org, packet.org);
+    assert.equal(data.inspection.address, packet.address);
+    assert.equal(data.inspection.region, 'МСК');
+    await ctx.auditDelivery.save({ textIds: [101] });
+    throw new Error('later packet failed');
+  }, { loadPacket });
+  await assert.rejects(first(108, h.id, 4, h.context), /later packet failed/);
+  assert.equal(h.state.delivery.packet.org, packet.org);
+  const retry = createAuditSubmitter(h.drafts, async (ctx, data) => {
+    assert.equal(data.inspection.org, packet.org);
+    assert.deepEqual((await ctx.auditDelivery.load()).textIds, [101]);
+  }, { loadPacket: async () => { throw new Error('Must reuse frozen manager packet'); } });
+  await retry(108, h.id, 4, h.context);
+  assert.equal(loads, 1);
+  assert.equal(h.state.submitted, true);
+});
+
+test('manager service changes require refresh before any report delivery', async () => {
+  const h = harness({ ui_version: 4, workflow: { step: 2, conclusion_status: 'insufficient' },
+    request_packet: { org: 'Клиент', address: 'Москва', service: 'Получение', materials: [] } });
+  let sent = false;
+  const submit = createAuditSubmitter(h.drafts, async () => { sent = true; }, {
+    loadPacket: async () => ({ org: 'Клиент', address: 'Москва', service: 'Продление', materials: [] }),
+  });
+  await assert.rejects(submit(108, h.id, 4, h.context), error => error.status === 409);
+  assert.equal(sent, false);
+  assert.equal(h.state.frozen, false);
+});

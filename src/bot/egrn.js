@@ -28,6 +28,23 @@ function documentTooLarge(err) {
     Number(err.code) === 413 ||
     /^413\b/.test(String(err.message || '')));
 }
+
+async function registerOriginal(targets, file) {
+  if (!(targets || []).some(t => t && t.order_id)) return;
+  try { await require('./order-evidence').registerOriginal(targets, file); }
+  catch (e) { console.error('egrn packet: original unavailable'); }
+}
+
+function documentRecord(message, chat, key, file) {
+  const record = { chat: Number(chat), id: message.message_id, key: key };
+  if (message.document && message.document.file_id) {
+    record.file_id = message.document.file_id;
+    record.name = file.name;
+    record.mime = message.document.mime_type || (/\.pdf$/i.test(file.name) ? 'application/pdf' : /\.zip$/i.test(file.name) ? 'application/zip' : 'application/octet-stream');
+    record.bytes = file.buf.length;
+  }
+  return record;
+}
 const TYPE_DOC = 'kvarmrusxmlpdf'; // выписка об объекте
 let tgApi = null; // bot.telegram — задаётся в setupEgrn, нужен и формам (заявка на замер, передача юристу)
 
@@ -483,11 +500,12 @@ function setupEgrn(bot) {
           if (fileMsgs.some(function (f) { return f.key === key; })) continue;
           try {
             checkDocumentSize(d.buf);
+            await registerOriginal(o.deliver, d);
             const extra = { caption: d.kind === 'pdf' ? caption.slice(0, 1000) : (d.kind === 'xml' ? 'XML ' + o.cad_num : 'Архив ' + o.cad_num), disable_notification: d.kind !== 'pdf' };
             if (o.status_msg_id) extra.reply_to_message_id = Number(o.status_msg_id);
             const m = await bot.telegram.sendDocument(o.chat_id, { source: d.buf, filename: d.name }, extra);
             if (m && m.message_id && d.kind !== 'xml') {
-              const record = { chat: Number(o.chat_id), id: m.message_id, key: key };
+              const record = documentRecord(m, o.chat_id, key, d);
               fileMsgs.push(record); newlySent.push(record);
             }
             if (d.kind === 'pdf' || d.kind === 'zip') sent++;
@@ -502,11 +520,12 @@ function setupEgrn(bot) {
           try {
             f = await download(u);
             checkDocumentSize(f.buf);
+            await registerOriginal(o.deliver, f);
             const extra = { caption: caption.slice(0, 1000) };
             if (o.status_msg_id) extra.reply_to_message_id = Number(o.status_msg_id);
             const m = await bot.telegram.sendDocument(o.chat_id, { source: f.buf, filename: f.name }, extra);
             if (m && m.message_id) {
-              const record = { chat: Number(o.chat_id), id: m.message_id, key: key };
+              const record = documentRecord(m, o.chat_id, key, f);
               fileMsgs.push(record); newlySent.push(record);
             }
             sent++;
@@ -553,7 +572,7 @@ async function copyFiles(fileMsgs, targets) {
 
 // Для форм «Заявка на замер» и «Передать юристу»:
 // есть свежая выписка — прикладываем сразу; нет и разрешён заказ — заказываем и доставим, когда будет готова.
-// targets: [{ chat, reply }]
+// targets: [{ chat, reply, order_id? }] — order_id links originals to a visit request.
 async function attachOrOrder(opts) {
   const cad = (String(opts.cad || '').match(CAD_RE) || [])[0];
   if (!cad) return { result: 'none' };
@@ -563,7 +582,12 @@ async function attachOrOrder(opts) {
     [cad, TYPE_DOC])).rows[0];
   if (prev && prev.files_sent > 0 && Array.isArray(prev.file_msgs) && prev.file_msgs.length) {
     await copyFiles(prev.file_msgs, opts.targets || []);
-    return { result: 'attached', cad: cad };
+    let packet = {};
+    if ((opts.targets || []).some(t => t && t.order_id)) {
+      try { packet = await require('./order-evidence').registerCached(opts.targets, prev.file_msgs, tgApi); }
+      catch (e) { console.error('egrn packet: original unavailable'); packet = { packet_warning: 'Оригинал выписки не добавлен к документам заявки. Прикрепите его к заявке.' }; }
+    }
+    return { result: 'attached', cad: cad, ...packet };
   }
   if (prev && prev.files_sent < 0) {
     // Остановка доставки не означает, что нужно повторно оплачивать выписку.

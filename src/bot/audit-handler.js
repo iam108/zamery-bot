@@ -9,6 +9,16 @@ const { normalizeWorkflow, validateWorkflow, buildWorkflowReport } = require('./
 // Отчёты, которые уже обрабатываются или отправлены (защита от дубля при повторной отправке)
 const seenSubmits = new Map();
 
+// JSONB may return the same object with a different key order after a
+// checkpoint. Sort object keys recursively while retaining array order and
+// JSON.stringify's normal handling of dates, undefined and other JSON values.
+function canonicalJson(value) {
+  return JSON.stringify(value, (key, item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return item;
+    return Object.fromEntries(Object.keys(item).sort().map(name => [name, item[name]]));
+  });
+}
+
 // Telegram иногда просит подождать (429 Too Many Requests) — ждём указанное время и повторяем
 async function tgRetry(fn) {
   for (let attempt = 0; attempt < 4; attempt++) {
@@ -36,13 +46,18 @@ async function handleAuditReport(ctx, data) {
   let progress = key && seenSubmits.get(key);
   // Keep only a digest, not full base64 images, during the retry window.
   const digestData = data.documents ? { ...data, documents: data.documents.map(({ source, data: binary, ...meta }) => ({ ...meta, contentHash: createHash('sha256').update(source || Buffer.from(binary, 'base64')).digest('hex') })) } : data;
-  const signature = createHash('sha256').update(JSON.stringify(digestData)).digest('hex');
+  const signature = createHash('sha256').update(canonicalJson(digestData)).digest('hex');
   if (!progress && ctx.auditDelivery) {
     const stored = await ctx.auditDelivery.load();
     progress = key && seenSubmits.get(key) || (stored && stored.signature ? { ...stored, job: null } : null);
   }
   if (progress && progress.signature !== signature) {
-    throw new Error('Этот отчёт уже начал отправляться. Повторите без изменений или откройте новую форму для нового отчёта.');
+    // Existing checkpoints used insertion-ordered JSON. Accept them only
+    // when that exact old serialization still matches; then checkpoint the
+    // canonical signature. Never bypass the unchanged-payload check.
+    const legacySignature = createHash('sha256').update(JSON.stringify(digestData)).digest('hex');
+    if (progress.signature !== legacySignature) throw new Error('Этот отчёт уже начал отправляться. Повторите без изменений или откройте новую форму для нового отчёта.');
+    progress.signature = signature;
   }
   if (!progress) {
     progress = { signature, textIds: [], photoIds: [], documentIds: [], saved: false, handoffSent: false, replied: false, job: null };
@@ -119,7 +134,7 @@ async function handleAuditReportInner(ctx, data, progress) {
     }
     plain.push('Табак' + (data.t_address ? ', ' + data.t_address : '') +
       (data.t_edu_name || data.t_edu_dist ? '. Образовательная организация: ' + (data.t_edu_name || '—') + (data.t_edu_dist ? ', ' + data.t_edu_dist + ' м' : '') : '. Образовательных организаций не отмечено'));
-  } else {
+  } else if (data.ui_version !== 4) {
     lines.push('🏢 <b>Здание:</b> ' + esc(data.building_type || '—'));
     lines.push('📐 <b>Границы:</b> ' + esc(data.boundaries || '—'));
     lines.push(data.schema_version === 3 ? '📋 <b>Сверка с представленным планом:</b> ' + esc(data.bti || 'Не проверено') : '📋 <b>БТИ:</b> ' + (data.bti === 'Да' ? y + ' Подходит' : data.bti === 'Нет' ? '❌ Не подходит' : '❓ Не проверено'));
