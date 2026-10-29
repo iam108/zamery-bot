@@ -11,6 +11,21 @@ const TYPES = {
 // Кадастровый номер: 77:17:0120316:38939 (квартал 6–7 цифр, номер 1–9 цифр)
 const CAD_RE = /\b\d{2}:\d{2}:\d{6,7}:\d{1,9}\b/g;
 const MAX_POLL_HOURS = 72;
+const MAX_DOCUMENT_BYTES = 50 * 1024 * 1024;
+
+function checkDocumentSize(buf) {
+  if (buf.length <= MAX_DOCUMENT_BYTES) return;
+  const err = new Error('Файл слишком большой для Telegram: ' + buf.length + ' байт (лимит ' + MAX_DOCUMENT_BYTES + ')');
+  err.code = 'EGRN_DOCUMENT_TOO_LARGE';
+  throw err;
+}
+
+function documentTooLarge(err) {
+  return !!err && (err.code === 'EGRN_DOCUMENT_TOO_LARGE' ||
+    Number(err.response && err.response.error_code) === 413 ||
+    Number(err.code) === 413 ||
+    /^413\b/.test(String(err.message || '')));
+}
 const TYPE_DOC = 'kvarmrusxmlpdf'; // выписка об объекте
 let tgApi = null; // bot.telegram — задаётся в setupEgrn, нужен и формам (заявка на замер, передача юристу)
 
@@ -412,30 +427,44 @@ function setupEgrn(bot) {
           continue;
         }
         let sent = 0;
+        const deliveryErrors = [];
         const fileMsgs = [];
         const caption = '📄 Выписка ЕГРН ' + o.cad_num + (o.label ? ' — ' + o.label : '');
         // PDF — в чат; XML и архив — тоже в чат, но без звука, для архива и будущего разбора
         for (const d of embedded) {
           try {
+            checkDocumentSize(d.buf);
             const extra = { caption: d.kind === 'pdf' ? caption.slice(0, 1000) : (d.kind === 'xml' ? 'XML ' + o.cad_num : 'Архив ' + o.cad_num), disable_notification: d.kind !== 'pdf' };
             if (o.status_msg_id) extra.reply_to_message_id = Number(o.status_msg_id);
             const m = await bot.telegram.sendDocument(o.chat_id, { source: d.buf, filename: d.name }, extra);
             if (m && m.message_id && d.kind !== 'xml') fileMsgs.push({ chat: Number(o.chat_id), id: m.message_id });
             if (d.kind === 'pdf' || d.kind === 'zip') sent++;
-          } catch (e) { console.error('egrn file:', e.message); }
+          } catch (e) {
+            console.error('egrn file:', e.message);
+            if (documentTooLarge(e)) deliveryErrors.push(e.message);
+          }
         }
         for (const u of urls.slice(0, 6)) {
           try {
             const f = await download(u);
+            checkDocumentSize(f.buf);
             const extra = { caption: caption.slice(0, 1000) };
             if (o.status_msg_id) extra.reply_to_message_id = Number(o.status_msg_id);
             const m = await bot.telegram.sendDocument(o.chat_id, { source: f.buf, filename: f.name }, extra);
             if (m && m.message_id) fileMsgs.push({ chat: Number(o.chat_id), id: m.message_id });
             sent++;
-          } catch (e) { console.error('egrn file:', e.message); }
+          } catch (e) {
+            console.error('egrn file:', e.message);
+            if (documentTooLarge(e)) deliveryErrors.push(e.message);
+          }
+        }
+        if (sent || deliveryErrors.length) {
+          // -1 исключает постоянную ошибку доставки из следующих опросов.
+          // Сама выписка остаётся готовой; сохраняем и уже отправленные файлы.
+          await pool.query('UPDATE egrn_orders SET files_sent=$1, file_msgs=$2, error=$3 WHERE id=$4',
+            [deliveryErrors.length ? -1 : sent, JSON.stringify(fileMsgs), deliveryErrors.length ? deliveryErrors.join('; ').slice(0, 300) : null, o.id]);
         }
         if (sent) {
-          await pool.query('UPDATE egrn_orders SET files_sent=$1, file_msgs=$2 WHERE id=$3', [sent, JSON.stringify(fileMsgs), o.id]);
           // копии: заказавшему и туда, куда выписку ждут (заявка на замер, юрист, «Заявки по клиенту»)
           const targets = (Array.isArray(o.deliver) ? o.deliver : []).slice();
           if (String(o.ordered_by) !== String(o.chat_id) && !targets.some(function (t) { return String(t.chat) === String(o.ordered_by); })) targets.push({ chat: Number(o.ordered_by) });
