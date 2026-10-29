@@ -12,6 +12,8 @@ const TYPES = {
 const CAD_RE = /\b\d{2}:\d{2}:\d{6,7}:\d{1,9}\b/g;
 const MAX_POLL_HOURS = 72;
 const MAX_DOCUMENT_BYTES = 50 * 1024 * 1024;
+const MAX_FAILURES = 5;
+const REQUEST_TIMEOUT_MS = 60 * 1000;
 
 function checkDocumentSize(buf) {
   if (buf.length <= MAX_DOCUMENT_BYTES) return;
@@ -54,6 +56,8 @@ function ensureTables() {
       );
       ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS deliver JSONB DEFAULT '[]';
       ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS file_msgs JSONB DEFAULT '[]';
+      ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS failures INT NOT NULL DEFAULT 0;
+      ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS retry_at TIMESTAMPTZ;
       CREATE TABLE IF NOT EXISTS egrn_pending (
         id         SERIAL PRIMARY KEY,
         cad_num    TEXT NOT NULL,
@@ -103,7 +107,7 @@ function authHeaders() {
 }
 
 async function apiStatus(idReq) {
-  const r = await fetch(API + '?id_req=' + encodeURIComponent(idReq), { headers: authHeaders() });
+  const r = await fetch(API + '?id_req=' + encodeURIComponent(idReq), { headers: authHeaders(), signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
   const text = await r.text();
   let j = null; try { j = JSON.parse(text); } catch (e) {}
   if (!r.ok || !j) throw new Error('API ' + r.status + ': ' + String(text).slice(0, 200));
@@ -224,7 +228,7 @@ function findFileUrls(item) {
 }
 
 async function download(url) {
-  const r = await fetch(url, { headers: authHeaders() });
+  const r = await fetch(url, { headers: authHeaders(), signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
   if (!r.ok) throw new Error('download ' + r.status);
   const buf = Buffer.from(await r.arrayBuffer());
   let name = '';
@@ -389,11 +393,48 @@ function setupEgrn(bot) {
   });
 
   // ── Опрос статусов
+  async function notifyStopped(o, tooLarge) {
+    const text = o.status === 'done'
+      ? '⚠️ Выписка готова, но ' + (tooLarge ? 'файл слишком большой для отправки в Telegram.' : 'не все файлы удалось доставить после нескольких попыток.')
+      : '⚠️ Не удалось проверить готовность выписки после нескольких попыток.';
+    const fallback = '\nСкачайте выписку или проверьте заявку №' + o.id_statement + ' в личном кабинете: https://armrus.org';
+    if (o.status_msg_id) {
+      try { await bot.telegram.editMessageText(o.chat_id, Number(o.status_msg_id), undefined, cardText(o, text + fallback), { parse_mode: 'HTML' }); }
+      catch (e) { console.error('egrn notification:', o.id_statement, e.message); }
+    }
+    // Личное уведомление — только заказавшему сотруднику, без технических ошибок и ссылок с токенами.
+    const target = o.ordered_by || o.chat_id;
+    if (target) {
+      try { await bot.telegram.sendMessage(target, text + '\nКадастровый номер: ' + o.cad_num + fallback); }
+      catch (e) { console.error('egrn notification:', o.id_statement, e.message); }
+    }
+  }
+
+  async function saveFailure(o, errors, permanent, fileMsgs) {
+    const failures = (o.failures || 0) + 1;
+    const stopped = permanent || failures >= MAX_FAILURES;
+    const retryAt = stopped ? null : new Date(Date.now() + 3 * 60 * 1000 * Math.pow(2, failures - 1));
+    await pool.query('UPDATE egrn_orders SET files_sent=$1, file_msgs=$2, error=$3, failures=$4, retry_at=$5, updated_at=NOW() WHERE id=$6',
+      [stopped ? -1 : 0, JSON.stringify(fileMsgs), errors.join('; ').slice(0, 300), failures, retryAt, o.id]);
+    if (stopped) await notifyStopped(o, permanent);
+  }
+
+  let polling = false;
   async function poll() {
-    if (!configured()) return;
+    if (!configured() || polling) return;
+    polling = true;
+    try {
+      await ensureTables();
+      await pollOrders();
+    } catch (e) {
+      console.error('egrn poll:', e.message);
+    } finally { polling = false; }
+  }
+
+  async function pollOrders() {
     let rows = [];
     try {
-      rows = (await pool.query("SELECT * FROM egrn_orders WHERE status IN ('ordered','done') AND files_sent = 0 AND created_at > NOW() - INTERVAL '" + MAX_POLL_HOURS + " hours' ORDER BY id LIMIT 20")).rows;
+      rows = (await pool.query("SELECT * FROM egrn_orders WHERE status IN ('ordered','done') AND files_sent = 0 AND (retry_at IS NULL OR retry_at <= NOW()) AND created_at > NOW() - INTERVAL '" + MAX_POLL_HOURS + " hours' ORDER BY id LIMIT 20")).rows;
     } catch (e) { return console.error('egrn poll:', e.message); }
     for (const o of rows) {
       try {
@@ -413,66 +454,81 @@ function setupEgrn(bot) {
           try { await bot.telegram.sendMessage(o.ordered_by, '❌ Выписка по ' + o.cad_num + ' не выполнена: ' + st.text); } catch (e) {}
           continue;
         }
-        if (newStatus !== 'done') continue;
+        if (newStatus !== 'done') {
+          await pool.query('UPDATE egrn_orders SET failures=0, retry_at=NULL, error=NULL WHERE id=$1', [o.id]);
+          continue;
+        }
 
         const embedded = extractDocs(item, o.cad_num);
         const urls = embedded.length ? [] : findFileUrls(item);
         if (!embedded.length && !urls.length) {
-          // файлы иногда появляются не сразу — ждём ещё несколько опросов
-          if (o.polls >= 10) {
-            await pool.query("UPDATE egrn_orders SET files_sent = -1, error='файлы не найдены в ответе API' WHERE id=$1", [o.id]);
-            const t = cardText(o, '⚠️ Готово, но файл не пришёл через API — посмотрите в кабинете armrus.org');
-            try { await bot.telegram.editMessageText(o.chat_id, Number(o.status_msg_id), undefined, t, { parse_mode: 'HTML' }); } catch (e) {}
-          }
+          await saveFailure(o, ['файлы не найдены в ответе API'], false, o.file_msgs || []);
           continue;
         }
         let sent = 0;
         const deliveryErrors = [];
-        const fileMsgs = [];
+        let permanent = false;
+        const fileMsgs = Array.isArray(o.file_msgs) ? o.file_msgs.slice() : [];
+        const newlySent = [];
+        function fileError(e, name, size) {
+          console.error('egrn file:', JSON.stringify({ order_id: o.id, id_statement: o.id_statement,
+            filename: name, bytes: size, error: e.message }));
+          deliveryErrors.push(String(e.message || 'ошибка доставки'));
+          if (documentTooLarge(e)) permanent = true;
+        }
         const caption = '📄 Выписка ЕГРН ' + o.cad_num + (o.label ? ' — ' + o.label : '');
         // PDF — в чат; XML и архив — тоже в чат, но без звука, для архива и будущего разбора
-        for (const d of embedded) {
+        for (const [index, d] of embedded.entries()) {
+          const key = 'embedded:' + index + ':' + d.name;
+          if (fileMsgs.some(function (f) { return f.key === key; })) continue;
           try {
             checkDocumentSize(d.buf);
             const extra = { caption: d.kind === 'pdf' ? caption.slice(0, 1000) : (d.kind === 'xml' ? 'XML ' + o.cad_num : 'Архив ' + o.cad_num), disable_notification: d.kind !== 'pdf' };
             if (o.status_msg_id) extra.reply_to_message_id = Number(o.status_msg_id);
             const m = await bot.telegram.sendDocument(o.chat_id, { source: d.buf, filename: d.name }, extra);
-            if (m && m.message_id && d.kind !== 'xml') fileMsgs.push({ chat: Number(o.chat_id), id: m.message_id });
+            if (m && m.message_id && d.kind !== 'xml') {
+              const record = { chat: Number(o.chat_id), id: m.message_id, key: key };
+              fileMsgs.push(record); newlySent.push(record);
+            }
             if (d.kind === 'pdf' || d.kind === 'zip') sent++;
           } catch (e) {
-            console.error('egrn file:', e.message);
-            if (documentTooLarge(e)) deliveryErrors.push(e.message);
+            fileError(e, d.name, d.buf.length);
           }
         }
-        for (const u of urls.slice(0, 6)) {
+        for (const [index, u] of urls.slice(0, 6).entries()) {
+          const key = 'url:' + index;
+          if (fileMsgs.some(function (f) { return f.key === key; })) continue;
+          let f;
           try {
-            const f = await download(u);
+            f = await download(u);
             checkDocumentSize(f.buf);
             const extra = { caption: caption.slice(0, 1000) };
             if (o.status_msg_id) extra.reply_to_message_id = Number(o.status_msg_id);
             const m = await bot.telegram.sendDocument(o.chat_id, { source: f.buf, filename: f.name }, extra);
-            if (m && m.message_id) fileMsgs.push({ chat: Number(o.chat_id), id: m.message_id });
+            if (m && m.message_id) {
+              const record = { chat: Number(o.chat_id), id: m.message_id, key: key };
+              fileMsgs.push(record); newlySent.push(record);
+            }
             sent++;
           } catch (e) {
-            console.error('egrn file:', e.message);
-            if (documentTooLarge(e)) deliveryErrors.push(e.message);
+            fileError(e, f ? f.name : 'download', f ? f.buf.length : null);
           }
         }
-        if (sent || deliveryErrors.length) {
-          // -1 исключает постоянную ошибку доставки из следующих опросов.
-          // Сама выписка остаётся готовой; сохраняем и уже отправленные файлы.
-          await pool.query('UPDATE egrn_orders SET files_sent=$1, file_msgs=$2, error=$3 WHERE id=$4',
-            [deliveryErrors.length ? -1 : sent, JSON.stringify(fileMsgs), deliveryErrors.length ? deliveryErrors.join('; ').slice(0, 300) : null, o.id]);
+        if (deliveryErrors.length) {
+          await saveFailure(o, deliveryErrors, permanent, fileMsgs);
+        } else if (sent || fileMsgs.length) {
+          await pool.query('UPDATE egrn_orders SET files_sent=$1, file_msgs=$2, error=$3, failures=0, retry_at=NULL WHERE id=$4',
+            [fileMsgs.length || sent, JSON.stringify(fileMsgs), null, o.id]);
         }
         if (sent) {
           // копии: заказавшему и туда, куда выписку ждут (заявка на замер, юрист, «Заявки по клиенту»)
           const targets = (Array.isArray(o.deliver) ? o.deliver : []).slice();
           if (String(o.ordered_by) !== String(o.chat_id) && !targets.some(function (t) { return String(t.chat) === String(o.ordered_by); })) targets.push({ chat: Number(o.ordered_by) });
-          await copyFiles(fileMsgs, targets);
+          await copyFiles(newlySent, targets);
         }
       } catch (e) {
         console.error('egrn status', o.id_statement, e.message);
-        await pool.query('UPDATE egrn_orders SET error=$1, polls=polls+1 WHERE id=$2', [e.message.slice(0, 300), o.id]);
+        await saveFailure(o, [String(e.message || 'ошибка проверки статуса')], false, o.file_msgs || []);
       }
     }
   }
@@ -508,6 +564,10 @@ async function attachOrOrder(opts) {
   if (prev && prev.files_sent > 0 && Array.isArray(prev.file_msgs) && prev.file_msgs.length) {
     await copyFiles(prev.file_msgs, opts.targets || []);
     return { result: 'attached', cad: cad };
+  }
+  if (prev && prev.files_sent < 0) {
+    // Остановка доставки не означает, что нужно повторно оплачивать выписку.
+    return { result: 'unavailable', cad: cad, id: prev.id_statement };
   }
   if (prev && prev.status !== 'failed' && prev.files_sent >= 0) {
     // уже заказана и ещё не готова — просто добавляем получателей

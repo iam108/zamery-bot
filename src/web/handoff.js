@@ -1175,7 +1175,7 @@ function setupHandoff(app) {
             cad: d.cad_num, label: d.org, order: !!d.egrn_order, orderedBy: req.tgUser.id, orderedName: req.staff.name,
             targets: targets, note: 'Для клиента ' + d.org + ' (юрист ' + lawyer.name + ')',
           });
-          egrnNote = { attached: 'Выписка ЕГРН приложена юристу.', ordered: 'Выписка ЕГРН заказана — придёт в чат выписок и юристу.', waiting: 'Выписка ЕГРН уже в работе — придёт в чат выписок и юристу.' }[eg.result] || '';
+          egrnNote = { unavailable: 'Доставка ранее заказанной выписки ЕГРН остановлена. Проверьте её в кабинете https://armrus.org — повторный заказ не создан.', attached: 'Выписка ЕГРН приложена юристу.', ordered: 'Выписка ЕГРН заказана — придёт в чат выписок и юристу.', waiting: 'Выписка ЕГРН уже в работе — придёт в чат выписок и юристу.' }[eg.result] || '';
         } catch (e) { console.error('egrn for handoff:', e.message); egrnNote = 'Выписку ЕГРН заказать не удалось: ' + e.message; }
       }
       res.json({ ok: true, id: c.id, warn: [dmWarn, egrnNote].filter(Boolean).join(' ') || undefined });

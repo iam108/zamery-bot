@@ -117,7 +117,7 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
             targets: [{ chat: Number(process.env.GROUP_CHAT_ID), reply: msg.message_id }],
             note: 'Для заявки на замер #' + order.id,
           });
-          const notes = { attached: '📄 Выписка ЕГРН приложена к заявке', ordered: '⏳ Выписка ЕГРН заказана — придёт ответом на заявку', waiting: '⏳ Выписка ЕГРН уже в работе — придёт ответом на заявку' };
+          const notes = { unavailable: '⚠️ Доставка ранее заказанной выписки ЕГРН остановлена. Проверьте её в кабинете https://armrus.org — повторный заказ не создан', attached: '📄 Выписка ЕГРН приложена к заявке', ordered: '⏳ Выписка ЕГРН заказана — придёт ответом на заявку', waiting: '⏳ Выписка ЕГРН уже в работе — придёт ответом на заявку' };
           if (notes[egrn.result]) await botInstance.telegram.sendMessage(process.env.GROUP_CHAT_ID, notes[egrn.result] + ' (' + egrn.cad + ')', { reply_to_message_id: msg.message_id, disable_notification: true });
         } catch (e) { console.error('egrn for order:', e.message); }
       }
