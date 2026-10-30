@@ -14,10 +14,10 @@ test('four entrances receive independent sequential labels and stable codes',()=
  assert.deepEqual(s.annotations.map(m=>m.label),['Вход 1','Вход 2','Вход 3','Вход 4']);assert.deepEqual(s.annotations.map(m=>m.code),['В1','В2','В3','В4']);
  s.annotations[0].label='Вход со двора';s=H.addMark(s,'entrance',[{x:.8,y:.4}]);assert.equal(s.annotations.at(-1).label,'Вход 5');assert.equal(s.annotations[0].label,'Вход со двора');
 });
-test('single entrance and organization auto-link measurements; ambiguous endpoints stay empty',()=>{
+test('measurements auto-link single endpoints and unambiguous nearby pins',()=>{
  let s=H.addMark({},'entrance',[{x:.1,y:.1}]);s=H.addMark(s,'hazard',[{x:.6,y:.6}]);s=H.addMark(s,'route',[{x:.1,y:.1},{x:.6,y:.6}]);
  assert.equal(s.annotations[2].fromEntranceId,s.annotations[0].id);assert.equal(s.annotations[2].toObjectId,s.annotations[1].id);
- s=H.addMark(s,'entrance',[{x:.3,y:.1}]);s=H.addMark(s,'straight',[{x:.3,y:.1},{x:.6,y:.6}]);assert.equal(s.annotations.at(-1).fromEntranceId,undefined);assert.equal(s.annotations.at(-1).toObjectId,undefined);
+ s=H.addMark(s,'entrance',[{x:.3,y:.1}]);s=H.addMark(s,'straight',[{x:.3,y:.1},{x:.6,y:.6}]);assert.equal(s.annotations.at(-1).fromEntranceId,s.annotations[3].id);assert.equal(s.annotations.at(-1).toObjectId,s.annotations[1].id);
 });
 test('pending contour survives normalization and blocks source change and export',()=>{
  const state=H.normalise({evidence_id:'a',page:2,pending:{tool:'boundary',points:triangle.slice(0,2)}});
@@ -88,4 +88,19 @@ test('slow saves serialize first and latest state without a PUT for every typed 
 test('failed durable save rejects flush; retry writes the newest snapshot',async()=>{
  let fail=true;const writes=[];const queue=H.createSaveQueue(async value=>{writes.push(value);if(fail)throw new Error('offline');});
  await assert.rejects(queue.enqueue({page:2}),/offline/);await assert.rejects(queue.flush(),/offline/);fail=false;await queue.enqueue({page:3});await queue.flush();assert.deepEqual(writes,[{page:2},{page:3}]);
+});
+
+test('measurement links use either drawing direction, preserve manual choices and reject distant/ambiguous pins',()=>{
+ let s=H.addMark({},'entrance',[{x:.1,y:.1}],{id:'entrance-a'});s=H.addMark(s,'entrance',[{x:.4,y:.1}],{id:'entrance-b'});s=H.addMark(s,'hazard',[{x:.8,y:.7}],{id:'org'});
+ const forward=H.measurementEndpoints(s,[{x:.402,y:.102},{x:.801,y:.699}]);assert.equal(forward.fromEntranceId,'entrance-b');assert.equal(forward.toObjectId,'org');
+ const reverse=H.measurementEndpoints(s,[{x:.8,y:.7},{x:.1,y:.1}]);assert.equal(reverse.fromEntranceId,'entrance-a');assert.equal(reverse.toObjectId,'org');
+ const manual=H.measurementEndpoints(s,[{x:.4,y:.1},{x:.8,y:.7}],{fromEntranceId:'entrance-a',toObjectId:'manual-org'});assert.equal(manual.fromEntranceId,'entrance-a');assert.equal(manual.toObjectId,'manual-org');
+ assert.deepEqual(H.measurementEndpoints(s,[{x:.6,y:.5},{x:.8,y:.7}]),{});
+ s=H.addMark(s,'entrance',[{x:.402,y:.102}],{id:'entrance-c'});assert.deepEqual(H.measurementEndpoints(s,[{x:.4,y:.1},{x:.8,y:.7}]),{});
+ const simple=H.addMark(H.addMark({},'entrance',[{x:.1,y:.1}]),'hazard',[{x:.8,y:.8}]);assert.deepEqual(H.measurementEndpoints(simple,[{x:.2,y:.3},{x:.4,y:.4}]),{},'One possible pair is still not proof that an unrelated line belongs to it');
+});
+test('removing a pin clears its links without losing lines, labels or identities and remains undoable',()=>{
+ let s=H.addMark({},'entrance',[{x:.1,y:.1}],{id:'entry',label:'Вход со двора'});s=H.addMark(s,'hazard',[{x:.8,y:.8}],{id:'org',label:'Школа'});s=H.addMark(s,'route',[{x:.1,y:.1},{x:.8,y:.8}],{id:'measure',distance:'150'});
+ const original=structuredClone(s),deleted=H.removeAnnotation(s,'entry');assert.deepEqual(s,original);assert.equal(deleted.annotations.length,2);const measure=deleted.annotations.find(m=>m.id==='measure');assert.equal(measure.fromEntranceId,undefined);assert.equal(measure.toObjectId,'org');assert.equal(measure.distance,'150');assert.deepEqual(measure.points,s.annotations[2].points);
+ const h=G.undoHistory(G.commitHistory(G.createHistory(s.annotations),deleted.annotations));assert.deepEqual(h.present,s.annotations);assert.equal(h.present[0].id,'entry');
 });

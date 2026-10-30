@@ -1,6 +1,7 @@
 (function () {
   'use strict';
   var tg = window.Telegram && window.Telegram.WebApp;
+  var actions = window.AuditActions;
   try { if (tg) { tg.ready(); tg.expand(); } } catch (e) {}
   var params = new URLSearchParams(window.location.search);
   var orderId = params.get('order_id') || '';
@@ -131,7 +132,7 @@
     if (raw && typeof raw === 'object') return [raw.name || raw.contact_name, raw.phone || raw.contact_phone, raw.comment].filter(Boolean).join(' · ');
     return String(raw);
   }
-  function packetPhone() { var text = packetContactText(state.packet && state.packet.contacts); var match = text.match(/\+?\d[\d() -]{8,}\d/); return match ? match[0].replace(/[^+\d]/g, '') : ''; }
+  function packetPhone() { return actions.findPhone((state.packet||state.data.request_packet||{}).contacts); }
   function managerFilesHtml(files, planActions) {
     if (!files.length) return '<p class="field-note">Менеджер пока не приложил файлы.</p>';
     return '<div class="manager-files">' + files.map(function (file) {
@@ -142,7 +143,7 @@
   }
   function packetSummary(){
     var packet=state.packet||state.data.request_packet||{},p=state.data.inspection,files=packetFiles(),contact=packetContactText(packet.contacts),phone=packetPhone(),archiveFiles=files.filter(function(f){return f.role==='archive';}),hasArchive=!!packet.archive_url||archiveFiles.length>0;
-    var html='<section class="request-packet"><div class="packet-title"><span class="tag">Заявка #'+esc(orderId)+'</span><span>'+esc(({catering:'Алкоголь · общепит',retail:'Алкоголь · магазин',tobacco:'Табак'})[state.data.object_category]||'Объект')+' · '+esc(p.service)+'</span></div><h2>'+esc(packet.object_name||packet.org||p.org)+'</h2><p class="packet-address">'+esc(packet.address||p.address)+'</p><div class="action-row"><a class="button secondary" data-route target="_blank" rel="noopener" href="https://yandex.ru/maps/?rtext=~'+encodeURIComponent(p.address||'')+'&rtt=auto">Как добраться ↗</a>'+(phone?'<a class="button secondary" href="tel:'+esc(phone)+'">Позвонить</a>':'')+'</div>'+(contact?'<p class="packet-contact">'+esc(contact)+'</p>':'');
+    var html='<section class="request-packet"><div class="packet-title"><span class="tag">Заявка #'+esc(orderId)+'</span><span>'+esc(({catering:'Алкоголь · общепит',retail:'Алкоголь · магазин',tobacco:'Табак'})[state.data.object_category]||'Объект')+' · '+esc(p.service)+'</span></div><h2>'+esc(packet.object_name||packet.org||p.org)+'</h2><p class="packet-address">'+esc(packet.address||p.address)+'</p><div class="action-row"><a class="button secondary" data-route target="_blank" rel="noopener" href="'+esc(actions.routeUrl(p.address||''))+'">Построить маршрут ↗</a>'+(phone?'<button type="button" class="button secondary" data-contact>Позвонить</button>':'')+'</div>'+(contact?'<p class="packet-contact">'+esc(contact)+'</p>':'');
     if(packet.zones_info)html+='<details class="packet-details"><summary>Комментарий менеджера</summary><p>'+esc(packet.zones_info)+'</p></details>';
     html+='<details class="packet-details"><summary>Документы заявки · '+files.length+'</summary>'+(files.length?'<button type="button" class="button secondary full" data-download-materials>Скачать всё</button>':'')+managerFilesHtml(files,false)+'<p class="field-note">Документы и папку объекта прикрепляет менеджер до передачи заявки аудитору.</p></details>';
     if(isRenewal())html+='<div class="archive-box"><div class="card-top"><h3>Архив объекта</h3><span class="tag">'+(archiveFiles.length?'Приложен':state.data.workflow.archive_skipped==='Да'?'Без архива':'Графика не приложена')+'</span></div>'+(hasArchive?'<div class="action-row"><button type="button" class="button secondary" data-download-archive>Скачать архив</button>'+(packet.archive_url?'<button type="button" class="button secondary" data-copy-archive>Скопировать ссылку</button>':'')+'</div>':'')+(!archiveFiles.length?'<button type="button" class="button secondary full" data-skip-archive>'+ (state.data.workflow.archive_skipped==='Да'?'Добавить архив / отменить пропуск':'Архива нет — продолжить')+'</button>':'')+'</div>';
@@ -257,7 +258,8 @@
     var extraButton=bindRoot.querySelector('[data-add-plan]');if(extraButton)extraButton.onclick=async function(){try{if(editor&&editor.flush)await editor.flush();var extra={id:id('extra'),evidence_id:'',page:1,annotations:[]};state.data.additional_plans.push(extra);activePlanId=extra.id;changed();render();}catch(error){notify(error.message);}};
     var removePlan=bindRoot.querySelector('[data-remove-plan]');if(removePlan)removePlan.onclick=async function(){try{if(editor&&editor.flush)await editor.flush();}catch(error){notify(error.message);return;}state.data.retired_plans=state.data.retired_plans||[];state.data.retired_plans.push(clone(currentPlan()));state.data.additional_plans=state.data.additional_plans.filter(function(p){return p.id!==activePlanId;});activePlanId='main';changed();render();};
     var skip=bindRoot.querySelector('[data-skip-archive]');if(skip)skip.onclick=function(){state.data.workflow.archive_skipped=state.data.workflow.archive_skipped==='Да'?'':'Да';changed();render();};
-    var route=bindRoot.querySelector('[data-route]');if(route)route.onclick=function(){localSave();saveNow().catch(function(){});};
+    var route=bindRoot.querySelector('[data-route]');if(route)route.onclick=function(event){event.preventDefault();localSave();saveNow().catch(function(){});if(openExternal(actions.routeUrl(state.data.inspection.address)))notify('В Картах выберите, откуда ехать. Чтобы продолжить отчёт, вернитесь в Telegram.');else notify('Карты не открылись. Разрешите открытие ссылки или скопируйте адрес из заявки.');};
+    bindRoot.querySelectorAll('[data-contact]').forEach(function(button){button.onclick=showContact;});
     var b = $('[data-download-materials]'); if (b) b.onclick = function () { downloadResource(state.packet.materials_download_url || '/api/audit/orders/' + encodeURIComponent(orderId) + '/materials/download-all', 'Документы-заявки-' + orderId + '.zip'); };
     b = $('[data-download-archive]'); if (b) b.onclick = function () { var attached=packetFiles().some(function(file){return file.role==='archive';});var url=state.packet.archive_download_url||(attached?'/api/audit/orders/'+encodeURIComponent(orderId)+'/materials/download-all?role=archive':'/api/audit/orders/'+encodeURIComponent(orderId)+'/archive/download');downloadResource(url,'Архив-заявки-'+orderId+'.zip'); };
     b = $('[data-copy-address]'); if (b) b.onclick = function () { copyText(state.data.inspection.address, 'Адрес скопирован'); };
@@ -268,7 +270,30 @@
     bindRoot.querySelectorAll('[data-remove-zone]').forEach(function (button) { button.onclick = function () { var zid = button.dataset.removeZone; if (evidenceFor('zone', zid).length) { notify('Сначала уберите файлы этой организации.'); return; } state.data.zones = state.data.zones.filter(function (z) { return z.id !== zid; }); changed(); render(); }; });
     b = $('#submit-audit'); if (b) b.onclick = submit;
   }
-  async function copyText(text, message) { try { if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error('unsupported'); await navigator.clipboard.writeText(text || ''); notify(message); } catch (e) { notify('Адрес или ссылка доступны в заявке — выделите и скопируйте текст.'); } }
+  function openExternal(url){return actions.openExternal(url,tg,function(href,target){return window.open(href,target);});}
+  function showContact(){
+    var phone=packetPhone();if(!phone){notify('Телефон не указан в заявке.');return;}
+    localSave();saveNow().catch(function(){});
+    var dialog=document.getElementById('contact-dialog');if(dialog&&dialog.open)return;if(dialog)dialog.remove();
+    dialog=document.createElement('dialog');dialog.id='contact-dialog';dialog.className='contact-dialog';dialog.setAttribute('aria-labelledby','contact-title');
+    dialog.innerHTML='<div class="contact-heading"><h2 id="contact-title">Контакт для выезда</h2><button type="button" class="button secondary" data-close-contact aria-label="Закрыть контакт">Закрыть</button></div><p class="contact-description">'+esc(packetContactText((state.packet||state.data.request_packet||{}).contacts))+'</p><input class="contact-number" type="tel" aria-label="Номер телефона" readonly value="'+esc(phone)+'"><div class="contact-actions"><a class="button primary" data-dial href="tel:'+esc(phone)+'">Набрать номер ↗</a><button type="button" class="button secondary" data-copy-phone>Скопировать номер</button></div><p class="field-note" data-contact-status role="status">Окно звонка откроется отдельно. Чтобы продолжить отчёт, вернитесь в Telegram.</p>';
+    document.body.appendChild(dialog);
+    dialog.querySelector('[data-close-contact]').onclick=function(){dialog.close();};
+    dialog.addEventListener('click',function(event){if(event.target===dialog)dialog.close();});
+    dialog.querySelector('[data-copy-phone]').onclick=async function(){var ok=await copyText(phone,'Номер скопирован');var status=dialog.querySelector('[data-contact-status]');status.textContent=ok?'Номер скопирован. Можно вставить в приложении «Телефон».':'Выделите номер в поле выше и выберите «Копировать».';if(!ok){var input=dialog.querySelector('input');input.focus();input.select();}};
+    dialog.querySelector('[data-dial]').onclick=function(event){
+      if(tg&&tg.platform&&tg.platform!=='unknown'){event.preventDefault();var url=actions.callUrl(location.origin,phone);if(!openExternal(url))dialog.querySelector('[data-contact-status]').textContent='Окно звонка не открылось. Скопируйте номер кнопкой рядом.';}
+    };
+    dialog.showModal();
+  }
+  async function copyText(text,message){
+    var previous=document.activeElement,temporary;
+    try{
+      if(navigator.clipboard&&navigator.clipboard.writeText){try{await navigator.clipboard.writeText(text||'');notify(message);return true;}catch(error){}}
+      temporary=document.createElement('textarea');temporary.value=text||'';temporary.className='clipboard-copy';(document.querySelector('dialog[open]')||document.body).appendChild(temporary);temporary.focus();temporary.select();if(!document.execCommand('copy'))throw new Error('copy');notify(message);return true;
+    }catch(error){notify('Выделите номер, адрес или ссылку и выберите «Копировать».');return false;}
+    finally{if(temporary)temporary.remove();if(previous&&previous.isConnected)previous.focus();}
+  }
   async function downloadResource(url, filename) {
     if(downloadJobs.has(url)){notify('Файл уже готовится. Дождитесь скачивания.');return;}downloadJobs.add(url);
     try {
@@ -295,7 +320,7 @@
   function freezeControls(){
     if(!state.frozen)return;
     root.querySelectorAll('input,select,textarea').forEach(function(control){control.disabled=true;});
-    root.querySelectorAll('button').forEach(function(button){if(button.id!=='submit-audit'&&!button.hasAttribute('data-open-evidence')&&!button.hasAttribute('data-go-step')&&!button.hasAttribute('data-download-material')&&!button.hasAttribute('data-download-materials')&&!button.hasAttribute('data-download-archive')&&!button.hasAttribute('data-copy-address')&&!button.hasAttribute('data-copy-archive'))button.disabled=true;});
+    root.querySelectorAll('button').forEach(function(button){if(button.id!=='submit-audit'&&!button.hasAttribute('data-open-evidence')&&!button.hasAttribute('data-go-step')&&!button.hasAttribute('data-download-material')&&!button.hasAttribute('data-download-materials')&&!button.hasAttribute('data-download-archive')&&!button.hasAttribute('data-copy-address')&&!button.hasAttribute('data-copy-archive')&&!button.hasAttribute('data-contact'))button.disabled=true;});
     root.querySelectorAll('.plan-editor-shell canvas').forEach(function(canvas){canvas.style.pointerEvents='none';});
     var submitButton=$('#submit-audit');if(submitButton)submitButton.textContent='Повторить отправку этой версии';
     var submitStatus=$('#submit-status');if(submitStatus)submitStatus.textContent='Отправка началась — версия зафиксирована. Можно просмотреть этапы и повторить отправку без изменений.';

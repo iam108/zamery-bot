@@ -1,0 +1,108 @@
+'use strict';
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const actions = require('../public/audit-actions');
+
+const phone = '+79995554433';
+const formats = ['+7 (999) 555-44-33', '8 999 555 44 33', '79995554433', '9995554433'];
+
+test('contact numbers normalize Russian country and local formats', () => {
+  for (const value of formats) assert.equal(actions.normalizePhone(value), phone, value);
+  for (const value of ['', null, '12345', 'номер 79995554433', '05.11.2026 10']) {
+    assert.equal(actions.normalizePhone(value), '', String(value));
+  }
+});
+
+test('a callable contact is found in manager text, objects, arrays and saved JSON', () => {
+  for (const value of formats) {
+    assert.equal(actions.findPhone('Перед выездом позвонить Кристине: ' + value), phone, value);
+    assert.equal(actions.findPhone({ name: 'Кристина', phone: value }), phone, value);
+  }
+  assert.equal(actions.findPhone([{ name: 'Ирина' }, { contact_name: 'Кристина', contact_phone: '8 (999) 555-44-33' }]), phone);
+  assert.equal(actions.findPhone(JSON.stringify([{ name: 'Кристина', phone: '8 (999) 555-44-33' }])), phone);
+  assert.equal(actions.findPhone({ comment: 'До выезда звонить ' + phone + ', доб. 123' }), phone);
+  assert.equal(actions.findPhone(phone + '; запасной +7 900 111-22-33'), phone);
+});
+
+test('dates beside a phone do not hide it and an appointment date never becomes a phone', () => {
+  assert.equal(actions.findPhone('Кристина ' + phone + ' 05.11.2026'), phone);
+  assert.equal(actions.findPhone('05.11.2026 в 10 часов: Кристина ' + phone), phone);
+  for (const value of ['Встреча 05.11.2026 10 часов', '05.11.2026', 'Срок 5.11.2026', 'Телефон не указан', '+799955544330']) {
+    assert.equal(actions.findPhone(value), '', value);
+  }
+});
+
+test('route uses the building address and keeps building structures in either floor notation', () => {
+  const building = 'Москва, Мясницкая улица, д. 15, корпус 2, строение 1';
+  for (const suffix of [', этаж 1, комната 75', ', 1 этаж, комната 75', ', 1-й этаж, комната 75', ', эт. 1, пом. 75', ', помещение 75']) {
+    assert.equal(actions.routeAddress(building + suffix), building, suffix);
+  }
+  assert.equal(actions.routeAddress(' Москва,  улица Этажная, д. 3 '), 'Москва, улица Этажная, д. 3');
+  assert.equal(actions.routeAddress('Москва, Мясницкая, д. 15, стр. 2, этаж 1'), 'Москва, Мясницкая, д. 15, стр. 2');
+  assert.equal(actions.routeAddress('Москва, Мясницкая, д. 15/2'), 'Москва, Мясницкая, д. 15/2');
+});
+
+test('Maps link opens route mode with an unspecified start and the exact destination', () => {
+  const destination = 'Москва, Мясницкая улица, д. 15, строение 2';
+  const url = new URL(actions.routeUrl(destination + ', этаж 1, комната 75'));
+  assert.equal(url.origin, 'https://yandex.ru');
+  assert.equal(url.pathname, '/maps/');
+  assert.equal(url.searchParams.get('mode'), 'routes');
+  assert.equal(url.searchParams.get('rtext'), '~' + destination);
+  assert.equal(url.searchParams.get('rtt'), 'auto');
+  assert.equal(actions.routeUrl('  '), '');
+});
+
+test('phone handoff stays on this origin and keeps the private number in the fragment only', () => {
+  const raw = actions.callUrl('https://example.test/audit?order_id=92#old', '8 (999) 555-44-33');
+  const url = new URL(raw);
+  assert.equal(url.origin, 'https://example.test');
+  assert.equal(url.pathname, '/audit-call.html');
+  assert.equal(url.search, '');
+  assert.equal(new URLSearchParams(url.hash.slice(1)).get('phone'), phone);
+  assert.equal(raw.split('#')[0].includes('9995554433'), false);
+  assert.equal(actions.callUrl('http://127.0.0.1:8780', phone).startsWith('http://127.0.0.1:8780/audit-call.html#'), true);
+});
+
+test('invalid phone and unsafe or malformed handoff origins fail without throwing', () => {
+  for (const origin of ['javascript:alert(1)', 'data:text/html,test', 'file:///tmp/test', 'ftp://example.test', '', 'not-an-origin']) {
+    assert.equal(actions.callUrl(origin, phone), '', origin);
+  }
+  assert.equal(actions.callUrl('https://example.test', 'нет номера'), '');
+});
+
+test('Telegram link is dispatched synchronously during the user gesture and never opens a second window', () => {
+  const events = [];
+  const telegram = { platform: 'ios', openLink(url, options) { events.push(['telegram', url, options]); } };
+  const url = actions.routeUrl('Москва, Мясницкая, д. 15');
+  events.push('gesture');
+  assert.equal(actions.openExternal(url, telegram, () => { assert.fail('unexpected browser fallback'); }), true);
+  events.push('returned');
+  assert.deepEqual(events, ['gesture', ['telegram', url, { try_instant_view: false }], 'returned']);
+});
+
+test('browser fallback keeps the report window separate and clears opener', () => {
+  for (const telegram of [null, { platform: 'unknown', openLink() { assert.fail('not inside Telegram'); } }, { platform: 'ios' }]) {
+    const calls = [], external = { opener: 'report' };
+    assert.equal(actions.openExternal('https://example.test', telegram, (...args) => { calls.push(args); return external; }), true);
+    assert.deepEqual(calls, [['https://example.test', '_blank']]);
+    assert.equal(external.opener, null);
+  }
+});
+
+test('unsupported Telegram bridge falls back; blocked or throwing browser windows report failure', () => {
+  let attempts = 0;
+  const telegram = { platform: 'android', openLink() { attempts++; throw new Error('unsupported bridge'); } };
+  const external = {};
+  assert.equal(actions.openExternal('https://example.test', telegram, () => external), true);
+  assert.equal(attempts, 1);
+  assert.equal(actions.openExternal('https://example.test', telegram, () => null), false);
+  assert.equal(actions.openExternal('https://example.test', null, () => { throw new Error('popup blocked'); }), false);
+});
+
+test('unapproved URL schemes never reach Telegram or the browser window', () => {
+  const telegram = { platform: 'ios', openLink() { assert.fail('unsafe Telegram link'); } };
+  for (const value of ['javascript:alert(1)', 'tel:' + phone, 'data:text/html,test', 'file:///tmp/test', '//example.test', '']) {
+    assert.equal(actions.openExternal(value, telegram, () => { assert.fail('unsafe browser link'); }), false, value);
+  }
+});

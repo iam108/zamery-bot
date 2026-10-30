@@ -65,3 +65,30 @@
 @media(prefers-reduced-motion:reduce){.ape-button{transition:none}.ape-button:active:not(:disabled){transform:none}}
 @media(prefers-contrast:more){.ape-editor,.ape-sheet-dialog{background:#f8faff;border-color:#7187ac}.ape-button,.ape-editor input,.ape-editor select,.ape-editor textarea{border-color:#7086a9}.ape-button.selected{outline:2px solid #255ceb;outline-offset:-2px}.ape-note,.ape-message,.ape-source,.ape-legend{color:#29456b}}
 @media(forced-colors:active){.ape-editor,.ape-sheet-dialog,.ape-button{border:1px solid CanvasText;box-shadow:none}.ape-button.selected,.ape-button.ape-primary{border:2px solid Highlight}}
+/* Territory work starts with a visible action, then edits exactly one marker. */
+.ape-map-actions{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;flex:1 0 100%}
+.ape-map-actions .ape-button{font-size:13px;padding:8px 6px;background:rgba(255,255,255,.65);border-color:rgba(255,255,255,.95)}
+.ape-map-actions .ape-button.selected{color:#fff;background:var(--ape-accent);box-shadow:0 3px 10px rgba(47,107,255,.16)}
+.ape-more-tools{position:relative;min-width:64px;flex-shrink:0}
+.ape-more-tools summary{display:flex;align-items:center;justify-content:center;min-height:44px;padding:8px 12px;font-size:12px;font-weight:550;cursor:pointer;list-style:none;border-radius:13px;background:var(--ape-well)}
+.ape-more-tools summary::after{content:'⌄';padding-left:7px;font-size:15px}
+.ape-more-tools>select{position:absolute;z-index:3;left:0;top:48px;width:220px;border:1px solid #a4b9df;box-shadow:0 8px 20px rgba(30,52,90,.17)}
+.ape-editor[data-kind=map] .ape-toolbar{padding:7px 10px;gap:5px}
+.ape-editor[data-kind=map] .ape-toolbar>.ape-button{font-size:12px}
+.ape-editor[data-kind=map] .ape-guidance{min-height:44px;height:auto;padding:3px 10px}
+.ape-editor[data-kind=map] .ape-message{font-size:12px;line-height:1.35}
+.ape-editor[data-kind=map] .ape-legend{display:flex;gap:5px;flex-wrap:wrap;max-height:130px;padding:8px 10px;background:rgba(249,252,255,.85)}
+.ape-editor[data-kind=map] .ape-legend:empty{display:none}
+.ape-editor[data-kind=map] .ape-mark-chip{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;justify-content:flex-start;min-height:44px;font-size:12px;padding:8px 11px}
+.ape-selected-panel{padding:8px 10px 10px;background:#edf3ff;border-top:1px solid #dbe5f4}
+.ape-selected-panel .ape-mark{border-color:#a9bfee;background:rgba(255,255,255,.85)}
+.ape-selected-caption{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:7px}
+.ape-selected-caption strong{font-size:13px;line-height:1.35;color:#2b4874}
+.ape-back-map{flex-shrink:0;color:#2657cc;font-size:12px;background:#eaf0fd}
+.ape-selected-panel .ape-mark-row{grid-template-columns:minmax(0,1fr) 44px}
+.ape-selected-panel .ape-mark-row>.ape-button:first-child{display:none}
+.ape-selected-panel .ape-mark input,.ape-selected-panel .ape-mark select,.ape-selected-panel .ape-mark textarea{font-size:16px}
+.ape-link-hint{font-size:12px;line-height:1.4;color:#526987;margin:9px 0 0}
+@media(max-width:600px){.ape-map-actions{gap:4px}.ape-map-actions .ape-button{font-size:12px;padding:8px 4px}.ape-editor[data-kind=map] .ape-toolbar{padding:6px 7px}.ape-editor[data-kind=map] .ape-zoom{width:auto;margin-left:auto}.ape-editor[data-kind=map] .ape-zoom-value{min-width:34px}.ape-editor[data-kind=map] .ape-zoom .ape-button{padding:7px;min-width:44px}.ape-editor[data-kind=map] .ape-toolbar>.ape-button{font-size:11px;padding:7px 9px}.ape-more-tools{min-width:54px}.ape-more-tools summary{font-size:11px;padding:7px 9px}.ape-selected-panel{padding:7px}.ape-selected-caption strong{font-size:12px}.ape-selected-panel .ape-mark-row{gap:5px}.ape-editor[data-kind=map] .ape-legend{padding:7px}.ape-editor[data-kind=map] .ape-mark-chip{font-size:11px}}
+@media(max-width:360px){.ape-editor[data-kind=map] .ape-zoom{flex-basis:100%;justify-content:center}.ape-map-actions{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(prefers-contrast:more){.ape-map-actions .ape-button,.ape-more-tools summary,.ape-selected-panel .ape-mark{border:1px solid #7187ac}.ape-link-hint{color:#29456b}}

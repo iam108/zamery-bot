@@ -45,6 +45,29 @@
     else state.pending = null;
     return state;
   }
+  function measurementEndpoints(value, points, fields = {}) {
+    const marks = value.annotations || [], entrances = marks.filter(m => m.tool === 'entrance'), organizations = marks.filter(m => m.tool === 'hazard');
+    const result = { ...fields };
+    if (!points?.length) return result;
+    const nearest = (items, p) => {
+      const candidates = items.filter(m => m.points?.[0]).map(m => ({ id: m.id, distance: G.distance(m.points[0], p) })).sort((a, b) => a.distance - b.distance);
+      if (!candidates.length || candidates[0].distance > .065 || candidates[1] && candidates[1].distance - candidates[0].distance < .012) return null;
+      return candidates[0];
+    };
+    const first = points[0], last = points.at(-1), forward = [nearest(entrances, first), nearest(organizations, last)], reverse = [nearest(entrances, last), nearest(organizations, first)];
+    const complete = [forward, reverse].filter(pair => pair.every(Boolean)).sort((a, b) => a[0].distance + a[1].distance - b[0].distance - b[1].distance);
+    if (!complete.length || complete[1] && Math.abs(complete[0][0].distance + complete[0][1].distance - complete[1][0].distance - complete[1][1].distance) < .012) return result;
+    result.fromEntranceId ||= complete[0][0].id; result.toObjectId ||= complete[0][1].id; return result;
+  }
+  function removeAnnotation(value, id) {
+    const state = normalise(value);
+    state.annotations = state.annotations.filter(m => m.id !== id).map(m => {
+      if (m.fromEntranceId === id) delete m.fromEntranceId;
+      if (m.toObjectId === id) delete m.toObjectId;
+      return m;
+    });
+    return state;
+  }
   function addMark(value, tool, points, fields) {
     const state = normalise(value), config = TOOLS[tool];
     if (!config) throw new Error('Выберите инструмент.');
@@ -56,8 +79,7 @@
     if (tool === 'entrance' && !mark.label) mark.label = 'Вход ' + n;
     if (tool === 'hazard' && !mark.status) mark.status = 'pending';
     if (['route', 'straight'].includes(tool)) {
-      const entrances = state.annotations.filter(m => m.tool === 'entrance'), objects = state.annotations.filter(m => m.tool === 'hazard');
-      if (entrances.length === 1 && objects.length === 1) { mark.fromEntranceId = entrances[0].id; mark.toObjectId = objects[0].id; }
+      Object.assign(mark, measurementEndpoints(state, ps, mark));
     }
     state.annotations.push(mark); state.pending = null; return state;
   }
@@ -203,7 +225,7 @@
     const kind = options.kind === 'map' ? 'map' : 'plan', service = options.service || 'alcohol';
     const controller = new AbortController(), signal = controller.signal;
     let state = normalise(options.getState?.()), image = null, alive = true, loadToken = 0, sourceLoading = false;
-    let activeTool = kind === 'map' ? 'entrance' : 'boundary', selected = null, selectedVertex = -1, zoom = 1, fitScale = 1;
+    let activeTool = kind === 'map' ? 'edit' : 'boundary', selected = null, selectedVertex = -1, zoom = 1, fitScale = 1;
     let past = [], future = [], saveTail = Promise.resolve(), saveError = null, revision = 0, pointer = null;
     let chooserToken = 0, candidate = null, renderTask = null;
     const el = (tag, text, cls) => { const n = document.createElement(tag); if (text !== undefined && text !== null) n.textContent = text; if (cls) n.className = cls; return n; };
@@ -215,10 +237,16 @@
     top.append(sourceLabel, chooseSource);
     const toolbar = el('div', null, 'ape-toolbar'); toolbar.setAttribute('role', 'toolbar'); toolbar.setAttribute('aria-label', 'Инструменты разметки');
     const toolSelect = el('select'); toolSelect.setAttribute('aria-label', 'Инструмент разметки'); toolNames(kind, service).forEach(([value, text]) => { const o = el('option', text); o.value = value; toolSelect.append(o); });
-    const pan = button('Переместить', '', () => setTool('pan'));
+    const mapActions = el('div', null, 'ape-map-actions'); mapActions.setAttribute('role', 'group'); mapActions.setAttribute('aria-label', 'Добавить на схему');
+    const mapActionButtons = new Map();
+    if (kind === 'map') for (const [tool, title] of [['entrance', '+ Вход'], ['hazard', '+ Организация'], ['route', '+ Замер'], ['edit', 'Выбрать']]) {
+      const control = button(title, '', () => setTool(tool)); control.dataset.mapTool = tool; mapActionButtons.set(tool, control); mapActions.append(control);
+    }
+    const moreTools = el('details', null, 'ape-more-tools'), moreSummary = el('summary', 'Ещё'); moreTools.append(moreSummary, toolSelect);
+    const pan = button(kind === 'map' ? 'Двигать карту' : 'Переместить', '', () => setTool('pan'));
     const minus = button('−', '', () => setZoom(zoom / 1.25)), plus = button('+', '', () => setZoom(zoom * 1.25)), fit = button('Вписать', '', () => fitImage());
     minus.setAttribute('aria-label', 'Уменьшить масштаб'); plus.setAttribute('aria-label', 'Увеличить масштаб');
-    const zoomText = el('span', '100%', 'ape-zoom-value'), zoomGroup = el('div', null, 'ape-zoom'); zoomGroup.append(minus, zoomText, plus, fit); toolbar.append(toolSelect, pan, zoomGroup);
+    const zoomText = el('span', '100%', 'ape-zoom-value'), zoomGroup = el('div', null, 'ape-zoom'); zoomGroup.append(minus, zoomText, plus, fit); if (kind === 'map') toolbar.append(mapActions, pan, moreTools, zoomGroup); else toolbar.append(toolSelect, pan, zoomGroup);
     const guidance = el('div', null, 'ape-guidance'), message = el('span', '', 'ape-message'); message.setAttribute('role', 'status'); message.setAttribute('aria-live', 'polite');
     const undo = button('↶', '', () => undoChange()), redo = button('↷', '', () => redoChange()); undo.setAttribute('aria-label', 'Отменить действие'); redo.setAttribute('aria-label', 'Вернуть действие');
     guidance.append(message, undo, redo);
@@ -230,12 +258,13 @@
     const deleteMark = button('Удалить отметку', '', () => removeMark(selected)); actionSlot.append(actionText, removePoint, finish, addVertex, deleteVertex, deleteMark);
     const viewport = el('div', null, 'ape-viewport'); viewport.tabIndex = 0; viewport.setAttribute('aria-label', 'Рабочая область графики');
     const canvas = el('canvas'); canvas.setAttribute('aria-label', kind === 'map' ? 'Схема территории для разметки' : 'План помещения для разметки'); viewport.append(canvas);
-    const legend = el('div', null, 'ape-legend'); legend.setAttribute('aria-label', 'Легенда графики');
+    const legend = el('div', null, 'ape-legend'); legend.setAttribute('aria-label', kind === 'map' ? 'Отметки на схеме' : 'Легенда графики');
+    const selectedPanel = el('section', null, 'ape-selected-panel'); selectedPanel.setAttribute('aria-label', 'Выбранная отметка'); selectedPanel.hidden = true;
     const drawer = el('details', null, 'ape-drawer'), drawerSummary = el('summary', 'Отметки и названия'), markList = el('div', null, 'ape-marks'); drawer.append(drawerSummary, markList);
     const footer = el('div', null, 'ape-footer'), saveStatus = el('span', 'Черновик'), retry = button('Повторить', '', () => persist()), download = button('Скачать PNG', 'ape-secondary', () => downloadPreview()), save = button('Сохранить разметку', 'ape-primary', async () => { try { assertExportable(state); await flush(); notice('Разметка сохранена.'); } catch (e) { notice(e.message, true); } });
     retry.hidden = true; footer.append(saveStatus, retry, download, save);
-    const sourceNote = el('p', kind === 'map' ? (service === 'tobacco' ? 'Прямую отмечайте вручную. Масштаб скриншота не определяет расстояние автоматически.' : 'Отметьте входы, проверенные организации и путь замера. Расстояние укажите вручную.') : 'Оригинал хранится отдельно. Полные подписи — в легенде под планом.', 'ape-note');
-    panel.append(top, sourceNote, toolbar, guidance, actionSlot, viewport, legend, drawer, footer); container.replaceChildren(panel);
+    const sourceNote = el('p', kind === 'map' ? 'Расстояние в метрах вводится вручную.' : 'Оригинал хранится отдельно. Полные подписи — в легенде под планом.', 'ape-note');
+    panel.append(top, sourceNote, toolbar, guidance, actionSlot, viewport, legend, selectedPanel, drawer, footer); container.replaceChildren(panel);
     const chooser = el('dialog', null, 'ape-sheet-dialog'), chooserHead = el('div', null, 'ape-sheet-head'); chooserHead.append(el('strong', kind === 'map' ? 'Скриншот территории' : 'Страница исходного документа'), button('Закрыть', '', () => chooser.close()));
     const sourceSelect = el('select'); sourceSelect.setAttribute('aria-label', 'Исходный документ');
     const uploadInput = el('input'); uploadInput.type = 'file'; uploadInput.accept = kind === 'map' ? 'image/*' : 'image/*,application/pdf'; uploadInput.hidden = true;
@@ -262,17 +291,19 @@
     function applySnapshot(s) { const high = { ...state.sequence }; state.annotations = copy(s.annotations); state.pending = copy(s.pending); for (const [key, value] of Object.entries(s.sequence || {})) high[key] = Math.max(high[key] || 0, value); state.sequence = high; selected = null; selectedVertex = -1; persist(); draw(); }
     function undoChange() { if (!past.length) return; future.push(snapshot()); applySnapshot(past.pop()); }
     function redoChange() { if (!future.length) return; past.push(snapshot()); applySnapshot(future.pop()); }
-    function setTool(value) { if (state.pending && state.pending.tool !== value && !['pan', 'edit'].includes(value)) { notice('Сначала завершите контур или отмените его точки.', true); toolSelect.value = activeTool; return; } activeTool = value; toolSelect.value = value; updateControls(); draw(false); }
+    function setTool(value) { if (state.pending && state.pending.tool !== value && !['pan', 'edit'].includes(value)) { notice('Сначала завершите контур или отмените его точки.', true); toolSelect.value = activeTool; return; } activeTool = value; toolSelect.value = value; if (kind === 'map') moreTools.open = false; updateControls(); draw(false); }
     function finishPending() { if (!state.pending) return; try { const before = snapshot(); state = addMark(state, state.pending.tool, state.pending.points); selected = state.annotations.at(-1).id; selectedVertex = -1; activeTool = 'edit'; toolSelect.value = activeTool; pushHistory(before); persist(); draw(); notice('Контур ' + state.annotations.at(-1).code + ' готов. Углы можно перетащить.'); } catch (e) { notice(e.message, true); } }
-    function removeMark(id) { if (!id) return; mutate(next => { next.annotations = next.annotations.filter(m => m.id !== id); }); if (selected === id) { selected = null; selectedVertex = -1; } draw(); }
+    function removeMark(id) { if (!id) return; mutate(next => { next.annotations = removeAnnotation(next, id).annotations; }); if (selected === id) { selected = null; selectedVertex = -1; } draw(); }
     function updateControls() {
       const ready = !!image && !sourceLoading, pending = state.pending?.points?.length || 0, mark = state.annotations.find(m => m.id === selected);
       toolSelect.value = activeTool; pan.classList.toggle('selected', activeTool === 'pan'); canvas.dataset.tool = activeTool;
-      toolbar.hidden = !ready; actionSlot.hidden = !ready; viewport.hidden = !ready; legend.hidden = !ready; drawer.hidden = !ready;
+      toolbar.hidden = !ready; actionSlot.hidden = !ready || kind === 'map'; viewport.hidden = !ready; legend.hidden = !ready; drawer.hidden = !ready || kind === 'map' && !state.versions?.length;
+      selectedPanel.hidden = kind !== 'map' || !ready || !mark || activeTool !== 'edit';
+      mapActionButtons.forEach((control, tool) => { control.classList.toggle('selected', activeTool === tool); control.setAttribute('aria-pressed', String(activeTool === tool)); });
       undo.disabled = !past.length; redo.disabled = !future.length; download.disabled = save.disabled = !ready;
       removePoint.hidden = finish.hidden = !pending; finish.disabled = pending < 3; addVertex.hidden = deleteVertex.hidden = !mark || !TOOLS[mark.tool]?.polygon || !!pending; deleteVertex.disabled = selectedVertex < 0; deleteMark.hidden = !mark || !!pending;
       actionText.textContent = pending ? 'Углов: ' + pending : mark ? mark.code : kind === 'map' ? 'Короткие коды на схеме, полные названия ниже' : 'Отметьте углы помещения';
-      if (!message.classList.contains('ape-error')) message.textContent = activeTool === 'pan' ? 'Перетаскивайте лист для перемещения.' : activeTool === 'edit' ? 'Выберите отметку. Точки можно перетаскивать.' : TOOLS[activeTool]?.polygon ? 'Нажимайте на углы, затем замкните контур.' : 'Нанесите отметку на изображение.';
+      if (!message.classList.contains('ape-error')) message.textContent = kind === 'map' ? ({ entrance: 'Нажмите на карте в месте входа.', hazard: 'Нажмите на карте в месте проверенной организации.', route: 'Проведите путь от входа до организации. Метры укажите после.', straight: 'Проведите прямую от входа до организации. Метры укажите после.', edit: state.annotations.length ? 'Нажмите на метку, чтобы изменить её. Метку можно перетащить.' : 'Добавьте вход или организацию кнопками над картой.', pan: 'Перетаскивайте карту; отметки останутся на месте.', text: 'Нажмите там, где нужна подпись.' }[activeTool] || 'Выберите действие.') : activeTool === 'pan' ? 'Перетаскивайте лист для перемещения.' : activeTool === 'edit' ? 'Выберите отметку. Точки можно перетаскивать.' : TOOLS[activeTool]?.polygon ? 'Нажимайте на углы, затем замкните контур.' : 'Нанесите отметку на изображение.';
       zoomText.textContent = Math.round(fitScale * zoom * 100) + '%';
       sourceLabel.textContent = state.evidence_id ? ((options.evidence || []).find(e => String(e.id) === String(state.evidence_id))?.name || 'Исходный файл') + ' · лист ' + state.page : 'Исходник не выбран';
     }
@@ -281,25 +312,31 @@
     function draw(refreshList = true) {
       if (!alive) return; updateControls(); if (!image) return;
       const scale = fitScale * zoom; renderScene(canvas, image, state, { kind, scale, selection: selected, vertex: selectedVertex }); canvas.style.width = Math.round(canvas.width * scale) + 'px'; canvas.style.height = Math.round(canvas.height * scale) + 'px';
-      legend.replaceChildren(); legendEntries(state, kind).forEach(entry => { const row = el('div'), code = el('b', entry.code), text = el('span', entry.text); code.style.color = entry.color; row.append(code, text); legend.append(row); });
-      drawerSummary.textContent = 'Отметки и названия · ' + state.annotations.length;
+      legend.replaceChildren(); legendEntries(state, kind).forEach((entry, i) => {
+        if (kind === 'map') { const mark = state.annotations[i], chip = button(entry.code + ' · ' + (mark.label || TOOLS[mark.tool]?.label || 'Отметка'), 'ape-mark-chip', () => { selected = mark.id; selectedVertex = -1; activeTool = 'edit'; draw(); }); chip.title = entry.text; chip.classList.toggle('selected', selected === mark.id); chip.setAttribute('aria-label', 'Открыть ' + entry.code + ' · ' + (mark.label || TOOLS[mark.tool]?.label || 'Отметка')); legend.append(chip); }
+        else { const row = el('div'), code = el('b', entry.code), text = el('span', entry.text); code.style.color = entry.color; row.append(code, text); legend.append(row); }
+      });
+      drawerSummary.textContent = kind === 'map' ? 'Предыдущие схемы' : 'Отметки и названия · ' + state.annotations.length;
       if (refreshList) renderMarks();
     }
     function editField(id, key, value) { mutate(next => { const m = next.annotations.find(m => m.id === id); if (m) m[key] = value; }, false); }
     function field(labelText, tag, value, handler) { const label = el('label', labelText), input = el(tag); input.setAttribute('aria-label', labelText); input.value = value || ''; on(input, tag === 'select' ? 'change' : 'input', e => handler(e.target.value)); label.append(input); return { label, input }; }
     function renderMarks() {
-      markList.replaceChildren();
-      state.annotations.forEach(m => {
+      markList.replaceChildren(); selectedPanel.replaceChildren();
+      const visibleMarks = kind === 'map' ? state.annotations.filter(m => m.id === selected) : state.annotations;
+      visibleMarks.forEach(m => {
         const item = el('div', null, 'ape-mark'), row = el('div', null, 'ape-mark-row'); item.classList.toggle('selected', selected === m.id);
         const choose = button(m.code, '', () => { selected = m.id; selectedVertex = -1; activeTool = 'edit'; draw(); }); choose.setAttribute('aria-label', 'Выбрать отметку ' + m.code);
         const name = el('input'); name.value = m.label || ''; name.placeholder = m.tool === 'hazard' ? 'Название организации' : (TOOLS[m.tool] || TOOLS.text).label; name.setAttribute('aria-label', (m.tool === 'hazard' ? 'Название организации ' : 'Название отметки ') + m.code); on(name, 'input', () => editField(m.id, 'label', name.value)); on(name, 'change', refreshEndpointLabels);
         const remove = button('×', '', () => removeMark(m.id)); remove.setAttribute('aria-label', 'Удалить отметку ' + m.code); row.append(choose, name, remove); item.append(row);
+        if (kind === 'map') { const caption = el('div', null, 'ape-selected-caption'); caption.append(el('strong', m.code + ' · ' + (TOOLS[m.tool]?.label || 'Отметка')), button('На карту ↑', 'ape-back-map', () => { toolbar.scrollIntoView({ block: 'start', behavior: 'auto' }); viewport.focus({ preventScroll: true }); })); item.prepend(caption); }
         if (TOOLS[m.tool]?.polygon) { const corners = el('div', null, 'ape-corners'); m.points.forEach((p, i) => { const b = button('Угол ' + (i + 1), '', () => { selected = m.id; selectedVertex = i; activeTool = 'edit'; draw(); }); b.classList.toggle('selected', selected === m.id && selectedVertex === i); corners.append(b); }); item.append(corners); }
         if (kind === 'map' && ['route', 'straight'].includes(m.tool)) {
           const links = el('div', null, 'ape-links'), distance = field('Замер ' + m.code + ', м', 'input', m.distance, v => editField(m.id, 'distance', v)); distance.input.inputMode = 'decimal'; links.append(distance.label);
+          const hint = el('p', '', 'ape-link-hint'); const updateHint = () => { const current = state.annotations.find(x => x.id === m.id); hint.textContent = current?.fromEntranceId && current?.toObjectId ? 'Точки замера выбраны. Проверьте их и введите расстояние.' : 'Выберите вход и организацию, между которыми выполнен замер.'; }; updateHint();
           for (const [key, label, filter] of [['fromEntranceId', 'От входа', 'entrance'], ['toObjectId', 'До организации', 'hazard']]) {
-            const f = field(label + ' · ' + m.code, 'select', m[key], v => editField(m.id, key, v)); f.input.dataset.endpoint = filter; f.input.append(new Option('Выбрать точку', '')); state.annotations.filter(x => x.tool === filter).forEach(x => f.input.append(new Option(x.code + ' · ' + (x.label || TOOLS[x.tool].label), x.id))); f.input.value = m[key] || ''; links.append(f.label);
-          } item.append(links);
+            const f = field(label + ' · ' + m.code, 'select', m[key], v => { editField(m.id, key, v); updateHint(); }); f.input.dataset.endpoint = filter; f.input.append(new Option('Выбрать точку', '')); state.annotations.filter(x => x.tool === filter).forEach(x => f.input.append(new Option(x.code + ' · ' + (x.label || TOOLS[x.tool].label), x.id))); f.input.value = m[key] || ''; links.append(f.label);
+          } item.append(links, hint);
         }
         if (kind === 'map' && m.tool === 'hazard') {
           const result = field('Результат проверки ' + m.code, 'select', m.status, v => { editField(m.id, 'status', v); source.label.hidden = v !== 'licensed'; });
@@ -307,11 +344,11 @@
           const source = field('Источник сведений о лицензии ' + m.code, 'input', m.source || m.sourceUrl, v => editField(m.id, 'source', v)); source.label.hidden = m.status !== 'licensed';
           const note = field('Наблюдение по организации ' + m.code, 'textarea', m.note, v => editField(m.id, 'note', v)); item.append(result.label, source.label, note.label);
         }
-        markList.append(item);
+        (kind === 'map' ? selectedPanel : markList).append(item);
       });
       if (state.versions?.length) markList.append(button(kind === 'map' ? 'Вернуть предыдущий скриншот' : 'Вернуть предыдущий лист', 'ape-secondary', async () => { try { state = restoreSource(state); past = []; future = []; await persist(); await (ready = loadSelected()); } catch (e) { notice(e.message, true); } }));
     }
-    function refreshEndpointLabels() { markList.querySelectorAll('[data-endpoint]').forEach(select => Array.from(select.options).forEach(option => { const m = state.annotations.find(m => String(m.id) === option.value); if (m) option.textContent = m.code + ' · ' + (m.label || TOOLS[m.tool].label); })); }
+    function refreshEndpointLabels() { panel.querySelectorAll('[data-endpoint]').forEach(select => Array.from(select.options).forEach(option => { const m = state.annotations.find(m => String(m.id) === option.value); if (m) option.textContent = m.code + ' · ' + (m.label || TOOLS[m.tool].label); })); }
     async function sourceResource(evidence, page) {
       const url = await options.evidenceUrl(evidence.id);
       const response = await fetch(url, { credentials: 'same-origin' }); if (!response.ok) throw new Error('Исходный файл недоступен.');
@@ -379,13 +416,13 @@
     function eventPoint(e) { const rect = canvas.getBoundingClientRect(); return point({ x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height }); }
     on(canvas, 'pointerdown', e => {
       if (!image || sourceLoading || e.button > 0) return; e.preventDefault(); canvas.setPointerCapture(e.pointerId); const p = eventPoint(e), rect = canvas.getBoundingClientRect();
-      pointer = { id: e.pointerId, start: p, clientX: e.clientX, clientY: e.clientY, scrollLeft: viewport.scrollLeft, scrollTop: viewport.scrollTop, before: snapshot(), points: [p], moved: false };
+      pointer = { threshold: e.pointerType === 'touch' ? 8 : 4, id: e.pointerId, start: p, clientX: e.clientX, clientY: e.clientY, scrollLeft: viewport.scrollLeft, scrollTop: viewport.scrollTop, before: snapshot(), points: [p], moved: false };
       if (activeTool === 'edit') { const hit = hitTest(state, p, rect.width, rect.height, 13); selected = hit?.id || null; selectedVertex = hit?.vertex ?? -1; pointer.mark = selected ? copy(state.annotations.find(m => m.id === selected)) : null; draw(false); }
     });
     on(canvas, 'pointermove', e => {
-      if (!pointer || pointer.id !== e.pointerId) return; e.preventDefault(); const p = eventPoint(e); pointer.moved ||= Math.hypot(e.clientX - pointer.clientX, e.clientY - pointer.clientY) > 3;
+      if (!pointer || pointer.id !== e.pointerId) return; e.preventDefault(); const p = eventPoint(e); pointer.moved ||= Math.hypot(e.clientX - pointer.clientX, e.clientY - pointer.clientY) > pointer.threshold;
       if (activeTool === 'pan') { viewport.scrollLeft = pointer.scrollLeft - (e.clientX - pointer.clientX); viewport.scrollTop = pointer.scrollTop - (e.clientY - pointer.clientY); return; }
-      if (activeTool === 'edit' && pointer.mark) {
+      if (activeTool === 'edit' && pointer.mark && pointer.moved) {
         try { const mark = { ...pointer.mark, isClosed: !!TOOLS[pointer.mark.tool]?.polygon }; const moved = selectedVertex >= 0 ? G.moveVertex(mark, selectedVertex, p) : G.moveContour(mark, p.x - pointer.start.x, p.y - pointer.start.y); delete moved.isClosed; state.annotations[state.annotations.findIndex(m => m.id === selected)] = moved; draw(false); } catch (_) { /* Keep the last valid geometry while a corner crosses another edge. */ } return;
       }
       if (activeTool === 'route') { if (G.distance(pointer.points.at(-1), p) > .002) pointer.points.push(p); state.pending = { tool: activeTool, points: pointer.points }; draw(false); }
@@ -396,12 +433,16 @@
       if (cancelled) { state.annotations = gesture.before.annotations; state.pending = gesture.before.pending; draw(); return; }
       const p = eventPoint(e), config = TOOLS[activeTool];
       if (activeTool === 'pan') return;
-      if (activeTool === 'edit') { if (gesture.mark && gesture.moved) { pushHistory(gesture.before); persist(); } draw(); return; }
+      if (activeTool === 'edit') { if (gesture.mark && gesture.moved) { pushHistory(gesture.before); persist(); } draw(); if (kind === 'map' && selected) selectedPanel.scrollIntoView({ block: 'nearest', behavior: 'auto' }); return; }
       if (!config) return;
       if (config.polygon) { mutate(next => { next.pending ||= { tool: activeTool, points: [] }; next.pending.points.push(p); }); return; }
+      if (config.point && gesture.moved) { state.pending = gesture.before.pending; draw(); return; }
       const points = config.point ? [p] : activeTool === 'route' ? [...gesture.points, p] : [gesture.start, p];
       if (!config.point && G.distance(points[0], points.at(-1)) < .001 && points.length < 3) { state.pending = gesture.before.pending; draw(); return; }
-      try { state = addMark(state, activeTool, points); pushHistory(gesture.before); persist(); selected = state.annotations.at(-1).id; selectedVertex = -1; draw(); if (activeTool === 'hazard' || activeTool === 'text') { drawer.open = true; markList.querySelector('.ape-mark:last-of-type input')?.focus({ preventScroll: true }); } }
+      try { const addedTool = activeTool; state = addMark(state, activeTool, points); pushHistory(gesture.before); persist(); selected = state.annotations.at(-1).id; selectedVertex = -1; if (kind === 'map') activeTool = 'edit'; draw();
+        if (kind === 'map') { if (addedTool !== 'entrance') selectedPanel.scrollIntoView({ block: 'nearest', behavior: 'auto' }); if (['hazard', 'text'].includes(addedTool)) selectedPanel.querySelector('.ape-mark-row input')?.focus({ preventScroll: true }); }
+        else if (activeTool === 'hazard' || activeTool === 'text') { drawer.open = true; markList.querySelector('.ape-mark:last-of-type input')?.focus({ preventScroll: true }); }
+      }
       catch (error) { state.pending = gesture.before.pending; draw(); notice(error.message, true); }
     }
     on(canvas, 'pointerup', e => endPointer(e, false)); on(canvas, 'pointercancel', e => endPointer(e, true));
@@ -414,5 +455,5 @@
       destroy() { alive = false; loadToken++; chooserToken++; renderTask?.cancel(); candidate?.pdf?.destroy(); controller.abort(); if (chooser.open) chooser.close(); container.replaceChildren(); image = null; },
     };
   }
-  return { mount, helpers: { normalise, addMark, selectSource, restoreSource, assertExportable, eligible, isPDF, toolNames, legendEntries, hitTest, renderScene, wrapText, createSaveQueue }, tools: TOOLS };
+  return { mount, helpers: { normalise, addMark, selectSource, restoreSource, assertExportable, eligible, isPDF, toolNames, legendEntries, hitTest, renderScene, wrapText, createSaveQueue, measurementEndpoints, removeAnnotation }, tools: TOOLS };
 });
