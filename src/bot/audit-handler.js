@@ -2,7 +2,7 @@ const { getOrderById } = require('../db/queries');
 const { saveAudit } = require('../web/handoff');
 const { esc } = require('./formatter');
 const { buildInspectionReport, validateInspection } = require('./audit-inspection');
-const { splitTelegramHtml, photoCaption } = require('./audit-delivery');
+const { splitTelegramHtml, photoCaption, deliveryMedia } = require('./audit-delivery');
 const { createHash } = require('crypto');
 const { normalizeWorkflow, validateWorkflow, buildWorkflowReport } = require('./audit-workflow');
 
@@ -117,7 +117,7 @@ async function handleAuditReportInner(ctx, data, progress) {
   lines.push.apply(lines, workflowReport.html);
   plain.push.apply(plain, workflowReport.plain);
 
-  if (data.object_category === 'tobacco') {
+  if (data.object_category === 'tobacco' && data.ui_version !== 5) {
     lines.push('🚬 <b>Табак</b>' + (data.t_address ? ' · ' + esc(data.t_address) : ''), '');
     lines.push('<b>1. Торговый зал</b>');
     lines.push((data.chk_t_no_display ? y : n) + ' Нет выкладки и демонстрации табачной продукции');
@@ -134,7 +134,7 @@ async function handleAuditReportInner(ctx, data, progress) {
     }
     plain.push('Табак' + (data.t_address ? ', ' + data.t_address : '') +
       (data.t_edu_name || data.t_edu_dist ? '. Образовательная организация: ' + (data.t_edu_name || '—') + (data.t_edu_dist ? ', ' + data.t_edu_dist + ' м' : '') : '. Образовательных организаций не отмечено'));
-  } else if (data.ui_version !== 4) {
+  } else if (![4, 5].includes(data.ui_version)) {
     lines.push('🏢 <b>Здание:</b> ' + esc(data.building_type || '—'));
     lines.push('📐 <b>Границы:</b> ' + esc(data.boundaries || '—'));
     lines.push(data.schema_version === 3 ? '📋 <b>Сверка с представленным планом:</b> ' + esc(data.bti || 'Не проверено') : '📋 <b>БТИ:</b> ' + (data.bti === 'Да' ? y + ' Подходит' : data.bti === 'Нет' ? '❌ Не подходит' : '❓ Не проверено'));
@@ -175,14 +175,14 @@ async function handleAuditReportInner(ctx, data, progress) {
     plain.push('Доп.: ' + extras.join(', '));
   }
 
-  if (data.video_url) { lines.push(''); lines.push('🎥 <b>Видео:</b> ' + esc(data.video_url)); plain.push('Видео: ' + data.video_url); }
+  if (data.video_url && data.ui_version !== 5) { lines.push(''); lines.push('🎥 <b>Видео:</b> ' + esc(data.video_url)); plain.push('Видео: ' + data.video_url); }
 
   lines.push('');
-  lines.push((data.object_category === 'tobacco' ? '📝 <b>3. Итог:</b> ' : '📝 <b>Итог:</b> ') + esc(data.conclusion));
+  if (data.ui_version !== 5) lines.push((data.object_category === 'tobacco' ? '📝 <b>3. Итог:</b> ' : '📝 <b>Итог:</b> ') + esc(data.conclusion));
   if (data.t_comment) { lines.push('💬 <b>Комментарий:</b> ' + esc(data.t_comment)); plain.push('Комментарий: ' + data.t_comment); }
   lines.push('');
   lines.push('👤 <i>Аудитор: ' + esc(actor) + '</i>');
-  plain.push('Итог: ' + data.conclusion);
+  if (data.ui_version !== 5) plain.push('Итог: ' + data.conclusion);
 
   var text = lines.join('\n');
 
@@ -206,10 +206,13 @@ async function handleAuditReportInner(ctx, data, progress) {
     await checkpoint();
   }
 
-  if (data.photos && data.photos.length) {
+  const mediaPacket = deliveryMedia(data);
+  const photos = mediaPacket.photos;
+  const documents = mediaPacket.documents;
+  if (photos.length) {
     try {
-      for (let offset = progress.photoIds.length; offset < data.photos.length;) {
-        const batch = data.photos.slice(offset, offset + 10);
+      for (let offset = progress.photoIds.length; offset < photos.length;) {
+        const batch = photos.slice(offset, offset + 10);
       if (batch.length === 1) {
         const photo = batch[0];
         const m = await tgRetry(function () { return tg.sendPhoto(GROUP_ID,
@@ -232,10 +235,10 @@ async function handleAuditReportInner(ctx, data, progress) {
     }
   }
 
-  if (data.documents && data.documents.length) {
+  if (documents.length) {
     try {
-      for (let offset = progress.documentIds.length; offset < data.documents.length;) {
-        const batch = data.documents.slice(offset, offset + 10);
+      for (let offset = progress.documentIds.length; offset < documents.length;) {
+        const batch = documents.slice(offset, offset + 10);
         const caption = file => {
           const subject = (data.entrances || []).find(e => e.id === file.subject_id)?.label || (data.zones || []).find(z => z.id === file.subject_id)?.name || '';
           return (photoCaption(file, data.order_id) + (subject ? ' · ' + subject : '') + '\n' + (file.name || 'Документ')).slice(0, 900);
@@ -276,7 +279,7 @@ async function handleAuditReportInner(ctx, data, progress) {
   }
 
   if (ctx.reply && !progress.replied) {
-    await ctx.reply('✅ Отчёт' + (data.photos && data.photos.length ? ' и фото (' + data.photos.length + ')' : '') + ' отправлены в группу!');
+    await ctx.reply('✅ Отчёт' + (photos.length ? ' и фото (' + photos.length + ')' : '') + ' отправлены в группу!');
     progress.replied = true;
     await checkpoint();
   }

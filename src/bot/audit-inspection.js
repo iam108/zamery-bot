@@ -5,12 +5,13 @@ const SERVICES = ['Получение', 'Продление', 'Переофор�
 const ALCOHOL_CATEGORIES = ['catering', 'retail'];
 
 function usesInspection(data) {
-  return ALCOHOL_CATEGORIES.includes(data.object_category) &&
+  return data.ui_version === 5 || ALCOHOL_CATEGORIES.includes(data.object_category) &&
     (data.schema_version === 2 || data.inspection != null);
 }
 
 function validateInspection(data) {
   if (!usesInspection(data)) return;
+  if (data.ui_version === 5) return validateCompactInspection(data);
   const p = data.inspection;
   if (!p || typeof p !== 'object' || Array.isArray(p)) throw new Error('Заполните сведения об объекте и услуге.');
   if (!SERVICES.includes(p.service)) throw new Error('Выберите услугу: получение, продление или переоформление.');
@@ -53,6 +54,7 @@ function validateInspection(data) {
 function buildInspectionReport(data) {
   if (!usesInspection(data)) return { html: [], plain: [] };
   validateInspection(data);
+  if (data.ui_version === 5) return buildCompactInspectionReport(data);
   const p = data.inspection;
   const plain = [];
   const warnings = [];
@@ -120,4 +122,98 @@ function buildInspectionReport(data) {
   return { html: plain.map(line => esc(line)), plain };
 }
 
-module.exports = { validateInspection, buildInspectionReport, usesInspection };
+const TOBACCO_CHOICES = {
+  tobacco_display: ['Закрытая', 'Открытая', 'Товара нет', 'Не проверено'],
+  tobacco_price_list: ['Есть', 'Нет', 'Не проверено'],
+  tobacco_advertising: ['Есть', 'Нет', 'Не проверено'],
+};
+const nonempty = value => typeof value === 'string' && value.trim().length > 0;
+const floorKey = value => String(value || '').trim().toLowerCase().replace(/этаж/g, '').replace(/\s+/g, ' ').trim();
+
+function validateCompactInspection(data) {
+  const p = data.inspection;
+  if (!['catering', 'retail', 'tobacco'].includes(data.object_category)) throw new Error('Менеджеру нужно уточнить тип объекта в заявке.');
+  if (!p || typeof p !== 'object' || Array.isArray(p)) throw new Error('Заполните сведения осмотра.');
+  if (!SERVICES.includes(p.service)) throw new Error('В заявке не указана услуга.');
+  for (const [key, label] of [['org', 'организацию'], ['address', 'адрес объекта'], ['floor_plan', 'этаж на плане'], ['floor_actual', 'фактический этаж']]) {
+    if (!nonempty(p[key])) throw new Error('Укажите ' + label + '.');
+  }
+  for (const [key, choices, label] of [
+    ['building_type', ['Жилое', 'Нежилое'], 'жилое или нежилое здание'],
+    ['bti', ['Да', 'Нет'], 'совпадает ли помещение с представленным планом'],
+    ['to', ['Нужно', 'Не нужно'], 'требуется ли техническое описание'],
+  ]) if (!choices.includes(data[key])) throw new Error('Укажите, ' + label + '.');
+  if (!/^[1-9]\d?$/.test(p.cadastral_count || '') || typeof p.cadastral_count !== 'string') throw new Error('Количество кадастровых помещений: целое число от 1 до 99.');
+  if (Number(p.cadastral_count) > 1 && !['Сохранена', 'Объединены'].includes(p.inter_cadastral_boundary)) throw new Error('Укажите, сохранены ли границы между кадастровыми помещениями.');
+  for (const [key, label] of [['rooms_complete', 'все ли комнаты из плана входят в объект'], ['within_cadastral', 'соблюдены ли границы помещения'], ['kkt_ip', 'есть ли касса ИП']]) {
+    if (!['Да', 'Нет'].includes(p[key])) throw new Error('Укажите, ' + label + '.');
+  }
+  if (!['1', '2'].includes(p.kkt_count)) throw new Error('Выберите количество касс: 1 или 2.');
+  if (data.bti === 'Нет' && !nonempty(p.plan_note)) throw new Error('Коротко опишите, что отличается на плане.');
+  if (data.object_category === 'tobacco') {
+    for (const [key, choices] of Object.entries(TOBACCO_CHOICES)) if (!choices.includes(p[key])) throw new Error('Укажите состояние выкладки, перечня цен и рекламы табака.');
+  } else {
+    if (!ANSWERS.includes(p.alcohol_present)) throw new Error('Укажите наличие алкоголя на объекте.');
+    if (p.service === 'Продление' && p.alcohol_present === 'Да' && !ANSWERS.includes(p.alcohol_within_licensed)) throw new Error('Укажите размещение алкоголя относительно лицензированной зоны.');
+  }
+  for (const key of ['archive_match', 'licensed_boundaries_match']) if (p[key] && !ANSWERS.includes(p[key])) throw new Error('Проверьте ответ о сверке с архивом.');
+  for (const [key, value] of Object.entries(p)) {
+    if (typeof value !== 'string' || value.length > (['risks', 'structural_elements', 'plan_note', 'archive_url'].includes(key) ? 2000 : 500)) throw new Error('Слишком длинное или некорректное поле проверки: ' + key);
+  }
+  if (data.conclusion != null && (typeof data.conclusion !== 'string' || data.conclusion.length > 6000)) throw new Error('Проверьте комментарий аудитора.');
+}
+
+function compactInspectionIssues(data) {
+  const p = data.inspection || {}, tasks = [];
+  const add = (id, label) => tasks.push({ id, label });
+  if (floorKey(p.floor_plan) !== floorKey(p.floor_actual)) add('floor-mismatch', 'Этаж на плане и фактический этаж различаются.');
+  if (p.within_cadastral === 'Нет') add('cadastral-boundaries', 'Аудитор отметил нарушение границ помещения.');
+  if (Number(p.cadastral_count) > 1 && p.inter_cadastral_boundary === 'Объединены') add('inter-cadastral', 'Помещения из ' + p.cadastral_count + ' кадастров объединены.');
+  if (p.rooms_complete === 'Нет') add('rooms-incomplete', 'Не все комнаты из плана входят в объект.');
+  if (data.bti === 'Нет') add('plan-mismatch', 'Расхождения планировки: ' + (p.plan_note || 'описание не заполнено'));
+  if (data.to === 'Нужно') add('technical-description', 'Требуется техническое описание.');
+  if (p.service === 'Продление') {
+    if (data.workflow?.archive_skipped === 'Да') add('archive-skipped', 'Архив не предоставлен; сверка с архивом не выполнена.');
+    else if (p.archive_match === 'Нет') add('archive-mismatch', 'Аудитор отметил расхождения с архивом.');
+    else if (p.archive_match === 'Не проверено') add('archive-unchecked', 'Сверка с архивом не выполнена.');
+    if (data.workflow?.archive_skipped !== 'Да' && p.licensed_boundaries_match === 'Нет') add('licensed-boundaries', 'Аудитор отметил расхождение лицензированных границ.');
+  }
+  if (data.object_category === 'tobacco') {
+    if (p.tobacco_display === 'Открытая') add('tobacco-display', 'Зафиксирована открытая выкладка табачной продукции.');
+    else if (p.tobacco_display === 'Не проверено') add('tobacco-display', 'Выкладка табака не проверена.');
+    if (p.tobacco_price_list !== 'Есть') add('tobacco-prices', p.tobacco_price_list === 'Нет' ? 'Перечень продукции с ценами отсутствует.' : 'Перечень цен не проверен.');
+    if (p.tobacco_advertising !== 'Нет') add('tobacco-ads', p.tobacco_advertising === 'Есть' ? 'Зафиксирована реклама табака.' : 'Реклама табака не проверена.');
+  } else {
+    if (p.alcohol_present === 'Не проверено') add('alcohol-unknown', 'Наличие алкоголя не установлено.');
+    else if (p.service === 'Получение' && p.alcohol_present === 'Да') add('alcohol-new', 'Получение: на объекте есть алкоголь (рабочее правило команды — убрать).');
+    if (p.service === 'Продление' && p.alcohol_present === 'Да' && p.alcohol_within_licensed !== 'Да') add('alcohol-zone', p.alcohol_within_licensed === 'Нет' ? 'Алкоголь находится за пределами лицензированной зоны.' : 'Размещение алкоголя в лицензированной зоне не подтверждено.');
+  }
+  return tasks;
+}
+
+function buildCompactInspectionReport(data) {
+  const p = data.inspection, plain = [];
+  const field = (label, value) => { if (value) plain.push(label + ': ' + value); };
+  field('Организация', p.org); field('Адрес', p.address); field('Услуга', p.service); field('Дата осмотра', p.visit_date);
+  field('Здание', data.building_type + ' · указано аудитором');
+  plain.push('Этаж: по плану — ' + p.floor_plan + '; фактически — ' + p.floor_actual);
+  field('Кадастровых помещений', p.cadastral_count);
+  if (Number(p.cadastral_count) > 1) field('Границы между кадастрами', p.inter_cadastral_boundary);
+  field('Все комнаты из плана входят в объект', p.rooms_complete);
+  field('Границы помещения соблюдены', p.within_cadastral);
+  field('Планировка совпадает с планом', data.bti); field('Что отличается', p.plan_note);
+  field('Техническое описание', data.to);
+  plain.push('Кассы: ' + p.kkt_count + '; касса ИП: ' + p.kkt_ip.toLowerCase());
+  if (data.object_category === 'tobacco') {
+    plain.push('Табак: выкладка — ' + p.tobacco_display.toLowerCase() + '; перечень цен — ' + p.tobacco_price_list.toLowerCase() + '; реклама — ' + p.tobacco_advertising.toLowerCase());
+  } else {
+    field('Алкоголь на объекте', p.alcohol_present);
+    if (p.service === 'Продление' && p.alcohol_present !== 'Нет') field('Алкоголь в лицензированной зоне', p.alcohol_within_licensed);
+  }
+  if (p.service === 'Продление' && data.workflow?.archive_skipped !== 'Да') {
+    field('Сверка с архивом', p.archive_match); field('Лицензированные границы совпадают', p.licensed_boundaries_match);
+  }
+  return { plain, html: plain.map(esc) };
+}
+
+module.exports = { validateInspection, buildInspectionReport, usesInspection, compactInspectionIssues, TOBACCO_CHOICES };

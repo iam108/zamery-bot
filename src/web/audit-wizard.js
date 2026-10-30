@@ -7,15 +7,19 @@ function auditWizard() {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="color-scheme" content="light dark">
+  <meta name="color-scheme" content="light">
   <title>Выезд аудитора</title>
   <script src="https://telegram.org/js/telegram-web-app.js"><\/script>
   <script src="/auth.js"><\/script>
   <link rel="stylesheet" href="/audit-wizard.css">
+  <link rel="stylesheet" href="/audit-plan-editor.css">
 </head>
 <body>
-  <div class="ambient ambient-one" aria-hidden="true"></div>
-  <div class="ambient ambient-two" aria-hidden="true"></div>
+  <div class="ambient-layer" aria-hidden="true">
+    <div class="ambient ambient-one"></div>
+    <div class="ambient ambient-two"></div>
+    <div class="ambient ambient-three"></div>
+  </div>
   <div class="audit-app" id="audit-app">
     <header class="app-header glass">
       <div class="header-top"><a class="back-link" href="/requests">← Заявки</a><span class="draft-pill" id="draft-id">Проверка</span></div>
@@ -30,6 +34,7 @@ function auditWizard() {
   </div>
   <footer class="bottom-bar glass"><div class="bottom-inner"><button type="button" class="button secondary" id="previous-step">← Назад</button><span id="step-counter">1 из 3</span><button type="button" class="button primary" id="next-step">Далее →</button></div></footer>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <script src="/audit-editor-geometry.js"><\/script>
   <script src="/audit-plan-editor.js"><\/script>
   <script src="/audit-wizard-client.js"><\/script>
 </body>

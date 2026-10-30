@@ -44,4 +44,19 @@ function photoCaption(photo, orderId) {
   return title + (orderId ? ' · отчёт по заявке #' + String(orderId).slice(0, 30) : ' · отчёт аудитора');
 }
 
-module.exports = { splitTelegramHtml, photoCaption };
+// Preserve original bytes for the lawyer. Telegram previews are additional
+// views, never replacements for the originals retained by the draft/handoff.
+function deliveryMedia(data) {
+  const documents = data.documents || [];
+  if (data.ui_version !== 5) return { photos: data.photos || [], documents };
+  const rank = file => file.role === 'map' ? 0 : file.role === 'plan' ? 1 : file.role === 'entrance' ? 2 : file.role === 'zone' ? 3 : 4;
+  const inline = documents.filter(file =>
+    /^(image\/(jpeg|png))$/.test(file.mime) &&
+    ['map', 'plan', 'entrance', 'zone', 'interior'].includes(file.role) &&
+    !['source', 'original'].includes(file.subject_id) &&
+    (file.source ? file.source.length : Buffer.byteLength(file.data || '', 'base64')) <= 10 * 1024 * 1024
+  ).sort((a, b) => rank(a) - rank(b));
+  return { photos: inline.map(file => ({ ...file, data: file.data || file.source.toString('base64') })), documents };
+}
+
+module.exports = { splitTelegramHtml, photoCaption, deliveryMedia };

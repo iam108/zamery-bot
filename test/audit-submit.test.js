@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const { randomUUID } = require('node:crypto');
 const { createAuditSubmitter } = require('../src/web/audit-submit');
 const { hydrateDraftReport } = require('../src/bot/audit-workflow');
+const { compactVisit } = require('./helpers/audit-v5');
 
 function harness(changes = {}) {
   const id = randomUUID(), fileId = randomUUID();
@@ -171,4 +172,74 @@ test('manager service changes require refresh before any report delivery', async
   await assert.rejects(submit(108, h.id, 4, h.context), error => error.status === 409);
   assert.equal(sent, false);
   assert.equal(h.state.frozen, false);
+});
+
+test('V5 submits the trusted complete manager packet and resumes the exact packet after a partial delivery', async () => {
+  const data = compactVisit('retail', 'Продление');
+  const h = harness(data);
+  h.snapshot.evidence = data.evidence.map((file, i) => ({ ...file, buffer: Buffer.from('V5_ORIGINAL_' + i) }));
+  const packet = { ...data.request_packet,
+    materials: [...data.request_packet.materials, { id: randomUUID(), role: 'document', name: 'Договор.pdf' }] };
+  h.snapshot.data.request_packet = { ...data.request_packet, materials: [] };
+  h.snapshot.data.inspection = { ...data.inspection, org: 'Подмена', address: 'Не адрес из заявки' };
+  let loads = 0;
+  const first = createAuditSubmitter(h.drafts, async (ctx, report) => {
+    assert.equal(report.inspection.org, packet.org);
+    assert.equal(report.inspection.address, packet.address);
+    assert.deepEqual(report.request_packet.materials, packet.materials);
+    assert.equal(report.documents[0].source.toString(), 'V5_ORIGINAL_0');
+    await ctx.auditDelivery.save({ textIds: [501] });
+    throw new Error('retry remaining media');
+  }, { loadPacket: async (orderId, ids) => { loads++; assert.equal(orderId, 58); assert.equal(ids, undefined); return packet; } });
+  await assert.rejects(first(108, h.id, 4, h.context), /retry remaining media/);
+  assert.equal(h.state.frozen, true);
+  assert.deepEqual(h.state.delivery.packet.materials, packet.materials);
+  let resumed = 0;
+  const retry = createAuditSubmitter(h.drafts, async (ctx, report) => {
+    resumed++;
+    assert.deepEqual(report.request_packet, packet);
+    assert.deepEqual((await ctx.auditDelivery.load()).textIds, [501]);
+  }, { loadPacket: async () => { throw new Error('must use frozen packet'); } });
+  await retry(108, h.id, 4, h.context);
+  assert.equal((await retry(108, h.id, 4, h.context)).already_submitted, true);
+  assert.equal(resumed, 1); assert.equal(loads, 1);
+});
+
+test('V5 cannot use a forged packet when trusted loading is unavailable or when the service changed', async () => {
+  for (const serviceChanged of [false, true]) {
+    const data = compactVisit();
+    const h = harness(data);
+    h.snapshot.evidence = data.evidence.map(file => ({ ...file, buffer: Buffer.from('ORIGINAL') }));
+    let deliveries = 0;
+    const options = serviceChanged ? { loadPacket: async () => ({ ...data.request_packet, service: 'Продление' }) } : {};
+    const submit = createAuditSubmitter(h.drafts, async () => { deliveries++; }, options);
+    await assert.rejects(submit(108, h.id, 4, h.context), serviceChanged ? /изменил услугу/ : /проверить заявку/);
+    assert.equal(deliveries, 0); assert.equal(h.state.frozen, false); assert.equal(h.state.releases, 1);
+  }
+});
+
+test('V5 deleted source evidence fails before trusted-packet checkpoint or delivery', async () => {
+  const data = compactVisit(), h = harness(data);
+  h.snapshot.evidence = data.evidence.filter(file => file.role !== 'plan-source');
+  let deliveries = 0;
+  const submit = createAuditSubmitter(h.drafts, async () => { deliveries++; }, { loadPacket: async () => data.request_packet });
+  await assert.rejects(submit(108, h.id, 4, h.context), /Исходный файл/);
+  assert.equal(deliveries, 0); assert.equal(h.state.frozen, false);
+  assert.deepEqual(h.state.delivery, {});
+});
+
+test('V5 changed object identity cannot silently relabel an already captured inspection', async () => {
+  for (const [field, value] of [['address', 'Москва, другой адрес'], ['org', 'Другое ООО'], ['object_category', 'tobacco']]) {
+    const data = compactVisit(), h = harness(data);
+    h.snapshot.evidence = data.evidence.map(file => ({ ...file, buffer: Buffer.from('ORIGINAL') }));
+    let delivered = false;
+    const submit = createAuditSubmitter(h.drafts, async () => { delivered = true; }, {
+      loadPacket: async () => ({ ...data.request_packet, [field]: value }),
+    });
+    await assert.rejects(submit(108, h.id, 4, h.context), error => error.status === 409 && /сверьте материалы объекта/.test(error.message));
+    assert.equal(delivered, false);
+    assert.equal(h.state.frozen, false);
+    assert.deepEqual(h.state.delivery, {});
+    assert.notEqual(h.snapshot.data.request_packet[field], value);
+  }
 });

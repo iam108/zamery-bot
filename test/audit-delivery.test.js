@@ -229,3 +229,42 @@ test('unchanged legacy checkpoint upgrades to canonical signature while changed 
   assert.equal(h.calls.filter(call => call.method === 'sendMessage').length, 1);
   assert.equal(h.saved.length, 1);
 });
+
+test('UI5 delivers ordered inline previews while retaining every original for handoff', () => {
+  const { deliveryMedia } = require('../src/bot/audit-delivery');
+  const files = [
+    { id: 'inside', name: 'room.jpg', role: 'interior', mime: 'image/jpeg', source: Buffer.from('ROOM') },
+    { id: 'pdf', name: 'egrn.pdf', role: 'plan-source', mime: 'application/pdf', source: Buffer.from('%PDF') },
+    { id: 'plan', name: 'marked.png', role: 'plan', subject_id: 'annotation', mime: 'image/png', source: Buffer.from('PLAN') },
+    { id: 'map', name: 'map.png', role: 'map', subject_id: 'annotation', mime: 'image/png', source: Buffer.from('MAP') },
+    { id: 'source', name: 'plan.png', role: 'plan', subject_id: 'source', mime: 'image/png', source: Buffer.from('SOURCE') },
+    { id: 'heic', name: 'entrance.heic', role: 'entrance', mime: 'image/heic', source: Buffer.from('HEIC') },
+  ];
+  const packet = deliveryMedia({ ui_version: 5, documents: files });
+  assert.deepEqual(packet.photos.map(p => p.id), ['map', 'plan', 'inside']);
+  assert.equal(Buffer.from(packet.photos[0].data, 'base64').toString(), 'MAP');
+  assert.equal(packet.documents, files);
+  assert.equal(files[0].data, undefined);
+  assert.equal(deliveryMedia({ ui_version: 4, documents: files }).photos.length, 0);
+});
+
+test('UI5 sends map/plan/entrance inline, originals separately, and does not duplicate confirmed media on retry', async () => {
+  const { compactVisit } = require('./helpers/audit-v5');
+  const report = compactVisit();
+  report.submit_id = 'v5-inline-retry';
+  report.documents = report.evidence.map(file => ({ ...file, source: Buffer.from('original-' + file.id) }));
+  let failSave = true;
+  const h = harness({ saveFailure: async () => { if (failSave) { failSave = false; throw new Error('save retry'); } } });
+  await assert.rejects(h.send(report), /save retry/);
+  const albums = h.calls.filter(call => call.method === 'sendMediaGroup');
+  assert.equal(albums.length, 2);
+  assert.deepEqual(Array.from(albums[0].args[1], item => item.type), ['photo', 'photo', 'photo']);
+  assert.match(albums[0].args[1][0].caption, /Карта/);
+  assert.match(albums[0].args[1][1].caption, /План/);
+  assert.ok(albums[1].args[1].every(item => item.type === 'document'));
+  assert.equal(albums[1].args[1].length, report.documents.length);
+  await h.send(report);
+  assert.equal(h.calls.filter(call => call.method === 'sendMediaGroup').length, 2);
+  assert.equal(h.saved.length, 1);
+  assert.equal(h.saved[0][4].documents[0].source, report.documents[0].source);
+});
