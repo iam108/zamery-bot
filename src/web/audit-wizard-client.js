@@ -2,6 +2,7 @@
   'use strict';
   var tg = window.Telegram && window.Telegram.WebApp;
   var actions = window.AuditActions;
+  var phoneHandoffBase = 'https://iam108.github.io/zamery-bot/';
   try { if (tg) { tg.ready(); tg.expand(); } } catch (e) {}
   var params = new URLSearchParams(window.location.search);
   var orderId = params.get('order_id') || '';
@@ -133,6 +134,26 @@
     return String(raw);
   }
   function packetPhone() { return actions.findPhone((state.packet||state.data.request_packet||{}).contacts); }
+  function nativePhoneLink() {
+    // Telegram iOS forwards target=_blank links to its native URL opener.
+    // The WebApp SDK's openLink instead accepts only approved protocols.
+    if (actions.hasTelegramBridge(window)) return !!(tg && tg.platform === 'ios');
+    return /iPhone|iPad|iPod/i.test((window.navigator || {}).userAgent || '');
+  }
+  function phoneActionUrl(phone) { return nativePhoneLink() ? 'tel:' + phone : actions.callUrl(phoneHandoffBase, phone, true); }
+  function saveBeforePhone() {
+    // Saving must never cancel a real link tap or delay it behind a request.
+    try { localSave(); } catch (_) {}
+    try { saveNow().catch(function () {}); } catch (_) {}
+  }
+  function bindPhoneAction(link, phone, onFailure) {
+    link.href = phoneActionUrl(phone); link.target = '_blank'; link.rel = 'noopener';
+    link.onclick = function (event) {
+      if (nativePhoneLink()) { saveBeforePhone(); return; }
+      event.preventDefault(); saveBeforePhone();
+      if (!openExternal(actions.callUrl(phoneHandoffBase, phone, true)) && onFailure) onFailure();
+    };
+  }
   function managerFilesHtml(files, planActions) {
     if (!files.length) return '<p class="field-note">Менеджер пока не приложил файлы.</p>';
     return '<div class="manager-files">' + files.map(function (file) {
@@ -143,7 +164,7 @@
   }
   function packetSummary(){
     var packet=state.packet||state.data.request_packet||{},p=state.data.inspection,files=packetFiles(),contact=packetContactText(packet.contacts),phone=packetPhone(),archiveFiles=files.filter(function(f){return f.role==='archive';}),hasArchive=!!packet.archive_url||archiveFiles.length>0;
-    var html='<section class="request-packet"><div class="packet-title"><span class="tag">Заявка #'+esc(orderId)+'</span><span>'+esc(({catering:'Алкоголь · общепит',retail:'Алкоголь · магазин',tobacco:'Табак'})[state.data.object_category]||'Объект')+' · '+esc(p.service)+'</span></div><h2>'+esc(packet.object_name||packet.org||p.org)+'</h2><p class="packet-address">'+esc(packet.address||p.address)+'</p><div class="action-row"><a class="button secondary" data-route target="_blank" rel="noopener" href="'+esc(actions.routeUrl(p.address||''))+'">Построить маршрут ↗</a>'+(phone?'<a class="button secondary" data-call target="_blank" rel="noopener" href="'+esc(actions.callUrl(location.origin,phone,true))+'">Позвонить ↗</a>':'')+'</div>'+(contact?'<p class="packet-contact">'+esc(contact)+'</p>':'');
+    var html='<section class="request-packet"><div class="packet-title"><span class="tag">Заявка #'+esc(orderId)+'</span><span>'+esc(({catering:'Алкоголь · общепит',retail:'Алкоголь · магазин',tobacco:'Табак'})[state.data.object_category]||'Объект')+' · '+esc(p.service)+'</span></div><h2>'+esc(packet.object_name||packet.org||p.org)+'</h2><p class="packet-address">'+esc(packet.address||p.address)+'</p><div class="action-row"><a class="button secondary" data-route target="_blank" rel="noopener" href="'+esc(actions.routeUrl(p.address||''))+'">Построить маршрут ↗</a>'+(phone?'<a class="button secondary" data-call target="_blank" rel="noopener" href="'+esc(phoneActionUrl(phone))+'">Позвонить ↗</a>':'')+'</div>'+(contact?'<p class="packet-contact">'+esc(contact)+'</p>':'');
     if(packet.zones_info)html+='<details class="packet-details"><summary>Комментарий менеджера</summary><p>'+esc(packet.zones_info)+'</p></details>';
     html+='<details class="packet-details"><summary>Документы заявки · '+files.length+'</summary>'+(files.length?'<button type="button" class="button secondary full" data-download-materials>Скачать всё</button>':'')+managerFilesHtml(files,false)+'<p class="field-note">Документы и папку объекта прикрепляет менеджер до передачи заявки аудитору.</p></details>';
     if(isRenewal())html+='<div class="archive-box"><div class="card-top"><h3>Архив объекта</h3><span class="tag">'+(archiveFiles.length?'Приложен':state.data.workflow.archive_skipped==='Да'?'Без архива':'Графика не приложена')+'</span></div>'+(hasArchive?'<div class="action-row"><button type="button" class="button secondary" data-download-archive>Скачать архив</button>'+(packet.archive_url?'<button type="button" class="button secondary" data-copy-archive>Скопировать ссылку</button>':'')+'</div>':'')+(!archiveFiles.length?'<button type="button" class="button secondary full" data-skip-archive>'+ (state.data.workflow.archive_skipped==='Да'?'Добавить архив / отменить пропуск':'Архива нет — продолжить')+'</button>':'')+'</div>';
@@ -259,7 +280,7 @@
     var removePlan=bindRoot.querySelector('[data-remove-plan]');if(removePlan)removePlan.onclick=async function(){try{if(editor&&editor.flush)await editor.flush();}catch(error){notify(error.message);return;}state.data.retired_plans=state.data.retired_plans||[];state.data.retired_plans.push(clone(currentPlan()));state.data.additional_plans=state.data.additional_plans.filter(function(p){return p.id!==activePlanId;});activePlanId='main';changed();render();};
     var skip=bindRoot.querySelector('[data-skip-archive]');if(skip)skip.onclick=function(){state.data.workflow.archive_skipped=state.data.workflow.archive_skipped==='Да'?'':'Да';changed();render();};
     var route=bindRoot.querySelector('[data-route]');if(route)route.onclick=function(event){event.preventDefault();showRoute();};
-    var call=bindRoot.querySelector('[data-call]');if(call)call.onclick=function(event){event.preventDefault();localSave();saveNow().catch(function(){});if(!openExternal(actions.callUrl(location.origin,packetPhone(),true)))showContact();};
+    var call=bindRoot.querySelector('[data-call]');if(call)bindPhoneAction(call,packetPhone(),showContact);
     bindRoot.querySelectorAll('[data-contact]').forEach(function(button){button.onclick=showContact;});
     var b = $('[data-download-materials]'); if (b) b.onclick = function () { downloadResource(state.packet.materials_download_url || '/api/audit/orders/' + encodeURIComponent(orderId) + '/materials/download-all', 'Документы-заявки-' + orderId + '.zip'); };
     b = $('[data-download-archive]'); if (b) b.onclick = function () { var attached=packetFiles().some(function(file){return file.role==='archive';});var url=state.packet.archive_download_url||(attached?'/api/audit/orders/'+encodeURIComponent(orderId)+'/materials/download-all?role=archive':'/api/audit/orders/'+encodeURIComponent(orderId)+'/archive/download');downloadResource(url,'Архив-заявки-'+orderId+'.zip'); };
@@ -279,17 +300,15 @@
   }
   function showContact(){
     var phone=packetPhone();if(!phone){notify('Телефон не указан в заявке.');return;}
-    localSave();saveNow().catch(function(){});
+    saveBeforePhone();
     var dialog=document.getElementById('contact-dialog');if(dialog&&dialog.open)return;if(dialog)dialog.remove();
     dialog=document.createElement('dialog');dialog.id='contact-dialog';dialog.className='contact-dialog';dialog.setAttribute('aria-labelledby','contact-title');
-    dialog.innerHTML='<div class="contact-heading"><h2 id="contact-title">Контакт для выезда</h2><button type="button" class="button secondary" data-close-contact aria-label="Закрыть контакт">Закрыть</button></div><p class="contact-description">'+esc(packetContactText((state.packet||state.data.request_packet||{}).contacts))+'</p><input class="contact-number" type="tel" aria-label="Номер телефона" readonly value="'+esc(phone)+'"><div class="contact-actions"><a class="button primary" data-dial href="tel:'+esc(phone)+'">Набрать номер ↗</a><button type="button" class="button secondary" data-copy-phone>Скопировать номер</button></div><p class="field-note" data-contact-status role="status">Окно звонка откроется отдельно. Чтобы продолжить отчёт, вернитесь в Telegram.</p>';
+    dialog.innerHTML='<div class="contact-heading"><h2 id="contact-title">Контакт для выезда</h2><button type="button" class="button secondary" data-close-contact aria-label="Закрыть контакт">Закрыть</button></div><p class="contact-description">'+esc(packetContactText((state.packet||state.data.request_packet||{}).contacts))+'</p><input class="contact-number" type="tel" aria-label="Номер телефона" readonly value="'+esc(phone)+'"><div class="contact-actions"><a class="button primary" data-dial target="_blank" rel="noopener" href="'+esc(phoneActionUrl(phone))+'">Набрать номер ↗</a><button type="button" class="button secondary" data-copy-phone>Скопировать номер</button></div><p class="field-note" data-contact-status role="status">Окно звонка откроется отдельно. Чтобы продолжить отчёт, вернитесь в Telegram.</p>';
     document.body.appendChild(dialog);
     dialog.querySelector('[data-close-contact]').onclick=function(){dialog.close();};
     dialog.addEventListener('click',function(event){if(event.target===dialog)dialog.close();});
     dialog.querySelector('[data-copy-phone]').onclick=async function(){var ok=await copyText(phone,'Номер скопирован');var status=dialog.querySelector('[data-contact-status]');status.textContent=ok?'Номер скопирован. Можно вставить в приложении «Телефон».':'Выделите номер в поле выше и выберите «Копировать».';if(!ok){var input=dialog.querySelector('input');input.focus();input.select();}};
-    dialog.querySelector('[data-dial]').onclick=function(event){
-      if(tg&&tg.platform&&tg.platform!=='unknown'){event.preventDefault();var url=actions.callUrl(location.origin,phone);if(!openExternal(url))dialog.querySelector('[data-contact-status]').textContent='Окно звонка не открылось. Скопируйте номер кнопкой рядом.';}
-    };
+    bindPhoneAction(dialog.querySelector('[data-dial]'),phone,function(){dialog.querySelector('[data-contact-status]').textContent='Окно звонка не открылось. Скопируйте номер кнопкой рядом.';});
     dialog.showModal();
   }
   async function copyText(text,message){

@@ -35,14 +35,71 @@ function harness() {
 
 test('the first Call click dispatches the one-shot dial URL without opening a contact dialog',()=>{
   const c=harness(),button={},events=[];
-  c.actions=require('../public/audit-actions');c.location={origin:'https://bot.example'};
+  c.actions=require('../public/audit-actions');c.phoneHandoffBase='https://iam108.github.io/zamery-bot/';
   c.packetPhone=()=>'+79995554433';c.saveNow=async()=>{events.push('save');};
   c.openExternal=url=>{events.push(['open',url]);return true;};c.showContact=()=>{assert.fail('An intermediate contact dialog adds an unnecessary step');};
-  const scope={querySelectorAll:()=>[],querySelector:s=>s==='[data-call]'?button:null};load(c,'bind');c.bind(scope);
+  const scope={querySelectorAll:()=>[],querySelector:s=>s==='[data-call]'?button:null};load(c,'nativePhoneLink','phoneActionUrl','saveBeforePhone','bindPhoneAction','bind');c.bind(scope);
   button.onclick({preventDefault(){events.push('prevent');}});
   assert.equal(events.filter(e=>Array.isArray(e)).length,1);
-  const url=new URL(events.find(e=>Array.isArray(e))[1]);assert.equal(url.pathname,'/audit-call.html');
+  const url=new URL(events.find(e=>Array.isArray(e))[1]);assert.equal(url.origin,'https://iam108.github.io');assert.equal(url.pathname,'/zamery-bot/audit-call.html');
   const hash=new URLSearchParams(url.hash.slice(1));assert.equal(hash.get('phone'),'+79995554433');assert.equal(hash.get('dial'),'1');
+});
+
+test('iOS Telegram Call keeps the real tel link tap even when saving fails',()=>{
+  const c=harness(),button={};let saves=0;
+  c.actions=require('../public/audit-actions');c.phoneHandoffBase='https://iam108.github.io/zamery-bot/';
+  c.tg={platform:'ios',openLink(){assert.fail('The SDK rejects tel URLs; the native link must handle this tap');}};
+  c.window.TelegramWebviewProxy={postEvent(){}};
+  c.packetPhone=()=>'+79995554433';c.localSave=()=>{throw new Error('storage full');};c.saveNow=()=>{saves++;throw new Error('offline');};
+  c.openExternal=()=>assert.fail('iOS must not visit an HTTPS handoff page');c.showContact=()=>assert.fail('No contact sheet is needed before iOS dialing');
+  const scope={querySelectorAll:()=>[],querySelector:s=>s==='[data-call]'?button:null};
+  load(c,'nativePhoneLink','phoneActionUrl','saveBeforePhone','bindPhoneAction','bind');c.bind(scope);
+  assert.equal(button.href,'tel:+79995554433');assert.equal(button.target,'_blank');assert.equal(button.rel,'noopener');
+  assert.doesNotThrow(()=>button.onclick({preventDefault(){assert.fail('Canceling the tap loses the native iOS URL-opening path');}}));
+  assert.equal(saves,1,'The server save is attempted independently of local storage failure');
+});
+
+test('native phone selection requires a real iOS bridge or an ordinary iPhone browser',()=>{
+  for(const [name,platform,bridge,userAgent,native] of [
+    ['Telegram iOS','ios',true,'',true],
+    ['Telegram macOS','macos',true,'Mozilla/5.0 (iPhone)',false],
+    ['Telegram Android','android',true,'',false],
+    ['SDK-only desktop preview','ios',false,'Mozilla/5.0 (Macintosh)',false],
+    ['Safari on iPhone','unknown',false,'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)',true]
+  ]){
+    const c=harness();c.actions=require('../public/audit-actions');c.phoneHandoffBase='https://iam108.github.io/zamery-bot/';c.tg={platform};
+    c.window.navigator={userAgent};if(bridge)c.window.TelegramWebviewProxy={postEvent(){}};
+    load(c,'nativePhoneLink','phoneActionUrl');
+    assert.equal(c.nativePhoneLink(),native,name);
+    const href=c.phoneActionUrl('+79995554433');
+    assert.equal(href.startsWith('tel:'),native,name);
+    if(!native){const url=new URL(href);assert.equal(url.host,'iam108.github.io',name);assert.equal(new URLSearchParams(url.hash.slice(1)).get('dial'),'1',name);}
+  }
+});
+
+test('a pending server save does not hold up the desktop phone handoff',()=>{
+  const c=harness(),button={};let opened=0;
+  c.actions=require('../public/audit-actions');c.phoneHandoffBase='https://iam108.github.io/zamery-bot/';
+  c.saveNow=()=>new Promise(()=>{});c.openExternal=()=>{opened++;return true;};
+  load(c,'nativePhoneLink','phoneActionUrl','saveBeforePhone','bindPhoneAction');c.bindPhoneAction(button,'+79995554433',()=>assert.fail('Dispatch succeeded'));
+  button.onclick({preventDefault(){}});assert.equal(opened,1);
+});
+
+test('contact sheet uses the same native iOS and desktop handoff behavior as the main Call button',()=>{
+  for(const native of [true,false]){
+    const c=harness(),elements=new Map();let opened=0,prevented=0;
+    const element=selector=>{if(!elements.has(selector))elements.set(selector,{});return elements.get(selector);};
+    const dialog={setAttribute(){},querySelector:element,addEventListener(){},showModal(){this.open=true;}};
+    c.document.getElementById=()=>null;c.document.createElement=()=>dialog;
+    c.actions=require('../public/audit-actions');c.phoneHandoffBase='https://iam108.github.io/zamery-bot/';c.packetPhone=()=>'+79995554433';
+    c.tg={platform:native?'ios':'macos'};c.window.TelegramWebviewProxy={postEvent(){}};
+    c.saveNow=async()=>{};c.esc=String;c.openExternal=()=>{opened++;return false;};
+    load(c,'nativePhoneLink','phoneActionUrl','saveBeforePhone','bindPhoneAction','packetContactText','showContact');c.showContact();
+    const dial=element('[data-dial]');assert.equal(dial.target,'_blank');assert.equal(dial.href.startsWith('tel:'),native);
+    dial.onclick({preventDefault(){prevented++;}});
+    assert.equal(prevented,native?0:1);assert.equal(opened,native?0:1);
+    if(!native)assert.match(element('[data-contact-status]').textContent,/Скопируйте номер/);
+  }
 });
 
 test('route click opens the start-point chooser rather than sending an empty origin to Maps',()=>{

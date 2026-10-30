@@ -71,6 +71,7 @@ test('phone handoff stays on this origin and keeps the private number in the fra
   assert.equal(new URLSearchParams(url.hash.slice(1)).get('phone'), phone);
   assert.equal(raw.split('#')[0].includes('9995554433'), false);
   assert.equal(actions.callUrl('http://127.0.0.1:8780', phone).startsWith('http://127.0.0.1:8780/audit-call.html#'), true);
+  assert.equal(new URL(actions.callUrl('https://example.test/audit/legacy?order_id=92#old', phone)).pathname, '/audit-call.html');
   assert.equal(new URLSearchParams(url.hash.slice(1)).has('dial'), false, 'Opening a saved contact must not start another dial request');
   const direct = new URL(actions.callUrl('https://example.test', phone, true));
   assert.equal(direct.search, '');
@@ -78,11 +79,53 @@ test('phone handoff stays on this origin and keeps the private number in the fra
   assert.equal(new URLSearchParams(direct.hash.slice(1)).get('phone'), phone);
 });
 
+test('native mobile route uses numeric destination and never mixes coordinates with an address origin', () => {
+  const point = {latitude:55.763022,longitude:37.634874};
+  const link = new URL(actions.routeUrl(point));
+  assert.equal(link.searchParams.get('rtext'), '~55.763022,37.634874');
+  assert.equal(link.searchParams.get('rtt'), 'auto');
+  assert.equal(new URL(actions.routeUrl(point,{latitude:55.761487,longitude:37.612191})).searchParams.get('rtext'),'55.761487,37.612191~55.763022,37.634874');
+  assert.equal(actions.routeUrl(point,'Москва, улица'), '');
+  for(const bad of [{},{latitude:91,longitude:37},{latitude:55,longitude:'37'}, {latitude:NaN,longitude:37}]) assert.equal(actions.routeUrl(bad), '');
+});
+
+test('address search fallback is explicitly a search rather than a nonworking mobile route', () => {
+  const link = new URL(actions.searchUrl('Москва, Тестовая, 3, этаж 1, комната 2'));
+  assert.equal(link.searchParams.get('text'), 'Москва, Тестовая, 3');
+  assert.equal(link.searchParams.has('rtext'), false);
+  assert.equal(actions.searchUrl(''), '');
+});
+
 test('invalid phone and unsafe or malformed handoff origins fail without throwing', () => {
-  for (const origin of ['javascript:alert(1)', 'data:text/html,test', 'file:///tmp/test', 'ftp://example.test', '', 'not-an-origin']) {
+  for (const origin of ['javascript:alert(1)', 'data:text/html,test', 'file:///tmp/test', 'ftp://example.test', '', 'not-an-origin', 'https://user:secret@example.test/zamery-bot/', 'https://user@example.test/', 'https://:secret@example.test/']) {
     assert.equal(actions.callUrl(origin, phone), '', origin);
   }
   assert.equal(actions.callUrl('https://example.test', 'нет номера'), '');
+});
+
+test('a phone handoff preserves a static project directory with or without a trailing slash', () => {
+  for (const base of ['https://iam108.github.io/zamery-bot/', 'https://iam108.github.io/zamery-bot']) {
+    const url = new URL(actions.callUrl(base, phone, true));
+    assert.equal(url.origin, 'https://iam108.github.io');
+    assert.equal(url.pathname, '/zamery-bot/audit-call.html');
+    assert.equal(url.search, '');
+    assert.equal(new URLSearchParams(url.hash.slice(1)).get('phone'), phone);
+    assert.equal(new URLSearchParams(url.hash.slice(1)).get('dial'), '1');
+    assert.equal(url.href.split('#')[0].includes('9995554433'), false);
+  }
+});
+
+test('base query and hash never leak to the public phone page and nested directories remain intact', () => {
+  for (const base of ['https://iam108.github.io/zamery-bot/?old=query#old-hash', 'https://iam108.github.io/zamery-bot?old=query#old-hash']) {
+    const url = new URL(actions.callUrl(base, phone));
+    assert.equal(url.pathname, '/zamery-bot/audit-call.html');
+    assert.equal(url.search, '');
+    assert.equal(url.href.includes('old'), false);
+    assert.equal(new URLSearchParams(url.hash.slice(1)).has('dial'), false);
+  }
+  assert.equal(new URL(actions.callUrl('https://example.test/tools/phone/', phone)).pathname, '/tools/phone/audit-call.html');
+  assert.equal(new URL(actions.callUrl('https://example.test/tools/phone', phone)).pathname, '/tools/phone/audit-call.html');
+  assert.equal(new URL(actions.callUrl('https://example.test/tools/index.html?old=query#hash', phone)).pathname, '/tools/audit-call.html');
 });
 
 test('Telegram link is dispatched synchronously during the user gesture and never opens a second window', () => {

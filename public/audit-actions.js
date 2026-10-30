@@ -45,18 +45,36 @@
     return text.length <= 250 ? text : '';
   }
   function routeUrl(address, origin) {
-    var destination = routeAddress(address);
+    var numeric = address && typeof address === 'object';
+    var destination = numeric ? routeOrigin(address) : routeAddress(address);
     if (!destination) return '';
+    // Native iOS Maps accepts coordinate pairs, not address strings. Never
+    // mix a prepared destination with a textual starting point.
+    if (numeric && origin != null && (typeof origin !== 'object' || !origin)) return '';
     var start = routeOrigin(origin);
     if (origin != null && !start) return '';
     return 'https://yandex.ru/maps/?mode=routes&rtext=' + encodeURIComponent(start) + '~' + encodeURIComponent(destination) + '&rtt=auto';
   }
+  function searchUrl(address) {
+    var text = routeAddress(address);
+    return text ? 'https://yandex.ru/maps/?text=' + encodeURIComponent(text) : '';
+  }
   function callUrl(origin, value, autoDial) {
     var phone = normalizePhone(value);
     if (!phone) return '';
-    var url;
-    try { url = new URL('/audit-call.html', origin); } catch (_) { return ''; }
-    if (!/^https?:$/.test(url.protocol)) return '';
+    var base, url;
+    try {
+      base = new URL(origin);
+      if (!/^https?:$/.test(base.protocol) || base.username || base.password) return '';
+      base.search = ''; base.hash = '';
+      // Accept both an origin and a static project directory, including a
+      // directory without its trailing slash. Preserve the existing /audit
+      // page input as a page, rather than treating it as a new directory.
+      if (base.pathname === '/audit' || base.pathname === '/audit/legacy') base.pathname = '/';
+      else if (/\/[^/]+\.[^/]+$/.test(base.pathname)) base = new URL('./', base);
+      else if (!base.pathname.endsWith('/')) base.pathname += '/';
+      url = new URL('audit-call.html', base);
+    } catch (_) { return ''; }
     // The private number is kept out of HTTP requests and access logs.
     url.hash = 'phone=' + encodeURIComponent(phone) + (autoDial ? '&dial=1' : '');
     return url.href;
@@ -79,5 +97,5 @@
     } catch (_) {}
     return false;
   }
-  return { normalizePhone: normalizePhone, findPhone: findPhone, routeAddress: routeAddress, routeOrigin: routeOrigin, routeUrl: routeUrl, callUrl: callUrl, hasTelegramBridge: hasTelegramBridge, openExternal: openExternal };
+  return { normalizePhone: normalizePhone, findPhone: findPhone, routeAddress: routeAddress, routeOrigin: routeOrigin, routeUrl: routeUrl, searchUrl: searchUrl, callUrl: callUrl, hasTelegramBridge: hasTelegramBridge, openExternal: openExternal };
 });
