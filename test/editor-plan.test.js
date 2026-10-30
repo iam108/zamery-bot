@@ -104,3 +104,14 @@ test('removing a pin clears its links without losing lines, labels or identities
  const original=structuredClone(s),deleted=H.removeAnnotation(s,'entry');assert.deepEqual(s,original);assert.equal(deleted.annotations.length,2);const measure=deleted.annotations.find(m=>m.id==='measure');assert.equal(measure.fromEntranceId,undefined);assert.equal(measure.toObjectId,'org');assert.equal(measure.distance,'150');assert.deepEqual(measure.points,s.annotations[2].points);
  const h=G.undoHistory(G.commitHistory(G.createHistory(s.annotations),deleted.annotations));assert.deepEqual(h.present,s.annotations);assert.equal(h.present[0].id,'entry');
 });
+test('map measurement badges sit halfway along rendered segments without covering their entrance',()=>{
+ const points=[{x:.1,y:.1},{x:.8,y:.1},{x:.8,y:.9}],mid=H.pathMidpoint(points,1000,500);assert.ok(Math.abs(mid.x-.65)<1e-10);assert.equal(mid.y,.1);
+ assert.deepEqual(H.pathMidpoint([{x:.3,y:.4},{x:.3,y:.4}],1000,500),{x:.3,y:.4});
+ const text=[],ctx={font:'',measureText:t=>({width:String(t).length*8}),fillText:(...args)=>text.push(args),drawImage(){},fillRect(){},save(){},restore(){},beginPath(){},rect(){},clip(){},moveTo(){},lineTo(){},stroke(){},setLineDash(){},arc(){},fill(){}};
+ const canvas={getContext:()=>ctx},source={width:1000,height:500};
+ for(const tool of ['route','straight']){
+  let state=H.addMark({},'entrance',[points[0]]);state=H.addMark(state,tool,tool==='route'?points:[points[0],points.at(-1)]);const original=structuredClone(state);
+  text.length=0;H.renderScene(canvas,source,state,{kind:'map',artifact:true});const entrance=text.find(t=>t[0]==='В1'),measure=text.find(t=>t[0]==='М1');assert.ok(Math.abs(measure[1]-entrance[1])>100,'The measurement badge must not share the entrance anchor');assert.deepEqual(state,original,'Moving a display badge must not alter annotation coordinates');
+  text.length=0;H.renderScene(canvas,source,state,{kind:'plan'});assert.equal(text.find(t=>t[0]==='М1')[1],entrance[1],'The plan renderer retains its existing anchor');
+ }
+});

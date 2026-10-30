@@ -137,6 +137,16 @@
     }
     if (row) rows.push(row); return rows;
   }
+  function pathMidpoint(points, width = 1, height = 1) {
+    if (!points?.length) return null;
+    const lengths = points.slice(1).map((p, i) => Math.hypot((p.x - points[i].x) * width, (p.y - points[i].y) * height));
+    let remaining = lengths.reduce((sum, length) => sum + length, 0) / 2;
+    for (let i = 0; i < lengths.length; i++) {
+      if (lengths[i] > 0 && remaining <= lengths[i]) { const t = remaining / lengths[i], a = points[i], b = points[i + 1]; return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t }; }
+      remaining -= lengths[i];
+    }
+    return points[0];
+  }
   function renderScene(canvas, source, state, opts) {
     const settings = { kind: 'plan', scale: 1, artifact: false, selection: null, vertex: -1, ...opts };
     const w = source.naturalWidth || source.width, h = source.naturalHeight || source.height;
@@ -149,7 +159,7 @@
     ctx.save(); ctx.beginPath(); ctx.rect(0, 0, w, h); ctx.clip();
     for (const mark of state.annotations) {
       if (!mark.points?.length) continue;
-      const config = TOOLS[mark.tool] || TOOLS.text, color = markColor(mark), anchor = mark.points[0];
+      const config = TOOLS[mark.tool] || TOOLS.text, color = markColor(mark), anchor = settings.kind === 'map' && ['route', 'straight'].includes(mark.tool) ? pathMidpoint(mark.points, w, h) : mark.points[0];
       ctx.save(); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 2 * unit; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
       if (config.dashed) ctx.setLineDash([7 * unit, 5 * unit]);
       ctx.beginPath(); mark.points.forEach((p, i) => i ? ctx.lineTo(p.x * w, p.y * h) : ctx.moveTo(p.x * w, p.y * h));
@@ -455,5 +465,5 @@
       destroy() { alive = false; loadToken++; chooserToken++; renderTask?.cancel(); candidate?.pdf?.destroy(); controller.abort(); if (chooser.open) chooser.close(); container.replaceChildren(); image = null; },
     };
   }
-  return { mount, helpers: { normalise, addMark, selectSource, restoreSource, assertExportable, eligible, isPDF, toolNames, legendEntries, hitTest, renderScene, wrapText, createSaveQueue, measurementEndpoints, removeAnnotation }, tools: TOOLS };
+  return { mount, helpers: { normalise, addMark, selectSource, restoreSource, assertExportable, eligible, isPDF, toolNames, legendEntries, hitTest, renderScene, wrapText, pathMidpoint, createSaveQueue, measurementEndpoints, removeAnnotation }, tools: TOOLS };
 });
