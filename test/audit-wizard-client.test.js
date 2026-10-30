@@ -33,6 +33,25 @@ function harness() {
   vm.createContext(c);load(c,'queue','step','isRenewal','evidenceFor','adoptRevision','removeGeneratedEvidence','submit','currentPlan','setCurrentPlan');return c;
 }
 
+test('the first Call click dispatches the one-shot dial URL without opening a contact dialog',()=>{
+  const c=harness(),button={},events=[];
+  c.actions=require('../public/audit-actions');c.location={origin:'https://bot.example'};
+  c.packetPhone=()=>'+79995554433';c.saveNow=async()=>{events.push('save');};
+  c.openExternal=url=>{events.push(['open',url]);return true;};c.showContact=()=>{assert.fail('An intermediate contact dialog adds an unnecessary step');};
+  const scope={querySelectorAll:()=>[],querySelector:s=>s==='[data-call]'?button:null};load(c,'bind');c.bind(scope);
+  button.onclick({preventDefault(){events.push('prevent');}});
+  assert.equal(events.filter(e=>Array.isArray(e)).length,1);
+  const url=new URL(events.find(e=>Array.isArray(e))[1]);assert.equal(url.pathname,'/audit-call.html');
+  const hash=new URLSearchParams(url.hash.slice(1));assert.equal(hash.get('phone'),'+79995554433');assert.equal(hash.get('dial'),'1');
+});
+
+test('route click opens the start-point chooser rather than sending an empty origin to Maps',()=>{
+  const c=harness(),button={};let opened=0;
+  c.showRoute=()=>{opened++;};c.openExternal=()=>{assert.fail('No empty-origin route should be dispatched by the first click');};
+  const scope={querySelectorAll:()=>[],querySelector:s=>s==='[data-route]'?button:null};load(c,'bind');c.bind(scope);
+  let prevented=false;button.onclick({preventDefault(){prevented=true;}});assert.equal(prevented,true);assert.equal(opened,1);
+});
+
 test('retry exports only current images and retires removed extra artifacts while keeping originals',async()=>{
   const c=harness();c.state.data.additional_plans=[{id:'extra-kept',evidence_id:'extra-original',page:2,annotations:[{id:'x1',tool:'licensed'}]}];
   c.state.evidence=[{id:'map-original',role:'map-source',subject_id:'source'},{id:'plan-original',role:'plan-source',subject_id:'source'},{id:'removed-extra-original',role:'plan-source',subject_id:'source'},{id:'entrance-photo',role:'entrance',subject_id:'e1'},

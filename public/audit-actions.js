@@ -35,24 +35,42 @@
     var address = (at > 0 ? full.slice(0, at) : full).replace(/[\s,;]+$/, '');
     return address;
   }
-  function routeUrl(address) {
+  function routeOrigin(value) {
+    if (value && typeof value === 'object') {
+      var lat = value.latitude, lon = value.longitude;
+      if (typeof lat !== 'number' || typeof lon !== 'number' || !Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) return '';
+      return Number(lat.toFixed(6)) + ',' + Number(lon.toFixed(6));
+    }
+    var text = String(value || '').trim().replace(/\s+/g, ' ');
+    return text.length <= 250 ? text : '';
+  }
+  function routeUrl(address, origin) {
     var destination = routeAddress(address);
     if (!destination) return '';
-    return 'https://yandex.ru/maps/?mode=routes&rtext=~' + encodeURIComponent(destination) + '&rtt=auto';
+    var start = routeOrigin(origin);
+    if (origin != null && !start) return '';
+    return 'https://yandex.ru/maps/?mode=routes&rtext=' + encodeURIComponent(start) + '~' + encodeURIComponent(destination) + '&rtt=auto';
   }
-  function callUrl(origin, value) {
+  function callUrl(origin, value, autoDial) {
     var phone = normalizePhone(value);
     if (!phone) return '';
     var url;
     try { url = new URL('/audit-call.html', origin); } catch (_) { return ''; }
     if (!/^https?:$/.test(url.protocol)) return '';
     // The private number is kept out of HTTP requests and access logs.
-    url.hash = 'phone=' + encodeURIComponent(phone);
+    url.hash = 'phone=' + encodeURIComponent(phone) + (autoDial ? '&dial=1' : '');
     return url.href;
   }
-  function openExternal(url, telegram, openWindow) {
+  function hasTelegramBridge(environment) {
+    if (!environment) return false;
+    try {
+      return !!(environment.TelegramWebviewProxy && typeof environment.TelegramWebviewProxy.postEvent === 'function' || environment.external && typeof environment.external.notify === 'function' || environment.parent && environment.parent !== environment && typeof environment.parent.postMessage === 'function');
+    } catch (_) { return false; }
+  }
+  function openExternal(url, telegram, openWindow, environment) {
     if (!/^https?:\/\//i.test(url || '')) return false;
-    if (telegram && telegram.platform && telegram.platform !== 'unknown' && typeof telegram.openLink === 'function') {
+    if (hasTelegramBridge(environment) && telegram && typeof telegram.openLink === 'function') {
+      // The SDK acknowledges dispatch only; it cannot confirm the external app opened.
       try { telegram.openLink(url, { try_instant_view: false }); return true; } catch (_) {}
     }
     try {
@@ -61,5 +79,5 @@
     } catch (_) {}
     return false;
   }
-  return { normalizePhone: normalizePhone, findPhone: findPhone, routeAddress: routeAddress, routeUrl: routeUrl, callUrl: callUrl, openExternal: openExternal };
+  return { normalizePhone: normalizePhone, findPhone: findPhone, routeAddress: routeAddress, routeOrigin: routeOrigin, routeUrl: routeUrl, callUrl: callUrl, hasTelegramBridge: hasTelegramBridge, openExternal: openExternal };
 });

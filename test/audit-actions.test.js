@@ -5,6 +5,7 @@ const actions = require('../public/audit-actions');
 
 const phone = '+79995554433';
 const formats = ['+7 (999) 555-44-33', '8 999 555 44 33', '79995554433', '9995554433'];
+const nativeBridge = () => ({ TelegramWebviewProxy: { postEvent() {} } });
 
 test('contact numbers normalize Russian country and local formats', () => {
   for (const value of formats) assert.equal(actions.normalizePhone(value), phone, value);
@@ -42,7 +43,7 @@ test('route uses the building address and keeps building structures in either fl
   assert.equal(actions.routeAddress('Москва, Мясницкая, д. 15/2'), 'Москва, Мясницкая, д. 15/2');
 });
 
-test('Maps link opens route mode with an unspecified start and the exact destination', () => {
+test('manual Maps fallback leaves start unspecified while explicit origins build a complete route', () => {
   const destination = 'Москва, Мясницкая улица, д. 15, строение 2';
   const url = new URL(actions.routeUrl(destination + ', этаж 1, комната 75'));
   assert.equal(url.origin, 'https://yandex.ru');
@@ -51,6 +52,14 @@ test('Maps link opens route mode with an unspecified start and the exact destina
   assert.equal(url.searchParams.get('rtext'), '~' + destination);
   assert.equal(url.searchParams.get('rtt'), 'auto');
   assert.equal(actions.routeUrl('  '), '');
+  const fromAddress = new URL(actions.routeUrl(destination, ' Москва,  Лубянская площадь, 2 '));
+  assert.equal(fromAddress.searchParams.get('rtext'), 'Москва, Лубянская площадь, 2~' + destination);
+  const fromLocation = new URL(actions.routeUrl(destination, { latitude: 55.7589444, longitude: 37.6272924 }));
+  assert.equal(fromLocation.searchParams.get('rtext'), '55.758944,37.627292~' + destination);
+  for (const bad of ['', ' '.repeat(5), 'a'.repeat(251), {latitude: 91, longitude: 30}, {latitude: 55, longitude: Infinity}, {latitude: '55', longitude: 37}, {latitude: 55}]) {
+    assert.equal(actions.routeUrl(destination, bad), '', JSON.stringify(bad));
+  }
+  assert.equal(actions.routeOrigin({latitude:0,longitude:0}), '0,0');
 });
 
 test('phone handoff stays on this origin and keeps the private number in the fragment only', () => {
@@ -62,6 +71,11 @@ test('phone handoff stays on this origin and keeps the private number in the fra
   assert.equal(new URLSearchParams(url.hash.slice(1)).get('phone'), phone);
   assert.equal(raw.split('#')[0].includes('9995554433'), false);
   assert.equal(actions.callUrl('http://127.0.0.1:8780', phone).startsWith('http://127.0.0.1:8780/audit-call.html#'), true);
+  assert.equal(new URLSearchParams(url.hash.slice(1)).has('dial'), false, 'Opening a saved contact must not start another dial request');
+  const direct = new URL(actions.callUrl('https://example.test', phone, true));
+  assert.equal(direct.search, '');
+  assert.equal(new URLSearchParams(direct.hash.slice(1)).get('dial'), '1');
+  assert.equal(new URLSearchParams(direct.hash.slice(1)).get('phone'), phone);
 });
 
 test('invalid phone and unsafe or malformed handoff origins fail without throwing', () => {
@@ -76,7 +90,7 @@ test('Telegram link is dispatched synchronously during the user gesture and neve
   const telegram = { platform: 'ios', openLink(url, options) { events.push(['telegram', url, options]); } };
   const url = actions.routeUrl('Москва, Мясницкая, д. 15');
   events.push('gesture');
-  assert.equal(actions.openExternal(url, telegram, () => { assert.fail('unexpected browser fallback'); }), true);
+  assert.equal(actions.openExternal(url, telegram, () => { assert.fail('unexpected browser fallback'); }, nativeBridge()), true);
   events.push('returned');
   assert.deepEqual(events, ['gesture', ['telegram', url, { try_instant_view: false }], 'returned']);
 });
@@ -90,13 +104,34 @@ test('browser fallback keeps the report window separate and clears opener', () =
   }
 });
 
+test('a cached Telegram platform without a native bridge cannot silently swallow an external link', () => {
+  const environment = {};
+  environment.parent = environment;
+  const telegram = { platform:'macos', initData:'cached data', openLink(){ assert.fail('There is no actual native bridge'); } };
+  const calls = [], external = {};
+  assert.equal(actions.hasTelegramBridge(environment), false);
+  assert.equal(actions.openExternal('https://example.test', telegram, (...args) => {calls.push(args);return external;}, environment), true);
+  assert.deepEqual(calls, [['https://example.test','_blank']]);
+});
+
+test('only the SDK-supported proxy, notify, or actual iframe channels count as Telegram bridges', () => {
+  assert.equal(actions.hasTelegramBridge(nativeBridge()), true);
+  assert.equal(actions.hasTelegramBridge({external:{notify(){}}}), true);
+  assert.equal(actions.hasTelegramBridge({parent:{postMessage(){}}}), true);
+  assert.equal(actions.hasTelegramBridge({TelegramWebviewProxy:{}}), false);
+  assert.equal(actions.hasTelegramBridge({external:{notify:'not a function'}}), false);
+  const unavailable = {};
+  Object.defineProperty(unavailable, 'parent', {get(){throw new Error('blocked');}});
+  assert.equal(actions.hasTelegramBridge(unavailable), false);
+});
+
 test('unsupported Telegram bridge falls back; blocked or throwing browser windows report failure', () => {
   let attempts = 0;
   const telegram = { platform: 'android', openLink() { attempts++; throw new Error('unsupported bridge'); } };
   const external = {};
-  assert.equal(actions.openExternal('https://example.test', telegram, () => external), true);
+  assert.equal(actions.openExternal('https://example.test', telegram, () => external, nativeBridge()), true);
   assert.equal(attempts, 1);
-  assert.equal(actions.openExternal('https://example.test', telegram, () => null), false);
+  assert.equal(actions.openExternal('https://example.test', telegram, () => null, nativeBridge()), false);
   assert.equal(actions.openExternal('https://example.test', null, () => { throw new Error('popup blocked'); }), false);
 });
 

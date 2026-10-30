@@ -189,6 +189,11 @@ strong { font-weight:650; }
 .contact-number { text-align:center; font-size:23px; font-weight:650; margin:0 0 18px; user-select:text; }
 .contact-actions { display:grid; gap:10px; }
 .contact-dialog .field-note { margin-top:14px; }
+.route-destination { margin:16px 0; font-size:15px; line-height:1.45; overflow-wrap:anywhere; }
+.route-dialog #route-origin { margin:8px 0 10px; font-size:16px; }
+.route-dialog [data-route-location] { width:100%; }
+.route-actions { margin-top:16px; }
+.route-dialog-fallback { position:fixed; inset:50% auto auto 50%; transform:translate(-50%,-50%); margin:0; z-index:1000; box-shadow:0 0 0 100vmax rgba(14,26,43,.32),var(--shadow); }
 .clipboard-copy { position:fixed; top:0; left:0; width:1px; min-height:1px; height:1px; padding:0; opacity:.01; }
 .submitting .step-content { pointer-events:none; opacity:.85; }
 .submitting .steps { pointer-events:none; opacity:.65; }

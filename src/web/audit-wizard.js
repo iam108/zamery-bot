@@ -11,8 +11,8 @@ function auditWizard() {
   <title>Выезд аудитора</title>
   <script src="https://telegram.org/js/telegram-web-app.js"><\/script>
   <script src="/auth.js"><\/script>
-  <link rel="stylesheet" href="/audit-wizard.css?v=20261030-actions3">
-  <link rel="stylesheet" href="/audit-plan-editor.css?v=20261030-actions3">
+  <link rel="stylesheet" href="/audit-wizard.css?v=20261030-actions4">
+  <link rel="stylesheet" href="/audit-plan-editor.css?v=20261030-actions4">
 </head>
 <body>
   <div class="ambient-layer" aria-hidden="true">
@@ -35,9 +35,10 @@ function auditWizard() {
   <footer class="bottom-bar glass"><div class="bottom-inner"><button type="button" class="button secondary" id="previous-step">← Назад</button><span id="step-counter">1 из 3</span><button type="button" class="button primary" id="next-step">Далее →</button></div></footer>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   <script src="/audit-editor-geometry.js"><\/script>
-  <script src="/audit-plan-editor.js?v=20261030-actions3"><\/script>
-  <script src="/audit-actions.js?v=20261030-actions3"><\/script>
-  <script src="/audit-wizard-client.js?v=20261030-actions3"><\/script>
+  <script src="/audit-plan-editor.js?v=20261030-actions4"><\/script>
+  <script src="/audit-actions.js?v=20261030-actions4"><\/script>
+  <script src="/audit-route.js?v=20261030-actions4"><\/script>
+  <script src="/audit-wizard-client.js?v=20261030-actions4"><\/script>
 </body>
 </html>`;
 }
