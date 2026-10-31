@@ -75,6 +75,7 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
   require('./order-materials').setupOrderMaterials(app);
   require('./order-archive').setupOrderArchive(app);
+  require('./order-route').setupOrderRoute(app);
 
   require('./audit-drafts').setupAuditDrafts(app);
 

@@ -102,11 +102,14 @@ test('contact sheet uses the same native iOS and desktop handoff behavior as the
   }
 });
 
-test('route click opens the start-point chooser rather than sending an empty origin to Maps',()=>{
-  const c=harness(),button={};let opened=0;
-  c.showRoute=()=>{opened++;};c.openExternal=()=>{assert.fail('No empty-origin route should be dispatched by the first click');};
-  const scope={querySelectorAll:()=>[],querySelector:s=>s==='[data-route]'?button:null};load(c,'bind');c.bind(scope);
-  let prevented=false;button.onclick({preventDefault(){prevented=true;}});assert.equal(prevented,true);assert.equal(opened,1);
+test('route binding prepares the saved object once and reuses it across renders',()=>{
+  const c=harness(),button={};let prepared=0,bound=0;
+  c.routeController=null;c.routeControllerKey='';c.state.packet.address='Москва, Тестовая, 1';
+  c.actions=require('../public/audit-actions');c.saveBeforePhone=()=>{};c.openExternal=()=>true;
+  c.window.AuditRoute={prepare(options){prepared++;assert.equal(options.address,'Москва, Тестовая, 1');options.load();return{bind(b){assert.equal(b,button);bound++;}};}};
+  const scope={querySelectorAll:()=>[],querySelector:s=>s==='[data-route]'?button:null};
+  load(c,'bindRouteAction','bind');c.bind(scope);c.bind(scope);
+  assert.equal(prepared,1);assert.equal(bound,2);assert.equal(c.calls.find(x=>x[0]==='request')[1],'/api/audit/orders/123/route');
 });
 
 test('retry exports only current images and retires removed extra artifacts while keeping originals',async()=>{
