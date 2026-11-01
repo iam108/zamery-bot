@@ -16,12 +16,13 @@ async function read(store, id) {
 
 // A transactional in-memory SQL fixture for the large-file boundary. PostgreSQL
 // syntax, actual BYTEA, constraints and rollback are additionally tested below.
-function memoryPool() {
+function memoryPool(options = {}) {
   let files = new Map(), chunks = new Map(), lock = Promise.resolve(), released = 0;
   const calls = [];
   function cloneChunks(value) { return new Map([...value].map(([id, entries]) => [id, new Map(entries)])); }
   async function query(sql, params = [], state = { files, chunks }) {
-    calls.push({ sql, chunk: sql.startsWith('INSERT INTO egrn_file_chunks') ? params[1] : undefined });
+    calls.push({ sql, chunk: sql.startsWith('INSERT INTO egrn_file_chunks') ? params[1] : undefined,
+      bytes: sql.startsWith('INSERT INTO egrn_file_chunks') ? params[2].length : undefined });
     if (sql.includes('CREATE TABLE') || sql.includes('pg_advisory_xact_lock')) return { rows: [] };
     if (sql.startsWith('INSERT INTO egrn_files(')) {
       if (state.files.has(params[0])) return { rows: [] };
@@ -31,7 +32,8 @@ function memoryPool() {
     }
     if (sql.startsWith('INSERT INTO egrn_file_chunks')) {
       if (!state.chunks.has(params[0])) state.chunks.set(params[0], new Map());
-      state.chunks.get(params[0]).set(params[1], Buffer.from(params[2]));
+      state.chunks.get(params[0]).set(params[1], options.retain === false ? { bytes: params[2].length } : Buffer.from(params[2]));
+      if (options.onChunk) await options.onChunk(params);
       return { rows: [] };
     }
     if (sql.includes(' FROM egrn_files WHERE id=')) return { rows: state.files.has(params[0]) ? [{ ...state.files.get(params[0]) }] : [] };
@@ -59,11 +61,11 @@ function memoryPool() {
 
 test('invalid order, source credentials, empty/non-document and oversized files never touch PostgreSQL', async () => {
   const pool = memoryPool(), store = createEgrnFileStore(pool);
-  assert.equal(MAX_BYTES, 200 * MiB);
+  assert.equal(MAX_BYTES, 2 * 1024 * MiB - 1);
   for (const request of [input(pdf(), { egrn_order_id: 0 }), input(pdf(), { egrn_order_id: '1e2' }), input(pdf(), { source_key: 'https://files.example/result?token=secret' }), input(pdf(), { source_key: 'token:secret' }), input(pdf(), { source_key: '' }), input(Buffer.alloc(0)), input(Buffer.from('<html>error</html>'))]) {
     await assert.rejects(store.save(request), failure => [400, 415].includes(failure.status));
   }
-  await assert.rejects(store.save(input(Buffer.allocUnsafe(MAX_BYTES + 1))), failure => failure.status === 413 && failure.code === 'EGRN_FILE_TOO_LARGE');
+  await assert.rejects(store.saveStream({ ...input(), bytes: MAX_BYTES + 1, sha256: digest(pdf()), open: async function* () { throw new Error('must not open'); } }), failure => failure.status === 413 && failure.code === 'EGRN_FILE_TOO_LARGE');
   assert.equal(pool.calls.length, 0);
   assert.equal(await store.get('not-a-uuid'), null);
 });
@@ -116,6 +118,98 @@ test('unknown files cannot stream an empty successful download', async () => {
   }
 });
 
+test('saveStream joins tiny fragments, splits oversized chunks and deduplicates without opening its source', async () => {
+  const pool = memoryPool(), store = createEgrnFileStore(pool), buffer = pdf(2 * MiB + 17);
+  const details = { egrn_order_id: 1, source_key: 'stream:0', name: 'Поток.pdf', bytes: buffer.length, sha256: digest(buffer) };
+  let opened = 0, closed = 0;
+  const saved = await store.saveStream({ ...details, open: async function* () {
+    opened++;
+    try { yield buffer.subarray(0, 1); yield buffer.subarray(1, 4); yield buffer.subarray(4); }
+    finally { closed++; }
+  } });
+  assert.equal(opened, 1); assert.equal(closed, 1);
+  assert.deepEqual(await read(store, saved.id), { bytes: buffer.length, count: 3, sha256: details.sha256 });
+  assert.deepEqual(pool.calls.filter(call => call.chunk !== undefined).map(call => call.bytes), [MiB, MiB, 17]);
+  const duplicate = await store.saveStream({ ...details, name: 'Другое имя.pdf', open() { opened++; throw new Error('A duplicate must not reopen the original.'); } });
+  assert.deepEqual(duplicate, saved);
+  assert.equal(opened, 1);
+  assert.equal(pool.calls.filter(call => call.chunk !== undefined).length, 3);
+  assert.equal((await store.save(input(buffer, { source_key: details.source_key }))).id, saved.id);
+});
+
+test('a stream over 200 MiB is persisted with bounded chunks without constructing a full file Buffer', async () => {
+  const pool = memoryPool({ retain: false }), store = createEgrnFileStore(pool);
+  const slab = pdf(3 * MiB + 47), tail = Buffer.alloc(19, 0x62), repeat = 67;
+  const hash = createHash('sha256'); for (let index = 0; index < repeat; index++) hash.update(slab); hash.update(tail);
+  const bytes = slab.length * repeat + tail.length, sha256 = hash.digest('hex');
+  let opened = 0, closed = 0;
+  const saved = await store.saveStream({ egrn_order_id: 1, source_key: 'large-stream', name: 'Большая выписка.pdf', bytes, sha256,
+    open: async function* () {
+      opened++;
+      try { for (let index = 0; index < repeat; index++) yield slab; yield tail; }
+      finally { closed++; }
+    } });
+  assert.ok(bytes > 200 * MiB);
+  assert.equal(saved.bytes, bytes); assert.equal(saved.sha256, sha256);
+  assert.equal(opened, 1); assert.equal(closed, 1);
+  const inserts = pool.calls.filter(call => call.chunk !== undefined);
+  assert.equal(inserts.length, Math.ceil(bytes / MiB));
+  assert.equal(inserts.reduce((sum, call) => sum + call.bytes, 0), bytes);
+  assert.ok(inserts.every(call => call.bytes <= MiB));
+});
+
+test('short, extra, wrong-hash, invalid-magic and failing streams roll back metadata and partial chunks', async () => {
+  const buffer = pdf(MiB + 30);
+  for (const [mode, expected] of [['short', 'EGRN_FILE_SIZE'], ['extra', 'EGRN_FILE_SIZE'], ['hash', 'EGRN_FILE_CHANGED'], ['type', 'EGRN_FILE_TYPE'], ['failure', undefined]]) {
+    const pool = memoryPool(), store = createEgrnFileStore(pool); let closed = false;
+    const source = mode === 'type' ? Buffer.alloc(buffer.length, 0x78) : buffer;
+    const bytes = source.length + (mode === 'short' ? 1 : mode === 'extra' ? -1 : 0);
+    await assert.rejects(store.saveStream({ egrn_order_id: 1, source_key: mode, name: 'Выписка.pdf', bytes,
+      sha256: mode === 'hash' ? '0'.repeat(64) : digest(source),
+      chunks: (async function* () {
+        try { yield source.subarray(0, MiB); if (mode === 'failure') throw new Error('injected source failure'); yield source.subarray(MiB); }
+        finally { closed = true; }
+      })()
+    }), failure => expected ? failure.code === expected : /injected source failure/.test(failure.message));
+    assert.equal(closed, true, mode);
+    assert.deepEqual(await store.listByOrder(1), [], mode);
+  }
+});
+
+test('cancellation while awaiting the source closes it and rolls back the active transaction', { timeout: 2000 }, async () => {
+  const pool = memoryPool(), store = createEgrnFileStore(pool), controller = new AbortController();
+  const buffer = pdf(MiB + 30); let reads = 0, closed = false;
+  const chunks = {
+    [Symbol.asyncIterator]() { return this; },
+    next() {
+      reads++;
+      if (reads === 1) return Promise.resolve({ value: buffer.subarray(0, MiB), done: false });
+      queueMicrotask(() => controller.abort());
+      return new Promise(() => {});
+    },
+    return() { closed = true; return Promise.resolve({ done: true }); }
+  };
+  await assert.rejects(store.saveStream({ egrn_order_id: 1, source_key: 'cancel', name: 'Выписка.pdf',
+    bytes: buffer.length, sha256: digest(buffer), chunks, signal: controller.signal }), failure => failure.code === 'EGRN_FILE_CANCELLED');
+  assert.equal(closed, true);
+  assert.deepEqual(await store.listByOrder(1), []);
+});
+
+test('cancellation does not wait for an asynchronous opener and cleans up a late source', { timeout: 2000 }, async () => {
+  const store = createEgrnFileStore(memoryPool()), controller = new AbortController();
+  let finishOpen, started, closed = false;
+  const opening = new Promise(resolve => { finishOpen = resolve; });
+  const begun = new Promise(resolve => { started = resolve; });
+  const saving = store.saveStream({ egrn_order_id: 1, source_key: 'cancel-open', name: 'Выписка.pdf',
+    bytes: 48, sha256: digest(pdf()), signal: controller.signal, open() { started(); return opening; } });
+  await begun; controller.abort();
+  await assert.rejects(saving, failure => failure.code === 'EGRN_FILE_CANCELLED');
+  finishOpen({ [Symbol.asyncIterator]() { return { return() { closed = true; return Promise.resolve({ done: true }); } }; } });
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(closed, true);
+  assert.deepEqual(await store.listByOrder(1), []);
+});
+
 test('PostgreSQL schema, BYTEA copies, streaming, rollback and restart persistence', { skip: !process.env.PGLITE_TEST_MODULE }, async () => {
   const { PGlite } = require(process.env.PGLITE_TEST_MODULE);
   const db = new PGlite(); let tail = Promise.resolve();
@@ -141,6 +235,21 @@ test('PostgreSQL schema, BYTEA copies, streaming, rollback and restart persisten
     assert.deepEqual(await restarted.get(saved.id), saved);
     assert.equal((await restarted.listByOrder(1)).length, 1);
     assert.equal(Number((await pool.query('SELECT COUNT(*) AS count FROM egrn_file_chunks', [])).rows[0].count), 3);
+
+    // Upgrade the deployed 200 MiB named constraint without replacing its files.
+    await pool.query('ALTER TABLE egrn_files DROP CONSTRAINT egrn_files_bytes_check; ALTER TABLE egrn_files ADD CONSTRAINT egrn_files_bytes_check CHECK(bytes BETWEEN 1 AND 209715200)');
+    await createEgrnFileStore(pool).ensure(); await createEgrnFileStore(pool).ensure();
+    assert.deepEqual(await restarted.get(saved.id), saved);
+    assert.equal((await read(restarted, saved.id)).sha256, expected);
+    const definition = (await pool.query("SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conname='egrn_files_bytes_check'", [])).rows[0].definition;
+    assert.ok(definition.includes(String(MAX_BYTES)));
+    const migrationClient = await pool.connect();
+    try {
+      await migrationClient.query('BEGIN');
+      await migrationClient.query('INSERT INTO egrn_files(id,egrn_order_id,source_key,name,mime,bytes,sha256) VALUES($1,1,$2,$3,$4,$5,$6)',
+        ['00000000-0000-5000-8000-000000000001', 'migration-proof', 'Выписка.pdf', 'application/pdf', MAX_BYTES, expected]);
+      await migrationClient.query('ROLLBACK');
+    } finally { migrationClient.release(); }
 
     // PostgreSQL must roll back both metadata and the already-written first chunk.
     const failPool = { ...pool, async connect() {

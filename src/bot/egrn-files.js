@@ -1,6 +1,6 @@
 const { createHash } = require('node:crypto');
 
-const MAX_BYTES = 200 * 1024 * 1024;
+const MAX_BYTES = 2 * 1024 * 1024 * 1024 - 1; // PostgreSQL INTEGER upper bound.
 const CHUNK_BYTES = 1024 * 1024;
 const UUID_NAMESPACE = Buffer.from('6ba7b8109dad11d180b400c04fd430c8', 'hex');
 const COLUMNS = 'id,egrn_order_id,source_key,name,mime,bytes,sha256';
@@ -11,11 +11,13 @@ const DDL = `
     source_key TEXT NOT NULL CHECK(length(source_key) BETWEEN 1 AND 512),
     name TEXT NOT NULL,
     mime TEXT NOT NULL CHECK(mime IN ('application/pdf','application/zip')),
-    bytes INTEGER NOT NULL CHECK(bytes BETWEEN 1 AND ${MAX_BYTES}),
+    bytes INTEGER NOT NULL CONSTRAINT egrn_files_bytes_check CHECK(bytes BETWEEN 1 AND ${MAX_BYTES}),
     sha256 TEXT NOT NULL CHECK(sha256 ~ '^[0-9a-f]{64}$'),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(egrn_order_id,source_key,sha256)
   );
+  ALTER TABLE egrn_files DROP CONSTRAINT IF EXISTS egrn_files_bytes_check;
+  ALTER TABLE egrn_files ADD CONSTRAINT egrn_files_bytes_check CHECK(bytes BETWEEN 1 AND ${MAX_BYTES});
   CREATE INDEX IF NOT EXISTS egrn_files_order ON egrn_files(egrn_order_id,created_at,id);
   CREATE TABLE IF NOT EXISTS egrn_file_chunks (
     file_id UUID NOT NULL REFERENCES egrn_files(id) ON DELETE CASCADE,
@@ -41,10 +43,83 @@ function sourceKey(value) {
 }
 function fileType(buffer) {
   if (!Buffer.isBuffer(buffer) || !buffer.length) throw error(400, 'EGRN_FILE_EMPTY', 'Файл выписки пуст или не получен.');
-  if (buffer.length > MAX_BYTES) throw error(413, 'EGRN_FILE_TOO_LARGE', 'Файл выписки превышает лимит 200 МБ.');
+  if (buffer.length > MAX_BYTES) throw error(413, 'EGRN_FILE_TOO_LARGE', 'Файл выписки превышает допустимый размер.');
   if (buffer.subarray(0, 5).equals(Buffer.from('%PDF-'))) return { mime: 'application/pdf', extension: 'pdf' };
   if (['504b0304', '504b0506', '504b0708'].includes(buffer.subarray(0, 4).toString('hex'))) return { mime: 'application/zip', extension: 'zip' };
   throw error(415, 'EGRN_FILE_TYPE', 'Сохранить можно только оригинал выписки в PDF или ZIP.');
+}
+function streamDetails(input) {
+  const bytes = input?.bytes;
+  if (!Number.isSafeInteger(bytes) || bytes <= 0) throw error(400, 'EGRN_FILE_SIZE', 'Не указан корректный размер файла выписки.');
+  if (bytes > MAX_BYTES) throw error(413, 'EGRN_FILE_TOO_LARGE', 'Файл выписки превышает допустимый размер.');
+  if (typeof input.sha256 !== 'string' || !/^[0-9a-f]{64}$/i.test(input.sha256)) throw error(400, 'EGRN_FILE_HASH', 'Не указана контрольная сумма файла выписки.');
+  if (typeof input.open !== 'function' && typeof input.chunks?.[Symbol.asyncIterator] !== 'function') throw error(400, 'EGRN_FILE_STREAM', 'Не получен поток оригинала выписки.');
+  return { bytes, sha256: input.sha256.toLowerCase() };
+}
+function cancelled() { return error(499, 'EGRN_FILE_CANCELLED', 'Сохранение оригинала выписки отменено.'); }
+async function streamReader(input, bytes) {
+  const signal = input.signal;
+  if (signal && (typeof signal.addEventListener !== 'function' || typeof signal.removeEventListener !== 'function')) throw error(400, 'EGRN_FILE_STREAM', 'Некорректный сигнал отмены сохранения.');
+  let done = false, part = null, offset = 0, received = 0, produced = 0, rejectAbort;
+  const abortPromise = new Promise((_, reject) => { rejectAbort = reject; });
+  abortPromise.catch(() => {});
+  const abort = () => rejectAbort(cancelled());
+  signal?.addEventListener('abort', abort, { once: true });
+  function check() { if (signal?.aborted) throw cancelled(); }
+  let source, iterator;
+  try {
+    check();
+    const opening = Promise.resolve().then(() => typeof input.open === 'function' ? input.open() : input.chunks);
+    // If an asynchronous opener settles after cancellation, release the late
+    // source without keeping the transaction or a network/file handle alive.
+    opening.then(value => {
+      if (!signal?.aborted) return;
+      try { value?.destroy?.(); } catch (_) {}
+      try { Promise.resolve(value?.[Symbol.asyncIterator]?.().return?.()).catch(() => {}); } catch (_) {}
+    }).catch(() => {});
+    source = await Promise.race([opening, abortPromise]); check();
+    if (typeof source?.[Symbol.asyncIterator] !== 'function') throw error(400, 'EGRN_FILE_STREAM', 'Не получен поток оригинала выписки.');
+    iterator = source[Symbol.asyncIterator]();
+  } catch (failure) { signal?.removeEventListener('abort', abort); throw failure; }
+  async function load() {
+    while (!part || offset === part.length) {
+      check();
+      if (done) return false;
+      const next = await Promise.race([Promise.resolve().then(() => iterator.next()), abortPromise]);
+      check();
+      if (next.done) { done = true; return false; }
+      if (!(Buffer.isBuffer(next.value) || next.value instanceof Uint8Array)) throw error(400, 'EGRN_FILE_STREAM', 'Поток выписки содержит некорректные данные.');
+      part = Buffer.from(next.value.buffer, next.value.byteOffset, next.value.byteLength); offset = 0;
+      received += part.length;
+      if (received > MAX_BYTES) throw error(413, 'EGRN_FILE_TOO_LARGE', 'Файл выписки превышает допустимый размер.');
+      if (received > bytes) throw error(409, 'EGRN_FILE_SIZE', 'Размер оригинала выписки не совпадает с заявленным.');
+    }
+    return true;
+  }
+  return {
+    check,
+    async next() {
+      check();
+      if (produced === bytes) { if (await load()) throw error(409, 'EGRN_FILE_SIZE', 'Размер оригинала выписки не совпадает с заявленным.'); return null; }
+      const content = Buffer.allocUnsafe(Math.min(CHUNK_BYTES, bytes - produced)); let written = 0;
+      while (written < content.length && await load()) {
+        const length = Math.min(content.length - written, part.length - offset);
+        part.copy(content, written, offset, offset + length); written += length; offset += length;
+      }
+      if (written !== content.length) throw error(409, 'EGRN_FILE_SIZE', 'Оригинал выписки получен не полностью.');
+      produced += written; return content;
+    },
+    async close() {
+      signal?.removeEventListener('abort', abort);
+      if (!done) {
+        try { if (typeof source.destroy === 'function') source.destroy(); } catch (_) {}
+        try {
+          const closing = Promise.resolve(iterator.return?.());
+          if (signal?.aborted) closing.catch(() => {}); else await closing.catch(() => {});
+        } catch (_) {}
+      }
+    }
+  };
 }
 function filename(value, extension) {
   let name = typeof value === 'string' ? value.normalize('NFC').split(/[?#]/)[0].split(/[\\/]/).pop() : '';
@@ -85,21 +160,38 @@ function createEgrnFileStore(pool) {
     return ready;
   }
   async function save(input) {
-    const order = orderId(input?.egrn_order_id), key = sourceKey(input?.source_key), buffer = input?.buffer;
-    const type = fileType(buffer), name = filename(input?.name, type.extension);
-    const sha256 = createHash('sha256').update(buffer).digest('hex'), id = fileId(order, key, sha256);
+    orderId(input?.egrn_order_id); sourceKey(input?.source_key);
+    const buffer = input?.buffer; fileType(buffer);
+    const sha256 = createHash('sha256').update(buffer).digest('hex');
+    return saveStream({ ...input, bytes: buffer.length, sha256, open: async function* () { yield buffer; } });
+  }
+  async function saveStream(input) {
+    const order = orderId(input?.egrn_order_id), key = sourceKey(input?.source_key);
+    const { bytes, sha256 } = streamDetails(input), id = fileId(order, key, sha256);
+    if (input.signal?.aborted) throw cancelled();
     await ensure();
-    const client = await pool.connect();
+    const client = await pool.connect(); let reader;
     try {
       await client.query('BEGIN');
+      // Serialize identical content before opening a potentially expensive source.
+      const compact = id.replace(/-/g, '');
+      await client.query('SELECT pg_advisory_xact_lock($1,$2)', [parseInt(compact.slice(0, 8), 16) | 0, parseInt(compact.slice(8, 16), 16) | 0]);
+      if (input.signal?.aborted) throw cancelled();
+      const existing = (await client.query(`SELECT ${COLUMNS} FROM egrn_files WHERE id=$1`, [id])).rows[0];
+      if (existing) {
+        if (Number(existing.egrn_order_id) !== order || existing.source_key !== key || existing.sha256 !== sha256 || Number(existing.bytes) !== bytes) throw error(409, 'EGRN_FILE_CONFLICT', 'Не удалось подтвердить ранее сохранённый файл выписки.');
+        await client.query('COMMIT'); return metadata(existing);
+      }
+      reader = await streamReader(input, bytes);
+      let content = await reader.next();
+      const type = fileType(content), name = filename(input.name, type.extension);
       const inserted = await client.query(`INSERT INTO egrn_files(${COLUMNS}) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO NOTHING RETURNING ${COLUMNS}`,
-        [id, order, key, name, type.mime, buffer.length, sha256]);
+        [id, order, key, name, type.mime, bytes, sha256]);
       let result;
       if (inserted.rows.length) {
         const writtenHash = createHash('sha256');
-        for (let start = 0, chunk = 0; start < buffer.length; start += CHUNK_BYTES, chunk++) {
-          // One private chunk at a time; do not duplicate an entire 100–200 MiB file.
-          const content = Buffer.from(buffer.subarray(start, start + CHUNK_BYTES));
+        for (let chunk = 0; content; chunk++, content = await reader.next()) {
+          reader.check();
           writtenHash.update(content);
           await client.query('INSERT INTO egrn_file_chunks(file_id,chunk_no,content) VALUES($1,$2,$3)', [id, chunk, content]);
         }
@@ -107,15 +199,16 @@ function createEgrnFileStore(pool) {
         result = metadata(inserted.rows[0]);
       } else {
         const existing = (await client.query(`SELECT ${COLUMNS} FROM egrn_files WHERE id=$1`, [id])).rows[0];
-        if (!existing || Number(existing.egrn_order_id) !== order || existing.source_key !== key || existing.sha256 !== sha256 || Number(existing.bytes) !== buffer.length || existing.mime !== type.mime) {
+        if (!existing || Number(existing.egrn_order_id) !== order || existing.source_key !== key || existing.sha256 !== sha256 || Number(existing.bytes) !== bytes || existing.mime !== type.mime) {
           throw error(409, 'EGRN_FILE_CONFLICT', 'Не удалось подтвердить ранее сохранённый файл выписки.');
         }
         result = metadata(existing);
       }
+      reader.check();
       await client.query('COMMIT');
       return result;
     } catch (failure) { await client.query('ROLLBACK').catch(() => {}); throw failure; }
-    finally { client.release(); }
+    finally { if (reader) await reader.close(); client.release(); }
   }
   async function get(id) {
     if (!validId(id)) return null;
@@ -142,7 +235,7 @@ function createEgrnFileStore(pool) {
     const extra = await pool.query('SELECT chunk_no FROM egrn_file_chunks WHERE file_id=$1 AND chunk_no >= $2 LIMIT 1', [id, index]);
     if (extra.rows.length || hash.digest('hex') !== file.sha256) throw error(500, 'EGRN_FILE_CORRUPT', 'Не удалось подтвердить целостность оригинала выписки.');
   }
-  return { ensure, save, get, listByOrder, chunks };
+  return { ensure, save, saveStream, get, listByOrder, chunks };
 }
 
 // Resolve the existing pool lazily: importing helpers does not open a connection.
@@ -150,5 +243,6 @@ let singleton;
 function store() { return singleton ||= createEgrnFileStore(require('../db/pool')); }
 module.exports = { MAX_BYTES, createEgrnFileStore,
   ensure: (...args) => store().ensure(...args), save: (...args) => store().save(...args),
+  saveStream: (...args) => store().saveStream(...args),
   get: (...args) => store().get(...args), listByOrder: (...args) => store().listByOrder(...args),
   chunks: (...args) => store().chunks(...args) };

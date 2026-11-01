@@ -2,12 +2,14 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { createHash } = require('node:crypto');
 const { createLargeDelivery } = require('../src/bot/egrn-large-delivery');
 
 const FILE_ID = '11111111-2222-4333-8444-555555555555';
 const OTHER_FILE_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 const PDF = Buffer.from('%PDF-1.7\nEGRN original test bytes\n%%EOF');
 const KEY = 'embedded:0:ЕГРН.pdf';
+const PDF_SHA256 = createHash('sha256').update(PDF).digest('hex');
 const copy = value => JSON.parse(JSON.stringify(value));
 
 function fixture(overrides = {}) {
@@ -43,6 +45,10 @@ function safeTemporary(error) {
 function lookupOnlyRecord(order = {}) {
   return {key:KEY,kind:'link',original_id:FILE_ID,name:'ЕГРН.pdf',mime:'application/pdf',bytes:100*1024*1024,
     cad_num:'77:01:0004016:1064',label:'Тестовый объект',deliveries:[],chat:-1001,...order};
+}
+function streamedFile(overrides = {}) {
+  return { name:'ЕГРН.pdf',bytes:PDF.length,sha256:PDF_SHA256,
+    open:async function*(){yield PDF.subarray(0,10);yield PDF.subarray(10);},...overrides };
 }
 
 test('original and descriptor are durable before a link is sent; every target receipt is persisted immediately',async()=>{
@@ -178,4 +184,84 @@ test('manual copy rejects a missing original or invalid target without changing 
   await assert.rejects(h.service.copy(record,{chat:null}),safeTemporary);
   h.store.get=async()=>null;await assert.rejects(h.service.copy(record,{chat:4004}),safeTemporary);
   assert.equal(h.sends.length,sent);assert.deepEqual(record,before);
+});
+
+test('stream delivery delegates a lazy iterable without accessing or persisting file buffers or local paths',async()=>{
+  const h=fixture();let opened=0,consumed=0;
+  const file=streamedFile({path:'/private/tmp/SECRET-provider/original.pdf',open(){
+    assert.equal(this,file,'Keep the descriptor method context');opened++;
+    return (async function*(){for(const chunk of [PDF.subarray(0,10),PDF.subarray(10)]){consumed++;yield chunk;}})();
+  }});
+  Object.defineProperty(file,'buf',{get(){assert.fail('A streamed original must never be read as a Buffer');}});
+  h.store.saveStream=async input=>{
+    h.events.push(['saveStream']);assert.equal(opened,0,'Only storage opens the source');
+    assert.equal(input.egrn_order_id,h.order.id);assert.equal(input.source_key,KEY);assert.equal(input.name,file.name);
+    assert.equal(input.bytes,PDF.length);assert.equal(input.sha256,PDF_SHA256);assert.equal(input.buffer,undefined);
+    assert.deepEqual(Object.keys(input).sort(),['bytes','egrn_order_id','name','open','sha256','source_key']);
+    const hash=createHash('sha256');let bytes=0;
+    for await(const chunk of input.open()){assert.ok(Buffer.isBuffer(chunk));hash.update(chunk);bytes+=chunk.length;}
+    assert.equal(bytes,PDF.length);assert.equal(hash.digest('hex'),PDF_SHA256);
+    return {...h.meta,sha256:PDF_SHA256};
+  };
+  const record=await h.service.deliver(h.order,file,KEY,h.records);
+  assert.equal(h.state.saveCount,0);assert.equal(opened,1);assert.equal(consumed,2);
+  assert.equal(h.events[0][0],'saveStream');assert.equal(h.events[1][0],'persist');assert.equal(h.snapshots[0][0].deliveries.length,0);
+  assert.equal(record.bytes,PDF.length);assert.equal(h.sends.length,3);
+  assert.doesNotMatch(JSON.stringify(h.snapshots),/private\/tmp|SECRET-provider|"open"|"buf"|"buffer"|"path"/);
+  assert.doesNotMatch(h.sends.map(send=>send.text).join('\n'),/private\/tmp|SECRET-provider/);
+});
+
+test('originals above 200 MiB are accepted without opening a cached source or duplicating notification receipts',async()=>{
+  const h=fixture();let opened=0,saves=0;const bytes=201*1024*1024;
+  const file=streamedFile({bytes,sha256:PDF_SHA256.toUpperCase(),open(){opened++;assert.fail('Stored source must remain unopened');}});
+  h.store.saveStream=async input=>{saves++;assert.equal(input.bytes,bytes);assert.equal(input.sha256,PDF_SHA256);return {...h.meta,bytes,sha256:PDF_SHA256};};
+  const record=await h.service.deliver(h.order,file,KEY,h.records);const previous=h.sends.length;
+  assert.equal(record.bytes,bytes);assert.equal(h.sends[0].options.reply_markup.inline_keyboard[0][0].text,'Скачать выписку · 201 МБ');
+  assert.equal(await h.service.deliver(h.order,file,KEY,h.records),record);
+  assert.equal(saves,2);assert.equal(opened,0);assert.equal(h.state.saveCount,0);assert.equal(h.records.length,1);assert.equal(h.sends.length,previous);
+});
+
+test('invalid stream sizes, hashes and missing streaming storage are rejected before saving, persisting or sending',async()=>{
+  const invalid=[...[
+    undefined,null,'37',0,-1,1.5,NaN,Infinity,Number.MAX_SAFE_INTEGER+1
+  ].map(bytes=>({bytes})),...[
+    undefined,null,'','a'.repeat(63),'g'.repeat(64),' '+PDF_SHA256
+  ].map(sha256=>({sha256})),{open:null}];
+  for(const changes of invalid){
+    const h=fixture();h.store.saveStream=async()=>assert.fail('Invalid stream metadata must not reach storage');
+    await assert.rejects(h.service.deliver(h.order,streamedFile(changes),KEY,h.records),safeTemporary);
+    assert.equal(h.state.saveCount,0);assert.equal(h.state.persistCount,0);assert.equal(h.state.signCount,0);assert.equal(h.sends.length,0);assert.deepEqual(h.records,[]);
+  }
+  const h=fixture();await assert.rejects(h.service.deliver(h.order,streamedFile(),KEY,h.records),safeTemporary);
+  assert.equal(h.state.saveCount,0);assert.equal(h.state.persistCount,0);assert.equal(h.sends.length,0);
+});
+
+test('stream delivery verifies saved original size and digest before a descriptor or notification exists',async()=>{
+  for(const changes of [{bytes:PDF.length+1},{bytes:Number.MAX_SAFE_INTEGER+1},{sha256:'a'.repeat(64)},{sha256:null},{sha256:undefined}]){
+    const h=fixture();h.store.saveStream=async()=>({...h.meta,sha256:PDF_SHA256,...changes});
+    await assert.rejects(h.service.deliver(h.order,streamedFile(),KEY,h.records),safeTemporary);
+    assert.equal(h.state.persistCount,0);assert.equal(h.state.signCount,0);assert.equal(h.sends.length,0);assert.deepEqual(h.records,[]);
+  }
+});
+
+test('stream opening or storage failures stay sanitized and cannot become successful deliveries',async()=>{
+  for(const failure of ['open','storage']){
+    const h=fixture();let opened=0;
+    const file=streamedFile({open(){opened++;if(failure==='open')throw new Error('/private/tmp/SECRET-source https://provider.example?token=PRIVATE');return (async function*(){yield PDF;})();}});
+    h.store.saveStream=async input=>{for await(const chunk of input.open()){assert.equal(chunk,PDF);throw new Error('postgres://user:SECRET@private.example/database');}};
+    await assert.rejects(h.service.deliver(h.order,file,KEY,h.records),safeTemporary);
+    assert.equal(opened,1);assert.equal(h.state.persistCount,0);assert.equal(h.state.signCount,0);assert.equal(h.sends.length,0);assert.deepEqual(h.records,[]);
+  }
+});
+
+test('retry after streamed storage uses only original metadata and sends solely the missing recipient',async()=>{
+  const h=fixture();let opened=0,streamSaves=0;
+  const file=streamedFile({open(){opened++;return (async function*(){yield PDF;})();}});
+  h.store.saveStream=async input=>{streamSaves++;for await(const chunk of input.open())assert.equal(chunk,PDF);return {...h.meta,sha256:PDF_SHA256};};
+  h.state.failChats.add(2002);
+  await assert.rejects(h.service.deliver(h.order,file,KEY,h.records),safeTemporary);
+  assert.equal(opened,1);assert.equal(streamSaves,1);assert.deepEqual(h.records[0].deliveries.map(value=>value.chat),[-1001,3003]);
+  h.store.get=async()=>{const value={...h.meta,sha256:PDF_SHA256};Object.defineProperty(value,'buffer',{get(){assert.fail('Retry must not load the original');}});return value;};
+  h.state.failChats.clear();const sent=h.sends.length;await h.service.retry(h.order,h.records[0],h.records);
+  assert.deepEqual(h.sends.slice(sent).map(value=>value.chat),[2002]);assert.equal(opened,1);assert.equal(streamSaves,1);assert.equal(h.state.saveCount,0);
 });

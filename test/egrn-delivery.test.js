@@ -38,7 +38,7 @@ function harness({ docs = [], urls = [], downloadedSize = 10, sendError, orderFi
         async deliver(o,file,key,records) {
           linkCalls.push({file,key});
           const failure=typeof linkError==='function'?linkError():linkError;if(failure)throw failure;
-          const record={kind:'link',key,original_id:'saved-large-file',name:file.name,bytes:file.buf.length,deliveries:[]};
+          const record={kind:'link',key,original_id:'saved-large-file',name:file.name,bytes:file.buf?file.buf.length:file.bytes,deliveries:[]};
           records.push(record);await persist(o,records);return record;
         },
         async retry(o,record,records) { const failure=typeof linkError==='function'?linkError():linkError;if(failure)throw failure;linkCalls.push({retry:record.original_id});await persist(o,records);return record; },
@@ -47,7 +47,7 @@ function harness({ docs = [], urls = [], downloadedSize = 10, sendError, orderFi
 
       throw new Error('Unexpected require: ' + name);
     },
-    process: { env: { EGRN_TOKEN: 'test', EGRN_DECLARANT_ID: '1' } },
+    Buffer, process: { env: { EGRN_TOKEN: 'test', EGRN_DECLARANT_ID: '1' } },
     console: { error(...args) { logs.push(args); } },
     fetch(){apiCalls.push('forbidden');throw new Error('Unexpected paid API request');},
     setTimeout: (fn) => { poll = fn; }, setInterval() {},
@@ -318,9 +318,40 @@ test('migration recovers only recent ready size failures, including structured T
   const ddl=h.queries.find(value=>value.sql.includes('CREATE TABLE IF NOT EXISTS egrn_orders')).sql;
   try{
     await db.exec(ddl);
-    for(const [error,status,age] of [['Файл слишком большой для Telegram: 100000000 байт','done',1],['413: Request Entity Too Large','done',1],['Request Entity Too Large','done',1],['502; 413: Request Entity Too Large','done',1],['download 500 for order 413','done',1],['502 Bad Gateway','done',1],['413: Request Entity Too Large','failed',1],['413: Request Entity Too Large','done',31]])
+    for(const [error,status,age] of [['Файл слишком большой для Telegram: 100000000 байт','done',1],['413: Request Entity Too Large','done',1],['Request Entity Too Large','done',1],['502; 413: Request Entity Too Large','done',1],['download 500 for order 413','done',1],['502 Bad Gateway','done',1],['413: Request Entity Too Large','failed',1],['413: Request Entity Too Large','done',31],['Файл выписки превышает 200 МБ.','done',1],['Файл выписки превышает 200 МБ.','done',31],['Файл выписки превышает 200 МБ.','failed',1],['Случайная ошибка 200 МБ.','done',1]])
       await db.query("INSERT INTO egrn_orders(cad_num,type_doc,error,status,files_sent,created_at) VALUES('77:01:0000000:1','kvarmrusxmlpdf',$1,$2,-1,NOW()-$3::int*INTERVAL '1 day')",[error,status,age]);
     await db.exec(ddl);
-    assert.deepEqual((await db.query('SELECT files_sent FROM egrn_orders ORDER BY id')).rows.map(row=>row.files_sent),[0,0,0,0,-1,-1,-1,-1]);
+    assert.deepEqual((await db.query('SELECT files_sent FROM egrn_orders ORDER BY id')).rows.map(row=>row.files_sent),[0,0,0,0,-1,-1,-1,-1,0,-1,-1,-1]);
   }finally{await db.close();}
+});
+
+test('poll delivers a streamed file over 200 MiB without assembling a buffer and always cleans the source',async()=>{
+  let cleaned=0, opened=0;
+  const file={name:'large.pdf',bytes:300*1024*1024,sha256:'a'.repeat(64),open(){opened++;throw new Error('The poller must pass the lazy source directly to storage');}};
+  const source={item:{id_req:42,status:[]},hasFiles:true,async documents(){return[file];},async cleanup(){cleaned++;}};
+  const h=harness({statusRequest:async()=>source});await h.poll();
+  assert.equal(h.order.files_sent,1);assert.equal(h.sent.length,0);assert.equal(h.linkCalls[0].file,file);
+  assert.equal(cleaned,1);assert.equal(opened,0);assert.equal(h.apiCalls.length,0);
+  assert.equal(h.queries.some(q=>q.sql.includes('INSERT INTO egrn_orders')),false);
+});
+
+test('streamed delivery failure keeps a retry and releases its temporary source',async()=>{
+  let cleaned=0;
+  const file={name:'large.pdf',bytes:300*1024*1024,sha256:'a'.repeat(64),open(){throw new Error('Not expected');}};
+  const h=harness({statusRequest:async()=>({item:{id_req:42,status:[]},hasFiles:true,async documents(){return[file];},async cleanup(){cleaned++;}}),linkError:new Error('Temporary storage failure')});
+  await h.poll();assert.equal(h.order.files_sent,0);assert.equal(h.order.failures,1);assert.equal(cleaned,1);assert.equal(h.sent.length,0);assert.equal(h.apiCalls.length,0);
+});
+
+test('small streamed PDF keeps native Telegram delivery',async()=>{
+  let cleaned=0;
+  const bytes=Buffer.from('%PDF-1.7\nsmall');
+  const file={name:'small.pdf',bytes:bytes.length,open:async function*(){yield bytes.subarray(0,5);yield bytes.subarray(5);}};
+  const h=harness({statusRequest:async()=>({item:{id_req:42,status:[]},hasFiles:true,async documents(){return[file];},async cleanup(){cleaned++;}})});
+  await h.poll();assert.equal(h.order.files_sent,1);assert.equal(h.sent.length,1);assert.deepEqual(h.sent[0].source,bytes);assert.equal(cleaned,1);assert.equal(h.linkCalls.length,0);
+});
+
+test('document extraction errors release the private temporary files without delivering success',async()=>{
+  let cleaned=0;
+  const h=harness({statusRequest:async()=>({item:{id_req:42,status:[]},hasFiles:true,async documents(){throw new Error('Interrupted file');},async cleanup(){cleaned++;}})});
+  await h.poll();assert.equal(cleaned,1);assert.equal(h.order.files_sent,0);assert.equal(h.sent.length,0);assert.equal(h.linkCalls.length,0);assert.equal(h.apiCalls.length,0);
 });

@@ -2,6 +2,7 @@
 
 const MESSAGE = 'Не удалось доставить ссылку на выписку. Повторим отправку автоматически.';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SHA256 = /^[0-9a-f]{64}$/i;
 
 function temporaryError() {
   return Object.assign(new Error(MESSAGE), { code: 'EGRN_LARGE_DELIVERY_TEMPORARY', temporary: true });
@@ -69,6 +70,7 @@ function messageText(record) {
 function createLargeDelivery(options = {}) {
   const store = options.store || {
     save(input) { return require('./egrn-files').save(input); },
+    saveStream(input) { return require('./egrn-files').saveStream(input); },
     get(id) { return require('./egrn-files').get(id); }
   };
   const makeUrl = options.makeUrl || (id => require('../web/egrn-downloads').createDownloadUrl(id));
@@ -143,10 +145,26 @@ function createLargeDelivery(options = {}) {
     try {
       requireSender(); requirePersist();
       if (!order || !positive(order.id) || !file || typeof file.name !== 'string' || !file.name.trim() ||
-          !Buffer.isBuffer(file.buf) || !file.buf.length || typeof key !== 'string' || !key || !Array.isArray(records) ||
-          !store || typeof store.save !== 'function') throw temporaryError();
-      const saved = metadata(await store.save({ egrn_order_id: positive(order.id), source_key: key, name: file.name, buffer: file.buf }), null, order);
-      if (saved.bytes !== file.buf.length) throw temporaryError();
+          typeof key !== 'string' || !key || !Array.isArray(records) || !store) throw temporaryError();
+      const input = { egrn_order_id: positive(order.id), source_key: key, name: file.name };
+      let original, expectedBytes;
+      if (typeof file.open === 'function') {
+        if (typeof file.bytes !== 'number' || !Number.isSafeInteger(file.bytes) || file.bytes <= 0 ||
+            typeof file.sha256 !== 'string' || !SHA256.test(file.sha256) || typeof store.saveStream !== 'function') throw temporaryError();
+        expectedBytes = file.bytes;
+        const sha256 = file.sha256.toLowerCase();
+        // The store owns iteration and integrity checks. Keep the source lazy so
+        // an already stored original does not need to be opened or buffered.
+        original = await store.saveStream({ ...input, bytes: expectedBytes, sha256, open: () => file.open() });
+        if (!original || typeof original.sha256 !== 'string' || !SHA256.test(original.sha256) ||
+            original.sha256.toLowerCase() !== sha256) throw temporaryError();
+      } else {
+        if (!Buffer.isBuffer(file.buf) || !file.buf.length || typeof store.save !== 'function') throw temporaryError();
+        expectedBytes = file.buf.length;
+        original = await store.save({ ...input, buffer: file.buf });
+      }
+      const saved = metadata(original, null, order);
+      if (saved.bytes !== expectedBytes) throw temporaryError();
       const existing = records.find(value => value && value.key === key);
       if (existing && (existing.kind !== 'link' || existing.original_id !== saved.id || existing.name !== saved.name ||
           existing.mime !== saved.mime || Number(existing.bytes) !== saved.bytes)) throw temporaryError();

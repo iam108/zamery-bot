@@ -12,9 +12,9 @@ const TYPES = {
 const CAD_RE = /\b\d{2}:\d{2}:\d{6,7}:\d{1,9}\b/g;
 const MAX_POLL_HOURS = 72;
 const MAX_DOCUMENT_BYTES = 50 * 1024 * 1024;
-const MAX_RECEIVED_BYTES = 200 * 1024 * 1024;
+const MAX_RECEIVED_BYTES = 2 * 1024 * 1024 * 1024 - 1;
 const MAX_FAILURES = 5;
-const REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
+const REQUEST_TIMEOUT_MS = 20 * 60 * 1000;
 
 function checkDocumentSize(buf) {
   if (buf.length <= MAX_DOCUMENT_BYTES) return;
@@ -108,7 +108,8 @@ function ensureTables() {
         WHERE files_sent=-1 AND status='done' AND created_at > NOW() - INTERVAL '30 days'
         AND (error LIKE '%Файл слишком большой для Telegram:%'
           OR error ~* '(^|;[[:space:]]*)413([:[:space:]]|$)'
-          OR error ~* '(^|;[[:space:]]*)Request Entity Too Large([[:space:][:punct:]]|$)');
+          OR error ~* '(^|;[[:space:]]*)Request Entity Too Large([[:space:][:punct:]]|$)'
+          OR error = 'Файл выписки превышает 200 МБ.');
       CREATE TABLE IF NOT EXISTS egrn_pending (
         id         SERIAL PRIMARY KEY,
         cad_num    TEXT NOT NULL,
@@ -157,12 +158,19 @@ function authHeaders() {
   return h;
 }
 
+let cleanedSources;
 async function apiStatus(idReq) {
-  const r = await fetch(API + '?id_req=' + encodeURIComponent(idReq), { headers: authHeaders(), signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-  const text = await r.text();
-  let j = null; try { j = JSON.parse(text); } catch (e) {}
-  if (!r.ok || !j) throw new Error('API ' + r.status + ': ' + String(text).slice(0, 200));
-  return j;
+  const source = require('./egrn-source');
+  if (!cleanedSources) cleanedSources = source.cleanupStale().catch(() => { cleanedSources = null; });
+  await cleanedSources;
+  const signal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+  const r = await fetch(API + '?id_req=' + encodeURIComponent(idReq), { headers: authHeaders(), signal });
+  if (!r.ok || !r.body) {
+    await r.body?.cancel().catch(() => {});
+    throw new Error('Сервис ЕГРН временно недоступен (HTTP ' + r.status + ').');
+  }
+  try { return await source.readStatusResponse(r.body, { idReq, signal }); }
+  catch (error) { await r.body.cancel().catch(() => {}); throw error; }
 }
 
 // Ищем запись по нашей заявке в ответе (формат: { "0": {...}, "1": {...} } или сразу объект)
@@ -242,7 +250,7 @@ function extractDocs(item, cad) {
   const docs = [];
   const base = String(cad || 'vypiska').replace(/:/g, '-');
   findEmbeddedFiles(item).forEach(function (f, i) {
-    if (f.b64.length > Math.ceil(MAX_RECEIVED_BYTES / 3) * 4) throw Object.assign(new Error('Файл выписки превышает 200 МБ.'), { code: 'EGRN_FILE_TOO_LARGE' });
+    if (f.b64.length > Math.ceil(MAX_RECEIVED_BYTES / 3) * 4) throw Object.assign(new Error('Файл выписки превышает 2 ГБ.'), { code: 'EGRN_FILE_TOO_LARGE' });
     const buf = Buffer.from(f.b64, 'base64');
     if (/^JVBER/.test(f.b64)) { docs.push({ name: 'ЕГРН_' + base + (i ? '_' + i : '') + '.pdf', buf: buf, kind: 'pdf' }); return; }
     try {
@@ -281,30 +289,57 @@ function findFileUrls(item) {
 }
 
 async function download(url) {
-  const r = await fetch(url, { headers: authHeaders(), signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-  if (!r.ok) throw new Error('download ' + r.status);
+  const signal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+  let target;
+  try { target = new URL(url); } catch (_) { throw new Error('Сервис передал некорректную ссылку на выписку.'); }
+  let r;
+  for (let redirects = 0; redirects <= 5; redirects++) {
+    if (target.protocol !== 'https:' || target.username || target.password) throw new Error('Сервис передал небезопасную ссылку на выписку.');
+    // Custom authorization headers must not follow a link/redirect to a
+    // different file-hosting service. Those links supply their own access.
+    const headers = target.origin === new URL(API).origin ? authHeaders() : {};
+    r = await fetch(target.href, { headers, signal, redirect: 'manual' });
+    if (![301, 302, 303, 307, 308].includes(r.status)) break;
+    const location = r.headers.get('location'); await r.body?.cancel().catch(() => {});
+    if (!location || redirects === 5) throw new Error('Не удалось открыть ссылку на выписку.');
+    target = new URL(location, target);
+  }
+  if (!r.ok) { await r.body?.cancel().catch(() => {}); throw new Error('Не удалось скачать выписку (HTTP ' + r.status + ').'); }
   if (Number(r.headers.get('content-length')) > MAX_RECEIVED_BYTES) {
     await r.body?.cancel().catch(() => {});
-    throw Object.assign(new Error('Файл выписки превышает 200 МБ.'), { code: 'EGRN_FILE_TOO_LARGE' });
+    throw Object.assign(new Error('Файл выписки превышает 2 ГБ.'), { code: 'EGRN_FILE_TOO_LARGE' });
   }
-  const parts = []; let bytes = 0;
   if (!r.body) throw new Error('Сервис ЕГРН не передал содержимое файла.');
-  for await (const part of r.body) {
-    bytes += part.length;
-    if (bytes > MAX_RECEIVED_BYTES) throw Object.assign(new Error('Файл выписки превышает 200 МБ.'), { code: 'EGRN_FILE_TOO_LARGE' });
-    parts.push(Buffer.from(part));
+  try {
+    let name = '';
+    const cd = r.headers.get('content-disposition') || '';
+    const m = cd.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+    if (m) { try { name = decodeURIComponent(m[1]); } catch (e) { name = m[1]; } }
+    if (!name) {
+      name = target.pathname.split('/').pop() || 'vypiska';
+      try { name = decodeURIComponent(name); } catch (_) { name = 'vypiska'; }
+    }
+    if (!/\.[a-z0-9]{2,4}$/i.test(name)) {
+      const ct = r.headers.get('content-type') || '';
+      name += /pdf/.test(ct) ? '.pdf' : /zip/.test(ct) ? '.zip' : /xml/.test(ct) ? '.xml' : '';
+    }
+    const received = await require('./egrn-source').readFileResponse(r.body, name, { signal });
+    return Object.assign(received.file, { cleanup: received.cleanup });
+  } catch (error) { await r.body.cancel().catch(() => {}); throw error; }
+}
+
+function documentBytes(file) { return file.buf ? file.buf.length : file.bytes; }
+async function smallDocument(file) {
+  if (file.buf) return file;
+  if (!Number.isSafeInteger(file.bytes) || file.bytes < 1 || file.bytes > MAX_DOCUMENT_BYTES || typeof file.open !== 'function') throw new Error('Некорректный файл выписки.');
+  const chunks = []; let size = 0;
+  for await (const chunk of file.open()) {
+    size += chunk.byteLength;
+    if (size > file.bytes) throw new Error('Размер полученной выписки изменился.');
+    chunks.push(chunk);
   }
-  const buf = Buffer.concat(parts, bytes);
-  let name = '';
-  const cd = r.headers.get('content-disposition') || '';
-  const m = cd.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
-  if (m) { try { name = decodeURIComponent(m[1]); } catch (e) { name = m[1]; } }
-  if (!name) name = decodeURIComponent((url.split('?')[0].split('/').pop() || 'vypiska'));
-  if (!/\.[a-z0-9]{2,4}$/i.test(name)) {
-    const ct = r.headers.get('content-type') || '';
-    name += /pdf/.test(ct) ? '.pdf' : /zip/.test(ct) ? '.zip' : /xml/.test(ct) ? '.xml' : '';
-  }
-  return { buf: buf, name: name };
+  if (size !== file.bytes) throw new Error('Файл выписки получен не полностью.');
+  return Object.assign({}, file, { buf: Buffer.concat(chunks, size) });
 }
 
 function cardText(o, extra) {
@@ -525,11 +560,14 @@ function setupEgrn(bot) {
       rows = (await pool.query("SELECT * FROM egrn_orders WHERE status IN ('ordered','done') AND files_sent = 0 AND (retry_at IS NULL OR retry_at <= NOW()) AND ((status='ordered' AND created_at > NOW() - INTERVAL '" + MAX_POLL_HOURS + " hours') OR (status='done' AND created_at > NOW() - INTERVAL '30 days')) ORDER BY id LIMIT 20")).rows;
     } catch (e) { return console.error('egrn poll:', e.message); }
     for (const o of rows) {
+      let source;
       try {
         if (await resumeLargeDelivery(o)) continue;
         const j = await apiStatus(o.id_statement);
-        const item = findReq(j, o.id_statement);
+        source = j && typeof j.cleanup === 'function' && typeof j.documents === 'function' ? j : null;
+        const item = source ? source.item : findReq(j, o.id_statement);
         const st = readStatus(item);
+        if (source?.hasFiles) { st.done = true; st.failed = false; }
         const newStatus = st.failed ? 'failed' : st.done ? 'done' : 'ordered';
         const changed = newStatus !== o.status || st.text !== o.status_text;
         await pool.query('UPDATE egrn_orders SET status=$1, status_text=$2, raw=$3, polls=polls+1, updated_at=NOW() WHERE id=$4', [newStatus, st.done && !/выполн/i.test(st.text) ? 'готова' : st.text, stripB64(item), o.id]);
@@ -548,7 +586,7 @@ function setupEgrn(bot) {
           continue;
         }
 
-        const embedded = extractDocs(item, o.cad_num);
+        const embedded = source ? await source.documents(o.cad_num) : extractDocs(item, o.cad_num);
         const urls = embedded.length ? [] : findFileUrls(item);
         if (!embedded.length && !urls.length) {
           await saveFailure(o, ['файлы не найдены в ответе API'], false, o.file_msgs || []);
@@ -570,12 +608,14 @@ function setupEgrn(bot) {
         }
         const caption = '📄 Выписка ЕГРН ' + o.cad_num + (o.label ? ' — ' + o.label : '');
         // PDF — в чат; XML и архив — тоже в чат, но без звука, для архива и будущего разбора
-        for (const [index, d] of embedded.entries()) {
+        for (const [index, original] of embedded.entries()) {
+          let d = original;
           const key = 'embedded:' + index + ':' + d.name;
           try {
             const existing = fileMsgs.find(file => file.key === key);
             if (existing) { if (existing.kind === 'link') await largeDelivery().retry(o, existing, fileMsgs); continue; }
-            if (d.buf.length > MAX_DOCUMENT_BYTES) { await largeDelivery().deliver(o, d, key, fileMsgs); sent++; continue; }
+            if (documentBytes(d) > MAX_DOCUMENT_BYTES) { await largeDelivery().deliver(o, d, key, fileMsgs); sent++; continue; }
+            d = await smallDocument(d);
             checkDocumentSize(d.buf);
             await registerOriginal(o.deliver, d);
             const extra = { caption: d.kind === 'pdf' ? caption.slice(0, 1000) : (d.kind === 'xml' ? 'XML ' + o.cad_num : 'Архив ' + o.cad_num), disable_notification: d.kind !== 'pdf' };
@@ -589,7 +629,7 @@ function setupEgrn(bot) {
             }
             if (d.kind === 'pdf' || d.kind === 'zip') sent++;
           } catch (e) {
-            fileError(e, d.name, d.buf.length);
+            fileError(e, d.name, documentBytes(d));
           }
         }
         for (const [index, u] of urls.slice(0, 6).entries()) {
@@ -599,7 +639,8 @@ function setupEgrn(bot) {
             const existing = fileMsgs.find(file => file.key === key);
             if (existing) { if (existing.kind === 'link') await largeDelivery().retry(o, existing, fileMsgs); continue; }
             f = await download(u);
-            if (f.buf.length > MAX_DOCUMENT_BYTES) { await largeDelivery().deliver(o, f, key, fileMsgs); sent++; continue; }
+            if (documentBytes(f) > MAX_DOCUMENT_BYTES) { await largeDelivery().deliver(o, f, key, fileMsgs); sent++; continue; }
+            f = await smallDocument(f);
             checkDocumentSize(f.buf);
             await registerOriginal(o.deliver, f);
             const extra = { caption: caption.slice(0, 1000) };
@@ -613,8 +654,8 @@ function setupEgrn(bot) {
             }
             sent++;
           } catch (e) {
-            fileError(e, f ? f.name : 'download', f ? f.buf.length : null);
-          }
+            fileError(e, f ? f.name : 'download', f ? documentBytes(f) : null);
+          } finally { if (f?.cleanup) await f.cleanup(); }
         }
         if (deliveryErrors.length) {
           await saveFailure(o, deliveryErrors, permanent, fileMsgs);
@@ -630,8 +671,8 @@ function setupEgrn(bot) {
         }
       } catch (e) {
         console.error('egrn status', o.id_statement, e.message);
-        await saveFailure(o, [String(e.message || 'ошибка проверки статуса')], false, o.file_msgs || []);
-      }
+        await saveFailure(o, [String(e.message || 'ошибка проверки статуса')], e.code === 'EGRN_FILE_TOO_LARGE', o.file_msgs || []);
+      } finally { if (source) await source.cleanup(); }
     }
   }
   setTimeout(poll, 30 * 1000);
