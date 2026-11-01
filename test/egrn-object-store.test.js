@@ -132,6 +132,30 @@ test('an object arriving after cancellation is closed rather than left unread',a
   await new Promise(resolve=>setImmediate(resolve));assert.equal(body.destroyed,true);
 });
 
+test('cleanup DELETE has a bounded deadline even when the SDK ignores cancellation', { timeout: 1000 }, async () => {
+  const h = fixture({ cleanupTimeoutMs: 15, send: () => new Promise(() => {}) });
+  await assert.rejects(h.store.remove(key), error => error.code === 'EGRN_OBJECT_TIMEOUT' && error.status === 503);
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0].operation, 'DeleteObjectCommand');
+  assert.equal(h.calls[0].options.abortSignal.aborted, true);
+});
+
+test('cleanup clears its deadline after success or sanitized provider failure', async () => {
+  const successful = fixture({ cleanupTimeoutMs: 10 });
+  await successful.store.remove(key);
+  const failed = fixture({ cleanupTimeoutMs: 10, send: async () => {
+    throw Object.assign(new Error('https://private.example/?key=' + env.EGRN_S3_SECRET_ACCESS_KEY), { name: 'AccessDenied', $metadata: { httpStatusCode: 403 } });
+  } });
+  await assert.rejects(failed.store.remove(key), error => {
+    assert.equal(error.code, 'EGRN_OBJECT_DELETE'); assert.equal(error.provider_status, 403);
+    assert.equal(String(error.stack).includes(env.EGRN_S3_SECRET_ACCESS_KEY), false);
+    assert.equal(String(error.stack).includes('private.example'), false); return true;
+  });
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(successful.calls[0].options.abortSignal.aborted, false);
+  assert.equal(failed.calls[0].options.abortSignal.aborted, false);
+});
+
 test('the real AWS SDK serializes streaming PUT/HEAD/GET with Content-Length and no aws-chunked trailer', async () => {
   const { S3Client } = require('@aws-sdk/client-s3');
   const requests = [];

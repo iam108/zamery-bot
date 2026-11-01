@@ -105,10 +105,17 @@ function createEgrnObjectStore(options = {}) {
   }
   async function remove(key) {
     if (!KEY.test(key || '')) throw failure('EGRN_OBJECT_ARGUMENT');
+    const controller = new AbortController(); let timedOut = false, rejectTimeout;
+    const deadline = new Promise((_, reject) => { rejectTimeout = reject; }); deadline.catch(() => {});
+    const timeout = Math.min(30000, Math.max(1, options.cleanupTimeoutMs || options.timeoutMs || 30000));
+    const timer = setTimeout(() => {
+      timedOut = true; controller.abort(); rejectTimeout(failure('EGRN_OBJECT_TIMEOUT'));
+    }, timeout);
     try {
       const { config, connection, sdk } = client();
-      await connection.send(new sdk.DeleteObjectCommand({ Bucket: config.bucket, Key: key }));
-    } catch (error) { throw failure('EGRN_OBJECT_DELETE', error); }
+      await Promise.race([connection.send(new sdk.DeleteObjectCommand({ Bucket: config.bucket, Key: key }), { abortSignal: controller.signal }), deadline]);
+    } catch (error) { throw timedOut ? failure('EGRN_OBJECT_TIMEOUT') : failure('EGRN_OBJECT_DELETE', error); }
+    finally { clearTimeout(timer); }
   }
   return { configured, put, get, remove };
 }
