@@ -12,8 +12,9 @@ const TYPES = {
 const CAD_RE = /\b\d{2}:\d{2}:\d{6,7}:\d{1,9}\b/g;
 const MAX_POLL_HOURS = 72;
 const MAX_DOCUMENT_BYTES = 50 * 1024 * 1024;
+const MAX_RECEIVED_BYTES = 200 * 1024 * 1024;
 const MAX_FAILURES = 5;
-const REQUEST_TIMEOUT_MS = 60 * 1000;
+const REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 
 function checkDocumentSize(buf) {
   if (buf.length <= MAX_DOCUMENT_BYTES) return;
@@ -33,6 +34,33 @@ async function registerOriginal(targets, file) {
   if (!(targets || []).some(t => t && t.order_id)) return;
   try { await require('./order-evidence').registerOriginal(targets, file); }
   catch (e) { console.error('egrn packet: original unavailable'); }
+}
+
+function largeDelivery() {
+  return require('./egrn-large-delivery').createLargeDelivery({ telegram: tgApi,
+    persist: async function (order, records) {
+      await pool.query('UPDATE egrn_orders SET file_msgs=$1, updated_at=NOW() WHERE id=$2', [JSON.stringify(records), order.id]);
+      order.file_msgs = records;
+    }
+  });
+}
+
+function hasReusableLinks(order) {
+  const files = Array.isArray(order && order.file_msgs) ? order.file_msgs : [];
+  const manifest = Array.isArray(order && order.delivery_manifest) ? order.delivery_manifest : [];
+  return !!(order && order.status === 'done' && files.some(file => file.kind === 'link') &&
+    (order.files_sent > 0 || manifest.length && manifest.every(key => files.some(file => file.key === key))));
+}
+
+async function resumeLargeDelivery(order) {
+  const records = Array.isArray(order.file_msgs) ? order.file_msgs : [];
+  const manifest = Array.isArray(order.delivery_manifest) ? order.delivery_manifest : [];
+  if (order.status !== 'done' || !records.some(file => file.kind === 'link') || !manifest.length ||
+      !manifest.every(key => records.some(file => file.key === key))) return false;
+  for (const record of records) if (record.kind === 'link') await largeDelivery().retry(order, record, records);
+  await pool.query('UPDATE egrn_orders SET files_sent=$1, file_msgs=$2, error=$3, failures=0, retry_at=NULL WHERE id=$4',
+    [records.length, JSON.stringify(records), null, order.id]);
+  return true;
 }
 
 function documentRecord(message, chat, key, file) {
@@ -75,6 +103,12 @@ function ensureTables() {
       ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS file_msgs JSONB DEFAULT '[]';
       ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS failures INT NOT NULL DEFAULT 0;
       ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS retry_at TIMESTAMPTZ;
+      ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS delivery_manifest JSONB NOT NULL DEFAULT '[]';
+      UPDATE egrn_orders SET files_sent=0, failures=0, retry_at=NULL, error='Повторная доставка крупной выписки', updated_at=NOW()
+        WHERE files_sent=-1 AND status='done' AND created_at > NOW() - INTERVAL '30 days'
+        AND (error LIKE '%Файл слишком большой для Telegram:%'
+          OR error ~* '(^|;[[:space:]]*)413([:[:space:]]|$)'
+          OR error ~* '(^|;[[:space:]]*)Request Entity Too Large([[:space:][:punct:]]|$)');
       CREATE TABLE IF NOT EXISTS egrn_pending (
         id         SERIAL PRIMARY KEY,
         cad_num    TEXT NOT NULL,
@@ -195,7 +229,8 @@ function unzip(buf) {
     const start = lho + 30 + lnlen + lelen;
     const comp = buf.slice(start, start + csize);
     let data = null;
-    if (method === 0) data = comp; else if (method === 8) data = zlib.inflateRawSync(comp);
+    if (method === 0) data = comp; else if (method === 8) data = zlib.inflateRawSync(comp, { maxOutputLength: MAX_RECEIVED_BYTES });
+    if (data && (data.length > MAX_RECEIVED_BYTES || files.reduce((sum, file) => sum + file.data.length, 0) + data.length > MAX_RECEIVED_BYTES)) throw new Error('Архив выписки превышает допустимый объём распаковки.');
     if (data && !/\/$/.test(name)) files.push({ name: name, data: data });
     p += 46 + nlen + elen + clen;
   }
@@ -207,6 +242,7 @@ function extractDocs(item, cad) {
   const docs = [];
   const base = String(cad || 'vypiska').replace(/:/g, '-');
   findEmbeddedFiles(item).forEach(function (f, i) {
+    if (f.b64.length > Math.ceil(MAX_RECEIVED_BYTES / 3) * 4) throw Object.assign(new Error('Файл выписки превышает 200 МБ.'), { code: 'EGRN_FILE_TOO_LARGE' });
     const buf = Buffer.from(f.b64, 'base64');
     if (/^JVBER/.test(f.b64)) { docs.push({ name: 'ЕГРН_' + base + (i ? '_' + i : '') + '.pdf', buf: buf, kind: 'pdf' }); return; }
     try {
@@ -247,7 +283,18 @@ function findFileUrls(item) {
 async function download(url) {
   const r = await fetch(url, { headers: authHeaders(), signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
   if (!r.ok) throw new Error('download ' + r.status);
-  const buf = Buffer.from(await r.arrayBuffer());
+  if (Number(r.headers.get('content-length')) > MAX_RECEIVED_BYTES) {
+    await r.body?.cancel().catch(() => {});
+    throw Object.assign(new Error('Файл выписки превышает 200 МБ.'), { code: 'EGRN_FILE_TOO_LARGE' });
+  }
+  const parts = []; let bytes = 0;
+  if (!r.body) throw new Error('Сервис ЕГРН не передал содержимое файла.');
+  for await (const part of r.body) {
+    bytes += part.length;
+    if (bytes > MAX_RECEIVED_BYTES) throw Object.assign(new Error('Файл выписки превышает 200 МБ.'), { code: 'EGRN_FILE_TOO_LARGE' });
+    parts.push(Buffer.from(part));
+  }
+  const buf = Buffer.concat(parts, bytes);
   let name = '';
   const cd = r.headers.get('content-disposition') || '';
   const m = cd.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
@@ -361,6 +408,12 @@ function setupEgrn(bot) {
           [p.cad_num, typeDoc])).rows[0];
         if (prev) {
           await ctx.answerCbQuery();
+          if (hasReusableLinks(prev)) {
+            await copyFiles(prev.file_msgs, [{ chat: cbChat }]);
+            return ctx.reply('Готовая выписка отправлена выше. Новую выписку заказывать не потребовалось.', {
+              reply_markup: { inline_keyboard: [[{ text: 'Заказать новую выписку ещё раз', callback_data: 'eg:' + p.id + ':' + ctx.match[2] + ':force' }]] },
+            });
+          }
           return ctx.reply('Выписку по ' + p.cad_num + ' уже заказывали ' + new Date(prev.created_at).toLocaleDateString('ru-RU') + ' (' + (prev.ordered_name || '') + '), статус: ' + (prev.status_text || prev.status) + '. Заказать ещё раз?', {
             reply_markup: { inline_keyboard: [[{ text: 'Да, заказать ещё раз', callback_data: 'eg:' + p.id + ':' + ctx.match[2] + ':force' }]] },
           });
@@ -399,6 +452,24 @@ function setupEgrn(bot) {
     } catch (e) { try { await ctx.answerCbQuery('Ошибка: ' + e.message.slice(0, 100), { show_alert: true }); } catch (x) {} }
   });
 
+  bot.action(/^egf:([0-9a-f-]{36})$/i, async function (ctx) {
+    try {
+      const message = ctx.callbackQuery && ctx.callbackQuery.message;
+      const chat = message && message.chat ? message.chat.id : ctx.from.id;
+      if (!(await canOrder(ctx.from.id, chat))) return ctx.answerCbQuery('Нет доступа к выпискам', { show_alert: true });
+      const file = await require('./egrn-files').get(ctx.match[1]);
+      if (!file) return ctx.answerCbQuery('Сохранённая выписка не найдена.', { show_alert: true });
+      const url = require('../web/egrn-downloads').createDownloadUrl(file.id);
+      await ctx.editMessageReplyMarkup({ inline_keyboard: [
+        [{ text: 'Скачать выписку · ' + Math.ceil(file.bytes / 1024 / 1024) + ' МБ', url }],
+        [{ text: 'Обновить ссылку', callback_data: 'egf:' + file.id }]
+      ] });
+      await ctx.answerCbQuery('Ссылка обновлена. Повторный заказ не создавался.');
+    } catch (_) {
+      await ctx.answerCbQuery('Не удалось обновить ссылку. Попробуйте позднее.', { show_alert: true }).catch(() => {});
+    }
+  });
+
   // Админу: сырой ответ API по заказу — чтобы разобраться с форматом
   bot.command('egrn_debug', async function (ctx) {
     const admins = String(process.env.ADMIN_TG_IDS || '').split(/[\s,;]+/);
@@ -412,7 +483,7 @@ function setupEgrn(bot) {
   // ── Опрос статусов
   async function notifyStopped(o, tooLarge) {
     const text = o.status === 'done'
-      ? '⚠️ Выписка готова, но ' + (tooLarge ? 'файл слишком большой для отправки в Telegram.' : 'не все файлы удалось доставить после нескольких попыток.')
+      ? '⚠️ Выписка готова, но ' + (tooLarge ? 'не удалось подготовить файл для скачивания.' : 'не все файлы удалось доставить после нескольких попыток.')
       : '⚠️ Не удалось проверить готовность выписки после нескольких попыток.';
     const fallback = '\nСкачайте выписку или проверьте заявку №' + o.id_statement + ' в личном кабинете: https://armrus.org';
     if (o.status_msg_id) {
@@ -451,10 +522,11 @@ function setupEgrn(bot) {
   async function pollOrders() {
     let rows = [];
     try {
-      rows = (await pool.query("SELECT * FROM egrn_orders WHERE status IN ('ordered','done') AND files_sent = 0 AND (retry_at IS NULL OR retry_at <= NOW()) AND created_at > NOW() - INTERVAL '" + MAX_POLL_HOURS + " hours' ORDER BY id LIMIT 20")).rows;
+      rows = (await pool.query("SELECT * FROM egrn_orders WHERE status IN ('ordered','done') AND files_sent = 0 AND (retry_at IS NULL OR retry_at <= NOW()) AND ((status='ordered' AND created_at > NOW() - INTERVAL '" + MAX_POLL_HOURS + " hours') OR (status='done' AND created_at > NOW() - INTERVAL '30 days')) ORDER BY id LIMIT 20")).rows;
     } catch (e) { return console.error('egrn poll:', e.message); }
     for (const o of rows) {
       try {
+        if (await resumeLargeDelivery(o)) continue;
         const j = await apiStatus(o.id_statement);
         const item = findReq(j, o.id_statement);
         const st = readStatus(item);
@@ -482,6 +554,9 @@ function setupEgrn(bot) {
           await saveFailure(o, ['файлы не найдены в ответе API'], false, o.file_msgs || []);
           continue;
         }
+        const manifest = embedded.length ? embedded.map((file, index) => 'embedded:' + index + ':' + file.name) : urls.slice(0, 6).map((_, index) => 'url:' + index);
+        await pool.query('UPDATE egrn_orders SET delivery_manifest=$1 WHERE id=$2', [JSON.stringify(manifest), o.id]);
+        o.delivery_manifest = manifest;
         let sent = 0;
         const deliveryErrors = [];
         let permanent = false;
@@ -491,19 +566,23 @@ function setupEgrn(bot) {
           console.error('egrn file:', JSON.stringify({ order_id: o.id, id_statement: o.id_statement,
             filename: name, bytes: size, error: e.message }));
           deliveryErrors.push(String(e.message || 'ошибка доставки'));
-          if (documentTooLarge(e)) permanent = true;
+          if (e.code === 'EGRN_FILE_TOO_LARGE' || e.code === 'EGRN_FILE_TYPE') permanent = true;
         }
         const caption = '📄 Выписка ЕГРН ' + o.cad_num + (o.label ? ' — ' + o.label : '');
         // PDF — в чат; XML и архив — тоже в чат, но без звука, для архива и будущего разбора
         for (const [index, d] of embedded.entries()) {
           const key = 'embedded:' + index + ':' + d.name;
-          if (fileMsgs.some(function (f) { return f.key === key; })) continue;
           try {
+            const existing = fileMsgs.find(file => file.key === key);
+            if (existing) { if (existing.kind === 'link') await largeDelivery().retry(o, existing, fileMsgs); continue; }
+            if (d.buf.length > MAX_DOCUMENT_BYTES) { await largeDelivery().deliver(o, d, key, fileMsgs); sent++; continue; }
             checkDocumentSize(d.buf);
             await registerOriginal(o.deliver, d);
             const extra = { caption: d.kind === 'pdf' ? caption.slice(0, 1000) : (d.kind === 'xml' ? 'XML ' + o.cad_num : 'Архив ' + o.cad_num), disable_notification: d.kind !== 'pdf' };
             if (o.status_msg_id) extra.reply_to_message_id = Number(o.status_msg_id);
-            const m = await bot.telegram.sendDocument(o.chat_id, { source: d.buf, filename: d.name }, extra);
+            let m;
+            try { m = await bot.telegram.sendDocument(o.chat_id, { source: d.buf, filename: d.name }, extra); }
+            catch (error) { if (!documentTooLarge(error)) throw error; await largeDelivery().deliver(o, d, key, fileMsgs); sent++; continue; }
             if (m && m.message_id && d.kind !== 'xml') {
               const record = documentRecord(m, o.chat_id, key, d);
               fileMsgs.push(record); newlySent.push(record);
@@ -515,15 +594,19 @@ function setupEgrn(bot) {
         }
         for (const [index, u] of urls.slice(0, 6).entries()) {
           const key = 'url:' + index;
-          if (fileMsgs.some(function (f) { return f.key === key; })) continue;
           let f;
           try {
+            const existing = fileMsgs.find(file => file.key === key);
+            if (existing) { if (existing.kind === 'link') await largeDelivery().retry(o, existing, fileMsgs); continue; }
             f = await download(u);
+            if (f.buf.length > MAX_DOCUMENT_BYTES) { await largeDelivery().deliver(o, f, key, fileMsgs); sent++; continue; }
             checkDocumentSize(f.buf);
             await registerOriginal(o.deliver, f);
             const extra = { caption: caption.slice(0, 1000) };
             if (o.status_msg_id) extra.reply_to_message_id = Number(o.status_msg_id);
-            const m = await bot.telegram.sendDocument(o.chat_id, { source: f.buf, filename: f.name }, extra);
+            let m;
+            try { m = await bot.telegram.sendDocument(o.chat_id, { source: f.buf, filename: f.name }, extra); }
+            catch (error) { if (!documentTooLarge(error)) throw error; await largeDelivery().deliver(o, f, key, fileMsgs); sent++; continue; }
             if (m && m.message_id) {
               const record = documentRecord(m, o.chat_id, key, f);
               fileMsgs.push(record); newlySent.push(record);
@@ -561,10 +644,11 @@ async function copyFiles(fileMsgs, targets) {
   for (const t of targets) {
     for (const fm of fileMsgs) {
       try {
+        if (fm.kind === 'link') { await largeDelivery().copy(fm, t); n++; continue; }
         await tgApi.callApi('copyMessage', Object.assign({ chat_id: t.chat, from_chat_id: fm.chat, message_id: fm.id },
           t.reply ? { reply_parameters: { message_id: Number(t.reply), allow_sending_without_reply: true } } : {}));
         n++;
-      } catch (e) { console.error('egrn copy:', e.message); }
+      } catch (e) { console.error('egrn copy:', fm.kind === 'link' ? 'Не удалось доставить ссылку на сохранённую выписку.' : e.message); if (fm.kind === 'link') throw e; }
     }
   }
   return n;
@@ -580,11 +664,11 @@ async function attachOrOrder(opts) {
   const prev = (await pool.query(
     "SELECT * FROM egrn_orders WHERE cad_num=$1 AND type_doc=$2 AND status <> 'failed' AND created_at > NOW() - INTERVAL '30 days' ORDER BY id DESC LIMIT 1",
     [cad, TYPE_DOC])).rows[0];
-  if (prev && prev.files_sent > 0 && Array.isArray(prev.file_msgs) && prev.file_msgs.length) {
+  if (prev && (prev.files_sent > 0 || hasReusableLinks(prev)) && Array.isArray(prev.file_msgs) && prev.file_msgs.length) {
     await copyFiles(prev.file_msgs, opts.targets || []);
     let packet = {};
-    if ((opts.targets || []).some(t => t && t.order_id)) {
-      try { packet = await require('./order-evidence').registerCached(opts.targets, prev.file_msgs, tgApi); }
+    if ((opts.targets || []).some(t => t && t.order_id) && prev.file_msgs.some(file => file.kind !== 'link')) {
+      try { packet = await require('./order-evidence').registerCached(opts.targets, prev.file_msgs.filter(file => file.kind !== 'link'), tgApi); }
       catch (e) { console.error('egrn packet: original unavailable'); packet = { packet_warning: 'Оригинал выписки не добавлен к документам заявки. Прикрепите его к заявке.' }; }
     }
     return { result: 'attached', cad: cad, ...packet };

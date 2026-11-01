@@ -18,6 +18,7 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
   app.get('/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
   app.use(express.static(path.join(__dirname, '../../public')));
+  require('./egrn-downloads').setupEgrnDownloads(app);
 
   app.use(session({
     store: new PgSession({ pool: pool, tableName: 'web_sessions' }),
