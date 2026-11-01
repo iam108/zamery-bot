@@ -11,7 +11,7 @@ function harness({ replies = [], sourceError, statusError } = {}) {
   const source = {
     async cleanupStale() {},
     async readStatusResponse(body, options) { reads.push({ body, options }); if (statusError) throw statusError; return { item: { id_req: options.idReq }, cleanup() {} }; },
-    async readFileResponse(body, name) { reads.push({ body, name }); if (sourceError) throw sourceError; return { file: { name, bytes: 300 * 1024 * 1024, open() {} }, cleanup() {} }; }
+    async readFileResponse(body, name, options) { reads.push({ body, name, options }); if (sourceError) throw sourceError; return { file: { name, bytes: 300 * 1024 * 1024, open() {} }, cleanup() {} }; }
   };
   const context = {
     module: { exports: {} }, Buffer, URL, AbortSignal, console,
@@ -44,6 +44,15 @@ test('status preparation failure cancels the unconsumed provider response withou
   const h = harness({ replies: [reply], statusError: expected });
   await assert.rejects(h.apiStatus(77), error => error === expected);
   assert.equal(reply.cancelled, 1); assert.equal(h.requests.length, 1); assert.equal(h.reads[0].options.idReq, 77);
+});
+
+test('network deadlines remain on fetch and are not inherited by fully received local originals',async()=>{
+  const status=harness({replies:[response()]});await status.apiStatus(77);
+  assert.ok(status.requests[0].options.signal instanceof AbortSignal);
+  assert.equal(status.reads[0].options.signal,undefined);
+  const file=harness({replies:[response()]});await file.download('https://provider.example/original.pdf');
+  assert.ok(file.requests[0].options.signal instanceof AbortSignal);
+  assert.equal(file.reads[0].options?.signal,undefined);
 });
 
 test('file preparation failure cancels its unconsumed response body', async () => {

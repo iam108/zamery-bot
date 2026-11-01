@@ -11,12 +11,17 @@ function harness({ docs = [], urls = [], downloadedSize = 10, sendError, orderFi
   const sent = [];
   const notices = [];
   const logs = [];
-  const linkCalls = [], linkCopies = [], actions = [], renewed = [], apiCalls = [];
+  const linkCalls = [], linkCopies = [], actions = [], commands = [], renewed = [], apiCalls = [];
   const order = { id: 1, id_statement: 42, cad_num: '77:17:0120316:1', status: 'done',
     status_text: 'готова', polls: 1, chat_id: 10, ordered_by: 10, deliver: [], files_sent: 0, ...orderFields };
   const pool = { query: async (sql, params) => {
     queries.push({ sql, params });
     if(sql.startsWith('SELECT 1 FROM staff'))return{rows:staffAllowed?[{approved:true}]:[]};
+    if(sql.startsWith('UPDATE egrn_orders SET files_sent=0, failures=0, retry_at=NULL, error=NULL')) {
+      if(String(params[0])!==String(order.id_statement)||order.status!=='done'||order.files_sent>0)return{rows:[]};
+      Object.assign(order,{files_sent:0,failures:0,retry_at:null,error:null});return{rows:[{id:order.id}]};
+    }
+    if(sql.startsWith('SELECT files_sent FROM egrn_orders WHERE id='))return{rows:[{files_sent:order.files_sent}]};
     if (sql.startsWith('UPDATE egrn_orders SET files_sent=$1')) {
       Object.assign(order, { files_sent: params[0], file_msgs: JSON.parse(params[1]), error: params[2] });
       if (sql.includes('failures=$4')) Object.assign(order, { failures: params[3], retry_at: params[4] });
@@ -63,7 +68,7 @@ function harness({ docs = [], urls = [], downloadedSize = 10, sendError, orderFi
   const hooks = context.module.exports.testHooks;
   hooks.configure(docs, urls, downloadedSize);
   if (statusRequest) hooks.setStatusRequest(statusRequest);
-  const bot = { on() {}, hears() {}, action(pattern,handler) {actions.push({pattern,handler});}, command() {}, telegram: {
+  const bot = { on() {}, hears() {}, action(pattern,handler) {actions.push({pattern,handler});}, command(name,handler) {commands.push({name,handler});}, telegram: {
     sendDocument: async (chat, file) => {
       sent.push(file);
       const error = typeof sendError === 'function' ? sendError(file) : sendError;
@@ -75,7 +80,7 @@ function harness({ docs = [], urls = [], downloadedSize = 10, sendError, orderFi
     callApi: async () => {},
   } };
   context.module.exports.setupEgrn(bot);
-  return { hooks, sent, queries, order, notices, logs, linkCalls, linkCopies, renewed, apiCalls, actions, poll: () => poll(), attachOrOrder: context.module.exports.attachOrOrder,
+  return { hooks, sent, queries, order, notices, logs, linkCalls, linkCopies, renewed, apiCalls, actions, commands, poll: () => poll(), attachOrOrder: context.module.exports.attachOrOrder,
     deliveries: () => queries.filter(q => q.sql.startsWith('UPDATE egrn_orders SET files_sent=$1')) };
 }
 
@@ -354,4 +359,37 @@ test('document extraction errors release the private temporary files without del
   let cleaned=0;
   const h=harness({statusRequest:async()=>({item:{id_req:42,status:[]},hasFiles:true,async documents(){throw new Error('Interrupted file');},async cleanup(){cleaned++;}})});
   await h.poll();assert.equal(cleaned,1);assert.equal(h.order.files_sent,0);assert.equal(h.sent.length,0);assert.equal(h.linkCalls.length,0);assert.equal(h.apiCalls.length,0);
+});
+
+function retryContext(replies, text='/egrn_retry 42',type='private') {
+  return{from:{id:10},chat:{id:10,type},message:{text},async reply(text){replies.push(text);}};
+}
+test('approved private retry clears old backoff and only redelivers the existing ready order',async()=>{
+  const h=harness({docs:[doc(60*1024*1024)],orderFields:{files_sent:-1,failures:5,retry_at:Date.now()+86400000,error:'terminated'}}),replies=[];
+  await h.commands.find(x=>x.name==='egrn_retry').handler(retryContext(replies));
+  assert.equal(h.order.files_sent,1);assert.equal(h.order.failures,0);assert.equal(h.apiCalls.length,0);assert.equal(h.linkCalls.length,1);
+  assert.equal(h.queries.some(q=>q.sql.includes('INSERT INTO egrn_orders')),false);
+  const select=h.queries.find(q=>q.sql.startsWith('SELECT * FROM egrn_orders')&&q.sql.includes('AND id=$1'));
+  assert.deepEqual(Array.from(select.params),[1]);assert.equal(replies.at(-1),'Выписка доставлена.');
+});
+test('retry of a durably stored file skips the provider and only sends the missing link',async()=>{
+  const key='embedded:0:statement.pdf',record={kind:'link',key,original_id:'saved-large-file',name:'statement.pdf',bytes:393*1024*1024};
+  const h=harness({orderFields:{file_msgs:[record],delivery_manifest:[key],files_sent:-1},statusRequest:async()=>assert.fail('No new provider request')}),replies=[];
+  await h.commands.find(x=>x.name==='egrn_retry').handler(retryContext(replies));
+  assert.equal(h.order.files_sent,1);assert.equal(h.linkCalls[0].retry,'saved-large-file');assert.equal(h.apiCalls.length,0);
+});
+test('retry denies unapproved users, group requests and malformed identifiers before changing any order',async()=>{
+  for(const [allowed,type,text]of[[false,'private','/egrn_retry 42'],[true,'group','/egrn_retry 42'],[true,'private','/egrn_retry 42; DELETE']]){
+    const h=harness({staffAllowed:allowed}),replies=[];
+    await h.commands.find(x=>x.name==='egrn_retry').handler(retryContext(replies,text,type));
+    assert.equal(h.queries.some(q=>q.sql.startsWith('UPDATE egrn_orders SET files_sent=0, failures=0')),false);
+    assert.equal(h.apiCalls.length,0);assert.equal(h.linkCalls.length,0);
+  }
+});
+test('retry cannot reopen a delivered or rejected order or order an unknown statement',async()=>{
+  for(const fields of[{files_sent:1},{status:'failed'},{id_statement:99}]){
+    const h=harness({orderFields:fields}),replies=[];
+    await h.commands.find(x=>x.name==='egrn_retry').handler(retryContext(replies));
+    assert.equal(h.apiCalls.length,0);assert.equal(h.linkCalls.length,0);assert.match(replies.at(-1),/Нет готовой недоставленной/);
+  }
 });

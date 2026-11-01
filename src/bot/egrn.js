@@ -169,7 +169,9 @@ async function apiStatus(idReq) {
     await r.body?.cancel().catch(() => {});
     throw new Error('Сервис ЕГРН временно недоступен (HTTP ' + r.status + ').');
   }
-  try { return await source.readStatusResponse(r.body, { idReq, signal }); }
+  // fetch already cancels the response body on its network deadline. A fully
+  // received local file must survive that deadline while being stored/delivered.
+  try { return await source.readStatusResponse(r.body, { idReq }); }
   catch (error) { await r.body.cancel().catch(() => {}); throw error; }
 }
 
@@ -323,7 +325,7 @@ async function download(url) {
       const ct = r.headers.get('content-type') || '';
       name += /pdf/.test(ct) ? '.pdf' : /zip/.test(ct) ? '.zip' : /xml/.test(ct) ? '.xml' : '';
     }
-    const received = await require('./egrn-source').readFileResponse(r.body, name, { signal });
+    const received = await require('./egrn-source').readFileResponse(r.body, name);
     return Object.assign(received.file, { cleanup: received.cleanup });
   } catch (error) { await r.body.cancel().catch(() => {}); throw error; }
 }
@@ -554,10 +556,11 @@ function setupEgrn(bot) {
     } finally { polling = false; }
   }
 
-  async function pollOrders() {
+  async function pollOrders(onlyId) {
     let rows = [];
     try {
-      rows = (await pool.query("SELECT * FROM egrn_orders WHERE status IN ('ordered','done') AND files_sent = 0 AND (retry_at IS NULL OR retry_at <= NOW()) AND ((status='ordered' AND created_at > NOW() - INTERVAL '" + MAX_POLL_HOURS + " hours') OR (status='done' AND created_at > NOW() - INTERVAL '30 days')) ORDER BY id LIMIT 20")).rows;
+      rows = (await pool.query("SELECT * FROM egrn_orders WHERE status IN ('ordered','done') AND files_sent = 0 AND (retry_at IS NULL OR retry_at <= NOW()) AND ((status='ordered' AND created_at > NOW() - INTERVAL '" + MAX_POLL_HOURS + " hours') OR (status='done' AND created_at > NOW() - INTERVAL '30 days'))" +
+        (onlyId ? ' AND id=$1' : '') + ' ORDER BY id LIMIT 20', onlyId ? [onlyId] : undefined)).rows;
     } catch (e) { return console.error('egrn poll:', e.message); }
     for (const o of rows) {
       let source;
@@ -602,7 +605,8 @@ function setupEgrn(bot) {
         const newlySent = [];
         function fileError(e, name, size) {
           console.error('egrn file:', JSON.stringify({ order_id: o.id, id_statement: o.id_statement,
-            filename: name, bytes: size, error: e.message }));
+            filename: name, bytes: size, error: e.message,
+            delivery_stage: e.delivery_stage, failure_code: e.failure_code, constraint: e.constraint }));
           deliveryErrors.push(String(e.message || 'ошибка доставки'));
           if (e.code === 'EGRN_FILE_TOO_LARGE' || e.code === 'EGRN_FILE_TYPE') permanent = true;
         }
@@ -675,6 +679,28 @@ function setupEgrn(bot) {
       } finally { if (source) await source.cleanup(); }
     }
   }
+  // Support operation only: redeliver a known ready order, never apiOrder().
+  // Keep the poll guard while resetting the backoff and processing this row.
+  bot.command('egrn_retry', async function (ctx) {
+    if (ctx.chat?.type !== 'private') return ctx.reply('Повтор доставки доступен в личном чате с ботом.');
+    if (!(await canOrder(ctx.from.id, ctx.chat.id))) return ctx.reply('Нет доступа. Нажмите /start.');
+    const match = String(ctx.message?.text || '').match(/^\/egrn_retry(?:@[a-z\d_]+)?\s+([1-9]\d{0,14})\s*$/i);
+    if (!match) return ctx.reply('Укажите номер уже готового заказа: /egrn_retry номер. Новый заказ не создаётся.');
+    if (polling) return ctx.reply('Доставка выписок уже выполняется. Повторите команду после её завершения.');
+    polling = true;
+    try {
+      await ensureTables();
+      const order = (await pool.query("UPDATE egrn_orders SET files_sent=0, failures=0, retry_at=NULL, error=NULL, updated_at=NOW() WHERE id_statement=$1 AND status='done' AND files_sent<=0 AND created_at > NOW()-INTERVAL '30 days' RETURNING id", [match[1]])).rows[0];
+      if (!order) return ctx.reply('Нет готовой недоставленной выписки с таким номером за последние 30 дней.');
+      await ctx.reply('Повторно доставляю готовую выписку. Новый платный заказ не создаётся.');
+      await pollOrders(order.id);
+      const latest = (await pool.query('SELECT files_sent FROM egrn_orders WHERE id=$1', [order.id])).rows[0];
+      await ctx.reply(latest?.files_sent > 0 ? 'Выписка доставлена.' : 'Доставка пока не завершена. Проверю причину и повторю по сохранённому заказу.');
+    } catch (error) {
+      console.error('egrn retry:', /^[a-z\d_]{1,80}$/i.test(String(error.code || '')) ? error.code : 'unavailable');
+      await ctx.reply('Не удалось повторить доставку. Новый платный заказ не создавался.');
+    } finally { polling = false; }
+  });
   setTimeout(poll, 30 * 1000);
   setInterval(poll, 3 * 60 * 1000);
 }

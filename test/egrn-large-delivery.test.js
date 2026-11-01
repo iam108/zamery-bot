@@ -265,3 +265,84 @@ test('retry after streamed storage uses only original metadata and sends solely 
   h.state.failChats.clear();const sent=h.sends.length;await h.service.retry(h.order,h.records[0],h.records);
   assert.deepEqual(h.sends.slice(sent).map(value=>value.chat),[2002]);assert.equal(opened,1);assert.equal(streamSaves,1);assert.equal(h.state.saveCount,0);
 });
+
+function diagnosticError(error, expected) {
+  safeTemporary(error);
+  assert.deepEqual({stage:error.delivery_stage,code:error.failure_code,constraint:error.constraint},expected);
+  assert.doesNotMatch(JSON.stringify(error),/https?:|postgres:|SECRET|PRIVATE|SIGNED|token=|signature=|\/private\/|description|detail|query/);
+  assert.equal(error.cause,undefined);assert.equal(error.response,undefined);
+  return true;
+}
+
+test('storage diagnostics retain only safe PostgreSQL or EGRN codes and constraints through outer wrappers',async()=>{
+  for(const streamed of [false,true]){
+    const h=fixture();const failure=Object.assign(new Error('SECRET https://private.example?token=PRIVATE /private/tmp/source.pdf'),
+      {code:streamed?'EGRN_FILE_CHANGED':'23514',constraint:'egrn_files_bytes_check',detail:'SECRET row',query:'PRIVATE query'});
+    const fail=async()=>{throw failure;};if(streamed)h.store.saveStream=fail;else h.store.save=fail;
+    await assert.rejects(h.service.deliver(h.order,streamed?streamedFile():h.file,KEY,h.records),error=>diagnosticError(error,
+      {stage:'storage',code:failure.code,constraint:'egrn_files_bytes_check'}));
+    assert.equal(h.state.persistCount,0);assert.equal(h.sends.length,0);assert.deepEqual(h.records,[]);
+  }
+});
+
+test('descriptor, signing and receipt diagnostics keep their precise stage after delivery catches them',async()=>{
+  for(const stage of ['descriptor','signing','receipt']){
+    const h=fixture();const failure=Object.assign(new Error('postgres://SECRET /private/tmp/PRIVATE signature=SIGNED'),
+      {code:'40001',constraint:'egrn_orders_file_msgs_check'});
+    if(stage==='signing')h.options.makeUrl=async()=>{throw failure;};
+    else h.options.persist=async()=>{h.state.persistCount++;if(stage==='descriptor'||h.state.persistCount===2)throw failure;};
+    h.service=createLargeDelivery(h.options);
+    await assert.rejects(h.service.deliver(h.order,h.file,KEY,h.records),error=>diagnosticError(error,
+      {stage,code:'40001',constraint:'egrn_orders_file_msgs_check'}));
+    assert.equal(h.sends.length,stage==='receipt'?1:0);
+  }
+});
+
+test('Telegram numeric error codes are sanitized while other targets still receive their links',async()=>{
+  const h=fixture(),send=h.options.telegram.sendMessage;const attempts=[];
+  h.options.telegram.sendMessage=async(...args)=>{
+    attempts.push(args[0]);if(args[0]===2002)throw Object.assign(new Error('https://api.telegram.org/botSECRET/sendMessage?token=PRIVATE'),
+      {code:'ETELEGRAM',response:{error_code:403,description:'SECRET forbidden target',parameters:{token:'PRIVATE'}}});
+    return send(...args);
+  };
+  await assert.rejects(h.service.deliver(h.order,h.file,KEY,h.records),error=>diagnosticError(error,
+    {stage:'telegram',code:'TELEGRAM_403',constraint:undefined}));
+  assert.deepEqual(attempts,[-1001,2002,3003]);assert.deepEqual(h.records[0].deliveries.map(value=>value.chat),[-1001,3003]);
+});
+
+test('unsafe diagnostic values and nonnumeric Telegram errors are discarded rather than interpolated',async()=>{
+  for(const changes of [
+    {code:'https://private.example?token=PRIVATE',constraint:'/private/tmp/SECRET',response:{error_code:'403'}},
+    {code:'x'.repeat(81),constraint:'x'.repeat(81),response:{error_code:NaN}},
+    {code:'23514\nSECRET',constraint:'check:PRIVATE',response:{error_code:Infinity}},
+    {code:'EGRN_LARGE_DELIVERY_TEMPORARY',delivery_stage:'https://private.example',failure_code:'?token=PRIVATE',constraint:'bad name',response:{error_code:-403}}
+  ]){
+    const h=fixture();h.options.telegram.sendMessage=async()=>{throw Object.assign(new Error('SECRET PRIVATE https://private.example'),changes);};
+    await assert.rejects(h.service.deliver(h.order,h.file,KEY,h.records),error=>diagnosticError(error,
+      {stage:'telegram',code:undefined,constraint:undefined}));
+  }
+});
+
+test('retry and manual copy preserve storage or signing diagnostics without reading original file content',async()=>{
+  for(const action of ['retry','copy']){
+    const h=fixture(),record=lookupOnlyRecord();h.records.push(record);
+    h.store.get=async()=>{throw Object.assign(new Error('SECRET postgres://private.example /private/tmp/source'),
+      {code:'42P01',constraint:'egrn_file_chunks_pkey'});};
+    const promise=action==='retry'?h.service.retry(h.order,record,h.records):h.service.copy(record,{chat:4004});
+    await assert.rejects(promise,error=>diagnosticError(error,{stage:'storage',code:'42P01',constraint:'egrn_file_chunks_pkey'}));
+    assert.equal(h.state.saveCount,0);assert.equal(h.sends.length,0);
+  }
+  const h=fixture(),record=lookupOnlyRecord();h.store.get=async()=>({...h.meta,bytes:record.bytes});
+  h.options.makeUrl=async()=>{throw Object.assign(new Error('SECRET https://private.example?signature=PRIVATE'),{code:'EGRN_DOWNLOAD_CONFIG'});};
+  h.service=createLargeDelivery(h.options);
+  await assert.rejects(h.service.copy(record,{chat:4004}),error=>diagnosticError(error,
+    {stage:'signing',code:'EGRN_DOWNLOAD_CONFIG',constraint:undefined}));
+});
+
+test('validation and missing receipt diagnostics remain distinct',async()=>{
+  const h=fixture();await assert.rejects(h.service.deliver(h.order,{name:'empty.pdf',buf:Buffer.alloc(0)},KEY,h.records),
+    error=>diagnosticError(error,{stage:'validation',code:undefined,constraint:undefined}));
+  h.options.telegram.sendMessage=async()=>({});
+  await assert.rejects(h.service.deliver(h.order,h.file,KEY,h.records),
+    error=>diagnosticError(error,{stage:'receipt',code:undefined,constraint:undefined}));
+});
