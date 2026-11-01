@@ -346,3 +346,15 @@ test('validation and missing receipt diagnostics remain distinct',async()=>{
   await assert.rejects(h.service.deliver(h.order,h.file,KEY,h.records),
     error=>diagnosticError(error,{stage:'receipt',code:undefined,constraint:undefined}));
 });
+
+test('object storage diagnostics retain only a safe provider code and HTTP status',async()=>{
+  const h=fixture();
+  h.store.save=async()=>{throw Object.assign(new Error('SECRET signed endpoint https://private.example?secret=PRIVATE'),
+    {code:'EGRN_OBJECT_WRITE',provider_code:'SignatureDoesNotMatch',provider_status:403,request:{secret:'PRIVATE'}});};
+  await assert.rejects(h.service.deliver(h.order,h.file,KEY,h.records),error=>{
+    assert.equal(error.delivery_stage,'storage');assert.equal(error.failure_code,'EGRN_OBJECT_WRITE');
+    assert.equal(error.provider_code,'SignatureDoesNotMatch');assert.equal(error.provider_status,403);
+    assert.doesNotMatch(JSON.stringify(error),/SECRET|PRIVATE|https|request/);return true;
+  });
+  assert.equal(h.sends.length,0);
+});

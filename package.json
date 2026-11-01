@@ -10,6 +10,7 @@
     "migrate": "node src/db/migrate.js"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "3.1157.0",
     "connect-pg-simple": "^10.0.0",
     "date-fns": "^3.3.1",
     "dotenv": "^16.3.1",
@@ -26,6 +27,6 @@
     "nodemon": "^3.0.3"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   }
 }

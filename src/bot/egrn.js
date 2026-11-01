@@ -163,16 +163,19 @@ async function apiStatus(idReq) {
   const source = require('./egrn-source');
   if (!cleanedSources) cleanedSources = source.cleanupStale().catch(() => { cleanedSources = null; });
   await cleanedSources;
-  const signal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
-  const r = await fetch(API + '?id_req=' + encodeURIComponent(idReq), { headers: authHeaders(), signal });
-  if (!r.ok || !r.body) {
-    await r.body?.cancel().catch(() => {});
-    throw new Error('Сервис ЕГРН временно недоступен (HTTP ' + r.status + ').');
-  }
-  // fetch already cancels the response body on its network deadline. A fully
-  // received local file must survive that deadline while being stored/delivered.
-  try { return await source.readStatusResponse(r.body, { idReq }); }
-  catch (error) { await r.body.cancel().catch(() => {}); throw error; }
+  return require('./egrn-source-retry').readWithRetry(async (attempt, { signal }) => {
+    console.log('egrn receive:', JSON.stringify({ id_statement: idReq, attempt }));
+    const r = await fetch(API + '?id_req=' + encodeURIComponent(idReq), { headers: authHeaders(), signal });
+    if (!r.ok || !r.body) {
+      await r.body?.cancel().catch(() => {});
+      const temporary = !r.body && r.ok || [408, 425, 429, 500, 502, 503, 504].includes(r.status);
+      throw Object.assign(new Error('Сервис ЕГРН временно недоступен.'), { code: temporary ? 'EGRN_SOURCE_RESPONSE' : 'EGRN_SOURCE_HTTP_' + r.status });
+    }
+    // fetch cancels its own response body on deadline. A completely received
+    // local original must survive that deadline while being stored/delivered.
+    try { return await source.readStatusResponse(r.body, { idReq }); }
+    catch (error) { await r.body.cancel().catch(() => {}); throw error; }
+  }, { onRetry(info) { console.error('egrn receive retry:', JSON.stringify({ id_statement: idReq, ...info })); } });
 }
 
 // Ищем запись по нашей заявке в ответе (формат: { "0": {...}, "1": {...} } или сразу объект)
@@ -606,7 +609,8 @@ function setupEgrn(bot) {
         function fileError(e, name, size) {
           console.error('egrn file:', JSON.stringify({ order_id: o.id, id_statement: o.id_statement,
             filename: name, bytes: size, error: e.message,
-            delivery_stage: e.delivery_stage, failure_code: e.failure_code, constraint: e.constraint }));
+            delivery_stage: e.delivery_stage, failure_code: e.failure_code, constraint: e.constraint,
+            provider_code: e.provider_code, provider_status: e.provider_status }));
           deliveryErrors.push(String(e.message || 'ошибка доставки'));
           if (e.code === 'EGRN_FILE_TOO_LARGE' || e.code === 'EGRN_FILE_TYPE') permanent = true;
         }
@@ -674,7 +678,8 @@ function setupEgrn(bot) {
           await copyFiles(newlySent, targets);
         }
       } catch (e) {
-        console.error('egrn status', o.id_statement, e.message);
+        console.error('egrn status', o.id_statement, e.message,
+          JSON.stringify({ source_code: e.source_code, source_name: e.source_name, source_bytes: e.source_bytes }));
         await saveFailure(o, [String(e.message || 'ошибка проверки статуса')], e.code === 'EGRN_FILE_TOO_LARGE', o.file_msgs || []);
       } finally { if (source) await source.cleanup(); }
     }

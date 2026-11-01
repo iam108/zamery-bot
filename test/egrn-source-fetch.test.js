@@ -20,6 +20,7 @@ function harness({ replies = [], sourceError, statusError } = {}) {
       if (name === '../db/pool') return {};
       if (name === './formatter') return { esc: String };
       if (name === './egrn-source') return source;
+      if (name === './egrn-source-retry') return require('../src/bot/egrn-source-retry');
       throw new Error('Unexpected dependency: ' + name);
     },
     async fetch(url, options) {
@@ -42,7 +43,7 @@ function response({ status = 200, headers = {} } = {}) {
 test('status preparation failure cancels the unconsumed provider response without a second request', async () => {
   const reply = response(), expected = Object.assign(new Error('Synthetic temporary directory failure'), { code: 'ENOSPC' });
   const h = harness({ replies: [reply], statusError: expected });
-  await assert.rejects(h.apiStatus(77), error => error === expected);
+  await assert.rejects(h.apiStatus(77), error => error.code === expected.code && error.attempts === 1);
   assert.equal(reply.cancelled, 1); assert.equal(h.requests.length, 1); assert.equal(h.reads[0].options.idReq, 77);
 });
 

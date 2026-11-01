@@ -92,9 +92,11 @@ function setupEgrnDownloads(app, options = {}) {
       const info = metadata(file);
       res.set({ 'Content-Type': info.type, 'Content-Length': String(info.bytes), 'Content-Disposition': info.disposition, 'Accept-Ranges': 'none' });
       if (req.method === 'HEAD') return res.end();
+      const controller = new AbortController(), abort = () => controller.abort();
+      req.once('aborted', abort); res.once('close', abort);
       async function* body() {
         let sent = 0;
-        for await (const chunk of store.chunks(id)) {
+        for await (const chunk of store.chunks(id, { signal: controller.signal })) {
           if (!(Buffer.isBuffer(chunk) || chunk instanceof Uint8Array) || sent + chunk.byteLength > info.bytes) throw new Error('Invalid stored file content');
           sent += chunk.byteLength;
           yield chunk;
@@ -103,7 +105,8 @@ function setupEgrnDownloads(app, options = {}) {
       }
       // pipeline destroys the source/async iterator on a disconnected client,
       // and waits for response drain instead of collecting the file in RAM.
-      await pipeline(Readable.from(body(), { objectMode: false, highWaterMark: 64 * 1024 }), res);
+      try { await pipeline(Readable.from(body(), { objectMode: false, highWaterMark: 64 * 1024 }), res); }
+      finally { req.removeListener('aborted', abort); res.removeListener('close', abort); }
     } catch (_) {
       if (res.headersSent || res.destroyed) { if (!res.destroyed) res.destroy(); return; }
       res.removeHeader('Content-Length'); res.removeHeader('Content-Disposition');

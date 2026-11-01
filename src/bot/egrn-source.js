@@ -133,7 +133,11 @@ function selectRequest(data, idReq) {
 }
 
 async function parseResponse(body, workspace, options) {
-  const input = Readable.from(body, { objectMode: false });
+  let sourceBytes = 0;
+  async function* incoming() {
+    for await (const chunk of body) { sourceBytes += chunk.byteLength; yield chunk; }
+  }
+  const input = Readable.from(incoming(), { objectMode: false });
   const parser = new Parser({ packKeys: false, packStrings: false, packNumbers: false,
     streamKeys: true, streamStrings: true, streamNumbers: true });
   // Handle the pump's rejection immediately while consuming tokens. Destroying
@@ -225,7 +229,11 @@ async function parseResponse(body, workspace, options) {
     input.destroy(); parser.destroy(); await pumping.catch(() => {});
     if (error.code?.startsWith('EGRN_')) throw error;
     if (error.code === 'ENOSPC') throw failure('EGRN_SOURCE_SPACE', 'Недостаточно места для получения выписки. Повторим попытку.');
-    throw failure('EGRN_SOURCE_RESPONSE', 'Не удалось полностью прочитать ответ сервиса ЕГРН. Повторим попытку.');
+    const problem = failure('EGRN_SOURCE_RESPONSE', 'Не удалось полностью прочитать ответ сервиса ЕГРН. Повторим попытку.');
+    const safe = value => typeof value === 'string' && /^[A-Za-z\d_]{1,80}$/.test(value) ? value : undefined;
+    problem.source_code = safe(error.code) || safe(error.cause?.code) || 'INCOMPLETE_RESPONSE';
+    problem.source_name = safe(error.name) || 'Error'; problem.source_bytes = sourceBytes;
+    throw problem;
   }
 }
 

@@ -1,9 +1,9 @@
-const { createHash } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 
 const MAX_BYTES = 2 * 1024 * 1024 * 1024 - 1; // PostgreSQL INTEGER upper bound.
 const CHUNK_BYTES = 1024 * 1024;
 const UUID_NAMESPACE = Buffer.from('6ba7b8109dad11d180b400c04fd430c8', 'hex');
-const COLUMNS = 'id,egrn_order_id,source_key,name,mime,bytes,sha256';
+const COLUMNS = 'id,egrn_order_id,source_key,name,mime,bytes,sha256,storage,object_key';
 const DDL = `
   CREATE TABLE IF NOT EXISTS egrn_files (
     id UUID PRIMARY KEY,
@@ -18,6 +18,10 @@ const DDL = `
   );
   ALTER TABLE egrn_files DROP CONSTRAINT IF EXISTS egrn_files_bytes_check;
   ALTER TABLE egrn_files ADD CONSTRAINT egrn_files_bytes_check CHECK(bytes BETWEEN 1 AND ${MAX_BYTES});
+  ALTER TABLE egrn_files ADD COLUMN IF NOT EXISTS storage TEXT NOT NULL DEFAULT 'postgres';
+  ALTER TABLE egrn_files ADD COLUMN IF NOT EXISTS object_key TEXT;
+  ALTER TABLE egrn_files DROP CONSTRAINT IF EXISTS egrn_files_storage_check;
+  ALTER TABLE egrn_files ADD CONSTRAINT egrn_files_storage_check CHECK(storage IN ('postgres','s3'));
   CREATE INDEX IF NOT EXISTS egrn_files_order ON egrn_files(egrn_order_id,created_at,id);
   CREATE TABLE IF NOT EXISTS egrn_file_chunks (
     file_id UUID NOT NULL REFERENCES egrn_files(id) ON DELETE CASCADE,
@@ -143,9 +147,10 @@ function metadata(row) {
   return { id: row.id, name: row.name, mime: row.mime, bytes: Number(row.bytes), sha256: row.sha256,
     egrn_order_id: Number(row.egrn_order_id), source_key: row.source_key };
 }
-function createEgrnFileStore(pool) {
+function createEgrnFileStore(pool, options = {}) {
   if (!pool || typeof pool.query !== 'function' || typeof pool.connect !== 'function') throw new TypeError('A PostgreSQL pool is required.');
   let ready;
+  const objects = options.objectStore === undefined ? require('./egrn-object-store').createEgrnObjectStore() : options.objectStore;
   async function ensure() {
     if (!ready) ready = (async () => {
       const client = await pool.connect();
@@ -166,6 +171,10 @@ function createEgrnFileStore(pool) {
     return saveStream({ ...input, bytes: buffer.length, sha256, open: async function* () { yield buffer; } });
   }
   async function saveStream(input) {
+    if (objects && objects.configured()) return saveObjectStream(input);
+    return savePostgresStream(input);
+  }
+  async function savePostgresStream(input) {
     const order = orderId(input?.egrn_order_id), key = sourceKey(input?.source_key);
     const { bytes, sha256 } = streamDetails(input), id = fileId(order, key, sha256);
     if (input.signal?.aborted) throw cancelled();
@@ -185,7 +194,7 @@ function createEgrnFileStore(pool) {
       reader = await streamReader(input, bytes);
       let content = await reader.next();
       const type = fileType(content), name = filename(input.name, type.extension);
-      const inserted = await client.query(`INSERT INTO egrn_files(${COLUMNS}) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO NOTHING RETURNING ${COLUMNS}`,
+      const inserted = await client.query(`INSERT INTO egrn_files(${COLUMNS}) VALUES($1,$2,$3,$4,$5,$6,$7,'postgres',NULL) ON CONFLICT(id) DO NOTHING RETURNING ${COLUMNS}`,
         [id, order, key, name, type.mime, bytes, sha256]);
       let result;
       if (inserted.rows.length) {
@@ -210,6 +219,76 @@ function createEgrnFileStore(pool) {
     } catch (failure) { await client.query('ROLLBACK').catch(() => {}); throw failure; }
     finally { if (reader) await reader.close(); client.release(); }
   }
+  function matches(row, order, key, sha256, bytes) {
+    return row && Number(row.egrn_order_id) === order && row.source_key === key && row.sha256 === sha256 && Number(row.bytes) === bytes;
+  }
+  async function removeAttempt(key) {
+    try { await objects.remove(key); }
+    catch (_) { console.error('egrn object cleanup: temporary storage failure'); }
+  }
+  async function linkObject(id, order, key, name, mime, bytes, sha256, objectKey) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const compact = id.replace(/-/g, '');
+      await client.query('SELECT pg_advisory_xact_lock($1,$2)', [parseInt(compact.slice(0, 8), 16) | 0, parseInt(compact.slice(8, 16), 16) | 0]);
+      const existing = (await client.query(`SELECT ${COLUMNS} FROM egrn_files WHERE id=$1`, [id])).rows[0];
+      if (existing) {
+        if (!matches(existing, order, key, sha256, bytes)) throw error(409, 'EGRN_FILE_CONFLICT', 'Не удалось подтвердить ранее сохранённый файл выписки.');
+        await client.query('COMMIT'); return existing;
+      }
+      const inserted = await client.query(`INSERT INTO egrn_files(${COLUMNS}) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING ${COLUMNS}`,
+        [id, order, key, name, mime, bytes, sha256, 's3', objectKey]);
+      await client.query('COMMIT'); return inserted.rows[0];
+    } catch (failure) { await client.query('ROLLBACK').catch(() => {}); throw failure; }
+    finally { client.release(); }
+  }
+  async function saveObjectStream(input) {
+    const order = orderId(input?.egrn_order_id), key = sourceKey(input?.source_key);
+    const { bytes, sha256 } = streamDetails(input), id = fileId(order, key, sha256);
+    if (input.signal?.aborted) throw cancelled();
+    await ensure();
+    const existing = (await pool.query(`SELECT ${COLUMNS} FROM egrn_files WHERE id=$1`, [id])).rows[0];
+    if (existing) {
+      if (!matches(existing, order, key, sha256, bytes)) throw error(409, 'EGRN_FILE_CONFLICT', 'Не удалось подтвердить ранее сохранённый файл выписки.');
+      return metadata(existing);
+    }
+    // Each attempt owns a fresh key. A failed/concurrent attempt can only
+    // delete its own unreferenced object, never an older committed original.
+    const objectKey = 'egrn-originals/' + id + '/' + randomUUID();
+    let reader, attempted = false, linked = false, verified = false;
+    try {
+      reader = await streamReader(input, bytes);
+      const first = await reader.next(), type = fileType(first), name = filename(input.name, type.extension);
+      async function* content() {
+        const hash = createHash('sha256'); let chunk = first;
+        while (chunk) { reader.check(); hash.update(chunk); yield chunk; chunk = await reader.next(); }
+        if (hash.digest('hex') !== sha256) throw error(409, 'EGRN_FILE_CHANGED', 'Контрольная сумма оригинала выписки не совпала.');
+        reader.check(); verified = true;
+      }
+      attempted = true;
+      await objects.put({ key: objectKey, bytes, sha256, mime: type.mime, body: content(), signal: input.signal });
+      if (!verified) throw error(409, 'EGRN_FILE_INCOMPLETE', 'Хранилище не подтвердило получение оригинала выписки.');
+      reader.check();
+      const row = await linkObject(id, order, key, name, type.mime, bytes, sha256, objectKey);
+      linked = row.object_key === objectKey;
+      if (!linked) await removeAttempt(objectKey);
+      return metadata(row);
+    } catch (failure) {
+      if (attempted && !linked) {
+        // A lost COMMIT acknowledgement must not cause deletion of a live
+        // object. Reconcile using a fresh connection; retain it if DB is down.
+        let keep = true;
+        try {
+          const row = (await pool.query(`SELECT ${COLUMNS} FROM egrn_files WHERE id=$1`, [id])).rows[0];
+          keep = row?.object_key === objectKey;
+          if (keep && matches(row, order, key, sha256, bytes)) return metadata(row);
+        } catch (_) {}
+        if (!keep) await removeAttempt(objectKey);
+      }
+      throw failure;
+    } finally { if (reader) await reader.close(); }
+  }
   async function get(id) {
     if (!validId(id)) return null;
     await ensure();
@@ -220,11 +299,25 @@ function createEgrnFileStore(pool) {
     id = orderId(id); await ensure();
     return (await pool.query(`SELECT ${COLUMNS} FROM egrn_files WHERE egrn_order_id=$1 ORDER BY created_at,id`, [id])).rows.map(metadata);
   }
-  async function* chunks(id) {
-    const file = await get(id);
+  async function* chunks(id, options = {}) {
+    if (options.signal?.aborted) throw cancelled();
+    if (!validId(id)) throw error(404, 'EGRN_FILE_NOT_FOUND', 'Файл выписки не найден.');
+    await ensure();
+    const row = (await pool.query(`SELECT ${COLUMNS} FROM egrn_files WHERE id=$1`, [id])).rows[0];
+    const file = row && metadata(row);
     if (!file) throw error(404, 'EGRN_FILE_NOT_FOUND', 'Файл выписки не найден.');
+    if (row.storage === 's3') {
+      const source = await objects.get({ key: row.object_key, bytes: file.bytes, sha256: file.sha256, signal: options.signal });
+      const reader = await streamReader({ chunks: source, signal: options.signal }, file.bytes), hash = createHash('sha256');
+      try {
+        for (let chunk = await reader.next(); chunk; chunk = await reader.next()) { hash.update(chunk); yield chunk; }
+        if (hash.digest('hex') !== file.sha256) throw error(500, 'EGRN_FILE_CORRUPT', 'Не удалось подтвердить целостность оригинала выписки.');
+      } finally { await reader.close(); }
+      return;
+    }
     const hash = createHash('sha256'); let total = 0, index = 0;
     while (total < file.bytes) {
+      if (options.signal?.aborted) throw cancelled();
       const row = (await pool.query('SELECT content FROM egrn_file_chunks WHERE file_id=$1 AND chunk_no=$2', [id, index])).rows[0];
       if (!row) throw error(500, 'EGRN_FILE_INCOMPLETE', 'Оригинал выписки сохранён не полностью.');
       const content = Buffer.from(row.content);

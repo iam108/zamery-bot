@@ -24,6 +24,10 @@ function temporaryError(cause, stage) {
   if (failureCode) error.failure_code = failureCode;
   const constraint = identifier(field(cause, 'constraint'));
   if (constraint) error.constraint = constraint;
+  const providerCode = identifier(field(cause, 'provider_code'));
+  if (providerCode) error.provider_code = providerCode;
+  const providerStatus = field(cause, 'provider_status');
+  if (Number.isInteger(providerStatus) && providerStatus >= 100 && providerStatus <= 599) error.provider_status = providerStatus;
   return error;
 }
 function positive(value) {
