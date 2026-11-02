@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "chatId": "5164597211",
+  "chatTitle": "Лицензии на алкоголь",
+  "telegramApp": "com.tdesktop.Telegram",
+  "spreadsheetId": "15je7KIryEg09thZVLpguVWXmWlxCsft2ULC6dc2m-vs",
+  "spreadsheetUrl": "https://docs.google.com/spreadsheets/d/15je7KIryEg09thZVLpguVWXmWlxCsft2ULC6dc2m-vs/edit",
+  "sheetName": "Реестр лицензий",
+  "sheetId": 0,
+  "startFrom": "2026-11-01T00:00:00+03:00",
+  "timeZone": "Europe/Moscow",
+  "dailyHour": 9,
+  "sourceQueries": [
+    "положительно",
+    "решение",
+    "лицензия",
+    "получили"
+  ],
+  "keyFile": "research/fsrar-pilot/.api-fns-key-2026-11-01",
+  "stateFile": "license-registry/private/state.json",
+  "maxCallsPerRun": 3,
+  "maxCallsPerDay": 10,
+  "quotaReserve": 20
+}

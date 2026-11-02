@@ -1,0 +1,14 @@
+{
+  "name": "license-registry",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Autonomous Telegram to Google Sheets alcohol license registry worker",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test *.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

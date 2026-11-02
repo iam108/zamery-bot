@@ -1,0 +1,22 @@
+# Default deny: never send local data, exports or credentials to the builder.
+**
+!package.json
+!config.json
+!*.mjs
+!network-helper.py
+
+# Test code and fixtures are not part of the runtime image.
+*.test.mjs
+**/*.test.mjs
+fixtures/
+test/
+tests/
+private/
+secrets/
+.env
+.env.*
+*.ax
+*.pem
+*.key
+*credentials*.json
+*service-account*.json
