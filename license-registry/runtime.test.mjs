@@ -499,6 +499,12 @@ test('private state proof hashes queue sections without exposing their contents 
   state.telegram.offset=124;const next=privateStateProof(state);
   assert.notEqual(next.sha256,first.sha256);assert.notEqual(next.sectionHashes.telegram,first.sectionHashes.telegram);
   assert.equal(next.sectionHashes.jobs,first.sectionHashes.jobs);
+  assert.equal(first.journalEntries,state.journal.length);
+  state.journal.push({type:'fixture_event',privateText:'PRIVATE_JOURNAL_TEXT'});
+  const changedJournal=privateStateProof(state);
+  assert.notEqual(changedJournal.sectionHashes.journal,next.sectionHashes.journal);
+  assert.equal(changedJournal.journalEntries,first.journalEntries+1);
+  assert.ok(!JSON.stringify(changedJournal).includes('PRIVATE_JOURNAL_TEXT'));
 });
 
 test('private job diagnostics are bounded and expose only safe identifiers, reasons and normalized API dates',()=>{

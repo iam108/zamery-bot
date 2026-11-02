@@ -8,6 +8,7 @@ import {TelegramClient,convertUpdate} from './telegram.mjs';
 import {LicenseWorker,FsrarClient,prepareSecrets,initializeState,classifyApiFailure,privateStateProof} from './runtime.mjs';
 import {createReadiness,createHealthHandler,safeErrorCode,validateFsrarStat,retryStartup} from './health.mjs';
 import {createNotifier} from './notifier.mjs';
+import {runReadOnlyAcceptance} from './acceptance.mjs';
 
 const dir=path.dirname(fileURLToPath(import.meta.url));
 const env=process.env;
@@ -87,6 +88,8 @@ async function initialize(){
   const api=monitoredApi(new FsrarClient({keyFile,proxyUrl:env.FSRAR_PROXY_URL,proxyServerName:env.FSRAR_PROXY_SERVER_NAME}));await api.validate();
   const quota=validateFsrarStat(await api.request('stat'));
   console.log(JSON.stringify({at:new Date().toISOString(),type:'api_quota',total:quota.total,used:quota.used,remaining:quota.remaining}));
+  // Explicit one-time acceptance uses private logs, not owner notifications.
+  if(env.ACCEPTANCE_SOURCE_JOB_ID)await runReadOnlyAcceptance({sourceJobId:env.ACCEPTANCE_SOURCE_JOB_ID,store,google,api});
   const worker=new LicenseWorker({store,google,api,config,dryRun:env.DRY_RUN==='true',report});
   startupDependency=null;health.running({dryRun:env.DRY_RUN==='true'});
   await report({type:'runtime_initialized',targetChatId:String(target.id),dryRun:env.DRY_RUN==='true',

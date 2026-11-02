@@ -44,7 +44,7 @@ function proofApiDates(item){
 export function privateStateProof(state){
   // Periodic lastIngestAt/startup timestamps are telemetry, not queue content.
   const sections={jobs:state.jobs,sources:state.sources,api:state.api,
-    telegram:{offset:state.telegram?.offset??0,inbox:state.telegram?.inbox??[]},cursors:state.cursors??{}};
+    telegram:{offset:state.telegram?.offset??0,inbox:state.telegram?.inbox??[]},cursors:state.cursors??{},journal:state.journal??[]};
   const digest=(value)=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
   const safeCount=(value)=>Number.isSafeInteger(value)&&value>=0?value:null;
   const jobs=Object.values(state.jobs);
@@ -57,7 +57,7 @@ export function privateStateProof(state){
   return {sha256:digest(sections),sectionHashes:Object.fromEntries(Object.entries(sections).map(([name,value])=>[name,digest(value)])),
     jobs:Object.keys(state.jobs).length,sources:Object.keys(state.sources).length,counts,
     apiAttemptedCalls:safeCount(state.api.attemptedCalls),telegramOffset:safeCount(state.telegram?.offset??0),pendingInbox:state.telegram?.inbox?.length??0,
-    jobStates,jobStatesTruncated:Math.max(0,jobs.length-jobStates.length)};
+    jobStates,jobStatesTruncated:Math.max(0,jobs.length-jobStates.length),journalEntries:state.journal?.length??0};
 }
 function editedSourceChanged(existing,message,extraction){
   if(!existing||!message.editDate)return false;
