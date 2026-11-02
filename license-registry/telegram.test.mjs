@@ -153,6 +153,7 @@ test('normalizes canonical identity for export dedup and keeps exact original Te
   const converted = convertUpdate(updateOf(), { targetChatId });
   assert.equal(sourceEventKey(converted), 'telegram:5164597211:62436');
   assert.equal(converted.telegram_chat_id, targetChatId);
+  assert.equal(converted.telegram_chat_type, 'supergroup');
   assert.equal(converted.date, new Date(1793174039 * 1000).toISOString());
   assert.equal(converted.originalDate, converted.date);
   assert.equal(converted.author, 'Валера Рабочий');
@@ -192,7 +193,24 @@ test('anonymous sender is attributed to its Telegram sender_chat and basic group
   const converted = convertUpdate(updateOf({ sender_chat: { id: Number(targetChatId), title: chatTitle } }), { targetChatId });
   assert.equal(converted.author, chatTitle);
   assert.equal(converted.authorId, targetChatId);
-  const basic = convertUpdate(updateOf({ chat: { id: -12345, type: 'group' } }), { targetChatId: '-12345', sourceChatId: '12345' });
+  const basic = convertUpdate(updateOf({ chat: { id: -12345, type: 'group' } }), { targetChatId: '-12345', sourceChatId: '12345', botId: bot.id });
   assert.equal(basic.source_url, null);
   assert.equal(basic.chat_id, '12345');
+  assert.equal(basic.telegram_chat_type, 'group');
+  assert.equal(basic.source_bot_id, String(bot.id));
+});
+
+test('basic-group messages require verified bot identity and retain it through edits', () => {
+  const options = { targetChatId: '-5164597211', sourceChatId: '5164597211', botId: bot.id };
+  const update = updateOf({ message_id: 2, chat: { id: -5164597211, type: 'group' } });
+  const original = convertUpdate(update, options);
+  assert.equal(sourceEventKey(original), `telegram-bot:${bot.id}:group:5164597211:2`);
+  assert.notEqual(sourceEventKey(original), sourceEventKey({ chatId: '5164597211', id: 2 }));
+  const edited = { update_id: update.update_id + 1, edited_message: { ...update.message, edit_date: 1793260439 } };
+  assert.equal(sourceEventKey(convertUpdate(edited, options)), sourceEventKey(original));
+  assert.equal(convertUpdate(edited, options).source_bot_id, String(bot.id));
+  assert.notEqual(sourceEventKey(convertUpdate(update, { ...options, botId: 987654321 })), sourceEventKey(original));
+  for (const botId of [undefined, '', 0, -1, '123:token', Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => convertUpdate(update, { ...options, botId }), { code: 'source_bot_id_required' });
+  }
 });

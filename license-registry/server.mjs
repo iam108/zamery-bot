@@ -84,16 +84,16 @@ async function initialize(){
   startupDependency=null;health.running({dryRun:env.DRY_RUN==='true'});
   await report({type:'runtime_initialized',targetChatId:String(target.id),dryRun:env.DRY_RUN==='true',
     fsrarQuota:{total:quota.total,used:quota.used,remaining:quota.remaining}});
-  return {store,telegram,worker,config};
+  return {store,telegram,worker,config,botId:target.botId};
 }
 
-async function run({store,telegram,worker,config}){
+async function run({store,telegram,worker,config,botId}){
   const polling=(async()=>{
     while(!stopping){
       try{
         const state=await store.read();
         const updates=await telegram.getUpdates({offset:state.telegram?.offset??0,signal:controller.signal});
-        await worker.persistUpdates(updates,(update)=>convertUpdate(update,{targetChatId:config.targetChatId,sourceChatId:config.sourceChatId}));
+        await worker.persistUpdates(updates,(update)=>convertUpdate(update,{targetChatId:config.targetChatId,sourceChatId:config.sourceChatId,botId}));
         health.success('telegram');
       }catch(error){
         if(stopping)break;

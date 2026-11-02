@@ -96,6 +96,19 @@ export function sourceEventKey(message) {
   const chat = message.chatId ?? message.chat_id ?? message.chat?.id;
   const id = message.messageId ?? message.message_id ?? message.id;
   if (chat == null || id == null) throw new Error('Telegram chat and message identifiers are required');
+  if (message.source_kind === 'telegram_bot_api') {
+    if (!['group', 'supergroup'].includes(message.telegram_chat_type)) throw new Error('Telegram Bot API chat type is required');
+    // Basic-group message IDs belong to the receiving bot's message box, not
+    // the user-export history. Keep both namespaces and other bots separate.
+    if (message.telegram_chat_type === 'group') {
+      const bot = String(message.source_bot_id ?? '');
+      if (!/^[1-9]\d*$/u.test(bot) || !Number.isSafeInteger(Number(bot))
+          || !/^[1-9]\d*$/u.test(String(id)) || !Number.isSafeInteger(Number(id))) {
+        throw new Error('Telegram basic-group bot and message identities are required');
+      }
+      return `telegram-bot:${bot}:group:${chat}:${id}`;
+    }
+  }
   return `telegram:${chat}:${id}`;
 }
 

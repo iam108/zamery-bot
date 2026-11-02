@@ -134,6 +134,44 @@ test('source and document replay after completion do not fetch or append again',
   assert.equal(Object.values(state.jobs)[0].sourceReviewRequired,undefined);
 });
 
+test('basic-group bot history stays separate from export IDs and deduplicates across restart and edits',async(t)=>{
+  const h=await harness(t);
+  const legacyKey='telegram:5164597211:2';
+  const botKey='telegram-bot:1234567890:group:5164597211:2';
+  await h.store.update((state)=>addJob(state,{id:'legacy-two',sourceEventKey:legacyKey,status:'done',inn:INN},{now:NOW}));
+  const group={id:-5164597211,type:'group'};
+  const convertBasic=(u)=>convertUpdate(u,{targetChatId:String(group.id),sourceChatId:'5164597211',botId:'1234567890'});
+  const first=update(10,2,{chat:group});
+  await h.worker.persistUpdates([first],convertBasic);await h.worker.tick();
+  let state=await h.store.read();
+  const botJobId=state.sources[botKey];
+  assert.ok(botJobId);assert.notEqual(botJobId,state.sources[legacyKey]);
+  assert.equal(Object.keys(state.jobs).length,2);assert.equal(state.jobs[botJobId].status,'done');
+  assert.equal(h.api.calls.length,1);assert.equal(h.google.writes,1);
+  const unchangedEdit={update_id:12,edited_message:{...first.message,edit_date:Date.parse(NOW)/1000}};
+  const restarted=h.makeWorker();
+  await restarted.persistUpdates([update(11,2,{chat:group}),unchangedEdit],convertBasic);await restarted.tick();
+  state=await createStore(h.file).read();
+  assert.equal(state.sources[botKey],botJobId);assert.equal(Object.keys(state.jobs).length,2);
+  assert.equal(h.api.calls.length,1);assert.equal(h.google.writes,1);
+  assert.equal(state.jobs[botJobId].sourceReviewRequired,undefined);
+  await restarted.persistUpdates([{update_id:13,edited_message:{...first.message,
+    text:'Сообщение ошибочное, лицензия не получена',edit_date:Date.parse(NOW)/1000}}],convertBasic);
+  await restarted.tick();state=await h.store.read();
+  assert.equal(state.jobs[botJobId].status,'done');assert.equal(state.jobs[botJobId].sourceReviewRequired,true);
+  assert.equal(state.sources[legacyKey],'legacy-two');assert.equal(state.jobs['legacy-two'].sourceReviewRequired,undefined);
+  assert.equal(h.api.calls.length,1);assert.equal(h.google.writes,1);
+});
+
+test('missing receiving-bot identity never acknowledges basic-group updates',async(t)=>{
+  const h=await harness(t);const before=await h.store.read();
+  const basic=update(10,2,{chat:{id:-5164597211,type:'group'}});
+  await assert.rejects(h.worker.persistUpdates([basic],(u)=>convertUpdate(u,{targetChatId:'-5164597211'})),
+    {code:'source_bot_id_required'});
+  assert.deepEqual(await h.store.read(),before);
+  assert.equal(h.api.calls.length,0);assert.equal(h.google.writes,0);
+});
+
 test('a corrected INN edit stops an existing waiting job without replacing its original identity',async(t)=>{
   const h=await harness(t);
   await h.worker.persistUpdates([update()],convert);await h.worker.ingestInbox(await h.google.context());

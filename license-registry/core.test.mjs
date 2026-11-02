@@ -93,6 +93,22 @@ test('missing time or message identity enters review rather than creating unsche
   assert.throws(() => sourceEventKey({ text: 'x' }));
 });
 
+test('basic-group Bot API identities never collide with user exports or another receiving bot', () => {
+  const legacy = { chatId: '5164597211', id: 2 };
+  const basic = { ...legacy, source_kind: 'telegram_bot_api', telegram_chat_type: 'group', source_bot_id: '1234567890' };
+  assert.equal(sourceEventKey(legacy), 'telegram:5164597211:2');
+  assert.equal(sourceEventKey(basic), 'telegram-bot:1234567890:group:5164597211:2');
+  assert.notEqual(sourceEventKey(basic), sourceEventKey(legacy));
+  assert.notEqual(sourceEventKey(basic), sourceEventKey({ ...basic, source_bot_id: '987654321' }));
+  assert.equal(sourceEventKey({ ...basic, edited: true, editDate: '2026-11-02T10:00:00Z' }), sourceEventKey(basic));
+  assert.equal(sourceEventKey({ ...basic, telegram_chat_type: 'supergroup' }), sourceEventKey(legacy));
+  assert.equal(sourceEventKey({ ...legacy, telegram_chat_type: 'group' }), sourceEventKey(legacy));
+  for (const source_bot_id of [undefined, '', '0', '-123', '123:token', '9007199254740992']) {
+    assert.throws(() => sourceEventKey({ ...basic, source_bot_id }));
+  }
+  assert.throws(() => sourceEventKey({ ...basic, telegram_chat_type: undefined }));
+});
+
 test('old Sverte API response does not complete October reissue event', () => {
   const result = selectLicense(event(), [license({ 'Дата изменения': '2026-04-17', 'Основание изменения': 'решение о выдаче лицензии' })]);
   assert.equal(result.status, 'waiting');

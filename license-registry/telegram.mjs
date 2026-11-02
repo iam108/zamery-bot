@@ -181,7 +181,7 @@ function unixDate(value, field) {
   return new Date(value * 1000).toISOString();
 }
 
-export function convertUpdate(update, { targetChatId, sourceChatId = '5164597211' } = {}) {
+export function convertUpdate(update, { targetChatId, sourceChatId = '5164597211', botId } = {}) {
   const target = chatId(targetChatId);
   const message = update?.message ?? update?.edited_message;
   if (!message || String(message.chat?.id) !== target) return null;
@@ -195,6 +195,11 @@ export function convertUpdate(update, { targetChatId, sourceChatId = '5164597211
   const text = typeof message.text === 'string' ? message.text
     : typeof message.caption === 'string' ? message.caption : '';
   if (!text && !message.document) return null;
+  const bot = botId == null ? null : String(botId);
+  if ((message.chat.type === 'group' || bot != null)
+      && (!/^[1-9]\d*$/u.test(bot ?? '') || !Number.isSafeInteger(Number(bot)))) {
+    throw new TelegramError('source_bot_id_required', 'A verified receiving bot ID is required for basic-group messages');
+  }
   const originalDate = unixDate(message.date, 'original date');
   const editDate = message.edit_date == null ? null : unixDate(message.edit_date, 'edit date');
   const sender = message.sender_chat ?? message.from;
@@ -206,7 +211,8 @@ export function convertUpdate(update, { targetChatId, sourceChatId = '5164597211
   const documentId = typeof message.document?.file_unique_id === 'string' ? message.document.file_unique_id : null;
   return {
     id: message.message_id, message_id: message.message_id,
-    chat_id: source, chatId: source, telegram_chat_id: target,
+    chat_id: source, chatId: source, telegram_chat_id: target, telegram_chat_type: message.chat.type,
+    ...(bot == null ? {} : { source_bot_id: bot }),
     update_id: update.update_id, source_update_id: update.update_id,
     date: originalDate, originalDate, editDate, edited: Boolean(update.edited_message), text,
     author, authorId: sender?.id == null ? null : String(sender.id),
