@@ -86,6 +86,7 @@ async function initialize(){
   startupDependency='api';health.stage('verifying_fsrar');
   const api=monitoredApi(new FsrarClient({keyFile,proxyUrl:env.FSRAR_PROXY_URL,proxyServerName:env.FSRAR_PROXY_SERVER_NAME}));await api.validate();
   const quota=validateFsrarStat(await api.request('stat'));
+  console.log(JSON.stringify({at:new Date().toISOString(),type:'api_quota',total:quota.total,used:quota.used,remaining:quota.remaining}));
   const worker=new LicenseWorker({store,google,api,config,dryRun:env.DRY_RUN==='true',report});
   startupDependency=null;health.running({dryRun:env.DRY_RUN==='true'});
   await report({type:'runtime_initialized',targetChatId:String(target.id),dryRun:env.DRY_RUN==='true',

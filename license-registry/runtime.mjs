@@ -5,7 +5,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { extractEvent, parseSheetRows, prepareJob, sourceEventKey, selectLicense,
-  planSheetUpsert, planRetry, nextMorning, localDate, normalizeName, normalizeAddress } from './core.mjs';
+  planSheetUpsert, planRetry, nextMorning, localDate, normalizeName, normalizeAddress, normalizeLicense } from './core.mjs';
 import { createStore, addJob, requireJob, dueJobs, reserveFetch, recordResponse,
   recordFailure, savePlan, acknowledge, recoverExpiredFetches, stateSummary } from './state.mjs';
 import {validatePinnedProxy} from './proxy-transport.mjs';
@@ -15,17 +15,49 @@ const directory = path.dirname(fileURLToPath(import.meta.url));
 const clone = (v) => JSON.parse(JSON.stringify(v));
 const instant = (now) => new Date(now()).toISOString();
 const sourceTextKey=(value)=>String(value??'').normalize('NFKC').toLowerCase().replace(/\s+/gu,' ').trim();
+const PROOF_STATUSES=['waiting','fetching','fetched','planned','review','done','blocked'];
+const PROOF_REASONS=new Set(['api_older_than_verified_sheet_record','api_operation_does_not_match_renewal',
+  'api_issueDate_older_than_existing','api_expiryDate_older_than_existing','api_daily_limit_reached',
+  'api_run_limit_reached','conflicting_api_records','duplicate_event','duplicate_or_ambiguous_sheet_records',
+  'event_date_required','event_inn_mismatch','event_inn_required','incomplete_existing_sheet_record',
+  'incomplete_api_pagination','insufficient_api_quota','invalid_api_record','invalid_api_response',
+  'invalid_explicit_inn','invalid_license_fields','invalid_or_incomplete_api_response','license_number_belongs_to_other_inn',
+  'maximum_attempts_reached','missing_message_identity','missing_or_invalid_message_date','multiple_licenses_or_objects',
+  'multiple_organizations_in_one_message','no_matching_active_license','object_address_conflict','organization_name_required',
+  'organization_not_identified','organization_name_is_ambiguous','positive_result_is_a_question','registry_has_not_reflected_event',
+  'registry_has_not_reflected_reissue','renewal_has_not_extended_expiry','retry_next_morning','row_number_required',
+  'unsupported_activity_for_sheet','source_message_edited','access_ip_blocked','authentication_failed','quota_exhausted',
+  'network_error','fsrar_transport_error','request_failed','api_fetch_interrupted']);
+const PROOF_LICENSE_STATUSES=new Set(['действующая','действует','active','истекла','истёк срок действия',
+  'прекращена','прекращено','аннулирована','приостановлена','inactive','expired','revoked','suspended','terminated']);
+function proofTimestamp(value){
+  if(typeof value!=='string'||!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/u.test(value)
+    ||!Number.isFinite(Date.parse(value)))return null;
+  return new Date(value).toISOString();
+}
+function proofApiDates(item){
+  let license;try{license=normalizeLicense(item);}catch{return {licenseNumber:null,issueDate:null,expiryDate:null,changeDate:null,status:null};}
+  return {licenseNumber:/^\d{2}[А-ЯA-Z]{2,4}\d{4,10}$/u.test(license.licenseNumber)?license.licenseNumber:null,
+    issueDate:license.issueDate,expiryDate:license.expiryDate,changeDate:license.changeDate,
+    status:PROOF_LICENSE_STATUSES.has(license.status)?license.status:null};
+}
 export function privateStateProof(state){
   // Periodic lastIngestAt/startup timestamps are telemetry, not queue content.
   const sections={jobs:state.jobs,sources:state.sources,api:state.api,
     telegram:{offset:state.telegram?.offset??0,inbox:state.telegram?.inbox??[]},cursors:state.cursors??{}};
   const digest=(value)=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
   const safeCount=(value)=>Number.isSafeInteger(value)&&value>=0?value:null;
-  const counts=Object.fromEntries(['waiting','fetching','fetched','planned','review','done'].map((status)=>
-    [status,Object.values(state.jobs).filter((job)=>job.status===status).length]));
+  const jobs=Object.values(state.jobs);
+  const counts=Object.fromEntries(PROOF_STATUSES.map((status)=>[status,jobs.filter((job)=>job.status===status).length]));
+  const jobStates=jobs.slice(-50).map((job)=>({id:typeof job.id==='string'&&/^[a-f0-9]{24}$/u.test(job.id)?job.id:null,
+    status:PROOF_STATUSES.includes(job.status)?job.status:'unknown',
+    reason:job.reason==null?null:PROOF_REASONS.has(job.reason)?job.reason:'unknown',attempts:safeCount(job.attempts??0),
+    nextCheckAt:proofTimestamp(job.nextCheckAt),apiRecordCount:Array.isArray(job.apiItems)?job.apiItems.length:0,
+    apiReceivedAt:proofTimestamp(job.apiReceivedAt),apiDates:Array.isArray(job.apiItems)?job.apiItems.slice(0,3).map(proofApiDates):[]}));
   return {sha256:digest(sections),sectionHashes:Object.fromEntries(Object.entries(sections).map(([name,value])=>[name,digest(value)])),
     jobs:Object.keys(state.jobs).length,sources:Object.keys(state.sources).length,counts,
-    apiAttemptedCalls:safeCount(state.api.attemptedCalls),telegramOffset:safeCount(state.telegram?.offset??0),pendingInbox:state.telegram?.inbox?.length??0};
+    apiAttemptedCalls:safeCount(state.api.attemptedCalls),telegramOffset:safeCount(state.telegram?.offset??0),pendingInbox:state.telegram?.inbox?.length??0,
+    jobStates,jobStatesTruncated:Math.max(0,jobs.length-jobStates.length)};
 }
 function editedSourceChanged(existing,message,extraction){
   if(!existing||!message.editDate)return false;

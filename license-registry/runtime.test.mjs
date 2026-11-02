@@ -500,3 +500,33 @@ test('private state proof hashes queue sections without exposing their contents 
   assert.notEqual(next.sha256,first.sha256);assert.notEqual(next.sectionHashes.telegram,first.sectionHashes.telegram);
   assert.equal(next.sectionHashes.jobs,first.sectionHashes.jobs);
 });
+
+test('private job diagnostics are bounded and expose only safe identifiers, reasons and normalized API dates',()=>{
+  const state=initialState(CONFIG);const privateText='PRIVATE_COMPANY client@example.test +79990000000 PRIVATE_SOURCE_TEXT';
+  const secret='k'.repeat(40);
+  for(let index=0;index<55;index++){
+    const id=index.toString(16).padStart(24,'0');
+    addJob(state,{id,sourceEventKey:`PRIVATE_SOURCE_${index}`,status:'waiting',reason:'registry_has_not_reflected_event',attempts:1,
+      nextCheckAt:'2026-11-03T09:00:00+03:00',apiReceivedAt:NOW,organization:privateText,sourceText:privateText,
+      apiItems:Array.from({length:4},()=>({...LICENSE,organization:privateText,address:privateText,email:privateText,changeReason:secret}))},{now:NOW});
+  }
+  const last=Object.values(state.jobs).at(-1);
+  last.apiItems[1]={...LICENSE,licenseNumber:secret,status:privateText};
+  last.apiItems[2]=null;
+  const proof=privateStateProof(state);
+  assert.equal(proof.jobStates.length,50);assert.equal(proof.jobStatesTruncated,5);
+  assert.equal(proof.jobStates[0].id,'5'.padStart(24,'0'));
+  const item=proof.jobStates.at(-1);
+  assert.equal(item.reason,'registry_has_not_reflected_event');assert.equal(item.attempts,1);
+  assert.equal(item.nextCheckAt,'2026-11-03T06:00:00.000Z');assert.equal(item.apiReceivedAt,NOW);
+  assert.equal(item.apiRecordCount,4);assert.equal(item.apiDates.length,3);
+  assert.deepEqual(item.apiDates[0],{licenseNumber:LICENSE.licenseNumber,issueDate:LICENSE.issueDate,
+    expiryDate:LICENSE.expiryDate,changeDate:LICENSE.changeDate,status:LICENSE.status});
+  assert.equal(item.apiDates[1].licenseNumber,null);assert.equal(item.apiDates[1].status,null);
+  assert.deepEqual(item.apiDates[2],{licenseNumber:null,issueDate:null,expiryDate:null,changeDate:null,status:null});
+  for(const sensitive of[privateText,'client@example.test','+79990000000','PRIVATE_SOURCE',secret])assert.ok(!JSON.stringify(proof).includes(sensitive));
+  Object.assign(last,{id:secret,status:privateText,reason:secret,attempts:privateText,nextCheckAt:privateText,apiReceivedAt:secret});
+  const unsafe=privateStateProof(state).jobStates.at(-1);
+  assert.equal(unsafe.id,null);assert.equal(unsafe.status,'unknown');assert.equal(unsafe.reason,'unknown');
+  assert.equal(unsafe.attempts,null);assert.equal(unsafe.nextCheckAt,null);assert.equal(unsafe.apiReceivedAt,null);
+});
