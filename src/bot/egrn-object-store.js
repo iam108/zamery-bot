@@ -2,7 +2,8 @@ const { Readable } = require('node:stream');
 const { finished } = require('node:stream/promises');
 
 const FIELDS = ['ENDPOINT', 'BUCKET', 'ACCESS_KEY_ID', 'SECRET_ACCESS_KEY', 'REGION'];
-const KEY = /^egrn-originals\/[0-9a-f-]{36}\/[0-9a-f-]{36}$/;
+const KEY = /^(egrn-originals|audit-originals)\/[0-9a-f-]{36}\/[0-9a-f-]{36}$/;
+const AUDIT_TYPES = new Set(['application/pdf', 'image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/heic', 'image/heif', 'image/avif', 'image/tiff', 'image/bmp']);
 const SAFE_ERROR = Symbol('safe-egrn-storage-error');
 function failure(code, error) {
   if (error?.[SAFE_ERROR]) return error;
@@ -24,8 +25,9 @@ function configuration(env) {
       !/^[a-z\d][a-z\d.-]{1,61}[a-z\d]$/.test(bucket) || !/^[a-z\d-]{1,64}$/.test(region)) throw failure('EGRN_OBJECT_CONFIG');
   return { endpoint: url.origin, bucket, region, credentials: { accessKeyId, secretAccessKey } };
 }
-function validate(file) {
-  if (!file || !KEY.test(file.key || '') || !Number.isSafeInteger(file.bytes) || file.bytes < 1 || file.bytes > 2147483647 ||
+function validKey(key, namespace) { return KEY.exec(key || '')?.[1] === namespace; }
+function validate(file, namespace) {
+  if (!file || !validKey(file.key, namespace) || !Number.isSafeInteger(file.bytes) || file.bytes < 1 || file.bytes > 2147483647 ||
       !/^[0-9a-f]{64}$/.test(file.sha256 || '')) throw failure('EGRN_OBJECT_ARGUMENT');
 }
 function verify(object, file) {
@@ -35,6 +37,8 @@ function verify(object, file) {
 }
 function createEgrnObjectStore(options = {}) {
   const env = options.env || process.env;
+  const namespace = options.namespace || 'egrn-originals';
+  if (!['egrn-originals', 'audit-originals'].includes(namespace)) throw failure('EGRN_OBJECT_ARGUMENT');
   let context;
   function configured() { return !!configuration(env); }
   function client() {
@@ -52,8 +56,8 @@ function createEgrnObjectStore(options = {}) {
     return context;
   }
   async function put(file) {
-    validate(file);
-    if (typeof file.body?.[Symbol.asyncIterator] !== 'function' || !['application/pdf', 'application/zip'].includes(file.mime)) throw failure('EGRN_OBJECT_ARGUMENT');
+    validate(file, namespace);
+    if (typeof file.body?.[Symbol.asyncIterator] !== 'function' || !(namespace === 'audit-originals' ? AUDIT_TYPES.has(file.mime) : ['application/pdf', 'application/zip'].includes(file.mime))) throw failure('EGRN_OBJECT_ARGUMENT');
     const { config, connection, sdk } = client(), controller = new AbortController();
     const body = Readable.from(file.body, { objectMode: false, highWaterMark: 1024 * 1024 });
     const completion = finished(body, { cleanup: true }); completion.catch(() => {});
@@ -76,7 +80,7 @@ function createEgrnObjectStore(options = {}) {
     } finally { clearTimeout(timer); file.signal?.removeEventListener('abort', abort); }
   }
   async function get(file) {
-    validate(file);
+    validate(file, namespace);
     const controller = new AbortController(); let body, rejectAbort, cleaned = false;
     const aborted = new Promise((_, reject) => { rejectAbort = reject; }); aborted.catch(() => {});
     const abort = () => {
@@ -104,7 +108,7 @@ function createEgrnObjectStore(options = {}) {
     } catch (error) { cleanup(); body?.destroy?.(); throw failure('EGRN_OBJECT_READ', error); }
   }
   async function remove(key) {
-    if (!KEY.test(key || '')) throw failure('EGRN_OBJECT_ARGUMENT');
+    if (!validKey(key, namespace)) throw failure('EGRN_OBJECT_ARGUMENT');
     const controller = new AbortController(); let timedOut = false, rejectTimeout;
     const deadline = new Promise((_, reject) => { rejectTimeout = reject; }); deadline.catch(() => {});
     const timeout = Math.min(30000, Math.max(1, options.cleanupTimeoutMs || options.timeoutMs || 30000));

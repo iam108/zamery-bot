@@ -128,6 +128,30 @@ test('failure to retire a generated image stops submission without reporting suc
   assert.ok(!c.calls.some(call=>call[0]==='request'&&call[1]==='/api/audit'));
 });
 
+test('regenerated drawings save their new preview IDs before submitting and preserve original sources',async()=>{
+  const c=harness();
+  c.state.data.map.preview_evidence_id='map-old';c.state.data.plan.preview_evidence_id='plan-old';
+  c.state.evidence=[{id:'map-original',role:'map-source',subject_id:'source'},{id:'plan-original',role:'plan-source',subject_id:'source'},
+    {id:'map-old',role:'map',subject_id:'annotation'},{id:'plan-old',role:'plan',subject_id:'annotation'}];
+  let persisted;
+  c.flush=async()=>{persisted=copy(c.state.data);c.calls.push(['flush']);c.state.dirty=false;};
+  const request=c.request;c.request=async(url,options)=>{
+    if(url==='/api/audit'){
+      for(const kind of ['map','plan']){
+        const drawing=persisted[kind],preview=c.state.evidence.find(e=>e.id===drawing.preview_evidence_id);
+        assert.ok(preview,'The server must receive a pointer to the current image');
+        assert.equal(preview.role,kind);assert.equal(preview.subject_id,'annotation');
+        assert.equal(drawing.evidence_id,kind+'-original');
+      }
+    }
+    return request(url,options);
+  };
+  await c.submit();assert.equal(c.state.completed,true);
+  assert.equal(persisted.map.preview_evidence_id,'new-map-annotation');
+  assert.equal(persisted.plan.preview_evidence_id,'new-plan-annotation');
+  assert.equal(c.state.evidence.some(e=>e.id==='map-old'||e.id==='plan-old'),false);
+});
+
 test('frozen submission retry sends the exact revision and never regenerates or cleans evidence',async()=>{
   const c=harness();c.state.frozen=true;c.state.evidence=[{id:'frozen-export',role:'plan',subject_id:'annotation-retired-but-frozen'}];
   const before=copy({data:c.state.data,evidence:c.state.evidence});await c.submit();

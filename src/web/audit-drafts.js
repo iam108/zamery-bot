@@ -1,5 +1,6 @@
 const { randomUUID, createHash } = require('node:crypto');
 const defaultPool = require('../db/pool');
+const { createAuditEvidenceStore, AuditEvidenceStorageError } = require('./audit-evidence-store');
 
 const LIMITS = Object.freeze({ metadataBytes: 1024 * 1024, fileBytes: 12 * 1024 * 1024, files: 60, totalBytes: 100 * 1024 * 1024 });
 const DDL = `
@@ -28,11 +29,16 @@ const DDL = `
     kind TEXT NOT NULL DEFAULT '',
     bytes INT NOT NULL,
     sha256 TEXT NOT NULL,
-    content BYTEA NOT NULL,
+    content BYTEA,
+    storage TEXT NOT NULL DEFAULT 'postgres',
+    object_key TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     deleted_at TIMESTAMPTZ,
     PRIMARY KEY (draft_id, id)
   );
+  ALTER TABLE audit_evidence ADD COLUMN IF NOT EXISTS storage TEXT NOT NULL DEFAULT 'postgres';
+  ALTER TABLE audit_evidence ADD COLUMN IF NOT EXISTS object_key TEXT;
+  ALTER TABLE audit_evidence ALTER COLUMN content DROP NOT NULL;
 `;
 
 class DraftError extends Error {
@@ -108,8 +114,9 @@ function evidenceMetadata(row) {
   return { id: row.id, name: row.name, mime: row.mime, role: row.role, subject_id: row.subject_id, kind: row.kind, bytes: Number(row.bytes), sha256: row.sha256, created_at: row.created_at };
 }
 
-function createDraftStore(pool = defaultPool, configuredLimits = LIMITS) {
+function createDraftStore(pool = defaultPool, configuredLimits = LIMITS, options = {}) {
   const limits = Object.assign({}, LIMITS, configuredLimits);
+  const originals = createAuditEvidenceStore(options);
   let initialized;
   async function ensureTables() {
     if (!initialized) initialized = (async () => {
@@ -147,13 +154,42 @@ function createDraftStore(pool = defaultPool, configuredLimits = LIMITS) {
   function checkRevision(row, expected) {
     if (Number(row.revision) !== revision(expected)) fail(409, 'REVISION_CONFLICT', 'Черновик изменился в другом окне. Обновите данные перед сохранением.');
   }
-  async function snapshot(client, row, originals = false) {
-    const files = (await client.query('SELECT ' + (originals ? '*' : 'id,name,mime,role,subject_id,kind,bytes,sha256,created_at') + ' FROM audit_evidence WHERE draft_id=$1 AND deleted_at IS NULL ORDER BY created_at,id', [row.id])).rows;
+  async function snapshot(client, row, includeOriginals = false) {
+    const files = (await client.query('SELECT ' + (includeOriginals ? '*' : 'id,name,mime,role,subject_id,kind,bytes,sha256,created_at') + ' FROM audit_evidence WHERE draft_id=$1 AND deleted_at IS NULL ORDER BY created_at,id', [row.id])).rows;
     return { id: row.id, order_id: row.order_id, revision: Number(row.revision), data: row.data, updated_at: row.updated_at, submitted_at: row.submitted_at, submitting: row.submitting_revision != null,
-      evidence: files.map(file => originals ? Object.assign(evidenceMetadata(file), { buffer: Buffer.from(file.content) }) : evidenceMetadata(file)) };
+      evidence: files.map(file => includeOriginals ? Object.assign(evidenceMetadata(file), { draft_id: row.id, content: file.content, storage: file.storage, object_key: file.object_key }) : evidenceMetadata(file)) };
+  }
+  async function hydrate(value) {
+    const evidence = [];
+    for (const file of value.evidence) evidence.push(Object.assign(evidenceMetadata(file), { buffer: await originals.read(file) }));
+    return Object.assign({}, value, { evidence });
   }
   async function bump(client, id) {
     return (await client.query('UPDATE audit_drafts SET revision=revision+1,updated_at=NOW() WHERE id=$1 RETURNING revision', [id])).rows[0].revision;
+  }
+  async function evidencePreflight(client, owner, id, file) {
+    const row = await find(client, owner, id, true);
+    const existing = (await client.query('SELECT id,name,mime,role,subject_id,kind,bytes,sha256,created_at,deleted_at,storage,object_key FROM audit_evidence WHERE draft_id=$1 AND id=$2', [row.id, file.id])).rows[0];
+    if (existing) {
+      if (['name', 'mime', 'role', 'subject_id', 'kind', 'sha256'].some(key => existing[key] !== file[key])) fail(409, 'FILE_CONFLICT', 'Под этим номером уже сохранён другой файл.');
+      let next = Number(row.revision);
+      if (existing.deleted_at) {
+        mutable(row);
+        await client.query('UPDATE audit_evidence SET deleted_at=NULL WHERE draft_id=$1 AND id=$2', [row.id, file.id]);
+        next = Number(await bump(client, row.id));
+      }
+      return { result: { evidence: evidenceMetadata(existing), revision: next }, object_key: existing.object_key };
+    }
+    mutable(row);
+    // Removed originals remain recoverable and count against the same limits.
+    const totals = (await client.query('SELECT COUNT(*) AS count,COALESCE(SUM(bytes),0) AS bytes FROM audit_evidence WHERE draft_id=$1', [row.id])).rows[0];
+    if (Number(totals.count) >= limits.files || Number(totals.bytes) + file.bytes > limits.totalBytes) fail(413, 'EVIDENCE_LIMIT', 'Достигнут лимит материалов проверки: 60 файлов или 100 МБ.');
+    return { row };
+  }
+  async function insertEvidence(client, row, file, objectKey) {
+    const saved = (await client.query('INSERT INTO audit_evidence(draft_id,id,name,mime,role,subject_id,kind,bytes,sha256,content,storage,object_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id,name,mime,role,subject_id,kind,bytes,sha256,created_at',
+      [row.id, file.id, file.name, file.mime, file.role, file.subject_id, file.kind, file.bytes, file.sha256, objectKey ? null : file.content, objectKey ? 's3' : 'postgres', objectKey || null])).rows[0];
+    return { evidence: evidenceMetadata(saved), revision: Number(await bump(client, row.id)) };
   }
   return {
     ensureTables,
@@ -205,26 +241,41 @@ function createDraftStore(pool = defaultPool, configuredLimits = LIMITS) {
     },
     async addEvidence(owner, id, input) {
       const file = prepareEvidence(input, limits);
-      return transaction(async client => {
-        const row = await find(client, owner, id, true);
-        const existing = (await client.query('SELECT id,name,mime,role,subject_id,kind,bytes,sha256,created_at,deleted_at FROM audit_evidence WHERE draft_id=$1 AND id=$2', [row.id, file.id])).rows[0];
-        if (existing) {
-          if (['name', 'mime', 'role', 'subject_id', 'kind', 'sha256'].some(key => existing[key] !== file[key])) fail(409, 'FILE_CONFLICT', 'Под этим номером уже сохранён другой файл.');
-          let next = Number(row.revision);
-          if (existing.deleted_at) {
-            mutable(row);
-            await client.query('UPDATE audit_evidence SET deleted_at=NULL WHERE draft_id=$1 AND id=$2', [row.id, file.id]);
-            next = Number(await bump(client, row.id));
-          }
-          return { evidence: evidenceMetadata(existing), revision: next };
-        }
-        mutable(row);
-        // Count stored originals, including recoverable removals, so repeated removals cannot exhaust storage.
-        const totals = (await client.query('SELECT COUNT(*) AS count,COALESCE(SUM(bytes),0) AS bytes FROM audit_evidence WHERE draft_id=$1', [row.id])).rows[0];
-        if (Number(totals.count) >= limits.files || Number(totals.bytes) + file.bytes > limits.totalBytes) fail(413, 'EVIDENCE_LIMIT', 'Достигнут лимит материалов проверки: 60 файлов или 100 МБ.');
-        const saved = (await client.query('INSERT INTO audit_evidence(draft_id,id,name,mime,role,subject_id,kind,bytes,sha256,content) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id,name,mime,role,subject_id,kind,bytes,sha256,created_at', [row.id, file.id, file.name, file.mime, file.role, file.subject_id, file.kind, file.bytes, file.sha256, file.content])).rows[0];
-        return { evidence: evidenceMetadata(saved), revision: Number(await bump(client, row.id)) };
+      if (!originals.configured()) return transaction(async client => {
+        const ready = await evidencePreflight(client, owner, id, file);
+        return ready.result || insertEvidence(client, ready.row, file);
       });
+      const ready = await transaction(client => evidencePreflight(client, owner, id, file));
+      if (ready.result) return ready.result;
+      const objectKey = originals.key(ready.row.id);
+      let retained = false;
+      try {
+        // The original and its verified HEAD exist before the short metadata
+        // transaction. A slow storage service never holds a PostgreSQL lock.
+        await originals.put(objectKey, file);
+        const stored = await transaction(async client => {
+          const latest = await evidencePreflight(client, owner, id, file);
+          if (latest.result) return latest;
+          const saved = await insertEvidence(client, latest.row, file, objectKey);
+          return { result: saved, object_key: objectKey };
+        });
+        retained = stored?.object_key === objectKey;
+        return stored.result;
+      } catch (error) {
+        // A COMMIT acknowledgement can be lost after the object pointer became
+        // durable. Never remove that original merely because the caller saw an
+        // error. If reconciliation is unavailable, retain the attempt safely.
+        try {
+          const recovered = await transaction(async client => {
+            const row = await find(client, owner, id);
+            const saved = (await client.query('SELECT * FROM audit_evidence WHERE draft_id=$1 AND id=$2', [row.id, file.id])).rows[0];
+            return { row, saved };
+          });
+          retained = recovered.saved?.object_key === objectKey;
+          if (retained && !recovered.saved.deleted_at && ['name', 'mime', 'role', 'subject_id', 'kind', 'sha256'].every(key => recovered.saved[key] === file[key])) return { evidence: evidenceMetadata(recovered.saved), revision: Number(recovered.row.revision) };
+        } catch (_) { retained = true; }
+        throw error;
+      } finally { if (!retained) await originals.remove(objectKey).catch(() => {}); }
     },
     async removeEvidence(owner, id, fileId) {
       return transaction(async client => {
@@ -234,21 +285,30 @@ function createDraftStore(pool = defaultPool, configuredLimits = LIMITS) {
       });
     },
     async downloadEvidence(owner, id, fileId) {
-      return transaction(async client => {
+      const file = await transaction(async client => {
         const row = await find(client, owner, id);
         const file = (await client.query('SELECT * FROM audit_evidence WHERE draft_id=$1 AND id=$2 AND deleted_at IS NULL', [row.id, uuid(fileId)])).rows[0];
         if (!file) fail(404, 'NOT_FOUND', 'Файл не найден.');
-        return Object.assign(evidenceMetadata(file), { buffer: Buffer.from(file.content) });
+        return file;
       });
+      return Object.assign(evidenceMetadata(file), { buffer: await originals.read(file) });
     },
     async loadDraftForSubmit(owner, id, expected) {
+      const loaded = await transaction(async client => {
+        const row = await find(client, owner, id, true); checkRevision(row, expected);
+        return snapshot(client, row, true);
+      });
+      if (loaded.submitted_at) return Object.assign({}, loaded, { evidence: loaded.evidence.map(evidenceMetadata) });
+      // Hydration happens before freezing: a failed original read must leave an
+      // editable report, and no network request holds the row lock meanwhile.
+      const complete = await hydrate(loaded);
       return transaction(async client => {
         const row = await find(client, owner, id, true); checkRevision(row, expected);
         if (!row.submitted_at && row.submitting_revision == null) {
           await client.query('UPDATE audit_drafts SET submitting_revision=revision WHERE id=$1', [row.id]);
           row.submitting_revision = row.revision;
         }
-        return snapshot(client, row, true);
+        return Object.assign({}, complete, { submitted_at: row.submitted_at, submitting: row.submitting_revision != null });
       });
     },
     async releaseDraftSubmission(owner, id, expected) {
@@ -288,7 +348,7 @@ function setupAuditDrafts(app, draftStore = store) {
     try { await fn(req, res); }
     catch (e) {
       if (!(e instanceof DraftError)) console.error('audit drafts:', e.message);
-      res.status(e.status || 500).json({ ok: false, code: e.code || 'DRAFT_ERROR', error: e instanceof DraftError ? e.message : 'Не удалось сохранить материалы проверки. Повторите попытку.' });
+      res.status(e.status || 500).json({ ok: false, code: e.code || 'DRAFT_ERROR', error: e instanceof DraftError || e instanceof AuditEvidenceStorageError ? e.message : 'Не удалось сохранить материалы проверки. Повторите попытку.' });
     }
   }; }
   app.get('/api/audit/drafts/current', route(async (req, res) => res.json({ ok: true, draft: await draftStore.current(req.tgUser.id, req.query.order_id) })));

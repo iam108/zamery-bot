@@ -68,6 +68,26 @@ test('SDK uses virtual-hosted style, explicit checksums and no retries of a one-
   assert.equal(config.responseChecksumValidation, 'WHEN_REQUIRED');
 });
 
+test('audit originals accept images privately, and neither namespace can access the other', async () => {
+  const h = fixture({ namespace: 'audit-originals' }), auditKey = key.replace('egrn-originals/', 'audit-originals/');
+  for (const mime of ['image/jpeg', 'image/png', 'application/pdf']) {
+    await h.store.put({ ...file(), key: auditKey, mime });
+    const body = await h.store.get({ key: auditKey, bytes: data.length, sha256 });
+    const chunks = []; for await (const part of body) chunks.push(part);
+    assert.deepEqual(Buffer.concat(chunks), data);
+    assert.equal(h.calls.at(-2).input.ACL, undefined);
+  }
+  await assert.rejects(h.store.put({ ...file(), key: auditKey, mime: 'image/svg+xml' }), { code: 'EGRN_OBJECT_ARGUMENT' });
+  await assert.rejects(h.store.get({ key, bytes: data.length, sha256 }), { code: 'EGRN_OBJECT_ARGUMENT' });
+  await assert.rejects(h.store.remove(key), { code: 'EGRN_OBJECT_ARGUMENT' });
+  const egrn = fixture();
+  await assert.rejects(egrn.store.put({ ...file(), mime: 'image/png' }), { code: 'EGRN_OBJECT_ARGUMENT' });
+  await assert.rejects(egrn.store.get({ key: auditKey, bytes: data.length, sha256 }), { code: 'EGRN_OBJECT_ARGUMENT' });
+  await assert.rejects(egrn.store.remove(auditKey), { code: 'EGRN_OBJECT_ARGUMENT' });
+  assert.equal(egrn.calls.length, 0);
+  assert.throws(() => createEgrnObjectStore({ namespace: '../other' }), { code: 'EGRN_OBJECT_ARGUMENT' });
+});
+
 test('wrong durable length, hash or missing metadata rejects the completed upload', async () => {
   for (const changed of [{ ContentLength: data.length - 1 }, { ChecksumSHA256: Buffer.alloc(32).toString('base64') }, { Metadata: {} }]) {
     const h = fixture({ send: async command => {
