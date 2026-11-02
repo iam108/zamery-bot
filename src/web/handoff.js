@@ -251,7 +251,7 @@ async function searchReports(q) {
 async function getReport(src, id) {
   if (src === 'a') {
     var a = (await pool.query('SELECT * FROM audits WHERE id=$1', [id])).rows[0];
-    return a ? { chat_id: a.chat_id, msg_ids: a.msg_ids, text: a.text, linked: 0, metadata: auditMetadata(a) } : null;
+    return a ? { chat_id: a.chat_id, msg_ids: a.msg_ids, text: a.text, linked: 0, metadata: auditMetadata(a), report_data: a.report_data } : null;
   }
   var r = (await pool.query('SELECT * FROM reports WHERE id=$1', [id])).rows[0];
   if (!r) return null;
@@ -268,8 +268,34 @@ async function getReport(src, id) {
     extra: audits.filter(function (x) { return String(x.chat_id) === String(r.chat_id); }).reduce(function (acc, x) { return acc.concat((x.msg_ids || []).map(Number)); }, []),
     text: isOrderCard(r.text) ? (texts.join('\n\n') || '') : [r.text].concat(texts).join('\n\n'),
     linked: replies.length + audits.length,
-    metadata: auditMetadata(audits.length ? audits[audits.length - 1] : { text: [r.text].concat(texts).join('\n\n') })
+    metadata: auditMetadata(audits.length ? audits[audits.length - 1] : { text: [r.text].concat(texts).join('\n\n') }),
+    report_data: audits.length ? audits[audits.length - 1].report_data : undefined
   };
+}
+
+// copyMessages preserves albums, but callers must provide the recipient's
+// action buttons explicitly. Read this link from the saved audit, never from
+// the manager's editable handoff form or a private source-chat message link.
+function auditVideoUrl(report) {
+  var data = report && report.report_data;
+  if (typeof data === 'string') { try { data = JSON.parse(data); } catch (_) { return null; } }
+  if (!data || data.ui_version !== 5) return null;
+  var w = data.workflow || {};
+  var value = Object.hasOwn(w, 'video_url') ? w.video_url : data.video_url;
+  if (typeof value !== 'string' || !value.trim()) return null;
+  try { var url = new URL(value); return url.protocol === 'https:' ? url.href : null; } catch (_) { return null; }
+}
+
+async function copyAuditPacket(telegram, target, audit) {
+  var ids = Array.from(new Set((audit.msg_ids || []).map(Number))).sort(function (a, b) { return a - b; });
+  if (ids.some(function (id) { return !Number.isSafeInteger(id) || id <= 0; })) throw new Error('Некорректный номер сообщения отчёта.');
+  var missing = 0;
+  for (var offset = 0; offset < ids.length; offset += 100) {
+    var batch = ids.slice(offset, offset + 100);
+    var copied = await telegram.callApi('copyMessages', { chat_id: target, from_chat_id: audit.chat_id, message_ids: batch });
+    missing += batch.length - (Array.isArray(copied) ? copied.length : 0);
+  }
+  if (missing) throw new Error('Telegram пропустил часть материалов отчёта.');
 }
 
 var RU_MONTHS = { 'января': 1, 'февраля': 2, 'марта': 3, 'апреля': 4, 'мая': 5, 'июня': 6, 'июля': 7, 'августа': 8, 'сентября': 9, 'октября': 10, 'ноября': 11, 'декабря': 12 };
@@ -1160,8 +1186,10 @@ function setupHandoff(app) {
       var total = 0;
       var audit = null;
       if (picked) audit = picked;
-      if (audit && audit.msg_ids) audit.msg_ids = Array.from(new Set(audit.msg_ids.concat(audit.extra || []).map(Number))).sort(function (x, y) { return x - y; }).slice(0, 100);
+      if (audit && audit.msg_ids) audit.msg_ids = Array.from(new Set(audit.msg_ids.concat(audit.extra || []).map(Number))).sort(function (x, y) { return x - y; });
       if (audit && audit.text && !d.audit_text_manual) d.audit_text = audit.text;
+      var auditVideo = auditVideoUrl(audit);
+      var auditWarnings = [];
       var c = (await pool.query(
         `INSERT INTO cases (order_id, lawyer_tg_id, lawyer_name, checklist_key, org, inn, client, phone, address,
           region, kind, service, priority, comment, audit_text, total, created_by, contacts, request_id)
@@ -1177,10 +1205,11 @@ function setupHandoff(app) {
       var CLIENTS = process.env.CLIENTS_CHAT_ID;
       if (CLIENTS) {
         if (audit && audit.msg_ids && audit.msg_ids.length) {
-          try { await bot.telegram.callApi('copyMessages', { chat_id: CLIENTS, from_chat_id: audit.chat_id, message_ids: audit.msg_ids.map(Number) }); }
-          catch (e) { console.error('copy to clients chat:', e.message); }
+          try { await copyAuditPacket(bot.telegram, CLIENTS, audit); }
+          catch (e) { console.error('copy to clients chat:', e.message); auditWarnings.push('Не все материалы отчёта доставлены в «Заявки по клиенту». Проверьте комплект.'); }
         }
         var opts = { parse_mode: 'HTML' };
+        if (auditVideo) opts.reply_markup = { inline_keyboard: [[{ text: '▶ Видео осмотра', url: auditVideo }]] };
         if (reqRow && String(reqRow.chat_id) === String(CLIENTS)) opts.reply_to_message_id = Number(reqRow.first_id);
         var cardMsg = null;
         try { cardMsg = await bot.telegram.sendMessage(CLIENTS, text, opts); }
@@ -1197,12 +1226,13 @@ function setupHandoff(app) {
         catch (e) { console.error('copy request to lawyer:', e.message); }
       }
       if (audit && audit.msg_ids && audit.msg_ids.length) {
-        try { await bot.telegram.callApi('copyMessages', { chat_id: lawyer.tg_id, from_chat_id: audit.chat_id, message_ids: audit.msg_ids.map(Number) }); }
-        catch (e) { console.error('copy to lawyer:', e.message); }
+        try { await copyAuditPacket(bot.telegram, lawyer.tg_id, audit); }
+        catch (e) { console.error('copy to lawyer:', e.message); auditWarnings.push('Не все материалы отчёта доставлены юристу. Проверьте комплект.'); }
       }
-      var kb = c.checklist_key
-        ? { inline_keyboard: [[{ text: '📋 Открыть чек-лист', web_app: { url: WEBAPP_URL + '/checklist?case_id=' + c.id } }]] }
-        : undefined;
+      var recipientButtons = [];
+      if (c.checklist_key) recipientButtons.push([{ text: '📋 Открыть чек-лист', web_app: { url: WEBAPP_URL + '/checklist?case_id=' + c.id } }]);
+      if (auditVideo) recipientButtons.push([{ text: '▶ Видео осмотра', url: auditVideo }]);
+      var kb = recipientButtons.length ? { inline_keyboard: recipientButtons } : undefined;
       var lawyerMsg = null, dmWarn = null;
       try {
         lawyerMsg = await bot.telegram.sendMessage(lawyer.tg_id, '🆕 <b>У вас новый клиент</b>\n\n' + text, { parse_mode: 'HTML', reply_markup: kb });
@@ -1225,7 +1255,7 @@ function setupHandoff(app) {
           egrnNote = { unavailable: 'Доставка ранее заказанной выписки ЕГРН остановлена. Проверьте её в кабинете https://armrus.org — повторный заказ не создан.', attached: 'Выписка ЕГРН приложена юристу.', ordered: 'Выписка ЕГРН заказана — придёт в чат выписок и юристу.', waiting: 'Выписка ЕГРН уже в работе — придёт в чат выписок и юристу.' }[eg.result] || '';
         } catch (e) { console.error('egrn for handoff:', e.message); egrnNote = 'Выписку ЕГРН заказать не удалось: ' + e.message; }
       }
-      res.json({ ok: true, id: c.id, warn: [dmWarn, egrnNote].filter(Boolean).join(' ') || undefined });
+      res.json({ ok: true, id: c.id, warn: [dmWarn, egrnNote].concat(auditWarnings).filter(Boolean).join(' ') || undefined });
     } catch (e) { console.error('api/handoff error:', e); res.json({ ok: false, error: e.message }); }
   });
 

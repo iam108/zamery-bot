@@ -2,7 +2,7 @@ const { getOrderById } = require('../db/queries');
 const { saveAudit } = require('../web/handoff');
 const { esc } = require('./formatter');
 const { buildInspectionReport, validateInspection } = require('./audit-inspection');
-const { splitTelegramHtml, photoCaption, deliveryMedia } = require('./audit-delivery');
+const { splitTelegramHtml, photoCaption, deliveryMedia, presentationMedia } = require('./audit-delivery');
 const { createHash } = require('crypto');
 const { normalizeWorkflow, validateWorkflow, buildWorkflowReport } = require('./audit-workflow');
 
@@ -60,8 +60,9 @@ async function handleAuditReport(ctx, data) {
     progress.signature = signature;
   }
   if (!progress) {
-    progress = { signature, textIds: [], photoIds: [], documentIds: [], saved: false, handoffSent: false, replied: false, job: null };
+    progress = { signature, ...(data.ui_version === 5 ? { deliveryVersion: 2 } : {}), textIds: [], photoIds: [], documentIds: [], saved: false, handoffSent: false, replied: false, job: null };
   }
+  if (progress.deliveryVersion != null && ![1, 2].includes(progress.deliveryVersion)) throw new Error('Неизвестный формат доставки отчёта. Отправка остановлена, чтобы не потерять материалы.');
   if (key && !seenSubmits.has(key)) {
       seenSubmits.set(key, progress);
       const timer = setTimeout(function () { seenSubmits.delete(key); }, 30 * 60 * 1000);
@@ -79,14 +80,27 @@ async function handleAuditReportInner(ctx, data, progress) {
   validateInspection(data);
   async function checkpoint() {
     if (ctx.auditDelivery) {
-      const { signature, textIds, photoIds, documentIds, saved, handoffSent, replied } = progress;
-      await ctx.auditDelivery.save({ signature, textIds, photoIds, documentIds, saved, handoffSent, replied });
+      const { signature, deliveryVersion, textIds, photoIds, documentIds, saved, handoffSent, replied } = progress;
+      await ctx.auditDelivery.save({ signature, ...(deliveryVersion != null ? { deliveryVersion } : {}), textIds, photoIds, documentIds, saved, handoffSent, replied });
     }
   }
   const GROUP_ID = process.env.GROUP_CHAT_ID;
   const actor = ctx.from
     ? (ctx.from.username ? '@' + ctx.from.username : ctx.from.first_name)
     : 'аудитор';
+
+  // Unversioned durable checkpoints must finish in the exact former order.
+  // Persist the new order before Telegram can acknowledge its first message.
+  const presentation = data.ui_version === 5 && progress.deliveryVersion === 2;
+  if (presentation) await checkpoint();
+
+  var text;
+  var plain;
+  if (presentation) {
+    const summary = require('./audit-summary').buildAuditSummary(data, actor || 'аудитор');
+    text = summary.html;
+    plain = [summary.plain];
+  } else {
 
   var zonesText = 'Нет';
   var zonesPlain = 'Нет';
@@ -109,7 +123,7 @@ async function handleAuditReportInner(ctx, data, progress) {
 
   var lines = [header, ''];
   // Короткий текст для юриста (без Markdown)
-  var plain = [];
+  plain = [];
   var inspectionReport = buildInspectionReport(data);
   lines.push.apply(lines, inspectionReport.html);
   plain.push.apply(plain, inspectionReport.plain);
@@ -184,7 +198,8 @@ async function handleAuditReportInner(ctx, data, progress) {
   lines.push('👤 <i>Аудитор: ' + esc(actor) + '</i>');
   if (data.ui_version !== 5) plain.push('Итог: ' + data.conclusion);
 
-  var text = lines.join('\n');
+  text = lines.join('\n');
+  }
 
   var replyToMsgId = null;
   if (data.order_id) {
@@ -201,12 +216,13 @@ async function handleAuditReportInner(ctx, data, progress) {
   for (let i = progress.textIds.length; i < textParts.length; i++) {
     const m = await tgRetry(function () { return tg.sendMessage(GROUP_ID, textParts[i], {
       parse_mode: 'HTML', reply_to_message_id: replyToMsgId || undefined,
+      ...(presentation ? { link_preview_options: { is_disabled: true } } : {}),
     }); });
     progress.textIds.push(m.message_id);
     await checkpoint();
   }
 
-  const mediaPacket = deliveryMedia(data);
+  const mediaPacket = presentation ? presentationMedia(data, { summaryText: plain.join('\n') }) : deliveryMedia(data);
   const photos = mediaPacket.photos;
   const documents = mediaPacket.documents;
   if (photos.length) {
@@ -216,12 +232,12 @@ async function handleAuditReportInner(ctx, data, progress) {
       if (batch.length === 1) {
         const photo = batch[0];
         const m = await tgRetry(function () { return tg.sendPhoto(GROUP_ID,
-          { source: Buffer.from(photo.data, 'base64') },
-          { caption: photoCaption(photo, data.order_id), reply_to_message_id: progress.textIds[0] }); });
+          { source: presentation && photo.source ? photo.source : Buffer.from(photo.data, 'base64') },
+          { caption: photoCaption(photo, data.order_id, presentation ? data : undefined), reply_to_message_id: progress.textIds[0] }); });
         progress.photoIds.push(m.message_id);
       } else {
         const media = batch.map(function (p) {
-          return { type: 'photo', media: { source: Buffer.from(p.data, 'base64') }, caption: photoCaption(p, data.order_id) };
+          return { type: 'photo', media: { source: presentation && p.source ? p.source : Buffer.from(p.data, 'base64') }, caption: photoCaption(p, data.order_id, presentation ? data : undefined) };
         });
         const msgs = await tgRetry(function () { return tg.sendMediaGroup(GROUP_ID, media, { reply_to_message_id: progress.textIds[0] }); });
         msgs.forEach(function (m) { progress.photoIds.push(m.message_id); });
@@ -240,6 +256,7 @@ async function handleAuditReportInner(ctx, data, progress) {
       for (let offset = progress.documentIds.length; offset < documents.length;) {
         const batch = documents.slice(offset, offset + 10);
         const caption = file => {
+          if (presentation) return file.caption;
           const subject = (data.entrances || []).find(e => e.id === file.subject_id)?.label || (data.zones || []).find(z => z.id === file.subject_id)?.name || '';
           return (photoCaption(file, data.order_id) + (subject ? ' · ' + subject : '') + '\n' + (file.name || 'Документ')).slice(0, 900);
         };
@@ -268,7 +285,27 @@ async function handleAuditReportInner(ctx, data, progress) {
     await checkpoint();
   }
 
-  if (data.order_id && !progress.handoffSent) {
+  if (presentation && !progress.handoffSent) {
+    const keyboard = [];
+    const links = [];
+    const video = Object.hasOwn(data.workflow || {}, 'video_url') ? data.workflow.video_url : data.video_url;
+    if (video) links.push({ text: '▶ Видео на Диске', url: video });
+    const originals = telegramMessageUrl(GROUP_ID, progress.documentIds[0]);
+    if (originals) links.push({ text: '📎 Оригиналы', url: originals });
+    if (links.length) keyboard.push(links);
+    if (data.order_id) keyboard.push([{ text: '⚖️ Передать юристу', callback_data: 'handoff:' + data.order_id }]);
+    if (keyboard.length) {
+      try {
+        await tgRetry(() => tg.editMessageReplyMarkup(GROUP_ID, progress.textIds[0], undefined, { inline_keyboard: keyboard }));
+      } catch (e) {
+        // Telegram may have applied the exact same keyboard before a lost
+        // checkpoint. Only its explicit "not modified" response is success.
+        if (!(e.response?.error_code === 400 && /message is not modified/i.test(e.response.description || ''))) throw e;
+      }
+    }
+    progress.handoffSent = true;
+    await checkpoint();
+  } else if (data.order_id && !progress.handoffSent) {
     await tgRetry(function () { return tg.sendMessage(GROUP_ID,
       '⚖️ Отчёт по заявке #' + data.order_id + ' добавлен — проверьте замечания перед передачей юристу', {
       reply_to_message_id: sentIds[0],
@@ -279,11 +316,19 @@ async function handleAuditReportInner(ctx, data, progress) {
   }
 
   if (ctx.reply && !progress.replied) {
-    await ctx.reply('✅ Отчёт' + (photos.length ? ' и фото (' + photos.length + ')' : '') + ' отправлены в группу!');
+    await ctx.reply(presentation ? '✅ Отчёт и материалы отправлены в группу.' : '✅ Отчёт' + (photos.length ? ' и фото (' + photos.length + ')' : '') + ' отправлены в группу!');
     progress.replied = true;
     await checkpoint();
   }
 
+}
+
+function telegramMessageUrl(chatId, messageId) {
+  if (!Number.isSafeInteger(Number(messageId)) || Number(messageId) <= 0) return null;
+  const chat = String(chatId || '');
+  if (/^-100\d+$/.test(chat)) return 'https://t.me/c/' + chat.slice(4) + '/' + messageId;
+  if (/^@[a-zA-Z][a-zA-Z0-9_]{4,}$/.test(chat)) return 'https://t.me/' + chat.slice(1) + '/' + messageId;
+  return null;
 }
 
 module.exports = { handleAuditReport };

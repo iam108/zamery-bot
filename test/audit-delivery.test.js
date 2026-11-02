@@ -47,7 +47,7 @@ function harness(options = {}) {
   let sequence = 1;
   const esc = text => String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const ctx = { from: { id: 10, username: 'auditor' }, telegram: {}, reply: async text => { calls.push({ method: 'reply', text }); } };
-  for (const method of ['sendMessage', 'sendPhoto', 'sendMediaGroup', 'sendDocument']) {
+  for (const method of ['sendMessage', 'sendPhoto', 'sendMediaGroup', 'sendDocument', 'editMessageReplyMarkup']) {
     ctx.telegram[method] = async (...args) => {
       calls.push({ method, args });
       if (options.fail) await options.fail(method, args);
@@ -65,6 +65,7 @@ function harness(options = {}) {
       if (name === './formatter') return { esc };
       if (name === './audit-delivery') return require('../src/bot/audit-delivery');
       if (name === './audit-workflow') return require('../src/bot/audit-workflow');
+      if (name === './audit-summary') return require('../src/bot/audit-summary');
       if (name === 'crypto') return require('node:crypto');
       if (name === './audit-inspection') return {
         validateInspection: data => { if (options.invalid) throw new Error('Заполните услугу'); },
@@ -248,7 +249,7 @@ test('UI5 delivers ordered inline previews while retaining every original for ha
   assert.equal(deliveryMedia({ ui_version: 4, documents: files }).photos.length, 0);
 });
 
-test('UI5 sends map/plan/entrance inline, originals separately, and does not duplicate confirmed media on retry', async () => {
+test('new UI5 sends one preview album and one originals ZIP without repeating either after a save retry', async () => {
   const { compactVisit } = require('./helpers/audit-v5');
   const report = compactVisit();
   report.submit_id = 'v5-inline-retry';
@@ -257,14 +258,18 @@ test('UI5 sends map/plan/entrance inline, originals separately, and does not dup
   const h = harness({ saveFailure: async () => { if (failSave) { failSave = false; throw new Error('save retry'); } } });
   await assert.rejects(h.send(report), /save retry/);
   const albums = h.calls.filter(call => call.method === 'sendMediaGroup');
-  assert.equal(albums.length, 2);
+  assert.equal(albums.length, 1);
   assert.deepEqual(Array.from(albums[0].args[1], item => item.type), ['photo', 'photo', 'photo']);
-  assert.match(albums[0].args[1][0].caption, /Карта/);
+  assert.match(albums[0].args[1][0].caption, /Схема территории/);
   assert.match(albums[0].args[1][1].caption, /План/);
-  assert.ok(albums[1].args[1].every(item => item.type === 'document'));
-  assert.equal(albums[1].args[1].length, report.documents.length);
+  const archives = h.calls.filter(call => call.method === 'sendDocument');
+  assert.equal(archives.length, 1);
+  assert.match(archives[0].args[1].filename, /оригиналы\.zip$/);
+  assert.equal(archives[0].args[1].source.readUInt32LE(0), 0x04034b50);
   await h.send(report);
-  assert.equal(h.calls.filter(call => call.method === 'sendMediaGroup').length, 2);
+  assert.equal(h.calls.filter(call => call.method === 'sendMediaGroup').length, 1);
+  assert.equal(h.calls.filter(call => call.method === 'sendDocument').length, 1);
+  assert.equal(h.calls.filter(call => call.method === 'editMessageReplyMarkup').length, 1);
   assert.equal(h.saved.length, 1);
   assert.equal(h.saved[0][4].documents[0].source, report.documents[0].source);
 });
