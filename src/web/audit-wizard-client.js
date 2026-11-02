@@ -269,7 +269,7 @@
       if(rebuild)control.addEventListener('change',rebuildAfterChange);
     });
     bindRoot.querySelectorAll('[data-go-step]').forEach(function (b) { b.onclick = function () { go(Number(b.dataset.goStep)); }; });
-    bindRoot.querySelectorAll('[data-upload-role]').forEach(function (control) { control.onchange = function () { var files = Array.from(control.files || []); control.value = ''; uploadFiles(files, control.dataset.uploadRole, control.dataset.uploadSubject).catch(function (error) { notify(error.message); }); }; });
+    bindRoot.querySelectorAll('[data-upload-role]').forEach(function (control) { control.onchange = function () { var files = Array.from(control.files || []); uploadFiles(files, control.dataset.uploadRole, control.dataset.uploadSubject).catch(function (error) { notify(error.message); }).finally(function () { control.value = ''; }); }; });
     bindRoot.querySelectorAll('[data-open-evidence]').forEach(function (b) { b.onclick = function () { openEvidence(b.dataset.openEvidence); }; });
     bindRoot.querySelectorAll('[data-delete-evidence]').forEach(function (b) { b.onclick = function () { deleteEvidence(b.dataset.deleteEvidence); }; });
     bindRoot.querySelectorAll('[data-download-material]').forEach(function (b) { b.onclick = function () { var file = packetFiles().find(function (f) { return String(f.id) === b.dataset.downloadMaterial; }); if (file) downloadResource(file.url, file.name); }; });
@@ -333,11 +333,88 @@
   async function evidenceUrl(eid){if(blobUrls.has(String(eid)))return blobUrls.get(String(eid));if(!state.draft)throw new Error('Сначала сохраните черновик.');var response=await fetch('/api/audit/drafts/'+encodeURIComponent(state.draft.id)+'/evidence/'+encodeURIComponent(eid));if(!response.ok)throw new Error('Не удалось загрузить оригинал файла.');var url=URL.createObjectURL(await response.blob());blobUrls.set(String(eid),url);return url;}
   function loadThumbnails(scope){(scope||root).querySelectorAll('[data-evidence-image]').forEach(function(image){evidenceUrl(image.dataset.evidenceImage).then(function(url){if(image.isConnected)image.src=url;}).catch(function(){if(image.isConnected)image.alt='Превью недоступно. Оригинал можно открыть повторно.';});});}
   async function openEvidence(eid){try{var url=await evidenceUrl(eid);var e=state.evidence.find(function(x){return String(x.id)===String(eid);});var link=document.createElement('a');link.href=url;link.download=e&&e.name||'document';document.body.appendChild(link);link.click();link.remove();}catch(error){notify(error.message);}}
-  function readBase64(file){return new Promise(function(resolve,reject){var reader=new FileReader();reader.onload=function(){resolve(String(reader.result).split(',')[1]);};reader.onerror=function(){reject(new Error('Не удалось прочитать файл '+file.name));};reader.readAsDataURL(file);});}
+  async function readBase64(file) {
+    function unreadable() { return new Error('Не удалось открыть «' + (file.name || 'файл') + '». Выберите его заново через «Файлы» → «На устройстве».'); }
+    if (!file.size) throw new Error('Файл «' + (file.name || 'без названия') + '» пустой.');
+    // Android's picker can return a temporary content-provider file. Capture
+    // its bytes in the selection callback, before saving or clearing the input.
+    if (typeof file.arrayBuffer === 'function') {
+      try {
+        var bytes = new Uint8Array(await file.arrayBuffer());
+        if (bytes.length !== file.size) throw unreadable();
+        var binary = '';
+        for (var offset = 0; offset < bytes.length; offset += 32768) binary += String.fromCharCode.apply(null, bytes.subarray(offset, offset + 32768));
+        return btoa(binary);
+      } catch (error) { /* Some WebViews support only the FileReader path. */ }
+    }
+    return new Promise(function (resolve, reject) {
+      var reader;
+      try {
+        reader = new FileReader();
+        reader.onload = function () {
+          var result = String(reader.result || ''), comma = result.indexOf(','), data = result.slice(comma + 1);
+          var padding = data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0;
+          if (comma < 0 || !/;base64$/i.test(result.slice(0, comma)) || data.length % 4 || data.length / 4 * 3 - padding !== file.size || /[^A-Za-z0-9+/]/.test(data.slice(0, data.length - padding))) { reject(unreadable()); return; }
+          resolve(data);
+        };
+        reader.onerror = reader.onabort = function () { reject(unreadable()); };
+        reader.readAsDataURL(file);
+      } catch (error) { reject(unreadable()); }
+    });
+  }
   async function evidenceId(file,role,subject,data){var key=[file.name,file.type||file.mime,role,subject||'',data].join('\n');if(window.crypto&&crypto.subtle&&window.TextEncoder){var digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(key));var hex=Array.from(new Uint8Array(digest)).map(function(n){return n.toString(16).padStart(2,'0');}).join('').slice(0,32);hex=hex.slice(0,12)+'4'+hex.slice(13,16)+'8'+hex.slice(17);return hex.slice(0,8)+'-'+hex.slice(8,12)+'-'+hex.slice(12,16)+'-'+hex.slice(16,20)+'-'+hex.slice(20,32);}var hash=0;for(var i=0;i<key.length;i++)hash=(Math.imul(31,hash)+key.charCodeAt(i))|0;var short=file.name+':'+role+':'+subject+':'+data.length+':'+hash;if(!uploadIds.has(short))uploadIds.set(short,uuid());return uploadIds.get(short);}
   async function postEvidence(file,role,subject,data,eid){var result=await request('/api/audit/drafts/'+encodeURIComponent(state.draft.id)+'/evidence',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:eid||await evidenceId(file,role,subject,data),revision:state.draft.revision,name:file.name,mime:file.type||file.mime,role:role,subject_id:subject||'',data:data})});adoptRevision(result);var evidence=result.evidence;if(evidence&&!Array.isArray(evidence)){state.evidence=state.evidence.filter(function(e){return String(e.id)!==String(evidence.id);});state.evidence.push(evidence);}return evidence;}
-  async function uploadFiles(files,role,subject,options){options=options||{};if(!files.length)return;if(state.submitting||state.frozen||state.conflict){notify('Сначала завершите текущую операцию с черновиком.');return;}var allowed=['image/jpeg','image/png','image/webp','image/gif','image/heic','image/heif','image/avif','image/tiff','image/bmp','application/pdf'];var invalid=files.find(function(f){return !allowed.includes(f.type)||f.size>12*1024*1024;});if(invalid)throw new Error(invalid.size>12*1024*1024?'Файл '+invalid.name+' больше 12 МБ.':'Поддерживаются изображения и PDF. Выберите другой формат для '+invalid.name+'.');if(state.evidence.length+state.pendingUploads+files.length>60)throw new Error('В одной проверке можно сохранить до 60 файлов.');var total=state.evidence.reduce(function(n,e){return n+Number(e.size||e.bytes||0);},0)+files.reduce(function(n,f){return n+f.size;},0);if(total>100*1024*1024)throw new Error('Общий объём файлов проверки больше 100 МБ.');state.pendingUploads+=files.length;status('Загружаю оригиналы файлов…');return queue(async function(){var saved=[];try{await flush();for(var i=0;i<files.length;i++){status('Загружаю оригинал '+(i+1)+' из '+files.length+'…');var data=await readBase64(files[i]);saved.push(await postEvidence(files[i],role,subject,data));state.pendingUploads--;localSave();}status('Оригиналы сохранены на сервере · '+timeLabel(),'success');if(!options.noRender)render();return saved;}catch(error){state.pendingUploads=0;status('Файлы сохранены не полностью · '+error.message,'warning');if(error.status===409){state.conflict=true;$('#conflict-panel').hidden=false;}throw error;}});}
-  async function uploadEditorSource(file,role){var type=file.type||'';if(!type&&/\.pdf$/i.test(file.name)){var first=await file.slice(0,8).arrayBuffer();if(new TextDecoder().decode(first).startsWith('%PDF-'))file=new File([file],file.name,{type:'application/pdf'});}if(file.type==='application/pdf'){var pdfjs=await import('/vendor/pdfjs/pdf.mjs');pdfjs.GlobalWorkerOptions.workerSrc='/vendor/pdfjs/pdf.worker.mjs';var task=pdfjs.getDocument({data:new Uint8Array(await file.arrayBuffer()),isEvalSupported:false});try{var pdf=await task.promise;if(!pdf.numPages)throw new Error('В PDF нет страниц.');await pdf.destroy();}catch(error){throw new Error('Не удалось прочитать PDF. Выберите другой файл.');}}var saved=await uploadFiles([file],role,'source',{noRender:true});return saved&&saved[0];}
+  async function uploadFiles(files, role, subject, options) {
+    options = options || {}; if (!files.length) return;
+    if (state.submitting || state.frozen || state.conflict) { notify('Сначала завершите текущую операцию с черновиком.'); return; }
+    var allowed = ['image/jpeg','image/png','image/webp','image/gif','image/heic','image/heif','image/avif','image/tiff','image/bmp','application/pdf'];
+    var invalid = files.find(function (f) { return !allowed.includes(f.type) || f.size > 12 * 1024 * 1024; });
+    if (invalid) throw new Error(invalid.size > 12 * 1024 * 1024 ? 'Файл ' + invalid.name + ' больше 12 МБ.' : 'Поддерживаются изображения и PDF. Выберите другой формат для ' + invalid.name + '.');
+    if (state.evidence.length + state.pendingUploads + files.length > 60) throw new Error('В одной проверке можно сохранить до 60 файлов.');
+    var total = state.evidence.reduce(function (n, e) { return n + Number(e.size || e.bytes || 0); }, 0) + files.reduce(function (n, f) { return n + f.size; }, 0);
+    if (total > 100 * 1024 * 1024) throw new Error('Общий объём файлов проверки больше 100 МБ.');
+    state.pendingUploads += files.length; status('Читаю выбранные файлы…');
+    // Start every read now, not after the network queue. Observe rejections now
+    // as well: a failed picker read must not become an unhandled rejection.
+    var prepared = Promise.all(options.preparedData || files.map(readBase64)).then(function (data) { return { data: data }; }, function (error) { return { error: error }; });
+    return queue(async function () {
+      var saved = [], remaining = files.length;
+      try {
+        var captured = await prepared; if (captured.error) throw captured.error;
+        await flush();
+        for (var i = 0; i < files.length; i++) {
+          status('Загружаю оригинал ' + (i + 1) + ' из ' + files.length + '…');
+          saved.push(await postEvidence(files[i], role, subject, captured.data[i]));
+          state.pendingUploads--; remaining--; localSave();
+        }
+        status('Оригиналы сохранены на сервере · ' + timeLabel(), 'success'); if (!options.noRender) render(); return saved;
+      } catch (error) {
+        state.pendingUploads = Math.max(0, state.pendingUploads - remaining);
+        status('Файлы сохранены не полностью · ' + error.message, 'warning');
+        if (error.status === 409) { state.conflict = true; $('#conflict-panel').hidden = false; }
+        throw error;
+      }
+    });
+  }
+  async function uploadEditorSource(file, role) {
+    if (state.submitting || state.frozen || state.conflict) throw new Error('Сначала завершите текущую операцию с черновиком.');
+    if (file.size > 12 * 1024 * 1024) throw new Error('Файл ' + file.name + ' больше 12 МБ.');
+    state.pendingUploads++; status('Читаю выбранный файл…');
+    var data;
+    try {
+      data = await readBase64(file);
+      if (!file.type && /\.pdf$/i.test(file.name) && atob(data.slice(0, 12)).startsWith('%PDF-')) file = { name: file.name, size: file.size, type: 'application/pdf' };
+      if (file.type === 'application/pdf') {
+        var pdfjs = await import('/vendor/pdfjs/pdf.mjs'); pdfjs.GlobalWorkerOptions.workerSrc = '/vendor/pdfjs/pdf.worker.mjs';
+        var raw = atob(data), bytes = new Uint8Array(raw.length); for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+        var task = pdfjs.getDocument({ data: bytes, isEvalSupported: false });
+        try { var pdf = await task.promise; if (!pdf.numPages) throw new Error('В PDF нет страниц.'); }
+        catch (error) { throw new Error('Не удалось прочитать PDF. Выберите другой файл.'); }
+        finally { await task.destroy(); }
+      }
+    } finally { state.pendingUploads--; }
+    var saved = await uploadFiles([file], role, 'source', { noRender: true, preparedData: [data] }); return saved && saved[0];
+  }
   async function deleteEvidence(eid){if(state.submitting||state.frozen||state.conflict)return;var evidence=state.evidence.find(function(e){return String(e.id)===String(eid);});if(!evidence)return;if(!window.confirm('Убрать файл «'+(evidence.name||'документ')+'» из этой проверки?'))return;queue(async function(){try{await flush();var result=await request('/api/audit/drafts/'+encodeURIComponent(state.draft.id)+'/evidence/'+encodeURIComponent(eid),{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({revision:state.draft.revision})});adoptRevision(result);state.evidence=state.evidence.filter(function(e){return String(e.id)!==String(eid);});if(String(state.data.plan.evidence_id)===String(eid)){state.data.plan.evidence_id='';state.data.plan.annotations=[];state.dirty=true;state.version++;await flush();}if(blobUrls.has(String(eid))){URL.revokeObjectURL(blobUrls.get(String(eid)));blobUrls.delete(String(eid));}localSave();render();notify('Файл убран из проверки.');}catch(error){notify(error.message);}});}
   async function removeGeneratedEvidence(eid){var result=await request('/api/audit/drafts/'+encodeURIComponent(state.draft.id)+'/evidence/'+encodeURIComponent(eid),{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({revision:state.draft.revision})});adoptRevision(result);state.evidence=state.evidence.filter(function(e){return e.id!==eid;});}
   async function exportGraphic(plan,kind,subject){if(!window.AuditPlanEditor||!plan.evidence_id||!plan.annotations.length)return null;var host=document.createElement('div');host.className='export-shell';document.body.appendChild(host);var api;try{api=window.AuditPlanEditor.mount(host,{kind:kind,service:state.data.object_category==='tobacco'?'tobacco':'alcohol',getState:function(){return plan;},onChange:function(){},evidenceUrl:evidenceUrl,evidence:state.evidence});await api.refresh();var result=await api.exportPreview();if(result)result.subject_id=subject;return result;}finally{if(api)api.destroy();host.remove();}}
@@ -373,6 +450,7 @@
   }
   async function submit(){
     if(state.submitting)return;
+    if(state.pendingUploads){notify('Дождитесь загрузки выбранных файлов.');return;}
     try{if(editor&&editor.flush)await editor.flush();}catch(error){notify(error.message);return;}
     var p=state.data.inspection;
     if(!state.frozen){

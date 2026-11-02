@@ -38,7 +38,7 @@ function auditWizard() {
   <script src="/audit-plan-editor.js?v=20261030-actions5"><\/script>
   <script src="/audit-actions.js?v=20261030-actions5"><\/script>
   <script src="/audit-route.js?v=20261030-actions5"><\/script>
-  <script src="/audit-wizard-client.js?v=20261030-actions5"><\/script>
+  <script src="/audit-wizard-client.js?v=20261102-file-read"><\/script>
 </body>
 </html>`;
 }
