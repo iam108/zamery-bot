@@ -710,17 +710,49 @@ function setupEgrn(bot) {
   setInterval(poll, 3 * 60 * 1000);
 }
 
-async function copyFiles(fileMsgs, targets) {
-  if (!tgApi) return 0;
+async function copyFiles(fileMsgs, targets, options = {}) {
+  if (!tgApi) {
+    if (options.strict) throw Object.assign(new Error('Не удалось подключить доставку выписки.'), { code: 'EGRN_COPY_UNAVAILABLE', uncertain: false });
+    return 0;
+  }
+  const confirmed = options.confirmed || {};
   let n = 0;
   for (const t of targets) {
     for (const fm of fileMsgs) {
+      // A reply thread is not another recipient. Keep receipts stable when the
+      // same case is resumed with a new card or a refreshed download URL.
+      const key = JSON.stringify([String(t.chat), fm.key || String(fm.chat) + ':' + String(fm.id)]);
+      if (confirmed[key] === true) continue;
+      let stage = 'telegram';
       try {
-        if (fm.kind === 'link') { await largeDelivery().copy(fm, t); n++; continue; }
-        await tgApi.callApi('copyMessage', Object.assign({ chat_id: t.chat, from_chat_id: fm.chat, message_id: fm.id },
-          t.reply ? { reply_parameters: { message_id: Number(t.reply), allow_sending_without_reply: true } } : {}));
+        const message = fm.kind === 'link' ? await largeDelivery().copy(fm, t) :
+          await tgApi.callApi('copyMessage', Object.assign({ chat_id: t.chat, from_chat_id: fm.chat, message_id: fm.id },
+            t.reply ? { reply_parameters: { message_id: Number(t.reply), allow_sending_without_reply: true } } : {}));
+        if (options.strict && !(fm.kind === 'link' && message === true) && (!Number.isSafeInteger(Number(message?.message_id)) || Number(message.message_id) < 1)) {
+          throw Object.assign(new Error('Telegram не подтвердил доставку выписки.'), { code: 'EGRN_COPY_RECEIPT', uncertain: true });
+        }
+        // Persist each acknowledgement before attempting another original.
+        // A failed receipt write must propagate even for legacy callers using
+        // this opt-in callback; continuing would create untracked duplicates.
+        stage = 'checkpoint';
+        if (options.onCopied) await options.onCopied(key, message);
+        if (options.strict || options.confirmed || options.onCopied) confirmed[key] = true;
         n++;
-      } catch (e) { console.error('egrn copy:', fm.kind === 'link' ? 'Не удалось доставить ссылку на сохранённую выписку.' : e.message); if (fm.kind === 'link') throw e; }
+      } catch (e) {
+        console.error('egrn copy:', fm.kind === 'link' ? 'Не удалось доставить ссылку на сохранённую выписку.' : options.strict ? 'Не удалось подтвердить доставку выписки.' : e.message);
+        if (options.strict) {
+          // Keep Telegram's explicit rejection intact. A lost response or a
+          // lost database acknowledgement cannot safely be resent blindly.
+          if (!e || typeof e !== 'object') e = new Error('Не удалось подтвердить доставку выписки.');
+          if (stage === 'checkpoint') { e.uncertain = true; e.code ||= 'EGRN_COPY_CHECKPOINT'; }
+          else if (typeof e.uncertain !== 'boolean') {
+            const beforeSend = ['validation', 'storage', 'descriptor', 'signing'].includes(e.delivery_stage);
+            e.uncertain = !beforeSend && !e.response && !/^TELEGRAM_\d+$/.test(String(e.failure_code || ''));
+            e.code ||= 'EGRN_COPY_FAILED';
+          }
+        }
+        if (fm.kind === 'link' || options.strict || options.onCopied) throw e;
+      }
     }
   }
   return n;
@@ -737,7 +769,7 @@ async function attachOrOrder(opts) {
     "SELECT * FROM egrn_orders WHERE cad_num=$1 AND type_doc=$2 AND status <> 'failed' AND created_at > NOW() - INTERVAL '30 days' ORDER BY id DESC LIMIT 1",
     [cad, TYPE_DOC])).rows[0];
   if (prev && (prev.files_sent > 0 || hasReusableLinks(prev)) && Array.isArray(prev.file_msgs) && prev.file_msgs.length) {
-    await copyFiles(prev.file_msgs, opts.targets || []);
+    await copyFiles(prev.file_msgs, opts.targets || [], opts.copyOptions);
     let packet = {};
     if ((opts.targets || []).some(t => t && t.order_id) && prev.file_msgs.some(file => file.kind !== 'link')) {
       try { packet = await require('./order-evidence').registerCached(opts.targets, prev.file_msgs.filter(file => file.kind !== 'link'), tgApi); }

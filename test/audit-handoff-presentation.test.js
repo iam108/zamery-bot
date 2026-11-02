@@ -46,6 +46,7 @@ function harness(options = {}) {
       if (name === '../checklists') return { LISTS: {}, STAGES: [], flagLabels: {}, pickChecklist: () => options.noChecklist ? null : 'qa-checklist' };
       if (name === '../bot/instance') return bot;
       if (name === './auth') return {};
+      if (name === './handoff-packet') return { setupHandoffPacket: () => ({}) };
       throw new Error('Unexpected handoff dependency: ' + name);
     }
   };

@@ -1139,6 +1139,8 @@ function setupHandoff(app) {
   const bot = require('../bot/instance');
   startDecisionReminders(bot);
   const WEBAPP_URL = process.env.WEBAPP_URL;
+  const packetService = require('./handoff-packet').setupHandoffPacket(app);
+  let submitV2;
 
   // Данные для предзаполнения формы
   app.get('/api/handoff/prefill', async function (req, res) {
@@ -1161,6 +1163,7 @@ function setupHandoff(app) {
         order: order ? {
           id: order.id, org: order.object_name || '', client: order.owner_name || '',
           owner: order.owner_name || '', name: order.object_name || '', zones: order.zones_info || '',
+          inn: order.inn || '', cad_num: order.cad_num || '', service: order.service || '',
           address: order.address || '', contacts: order.contacts || '',
           region: guessRegion(order.address), kind: guessKind(order.object_type)
         } : null,
@@ -1173,6 +1176,13 @@ function setupHandoff(app) {
   app.post('/api/handoff', async function (req, res) {
     try {
       var d = req.body;
+      if (d && d.handoff_version === 2) {
+        if (!submitV2) submitV2 = require('./handoff-submit').createHandoffSubmitter({
+          pool, ready: ensureTables, packetService, telegram: bot.telegram, loadReport: getReport,
+          pickChecklist, webappUrl: WEBAPP_URL, clientsChatId: process.env.CLIENTS_CHAT_ID,
+        });
+        return res.json(await submitV2({ body: d, user: req.tgUser, staff: req.staff }));
+      }
       var lawyer = (await pool.query("SELECT * FROM staff WHERE tg_id=$1 AND role='lawyer' AND approved = true", [d.lawyer_tg_id])).rows[0];
       if (!lawyer) return res.json({ ok: false, error: 'Юрист не найден. Он должен нажать /start в боте и выбрать роль «Юрист».' });
       d.checklist_key = pickChecklist(d.region, d.kind, d.service);
@@ -1256,7 +1266,10 @@ function setupHandoff(app) {
         } catch (e) { console.error('egrn for handoff:', e.message); egrnNote = 'Выписку ЕГРН заказать не удалось: ' + e.message; }
       }
       res.json({ ok: true, id: c.id, warn: [dmWarn, egrnNote].concat(auditWarnings).filter(Boolean).join(' ') || undefined });
-    } catch (e) { console.error('api/handoff error:', e); res.json({ ok: false, error: e.message }); }
+    } catch (e) { console.error('api/handoff error:', e.message); res.status(e.status || 500).json({ ok: false, error: e.message, code: e.code,
+      ...(typeof e.case_created === 'boolean' ? { case_created: e.case_created } : {}),
+      ...(e.case_id ? { case_id: e.case_id } : {}),
+      ...(e.manual_review ? { manual_review: true, retry: false } : {}) }); }
   });
 
   // Сохранение чек-листа
@@ -1265,6 +1278,9 @@ function setupHandoff(app) {
       if (!req.body || typeof req.body !== 'object' || !req.body.case_id) {
         console.log('checklist save: пустое тело', req.get('Content-Type'), req.get('Content-Length'));
         return res.status(400).json({ ok: false, error: 'Пустой запрос (тип ' + (req.get('Content-Type') || '—') + ')' });
+      }
+      if (req.body.data != null && (typeof req.body.data !== 'object' || Array.isArray(req.body.data))) {
+        return res.status(400).json({ ok: false, error: 'Ответы чек-листа должны быть объектом.' });
       }
       var id = parseInt(req.body.case_id);
       var c = (await pool.query('SELECT * FROM cases WHERE id=$1', [id])).rows[0];
@@ -1275,7 +1291,7 @@ function setupHandoff(app) {
       var total = parseInt(req.body.total) || 0;
       var nowDone = total > 0 && done >= total;
       await pool.query(
-        'UPDATE cases SET data=$1, done=$2, total=$3, completed_at=' + (nowDone ? 'COALESCE(completed_at, NOW())' : 'NULL') + ' WHERE id=$4',
+        'UPDATE cases SET data=($1::jsonb - \'_handoff\') || CASE WHEN data ? \'_handoff\' THEN jsonb_build_object(\'_handoff\',data->\'_handoff\') ELSE \'{}\'::jsonb END, done=$2, total=$3, completed_at=' + (nowDone ? 'COALESCE(completed_at, NOW())' : 'NULL') + ' WHERE id=$4',
         [data, done, total, id]
       );
 
@@ -1301,12 +1317,12 @@ function setupHandoff(app) {
         var subOn = /^\d{4}-\d{2}-\d{2}$/.test(data._submittedOn || '') ? data._submittedOn : mskToday();
         due = addWorkdays(subOn, decisionDays(c.region));
         data._submittedOn = subOn; data._decisionDue = due;
-        await pool.query('UPDATE cases SET data=$1, submitted_on=$2, decision_due=$3, reminded_on=NULL WHERE id=$4', [data, subOn, due, id]);
+        await pool.query('UPDATE cases SET data=($1::jsonb - \'_handoff\') || CASE WHEN data ? \'_handoff\' THEN jsonb_build_object(\'_handoff\',data->\'_handoff\') ELSE \'{}\'::jsonb END, submitted_on=$2, decision_due=$3, reminded_on=NULL WHERE id=$4', [data, subOn, due, id]);
       } else if (data._stage === 'Подано' && data._submittedOn && data._submittedOn !== old._submittedOn) {
         // юрист поправил дату подачи — пересчитываем срок
         due = addWorkdays(data._submittedOn, decisionDays(c.region));
         data._decisionDue = due;
-        await pool.query('UPDATE cases SET data=$1, submitted_on=$2, decision_due=$3, reminded_on=NULL WHERE id=$4', [data, data._submittedOn, due, id]);
+        await pool.query('UPDATE cases SET data=($1::jsonb - \'_handoff\') || CASE WHEN data ? \'_handoff\' THEN jsonb_build_object(\'_handoff\',data->\'_handoff\') ELSE \'{}\'::jsonb END, submitted_on=$2, decision_due=$3, reminded_on=NULL WHERE id=$4', [data, data._submittedOn, due, id]);
       }
       if (data._stage && data._stage !== old._stage && CLIENTS) {
         var stageMsg = data._stage === 'Подано'
@@ -1651,7 +1667,9 @@ function handoffClient() {
   };
 }
 
-function handoffPage() {
+function handoffPage() { return require('./handoff-page')(); }
+
+function legacyHandoffPage() {
   var css = [
     ':root{--bg:#E8EEF6;--ink:#0E1A2B;--ink2:#5B6B82;--glass:rgba(255,255,255,.56);--glass2:rgba(255,255,255,.74);--edge:rgba(255,255,255,.85);--hair:rgba(14,26,43,.08);--well:rgba(14,26,43,.06);',
     ' --ok:#1FA971;--bad:#E5484D;--accent:#2F6BFF;--o1:#8EC5FF;--o2:#C3B2FF;--o3:#9CEBD3;--shadow:0 10px 30px rgba(30,52,90,.12),0 1px 2px rgba(30,52,90,.06)}',
@@ -2522,7 +2540,7 @@ function checklistPage(c, L) {
   ].join('\n');
 
   var cfg = {
-    list: L, data: c.data || {}, stages: STAGES,
+    list: L, data: Object.fromEntries(Object.entries(c.data || {}).filter(function (entry) { return entry[0] !== '_handoff'; })), stages: STAGES,
     caseInfo: { id: c.id, service: c.service, lawyer: c.lawyer_name, region: c.region }
   };
 
