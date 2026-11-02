@@ -1,11 +1,11 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { extractEvent, parseSheetRows, prepareJob, sourceEventKey, selectLicense,
-  planSheetUpsert, planRetry, nextMorning, localDate } from './core.mjs';
+  planSheetUpsert, planRetry, nextMorning, localDate, normalizeName, normalizeAddress } from './core.mjs';
 import { createStore, addJob, requireJob, dueJobs, reserveFetch, recordResponse,
   recordFailure, savePlan, acknowledge, recoverExpiredFetches, stateSummary } from './state.mjs';
 
@@ -13,6 +13,17 @@ const executeFile = promisify(execFile);
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const clone = (v) => JSON.parse(JSON.stringify(v));
 const instant = (now) => new Date(now()).toISOString();
+const sourceTextKey=(value)=>String(value??'').normalize('NFKC').toLowerCase().replace(/\s+/gu,' ').trim();
+function editedSourceChanged(existing,message,extraction){
+  if(!existing||!message.editDate)return false;
+  if(sourceTextKey(existing.sourceText)!==sourceTextKey(message.text??message.caption))return true;
+  const event=extraction.event;
+  if(!event)return false;
+  return ['inn','organization','operation','kpp','licenseNumber','address','decisionDate'].some((field)=>{
+    const normalize=field==='organization'?normalizeName:field==='address'?normalizeAddress:(value)=>String(value??'');
+    return normalize(existing[field])!==normalize(event[field]);
+  });
+}
 
 export function classifyApiFailure(envelope) {
   if (!envelope || typeof envelope !== 'object') return 'invalid_api_response';
@@ -26,7 +37,23 @@ export function classifyApiFailure(envelope) {
 }
 
 export class FsrarClient {
-  constructor({keyFile, execute = executeFile}) { this.keyFile = keyFile; this.execute = execute; }
+  #proxyUrl;
+  constructor({keyFile, proxyUrl, execute = executeFile}) {
+    this.keyFile = keyFile;
+    this.execute = execute;
+    if (proxyUrl != null && proxyUrl !== '') {
+      try {
+        const url = new URL(proxyUrl);
+        const octets = url.hostname.split('.');
+        if (!['http:', 'https:'].includes(url.protocol) || !url.username || !url.password ||
+            octets.length !== 4 || octets.some((v) => !/^\d{1,3}$/u.test(v) || Number(v) > 255) ||
+            url.pathname !== '/' || url.search || url.hash) throw new Error();
+        // Decode once to reject malformed percent escapes; values never leave the child environment.
+        decodeURIComponent(url.username); decodeURIComponent(url.password);
+        this.#proxyUrl = url.toString();
+      } catch { throw new Error('fsrar_proxy_invalid'); }
+    }
+  }
   async validate() {
     const mode = (await fs.stat(this.keyFile)).mode & 0o777;
     if (mode & 0o077) throw new Error('fsrar_key_permissions');
@@ -37,7 +64,15 @@ export class FsrarClient {
     const args = [path.join(directory, 'network-helper.py'), '--key-file', this.keyFile, '--method', method];
     if (method === 'fsrar') { args.push('--inn', job.inn); if (job.kpp) args.push('--kpp', job.kpp); }
     try {
-      const {stdout} = await this.execute('python3', args, {timeout:23000,maxBuffer:3000000});
+      const options = {timeout:23000,maxBuffer:3000000};
+      if (this.#proxyUrl) {
+        // Only this API helper gets the pinned route. Google/Telegram and the parent retain their own network paths.
+        const env = {...process.env, HTTPS_PROXY:this.#proxyUrl, HTTP_PROXY:this.#proxyUrl};
+        // urllib gives lowercase entries precedence; NO_PROXY would silently bypass the configured route.
+        for (const key of ['https_proxy','http_proxy','ALL_PROXY','all_proxy','NO_PROXY','no_proxy']) delete env[key];
+        options.env = env;
+      }
+      const {stdout} = await this.execute('python3', args, options);
       return JSON.parse(stdout);
     } catch { return {attempted:true,transport_error:'fsrar_transport_error'}; }
   }
@@ -96,6 +131,26 @@ export class LicenseWorker {
         const source=sourceEventKey(message);
         const extraction=extractEvent(message,rows,{timeZone:state.config.timeZone});
         const existing=state.sources[source] && state.jobs[state.sources[source]];
+        // Edits are checked even when the new text is negative/ignored. The
+        // original identity and any uncertain write/API evidence remain intact.
+        if(editedSourceChanged(existing,message,extraction)){
+          const text=String(message.text??message.caption??'').slice(0,20000);
+          const edit={editDate:message.editDate,text,extractionStatus:extraction.status,
+            proposedInn:extraction.event?.inn??null,proposedOrganization:extraction.event?.organization??null};
+          const fingerprint=createHash('sha256').update(JSON.stringify(edit)).digest('hex');
+          const alreadyJournaled=existing.sourceEditFingerprint===fingerprint;
+          const previousStatus=existing.status;
+          if(existing.status!=='done'){existing.status='review';existing.reason='source_message_edited';existing.nextCheckAt=null;}
+          Object.assign(existing,{sourceReviewRequired:true,sourceReviewReason:'source_message_edited',
+            latestSourceEdit:edit,sourceEditFingerprint:fingerprint,updatedAt:instant(this.now)});
+          if(!alreadyJournaled){
+            state.journal.push({at:instant(this.now),type:'source_message_edited',jobId:existing.id,
+              sourceEventKey:source,editDate:message.editDate,previousStatus,status:existing.status,
+              proposedInn:edit.proposedInn});
+          }
+          results.push({status:'source_review_required',id:existing.id});continue;
+        }
+        if(existing?.sourceReviewRequired){results.push({status:'source_review_required',id:existing.id});continue;}
         if (extraction.status==='ignore') { results.push({status:'ignored',source});continue; }
         const event=extraction.event??{id:source,sourceEventKey:source,reportedAt:message.date,
           organization:null,inn:null,operation:'unknown',nextCheckAt:null};
@@ -124,9 +179,35 @@ export class LicenseWorker {
         nextCheckAt:retry.nextCheckAt,terminal:retry.status!=='waiting'});
     });
   }
-  async fetch(id) {
+  async checkFetchBudget(id,runId) {
+    return this.store.update((state)=>{
+      const job=requireJob(state,id);
+      if(job.status!=='waiting'||Date.parse(job.nextCheckAt)>+this.now())return 'not_due';
+      if((job.attempts??0)>=(state.config.maxAttempts??7)){
+        recordFailure(state,id,{code:'maximum_attempts_reached',terminal:true,now:this.now()});
+        return 'maximum_attempts_reached';
+      }
+      if(state.api.blocked)return 'api_blocked';
+      if(state.api.attemptedCalls>=state.config.apiTotalLimit-state.config.apiReserve){
+        recordFailure(state,id,{code:'insufficient_api_quota',terminal:true,now:this.now()});
+        return 'insufficient_api_quota';
+      }
+      const day=localDate(this.now(),state.config.timeZone);
+      if((state.api.daily[day]??0)>=state.config.dailyLimit){
+        const nextCheckAt=nextMorning(this.now(),{timeZone:state.config.timeZone,hour:this.config.dailyHour??9});
+        if(job.nextCheckAt!==nextCheckAt||job.reason!=='api_daily_limit_reached'){
+          Object.assign(job,{nextCheckAt,reason:'api_daily_limit_reached',updatedAt:instant(this.now)});
+          state.journal.push({at:instant(this.now),type:'api_budget_deferred',jobId:id,sourceEventKey:job.sourceEventKey,
+            reason:'api_daily_limit_reached',nextCheckAt});
+        }
+        return 'api_daily_limit_reached';
+      }
+      if((state.api.runs[runId]??0)>=state.config.runLimit)return 'api_run_limit_reached';
+      return null;
+    });
+  }
+  async fetch(id,{runId=`${localDate(this.now(),this.config.timeZone)}:${randomUUID()}`}={}) {
     await this.api.validate();
-    const runId=`${localDate(this.now(),this.config.timeZone)}:daily`;
     const reserved=await this.store.update((s)=>reserveFetch(s,id,{now:this.now(),runId}));
     const envelope=await this.api.request('fsrar',reserved.job);
     return this.store.update((state)=>{
@@ -161,11 +242,20 @@ export class LicenseWorker {
       return clone(current);
     });
   }
-  async processJob(id) {
+  async processJob(id,{runId=`${localDate(this.now(),this.config.timeZone)}:${randomUUID()}`}={}) {
     let job=requireJob(await this.store.read(),id);
     if (job.status==='waiting') {
       if (this.dryRun) return;
-      job=await this.fetch(id);
+      const deferred=await this.checkFetchBudget(id,runId);
+      if(deferred)return {deferred};
+      job=await this.fetch(id,{runId});
+    }
+    // Polling can persist a correction while the API request is in flight.
+    // Consume a pending edit for this source before proceeding to Google.
+    const pending=await this.store.read();
+    if(pending.telegram?.inbox?.some(({message})=>message.editDate&&sourceEventKey(message)===job.sourceEventKey)){
+      await this.ingestInbox(await this.google.context());
+      job=requireJob(await this.store.read(),id);
     }
     if (!['fetched','planned'].includes(job.status)) return;
     // An uncertain Google write must retain its original expected cells/hash:
@@ -202,8 +292,14 @@ export class LicenseWorker {
       const context=await this.google.context();
       await this.ingestInbox(context);
       const jobs=dueJobs(await this.store.read(),this.now());
+      const runId=`${localDate(this.now(),this.config.timeZone)}:${randomUUID()}`;
+      let fetchLimited=false;
       for(const job of jobs) {
-        try { await this.processJob(job.id); }
+        if(fetchLimited&&job.status==='waiting')continue;
+        try {
+          const outcome=await this.processJob(job.id,{runId});
+          if(['api_run_limit_reached','api_blocked'].includes(outcome?.deferred))fetchLimited=true;
+        }
         catch(error) { await this.report({type:'processing_error',jobId:job.id,code:error.code||error.message||'processing_failed'}); }
       }
       return stateSummary(await this.store.read());
@@ -212,6 +308,9 @@ export class LicenseWorker {
 }
 
 export async function initializeState(file, config, env, now=()=>new Date()) {
+  if(env.REQUIRE_INITIAL_STATE==='true'&&!env.INITIAL_STATE_JSON){
+    try{await fs.access(file);}catch(error){if(error.code==='ENOENT')throw new Error('initial_state_required');throw error;}
+  }
   await fs.mkdir(path.dirname(file),{recursive:true,mode:0o700});
   // One-time migration via a secret variable; never bake client data into the image.
   if (env.INITIAL_STATE_JSON) {

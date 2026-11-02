@@ -7,6 +7,7 @@ import {GoogleSheetsClient} from './google.mjs';
 import {TelegramClient,convertUpdate} from './telegram.mjs';
 import {LicenseWorker,FsrarClient,prepareSecrets,initializeState,classifyApiFailure} from './runtime.mjs';
 import {createReadiness,createHealthHandler,safeErrorCode,validateFsrarStat,retryStartup} from './health.mjs';
+import {createNotifier} from './notifier.mjs';
 
 const dir=path.dirname(fileURLToPath(import.meta.url));
 const env=process.env;
@@ -15,10 +16,12 @@ const secrets=[env.BOT_TOKEN,env.FSRAR_API_KEY,env.GOOGLE_SERVICE_ACCOUNT_JSON].
 const health=createReadiness({secrets});
 let stopping=false;
 let startupDependency=null;
+let notificationReporter=null;
 const seenReports=new Map();
 async function report(event){
   const clean={at:new Date().toISOString(),...event};
   if(clean.code)clean.code=safeErrorCode(clean.code,'processing_failed',secrets);
+  if(notificationReporter)return notificationReporter(clean);
   const fingerprint=JSON.stringify({...clean,at:undefined});
   if(Date.now()-(seenReports.get(fingerprint)||0)<3600000)return;
   seenReports.set(fingerprint,Date.now());
@@ -67,13 +70,15 @@ async function initialize(){
   const google=monitoredGoogle(new GoogleSheetsClient({spreadsheetId:config.spreadsheetId,sheetName:config.sheetName,
     sheetId:config.sheetId,credentials:env.GOOGLE_SERVICE_ACCOUNT_JSON||env.GOOGLE_APPLICATION_CREDENTIALS}));
   const telegram=new TelegramClient({token:env.BOT_TOKEN});
+  notificationReporter=createNotifier({telegram,store,ownerChatId:env.NOTIFY_CHAT_ID});
+  await notificationReporter.verifyOwner();
   startupDependency='telegram';health.stage('verifying_telegram');
   const target=await telegram.verifyTarget({targetChatId:config.targetChatId,chatTitle:disk.chatTitle});
   // Verification grants the first 30-second poll a short readiness grace.
   health.success('telegram');
   startupDependency='google';health.stage('verifying_google');await google.context();
   startupDependency='api';health.stage('verifying_fsrar');
-  const api=monitoredApi(new FsrarClient({keyFile}));await api.validate();
+  const api=monitoredApi(new FsrarClient({keyFile,proxyUrl:env.FSRAR_PROXY_URL}));await api.validate();
   const quota=validateFsrarStat(await api.request('stat'));
   const worker=new LicenseWorker({store,google,api,config,dryRun:env.DRY_RUN==='true',report});
   startupDependency=null;health.running({dryRun:env.DRY_RUN==='true'});
@@ -109,11 +114,14 @@ async function run({store,telegram,worker,config}){
           await report({type:'api_blocked',code:summary.api.blocked.code});
         }
         const state=await store.read();
-        for(const job of Object.values(state.jobs))if(job.status==='review')await report({type:'review_required',jobId:job.id,organization:job.organization,code:job.reason});
+        for(const job of Object.values(state.jobs))if(job.status==='review'||job.sourceReviewRequired)await report({type:'review_required',jobId:job.id,organization:job.organization,
+          code:job.sourceReviewRequired?'source_message_edited':job.reason});
       }catch(error){
         const code=safeErrorCode(error,'worker_tick_failed',secrets);
         health.failure('worker',code);await report({type:'worker_error',code});
       }
+      // A notification retry must continue after the licensing job is already done.
+      await notificationReporter?.flush();
       await sleep(60000,undefined,{signal:controller.signal}).catch(()=>{});
     }
   })();

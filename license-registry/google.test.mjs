@@ -21,8 +21,8 @@ function existingRow() {
     10: 'Общепит ', 11: license.address, 12: 'Менеджер', 13: '555', 14: 'private-chat', 16: 'Ручной комментарий' });
   return row;
 }
-function jobAndPlan(values, { rowNumber, selectedLicense = license } = {}) {
-  const job = { id: 'job', inn: selectedLicense.inn, organization: 'ООО «ХОРОШОТ»', operation: 'issuance',
+function jobAndPlan(values, { rowNumber, selectedLicense = license, organization = 'ООО «ХОРОШОТ»' } = {}) {
+  const job = { id: 'job', inn: selectedLicense.inn, organization, operation: 'issuance',
     reportedDate: '2026-10-28', sourceEventKey: 'telegram:5164597211:62436', selectedLicense };
   const plan = planSheetUpsert(selectedLicense, parseSheetRows(values), job);
   assert.ok(['update', 'append', 'noop'].includes(plan.action), JSON.stringify(plan));
@@ -215,4 +215,42 @@ test('no-op requires the correct license and both dates to be read back', async 
   const receipt = await client(mock).applyPlan(plan, job);
   assert.equal(receipt.cells.I2, license.issueDate); assert.equal(receipt.cells.J2, license.expiryDate);
   assert.equal(mock.batches.length, 0);
+});
+
+test('a historical Expert license in row 632 is preserved while the proven current blank-license row 869 is completed', async () => {
+  const expert = { ...license, inn: '7736274613', licenseNumber: '77РПО0017082',
+    issueDate: '2022-11-18', expiryDate: '2027-11-17', email: '',
+    address: 'Россия, , Москва Город, , , , , , , , вн.тер.г. муниципальный округ Пресненский, ул. Ходынская, д. 2, стр. 1, этаж 1, часть помещ. I' };
+  const values = Array.from({ length: 869 }, () => []);
+  values[0] = [...REGISTRY_HEADERS];
+  const historical = Array(17).fill('');
+  Object.assign(historical, { 4: 'ООО "ЭКСПЕРТ"', 6: expert.inn, 7: expert.licenseNumber,
+    8: '18.11.2022', 9: '17.11.2025', 10: 'Общепит ',
+    11: 'оссия, , Москва Город, Ходынская Улица, 2 , 1, этаж 1, часть пом. I',
+    16: 'Историческая запись, сохранить' });
+  values[631] = historical;
+  const current = Array(17).fill('');
+  Object.assign(current, { 4: 'ООО "ЭКСПЕРТ"', 6: expert.inn, 8: '18 ноя 2022',
+    9: '17 ноя 2027', 10: 'Общепит ', 11: expert.address, 16: 'Текущая ручная запись' });
+  values[868] = current;
+  const { job, plan } = jobAndPlan(values, { selectedLicense: expert, organization: 'ООО "ЭКСПЕРТ"' });
+  assert.equal(plan.action, 'update'); assert.equal(plan.rowNumber, 869);
+  assert.deepEqual(plan.updates.map((u) => [u.column, u.row]), [['H', 869]]);
+  const mock = mockGoogle(values, { gridRows: 900 });
+  const receipt = await client(mock).applyPlan(plan, job);
+  assert.equal(receipt.cells.H869, expert.licenseNumber);
+  assert.equal(receipt.cells.I869, '2022-11-18'); assert.equal(receipt.cells.J869, '2027-11-17');
+  assert.deepEqual(mock.values[631], historical);
+  assert.equal(mock.values[868][16], 'Текущая ручная запись');
+  assert.ok(mock.batches[0].requests.every((r) => r.updateCells?.start.rowIndex === 868));
+  // A plan saved by an older worker must also be refused instead of upgrading the historical row.
+  const obsolete = { action: 'update', rowNumber: 632, identity: plan.identity, sourceEventKey: job.sourceEventKey,
+    updates: [{ row: 632, column: 'J', columnIndex: 9, before: historical[9], after: expert.expiryDate },
+      { row: 632, column: 'L', columnIndex: 11, before: historical[11], after: expert.address }],
+    expectedCells: { J632: expert.expiryDate, L632: expert.address }, spreadsheetId: id, sheetName: title };
+  const oldPlan = { ...obsolete, hash: hash(obsolete), createdAt: plan.createdAt };
+  const freshMock = mockGoogle(values, { gridRows: 900 });
+  await assert.rejects(client(freshMock).applyPlan(oldPlan, job), { code: 'sheet_plan_stale' });
+  assert.equal(freshMock.batches.length, 0);
+  assert.deepEqual(freshMock.values[631], historical);
 });

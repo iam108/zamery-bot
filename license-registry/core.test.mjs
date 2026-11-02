@@ -212,6 +212,71 @@ test('blank license row can be completed only with exact object address', () => 
   assert.equal(planSheetUpsert(license(), [sheetRow({ licenseNumber: '', address: 'другой объект' })], event()).reason, 'incomplete_existing_sheet_record');
 });
 
+function expertRenewalFixture() {
+  // The sheet rows are observed facts; this API response is a hypothetical
+  // renewal fixture, not a claim that the live provider returned these dates.
+  const inn='7736274613';const number='77РПО0017082';
+  const oldAddress='оссия, , Москва Город, Ходынская Улица, 2 , 1, этаж 1, часть пом. I';
+  const currentAddress='Россия, , Москва Город, , , , , , , , вн.тер.г. муниципальный округ Пресненский, ул. Ходынская, д. 2, стр. 1, этаж 1, часть помещ. I';
+  const historical={...sheetRow({organization:'ООО ЭКСПЕРТ',inn,licenseNumber:number,
+    issueDate:'18.11.2022',expiryDate:'17.11.2025',address:oldAddress}),rowNumber:632};
+  const current={...sheetRow({organization:'ООО ЭКСПЕРТ',inn,licenseNumber:'',
+    issueDate:'18 ноя 2022',expiryDate:'17 ноя 2027',address:currentAddress}),rowNumber:869};
+  const response=license({'ИНН':inn,'Номер лицензии':number,'Дата выдачи':'2022-11-18',
+    'Дата окончания':'2027-11-17','Адрес подразделения':currentAddress,'e-mail':''});
+  return {historical,current,response,event:event({inn,organization:'ООО ЭКСПЕРТ',operation:'renewal'})};
+}
+
+test('a confirmed renewal fills the exact current blank-license row and preserves its numbered historical period',()=>{
+  const f=expertRenewalFixture();const before=structuredClone([f.historical,f.current]);
+  const result=planSheetUpsert(f.response,[f.historical,f.current],f.event);
+  assert.equal(result.action,'update');assert.equal(result.rowNumber,869);
+  assert.deepEqual(result.updates.map((u)=>[u.row,u.column,u.after]),[[869,'H','77РПО0017082']]);
+  assert.deepEqual([f.historical,f.current],before);
+});
+
+test('current-period selection uses exact dates/address rather than the largest row number or input order',()=>{
+  const f=expertRenewalFixture();const earlierRow={...f.current,rowNumber:200};
+  for(const rows of [[f.historical,earlierRow],[earlierRow,f.historical]]){
+    const result=planSheetUpsert(f.response,rows,f.event);
+    assert.equal(result.action,'update');assert.equal(result.rowNumber,200);
+    assert.ok(result.updates.every((u)=>u.row===200));
+  }
+});
+
+test('after filling H a repeated API record still selects its exact current period among older numbered rows',()=>{
+  const f=expertRenewalFixture();
+  const historical={...f.historical,values:[...f.historical.values]};historical.values[11]=f.current.values[11];
+  const completed={...f.current,values:[...f.current.values]};completed.values[7]='77РПО0017082';
+  const before=structuredClone([historical,completed]);
+  const result=planSheetUpsert(f.response,[historical,completed],f.event);
+  assert.equal(result.action,'noop');assert.equal(result.rowNumber,869);assert.deepEqual(result.updates,[]);
+  assert.deepEqual([historical,completed],before);
+  const future={...historical,values:historical.values.map((v,i)=>i===9?'17.11.2028':v)};
+  assert.equal(planSheetUpsert(f.response,[future,completed],f.event).action,'review');
+});
+
+test('a full licensed row and blank row with the same current object and dates require review',()=>{
+  const f=expertRenewalFixture();
+  const licensed={...f.current,values:[...f.current.values],rowNumber:632};licensed.values[7]='77РПО0017082';
+  const result=planSheetUpsert(f.response,[licensed,f.current],f.event);
+  assert.equal(result.action,'review');assert.equal(result.reason,'duplicate_or_ambiguous_sheet_records');
+  assert.deepEqual(result.updates,[]);
+});
+
+test('multiple current blank rows and unproved historical dates never select an arbitrary renewal row',()=>{
+  const f=expertRenewalFixture();
+  for(const rows of [
+    [f.historical,f.current,{...f.current,rowNumber:870}],
+    [{...f.historical,values:f.historical.values.map((v,i)=>i===9?'уточнить':v)},f.current],
+    [{...f.historical,values:f.historical.values.map((v,i)=>i===9?'17.11.2028':v)},f.current],
+    [{...f.historical,values:f.historical.values.map((v,i)=>i===9?'17.11.2027':v)},f.current],
+  ]){
+    const result=planSheetUpsert(f.response,rows,f.event);
+    assert.equal(result.action,'review');assert.deepEqual(result.updates,[]);
+  }
+});
+
 test('new license number creates a new row, not overwriting older license of same INN', () => {
   const newRecord = license({ 'Номер лицензии': '77РПО0022000', 'Дата выдачи': '2026-10-30', 'Дата окончания': '2027-10-29' });
   const result = planSheetUpsert(newRecord, [sheetRow()], event({ operation: 'issuance' }));

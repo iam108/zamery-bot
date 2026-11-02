@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """One bounded API request using macOS/system proxy settings; never prints the key."""
 import argparse
+import base64
 import json
+import os
 import pathlib
 import re
 import stat
@@ -14,6 +16,34 @@ import urllib.request
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+def redact(text, key='', proxy_urls=None):
+    """Proxy credentials can appear in urllib exception text or a proxy's HTML error page."""
+    secrets = [(key, '[REDACTED]')] if key else []
+    urls = proxy_urls if proxy_urls is not None else [
+        value for name, value in os.environ.items()
+        if name.lower() in ('http_proxy', 'https_proxy', 'all_proxy') and value]
+    for proxy_url in urls:
+        secrets.extend([(proxy_url, '[REDACTED_PROXY]'),
+                        (urllib.parse.unquote(proxy_url), '[REDACTED_PROXY]')])
+        try:
+            parsed = urllib.parse.urlsplit(proxy_url)
+            if parsed.password:
+                password = urllib.parse.unquote(parsed.password)
+                secrets.extend([(parsed.password, '[REDACTED_PROXY]'),
+                                (password, '[REDACTED_PROXY]')])
+                if parsed.username:
+                    username = urllib.parse.unquote(parsed.username)
+                    encoded_auth = base64.b64encode((username + ':' + password).encode()).decode()
+                    secrets.append((encoded_auth, '[REDACTED_PROXY]'))
+        except ValueError:
+            pass
+    result = str(text)
+    for secret, replacement in sorted(secrets, key=lambda item: len(item[0]), reverse=True):
+        if secret:
+            result = result.replace(secret, replacement)
+    return result
 
 
 def main():
@@ -57,7 +87,7 @@ def main():
             raw = response.read(2_000_001)
             if len(raw) > 2_000_000:
                 raise ValueError('API response exceeds the bounded read limit')
-            body = raw.decode('utf-8', 'replace').replace(key, '[REDACTED]')
+            body = redact(raw.decode('utf-8', 'replace'), key)
             try:
                 payload = json.loads(body)
             except ValueError:
@@ -65,11 +95,10 @@ def main():
             result = {'http_status': response.status, 'response': payload, 'attempted': True}
     except urllib.error.HTTPError as error:
         body = error.read(1500).decode('utf-8', 'replace')
-        result = {'http_status': error.code, 'error': body.replace(key, '[REDACTED]') if key else body,
+        result = {'http_status': error.code, 'error': redact(body, key),
                   'attempted': attempted}
     except Exception as error:
-        text = str(error)
-        result = {'transport_error': text.replace(key, '[REDACTED]') if key else text,
+        result = {'transport_error': redact(str(error), key),
                   'attempted': attempted}
     print(json.dumps(result, ensure_ascii=False))
 

@@ -216,13 +216,34 @@ export function planSheetUpsert(value, existingRows, event = {}, { timeZone = 'E
   if (event.inn && event.inn !== l.inn) return { action: 'review', reason: 'event_inn_mismatch', updates: [] };
   const sameInn = rows.filter((r) => rowValue(r, 'inn') === l.inn);
   let matches = sameInn.filter((r) => normalizeLicenseNumber(rowValue(r, 'licenseNumber')) === l.licenseNumber);
+  const incomplete = sameInn.filter((r) => !rowValue(r, 'licenseNumber'));
+  const exactIncomplete = incomplete.filter((r) => l.address && normalizeAddress(rowValue(r, 'address')) === normalizeAddress(l.address));
+  const datedIncomplete = exactIncomplete.filter((r) => normalizeDate(rowValue(r, 'issueDate')) === l.issueDate &&
+    normalizeDate(rowValue(r, 'expiryDate')) === l.expiryDate);
+  const earlierPeriod = (r) => {
+    const issue = normalizeDate(rowValue(r, 'issueDate'));
+    const expiry = normalizeDate(rowValue(r, 'expiryDate'));
+    return issue && expiry && expiry >= issue && issue <= l.issueDate && expiry < l.expiryDate;
+  };
+  if (matches.length && datedIncomplete.length) {
+    // A renewal can already have its own manually entered row with blank H.
+    // Prefer that row only when both dates and the exact object agree, and all
+    // numbered candidates are demonstrably earlier periods. Row order/number
+    // and a merely different address never establish a historical period.
+    const historical = matches.every(earlierPeriod);
+    if (datedIncomplete.length !== 1 || !historical) return { action: 'review', reason: 'duplicate_or_ambiguous_sheet_records', updates: [] };
+    matches = datedIncomplete;
+  }
   if (matches.length > 1) {
     matches = matches.filter((r) => normalizeAddress(rowValue(r, 'address')) === normalizeAddress(l.address));
+    if (matches.length > 1) {
+      const currentPeriod = matches.filter((r) => normalizeDate(rowValue(r, 'issueDate')) === l.issueDate &&
+        normalizeDate(rowValue(r, 'expiryDate')) === l.expiryDate);
+      if (currentPeriod.length === 1 && matches.filter((r) => r !== currentPeriod[0]).every(earlierPeriod)) matches = currentPeriod;
+    }
     if (matches.length !== 1) return { action: 'review', reason: 'duplicate_or_ambiguous_sheet_records', updates: [] };
   }
   if (!matches.length) {
-    const incomplete = sameInn.filter((r) => !rowValue(r, 'licenseNumber'));
-    const exactIncomplete = incomplete.filter((r) => l.address && normalizeAddress(rowValue(r, 'address')) === normalizeAddress(l.address));
     if (exactIncomplete.length === 1) matches = exactIncomplete;
     else if (incomplete.length) return { action: 'review', reason: 'incomplete_existing_sheet_record', updates: [] };
   }
