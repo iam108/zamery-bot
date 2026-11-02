@@ -20,12 +20,12 @@ test('an explicit single-IP proxy is limited to the API helper child environment
   } });
   assert.deepEqual(await client.request('fsrar', { inn: '9705148570', kpp: '770501001' }), envelope);
   const [command, args, options] = calls[0];
-  assert.equal(command, 'python3');
+  assert.equal(command, process.execPath);
+  assert.ok(args[0].endsWith('api-network-helper.mjs'));
   assert.ok(args.includes('--key-file') && args.includes(keyFile));
   assert.ok(!args.some((arg) => /TEST_PROXY_SECRET|fixie:/u.test(arg)));
-  assert.equal(new URL(options.env.HTTPS_PROXY).hostname, '54.173.229.123');
-  assert.equal(options.env.HTTPS_PROXY, options.env.HTTP_PROXY);
-  for (const name of ['https_proxy', 'http_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy']) {
+  assert.equal(new URL(options.env.FSRAR_PROXY_URL).hostname, '54.173.229.123');
+  for (const name of ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy']) {
     assert.ok(!Object.hasOwn(options.env, name), `${name} cannot bypass the pinned API route`);
   }
   assert.ok(Object.keys(parent).every((name) => parent[name] === process.env[name]) &&
@@ -35,7 +35,8 @@ test('an explicit single-IP proxy is limited to the API helper child environment
 
 test('without an explicit proxy the API helper retains the operating system default route', async () => {
   let options;
-  const client = new FsrarClient({ keyFile, execute: async (_command, _args, o) => {
+  const client = new FsrarClient({ keyFile, execute: async (command, args, o) => {
+    assert.equal(command,'python3');assert.ok(args[0].endsWith('network-helper.py'));
     options = o; return { stdout: JSON.stringify(envelope) };
   } });
   await client.request('stat');
@@ -51,7 +52,7 @@ test('both API methods use the explicit route and no key or proxy secret is pass
   await client.request('fsrar', { inn: '9705148570' });
   assert.equal(calls.length, 2);
   for (const { args, options } of calls) {
-    assert.ok(options.env.HTTPS_PROXY.includes('54.173.229.123'));
+    assert.ok(options.env.FSRAR_PROXY_URL.includes('54.173.229.123'));
     assert.ok(!JSON.stringify(args).includes('TEST_PROXY_SECRET'));
     assert.equal(args[args.indexOf('--key-file') + 1], keyFile);
   }
@@ -74,7 +75,8 @@ test('only credentialed HTTP(S) proxies with pinned numeric IPv4 addresses are a
     assert.throws(() => new FsrarClient({ keyFile, proxyUrl: bad }), (error) =>
       error.message === 'fsrar_proxy_invalid' && !error.message.includes('TEST_PROXY_SECRET'));
   }
-  assert.doesNotThrow(() => new FsrarClient({ keyFile, proxyUrl: 'https://fixie:TEST_PROXY_SECRET@54.173.229.123:443' }));
+  assert.throws(() => new FsrarClient({ keyFile, proxyUrl: 'https://fixie:TEST_PROXY_SECRET@54.173.229.123:443' }),/fsrar_proxy_invalid/u);
+  assert.doesNotThrow(() => new FsrarClient({ keyFile, proxyUrl: 'https://fixie:TEST_PROXY_SECRET@54.173.229.123:443',proxyServerName:'criterium.usefixie.com' }));
 });
 
 test('execution failures and malformed helper output return a generic transport error', async () => {

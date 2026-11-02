@@ -176,6 +176,23 @@ test('edited message retains original decision-reporting time with separate edit
   assert.equal(converted.text, 'ООО «Хорошот» решение положительное');
 });
 
+test('clearing a photo caption retains the edit identity while an ordinary uncaptioned photo is ignored', () => {
+  const options = { targetChatId: '-5164597211', sourceChatId: '5164597211', botId: bot.id };
+  const original = updateOf({ message_id: 3, chat: { id: -5164597211, type: 'group' },
+    document: undefined, photo: [{ file_id: 'photo', file_unique_id: 'photo-unique', width: 20, height: 20 }],
+    caption: 'Эксперт положительно' });
+  const converted = convertUpdate(original, options);
+  const uncaptioned = { ...original.message, caption: undefined };
+  assert.equal(convertUpdate({ update_id: 101, message: uncaptioned }, options), null);
+  const cleared = convertUpdate({ update_id: 102,
+    edited_message: { ...uncaptioned, edit_date: 1793260439 } }, options);
+  assert.equal(cleared.text, '');
+  assert.equal(cleared.edited, true);
+  assert.equal(cleared.editDate, new Date(1793260439 * 1000).toISOString());
+  assert.equal(cleared.date, converted.date);
+  assert.equal(sourceEventKey(cleared), sourceEventKey(converted));
+});
+
 test('ignores other groups, unsupported updates and service-only messages', () => {
   assert.equal(convertUpdate(updateOf({ chat: { id: -1001111111111, type: 'supergroup' } }), { targetChatId }), null);
   assert.equal(convertUpdate({ update_id: 100, my_chat_member: {} }, { targetChatId }), null);

@@ -8,12 +8,25 @@ import { extractEvent, parseSheetRows, prepareJob, sourceEventKey, selectLicense
   planSheetUpsert, planRetry, nextMorning, localDate, normalizeName, normalizeAddress } from './core.mjs';
 import { createStore, addJob, requireJob, dueJobs, reserveFetch, recordResponse,
   recordFailure, savePlan, acknowledge, recoverExpiredFetches, stateSummary } from './state.mjs';
+import {validatePinnedProxy} from './proxy-transport.mjs';
 
 const executeFile = promisify(execFile);
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const clone = (v) => JSON.parse(JSON.stringify(v));
 const instant = (now) => new Date(now()).toISOString();
 const sourceTextKey=(value)=>String(value??'').normalize('NFKC').toLowerCase().replace(/\s+/gu,' ').trim();
+export function privateStateProof(state){
+  // Periodic lastIngestAt/startup timestamps are telemetry, not queue content.
+  const sections={jobs:state.jobs,sources:state.sources,api:state.api,
+    telegram:{offset:state.telegram?.offset??0,inbox:state.telegram?.inbox??[]},cursors:state.cursors??{}};
+  const digest=(value)=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
+  const safeCount=(value)=>Number.isSafeInteger(value)&&value>=0?value:null;
+  const counts=Object.fromEntries(['waiting','fetching','fetched','planned','review','done'].map((status)=>
+    [status,Object.values(state.jobs).filter((job)=>job.status===status).length]));
+  return {sha256:digest(sections),sectionHashes:Object.fromEntries(Object.entries(sections).map(([name,value])=>[name,digest(value)])),
+    jobs:Object.keys(state.jobs).length,sources:Object.keys(state.sources).length,counts,
+    apiAttemptedCalls:safeCount(state.api.attemptedCalls),telegramOffset:safeCount(state.telegram?.offset??0),pendingInbox:state.telegram?.inbox?.length??0};
+}
 function editedSourceChanged(existing,message,extraction){
   if(!existing||!message.editDate)return false;
   if(sourceTextKey(existing.sourceText)!==sourceTextKey(message.text??message.caption))return true;
@@ -38,19 +51,15 @@ export function classifyApiFailure(envelope) {
 
 export class FsrarClient {
   #proxyUrl;
-  constructor({keyFile, proxyUrl, execute = executeFile}) {
+  #proxyServerName;
+  constructor({keyFile, proxyUrl, proxyServerName, execute = executeFile}) {
     this.keyFile = keyFile;
     this.execute = execute;
     if (proxyUrl != null && proxyUrl !== '') {
       try {
-        const url = new URL(proxyUrl);
-        const octets = url.hostname.split('.');
-        if (!['http:', 'https:'].includes(url.protocol) || !url.username || !url.password ||
-            octets.length !== 4 || octets.some((v) => !/^\d{1,3}$/u.test(v) || Number(v) > 255) ||
-            url.pathname !== '/' || url.search || url.hash) throw new Error();
-        // Decode once to reject malformed percent escapes; values never leave the child environment.
-        decodeURIComponent(url.username); decodeURIComponent(url.password);
+        const url = validatePinnedProxy(proxyUrl,proxyServerName);
         this.#proxyUrl = url.toString();
+        this.#proxyServerName = proxyServerName;
       } catch { throw new Error('fsrar_proxy_invalid'); }
     }
   }
@@ -61,18 +70,22 @@ export class FsrarClient {
     if (!/^[A-Za-z0-9_-]{40}$/u.test(key)) throw new Error('fsrar_key_invalid');
   }
   async request(method, job = {}) {
-    const args = [path.join(directory, 'network-helper.py'), '--key-file', this.keyFile, '--method', method];
+    const helper = this.#proxyUrl ? 'api-network-helper.mjs' : 'network-helper.py';
+    const args = [path.join(directory, helper), '--key-file', this.keyFile, '--method', method];
     if (method === 'fsrar') { args.push('--inn', job.inn); if (job.kpp) args.push('--kpp', job.kpp); }
     try {
       const options = {timeout:23000,maxBuffer:3000000};
       if (this.#proxyUrl) {
         // Only this API helper gets the pinned route. Google/Telegram and the parent retain their own network paths.
-        const env = {...process.env, HTTPS_PROXY:this.#proxyUrl, HTTP_PROXY:this.#proxyUrl};
-        // urllib gives lowercase entries precedence; NO_PROXY would silently bypass the configured route.
-        for (const key of ['https_proxy','http_proxy','ALL_PROXY','all_proxy','NO_PROXY','no_proxy']) delete env[key];
+        const env = {...process.env, FSRAR_PROXY_URL:this.#proxyUrl};
+        if(this.#proxyServerName)env.FSRAR_PROXY_SERVER_NAME=this.#proxyServerName;
+        else delete env.FSRAR_PROXY_SERVER_NAME;
+        // The Node helper connects to the numeric proxy explicitly. No inherited
+        // proxy/no-proxy setting can redirect or bypass that single route.
+        for (const key of ['HTTPS_PROXY','HTTP_PROXY','https_proxy','http_proxy','ALL_PROXY','all_proxy','NO_PROXY','no_proxy']) delete env[key];
         options.env = env;
       }
-      const {stdout} = await this.execute('python3', args, options);
+      const {stdout} = await this.execute(this.#proxyUrl?process.execPath:'python3', args, options);
       return JSON.parse(stdout);
     } catch { return {attempted:true,transport_error:'fsrar_transport_error'}; }
   }

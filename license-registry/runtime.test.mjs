@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { LicenseWorker, initializeState, classifyApiFailure, prepareSecrets, FsrarClient } from './runtime.mjs';
+import { LicenseWorker, initializeState, classifyApiFailure, prepareSecrets, FsrarClient, privateStateProof } from './runtime.mjs';
 import { convertUpdate } from './telegram.mjs';
 import { initialState, addJob, createStore, hash } from './state.mjs';
 import { REGISTRY_HEADERS } from './google.mjs';
@@ -214,6 +214,36 @@ test('an edit arriving during the API request is consumed before any Google writ
   assert.equal(job.status,'review');assert.equal(job.reason,'source_message_edited');
   assert.equal(job.apiItems.length,1);assert.equal(job.attempts,1);
   assert.equal(h.google.writes,0);assert.equal(h.google.applyCalls.length,0);
+});
+
+test('clearing a positive photo caption stops a waiting job before an API request',async(t)=>{
+  const h=await harness(t);
+  const photo=update(10,42,{text:undefined,caption:update().message.text,
+    photo:[{file_id:'photo',file_unique_id:'photo-unique',width:20,height:20}]});
+  await h.worker.persistUpdates([photo],convert);await h.worker.ingestInbox(await h.google.context());
+  const original=Object.values((await h.store.read()).jobs)[0];assert.equal(original.status,'waiting');
+  const cleared={update_id:11,edited_message:{...photo.message,caption:undefined,edit_date:Date.parse(NOW)/1000}};
+  await h.makeWorker().persistUpdates([cleared],convert);await h.makeWorker().tick();
+  const state=await h.store.read();const job=state.jobs[original.id];
+  assert.equal(job.status,'review');assert.equal(job.reason,'source_message_edited');
+  assert.equal(job.sourceText,original.sourceText);assert.equal(job.latestSourceEdit.text,'');
+  assert.equal(job.sourceReviewRequired,true);assert.equal(state.telegram.offset,12);
+  assert.equal(state.telegram.inbox.length,0);assert.equal(h.api.calls.length,0);assert.equal(h.google.writes,0);
+});
+
+test('clearing a positive photo caption during the API request prevents the Google write',async(t)=>{
+  let h;
+  const photo=update(10,42,{text:undefined,caption:update().message.text,
+    photo:[{file_id:'photo',file_unique_id:'photo-unique',width:20,height:20}]});
+  const cleared={update_id:11,edited_message:{...photo.message,caption:undefined,edit_date:Date.parse(NOW)/1000}};
+  h=await harness(t,{request:async()=>{
+    await h.worker.persistUpdates([cleared],convert);return envelope();
+  }});
+  await h.worker.persistUpdates([photo],convert);await h.worker.tick();
+  const state=await h.store.read();const job=Object.values(state.jobs)[0];
+  assert.equal(job.status,'review');assert.equal(job.reason,'source_message_edited');
+  assert.equal(job.latestSourceEdit.text,'');assert.equal(job.apiItems.length,1);assert.equal(job.attempts,1);
+  assert.equal(h.api.calls.length,1);assert.equal(h.google.writes,0);assert.equal(h.google.applyCalls.length,0);
 });
 
 test('editing a completed source flags owner review without undoing the receipt or repeating API/Google writes',async(t)=>{
@@ -453,4 +483,20 @@ test('secret preparation and API transport keep the key in a restricted file and
   assert.equal(classifyApiFailure(null),'invalid_api_response');
   assert.equal(classifyApiFailure({http_status:200,response:{error:'Неверный ключ'}}),'authentication_failed');
   assert.equal(classifyApiFailure({http_status:200,response:{error:'Лимит запросов'}}),'quota_exhausted');
+});
+
+test('private state proof hashes queue sections without exposing their contents or changing on periodic telemetry',()=>{
+  const state=initialState(CONFIG);
+  addJob(state,{id:'fixture',sourceEventKey:'telegram:private-source:private-message',status:'waiting',
+    organization:'PRIVATE_COMPANY',sourceText:'PRIVATE_SOURCE_TEXT'},{now:NOW});
+  state.telegram={offset:123,inbox:[],lastIngestAt:NOW};
+  const first=privateStateProof(state);
+  assert.equal(first.jobs,1);assert.equal(first.sources,1);assert.equal(first.counts.waiting,1);assert.equal(first.telegramOffset,123);
+  for(const field of ['PRIVATE_COMPANY','PRIVATE_SOURCE_TEXT','private-source','private-message'])assert.ok(!JSON.stringify(first).includes(field));
+  assert.match(first.sha256,/^[a-f0-9]{64}$/u);
+  state.runtime={startedAt:'2026-11-02T00:00:00Z'};state.telegram.lastIngestAt='2026-11-02T00:00:00Z';
+  assert.deepEqual(privateStateProof(state),first);
+  state.telegram.offset=124;const next=privateStateProof(state);
+  assert.notEqual(next.sha256,first.sha256);assert.notEqual(next.sectionHashes.telegram,first.sectionHashes.telegram);
+  assert.equal(next.sectionHashes.jobs,first.sectionHashes.jobs);
 });

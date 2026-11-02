@@ -5,7 +5,7 @@ import {fileURLToPath} from 'node:url';
 import {setTimeout as sleep} from 'node:timers/promises';
 import {GoogleSheetsClient} from './google.mjs';
 import {TelegramClient,convertUpdate} from './telegram.mjs';
-import {LicenseWorker,FsrarClient,prepareSecrets,initializeState,classifyApiFailure} from './runtime.mjs';
+import {LicenseWorker,FsrarClient,prepareSecrets,initializeState,classifyApiFailure,privateStateProof} from './runtime.mjs';
 import {createReadiness,createHealthHandler,safeErrorCode,validateFsrarStat,retryStartup} from './health.mjs';
 import {createNotifier} from './notifier.mjs';
 
@@ -17,10 +17,15 @@ const health=createReadiness({secrets});
 let stopping=false;
 let startupDependency=null;
 let notificationReporter=null;
+let proofStore=null;
 const seenReports=new Map();
 async function report(event){
   const clean={at:new Date().toISOString(),...event};
   if(clean.code)clean.code=safeErrorCode(clean.code,'processing_failed',secrets);
+  if(proofStore&&['runtime_initialized','write_verified'].includes(clean.type)){
+    try{console.log(JSON.stringify({at:clean.at,type:'state_proof',trigger:clean.type,...privateStateProof(await proofStore.read())}));}
+    catch{console.log(JSON.stringify({at:clean.at,type:'state_proof_error',trigger:clean.type,code:'state_read_failed'}));}
+  }
   if(notificationReporter)return notificationReporter(clean);
   const fingerprint=JSON.stringify({...clean,at:undefined});
   if(Date.now()-(seenReports.get(fingerprint)||0)<3600000)return;
@@ -67,6 +72,7 @@ async function initialize(){
   const stateFile=env.STATE_FILE||'/data/state.json';
   const {keyFile}=await prepareSecrets(env,path.dirname(stateFile));
   const store=await initializeState(stateFile,config,env);
+  proofStore=store;
   const google=monitoredGoogle(new GoogleSheetsClient({spreadsheetId:config.spreadsheetId,sheetName:config.sheetName,
     sheetId:config.sheetId,credentials:env.GOOGLE_SERVICE_ACCOUNT_JSON||env.GOOGLE_APPLICATION_CREDENTIALS}));
   const telegram=new TelegramClient({token:env.BOT_TOKEN});
@@ -78,7 +84,7 @@ async function initialize(){
   health.success('telegram');
   startupDependency='google';health.stage('verifying_google');await google.context();
   startupDependency='api';health.stage('verifying_fsrar');
-  const api=monitoredApi(new FsrarClient({keyFile,proxyUrl:env.FSRAR_PROXY_URL}));await api.validate();
+  const api=monitoredApi(new FsrarClient({keyFile,proxyUrl:env.FSRAR_PROXY_URL,proxyServerName:env.FSRAR_PROXY_SERVER_NAME}));await api.validate();
   const quota=validateFsrarStat(await api.request('stat'));
   const worker=new LicenseWorker({store,google,api,config,dryRun:env.DRY_RUN==='true',report});
   startupDependency=null;health.running({dryRun:env.DRY_RUN==='true'});

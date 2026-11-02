@@ -194,7 +194,9 @@ export function convertUpdate(update, { targetChatId, sourceChatId = '5164597211
   }
   const text = typeof message.text === 'string' ? message.text
     : typeof message.caption === 'string' ? message.caption : '';
-  if (!text && !message.document) return null;
+  // A cleared photo/video caption is still a source correction. Persist the
+  // edit so the worker can stop an existing job before any Google write.
+  if (!text && !message.document && !update.edited_message) return null;
   const bot = botId == null ? null : String(botId);
   if ((message.chat.type === 'group' || bot != null)
       && (!/^[1-9]\d*$/u.test(bot ?? '') || !Number.isSafeInteger(Number(bot)))) {
