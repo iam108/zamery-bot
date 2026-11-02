@@ -4,6 +4,7 @@
 !config.json
 !*.mjs
 !network-helper.py
+!check-egress.py
 
 # Test code and fixtures are not part of the runtime image.
 *.test.mjs
