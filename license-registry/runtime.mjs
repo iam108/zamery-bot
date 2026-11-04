@@ -9,6 +9,7 @@ import { extractEvent, parseSheetRows, prepareJob, sourceEventKey, selectLicense
 import { createStore, addJob, requireJob, dueJobs, reserveFetch, recordResponse,
   recordFailure, savePlan, acknowledge, recoverExpiredFetches, stateSummary } from './state.mjs';
 import {validatePinnedProxy} from './proxy-transport.mjs';
+import {getOfficialLicenseEvidence,OFFICIAL_EVIDENCE_SOURCE} from './official-evidence.mjs';
 
 const executeFile = promisify(execFile);
 const directory = path.dirname(fileURLToPath(import.meta.url));
@@ -27,7 +28,7 @@ const PROOF_REASONS=new Set(['api_older_than_verified_sheet_record','api_operati
   'organization_not_identified','organization_name_is_ambiguous','positive_result_is_a_question','registry_has_not_reflected_event',
   'registry_has_not_reflected_reissue','renewal_has_not_extended_expiry','retry_next_morning','row_number_required',
   'unsupported_activity_for_sheet','source_message_edited','access_ip_blocked','authentication_failed','quota_exhausted',
-  'network_error','fsrar_transport_error','request_failed','api_fetch_interrupted']);
+  'network_error','fsrar_transport_error','request_failed','api_fetch_interrupted','official_evidence_invalid','official_evidence_write_scope']);
 const PROOF_LICENSE_STATUSES=new Set(['действующая','действует','active','истекла','истёк срок действия',
   'прекращена','прекращено','аннулирована','приостановлена','inactive','expired','revoked','suspended','terminated']);
 function proofTimestamp(value){
@@ -41,6 +42,12 @@ function proofApiDates(item){
     issueDate:license.issueDate,expiryDate:license.expiryDate,changeDate:license.changeDate,
     status:PROOF_LICENSE_STATUSES.has(license.status)?license.status:null};
 }
+function proofOfficialEvidence(evidence){
+  if(!evidence)return null;
+  const safeHash=(value)=>typeof value==='string'&&/^[a-f0-9]{64}$/u.test(value)?value:null;
+  return {source:evidence.source===OFFICIAL_EVIDENCE_SOURCE?evidence.source:'unknown',verifiedAt:proofTimestamp(evidence.verifiedAt),
+    evidenceHash:safeHash(evidence.evidenceSha256),recordHash:safeHash(evidence.recordHash),...proofApiDates(evidence.record)};
+}
 export function privateStateProof(state){
   // Periodic lastIngestAt/startup timestamps are telemetry, not queue content.
   const sections={jobs:state.jobs,sources:state.sources,api:state.api,
@@ -53,7 +60,8 @@ export function privateStateProof(state){
     status:PROOF_STATUSES.includes(job.status)?job.status:'unknown',
     reason:job.reason==null?null:PROOF_REASONS.has(job.reason)?job.reason:'unknown',attempts:safeCount(job.attempts??0),
     nextCheckAt:proofTimestamp(job.nextCheckAt),apiRecordCount:Array.isArray(job.apiItems)?job.apiItems.length:0,
-    apiReceivedAt:proofTimestamp(job.apiReceivedAt),apiDates:Array.isArray(job.apiItems)?job.apiItems.slice(0,3).map(proofApiDates):[]}));
+    apiReceivedAt:proofTimestamp(job.apiReceivedAt),apiDates:Array.isArray(job.apiItems)?job.apiItems.slice(0,3).map(proofApiDates):[],
+    officialEvidence:proofOfficialEvidence(job.officialLicenseEvidence)}));
   return {sha256:digest(sections),sectionHashes:Object.fromEntries(Object.entries(sections).map(([name,value])=>[name,digest(value)])),
     jobs:Object.keys(state.jobs).length,sources:Object.keys(state.sources).length,counts,
     apiAttemptedCalls:safeCount(state.api.attemptedCalls),telegramOffset:safeCount(state.telegram?.offset??0),pendingInbox:state.telegram?.inbox?.length??0,
@@ -267,14 +275,24 @@ export class LicenseWorker {
   async plan(id,context) {
     const snapshot=await this.store.read();
     const job=requireJob(snapshot,id);
-    if (job.apiIncomplete) return this.store.update((s)=>recordFailure(s,id,{code:'incomplete_api_pagination',terminal:true,now:this.now()}));
-    const selected=selectLicense(job,job.apiItems);
-    if (selected.status==='waiting') return this.retry(id,selected.reason);
+    let official;
+    try{official=getOfficialLicenseEvidence(job);}catch{return this.store.update((s)=>recordFailure(s,id,{code:'official_evidence_invalid',terminal:true,now:this.now()}));}
+    if (!official&&job.apiIncomplete) return this.store.update((s)=>recordFailure(s,id,{code:'incomplete_api_pagination',terminal:true,now:this.now()}));
+    const selected=selectLicense(job,official?[official.record]:job.apiItems);
+    if (selected.status==='waiting') return official
+      ?this.store.update((s)=>recordFailure(s,id,{code:selected.reason,terminal:true,now:this.now()}))
+      :this.retry(id,selected.reason);
     if (selected.status!=='ready') return this.store.update((s)=>recordFailure(s,id,{code:selected.reason,terminal:true,now:this.now()}));
     const rows=parseSheetRows(context.values,{startRow:context.startRow??1});
     const plan=planSheetUpsert(selected.license,rows,job);
-    if (plan.action==='waiting') return this.retry(id,plan.reason);
+    if (plan.action==='waiting') return official
+      ?this.store.update((s)=>recordFailure(s,id,{code:plan.reason,terminal:true,now:this.now()}))
+      :this.retry(id,plan.reason);
     if (plan.action==='review') return this.store.update((s)=>recordFailure(s,id,{code:plan.reason,terminal:true,now:this.now()}));
+    if(official&&(plan.action==='append'||plan.updates.some((update)=>!['H','P'].includes(update.column)))){
+      return this.store.update((s)=>recordFailure(s,id,{code:'official_evidence_write_scope',terminal:true,now:this.now()}));
+    }
+    if(official)plan.sourceEvidence={source:official.source,evidenceId:official.id,evidenceSha256:official.evidenceSha256,recordHash:official.recordHash};
     if (plan.action==='append') {
       let last=(context.startRow??1)-1;
       context.values.forEach((row,index)=>{if(row.some((v)=>v!=null&&String(v)!==''))last=(context.startRow??1)+index;});
@@ -283,6 +301,7 @@ export class LicenseWorker {
     }
     return this.store.update((s)=>{
       const current=requireJob(s,id);current.selectedLicense=selected.license;
+      if(official)current.selectedEvidence=clone(plan.sourceEvidence);
       savePlan(s,id,plan,{expectedCells:expectedCells(plan,selected.license),now:this.now()});
       return clone(current);
     });
@@ -326,9 +345,10 @@ export class LicenseWorker {
         throw error;
       }
     }
+    if(job.selectedEvidence?.source===OFFICIAL_EVIDENCE_SOURCE)receipt={...receipt,sourceEvidence:clone(job.selectedEvidence)};
     const result=await this.store.update((s)=>acknowledge(s,id,receipt,{now:this.now()}));
     if(!result.alreadyDone) await this.report({type:'write_verified',jobId:id,organization:job.organization,
-      action:job.plan.action,cells:Object.keys(receipt.cells)});
+      action:job.plan.action,cells:job.plan.updates.map((update)=>`${update.column}${update.row}`)});
   }
   async tick() {
     if(this.busy)return {busy:true};this.busy=true;

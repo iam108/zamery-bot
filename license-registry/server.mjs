@@ -10,6 +10,7 @@ import {createReadiness,createHealthHandler,safeErrorCode,validateFsrarStat,retr
 import {createNotifier} from './notifier.mjs';
 import {runReadOnlyAcceptance} from './acceptance.mjs';
 import {createPollingMonitor,pollOnce,safeNotification} from './polling.mjs';
+import {importOfficialLicenseEvidence} from './official-evidence.mjs';
 
 const dir=path.dirname(fileURLToPath(import.meta.url));
 const env=process.env;
@@ -89,6 +90,12 @@ async function initialize(){
   const api=monitoredApi(new FsrarClient({keyFile,proxyUrl:env.FSRAR_PROXY_URL,proxyServerName:env.FSRAR_PROXY_SERVER_NAME}));await api.validate();
   const quota=validateFsrarStat(await api.request('stat'));
   console.log(JSON.stringify({at:new Date().toISOString(),type:'api_quota',total:quota.total,used:quota.used,remaining:quota.remaining}));
+  if(env.OFFICIAL_LICENSE_EVIDENCE_JSON){
+    let payload;try{payload=JSON.parse(env.OFFICIAL_LICENSE_EVIDENCE_JSON);}catch{throw new Error('official_evidence_invalid_json');}
+    const result=await importOfficialLicenseEvidence({store,payload});
+    console.log(JSON.stringify({at:new Date().toISOString(),type:'official_evidence_import',status:result.status,
+      jobId:/^[a-f0-9]{24}$/u.test(payload.jobId)?payload.jobId:null}));
+  }
   // Explicit one-time acceptance uses private logs, not owner notifications.
   if(env.ACCEPTANCE_SOURCE_JOB_ID)await runReadOnlyAcceptance({sourceJobId:env.ACCEPTANCE_SOURCE_JOB_ID,store,google,api});
   const worker=new LicenseWorker({store,google,api,config,dryRun:env.DRY_RUN==='true',report});
