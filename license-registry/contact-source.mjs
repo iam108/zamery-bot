@@ -210,6 +210,16 @@ export async function prepareContactSource({env=process.env,dataDir,log,poolFact
     if(bootstrapUrl){
       const url=connection(bootstrapUrl);
       bootstrapPool=handleIdleErrors(await poolFactory(options(url.url.toString(),true)),log);
+      if(env.CONTACTS_FORM_DIAGNOSTIC==='true'){
+        const patterns={form_title:'Новая форма заполнена',organization:'Наименование организации',inn:'ИНН',
+          client_name:'Имя клиента',client:'Клиент[[:space:]]*:',contact:'Контакт',name:'Имя[[:space:]]*:',
+          phone:'Телефон',number:'Номер[[:space:]]*:',address:'Адрес'};
+        const keys=Object.keys(patterns);
+        const counts=await transaction(bootstrapPool,true,async(client)=>(await client.query(
+          `SELECT count(*)::text AS total,${keys.map((key,index)=>`count(*) FILTER (WHERE text ~* $${index+2})::text AS ${key}`).join(',')}
+           FROM public.reports WHERE chat_id=$1`,[chatId,...Object.values(patterns)])).rows[0]);
+        emit(log,{type:'contacts_form_diagnostic',counts:Object.fromEntries(['total',...keys].map((key)=>[key,Number(counts?.[key]??0)]))});
+      }
       stored=await bootstrap({pool:bootstrapPool,url,stored,file,chatId});
       await bootstrapPool.end();bootstrapPool=null;
       delete env.CONTACTS_BOOTSTRAP_DATABASE_URL;
