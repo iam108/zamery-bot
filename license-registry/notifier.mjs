@@ -1,10 +1,23 @@
 import { createHash } from 'node:crypto';
 
 const TYPES = new Set(['write_verified', 'processing_error', 'telegram_error', 'telegram_recovered', 'worker_error',
-  'startup_failed', 'runtime_failed', 'api_blocked', 'review_required', 'runtime_initialized']);
+  'startup_failed', 'runtime_failed', 'api_blocked', 'review_required', 'runtime_initialized',
+  'contact_write_verified','contact_review_required','contact_source_error']);
 const COLUMNS = Object.freeze({ E: 'организация', G: 'ИНН', H: 'номер лицензии', I: 'дата выдачи',
-  J: 'дата окончания', K: 'вид деятельности', L: 'адрес объекта', P: 'email' });
+  J: 'дата окончания', K: 'вид деятельности', L: 'адрес объекта', M: 'имя контакта', N: 'телефон', O: 'Telegram', P: 'email' });
 const REASONS = Object.freeze({
+  contacts_source_failed: 'Не удалось прочитать заявки бота замеров. Обработчик повторит попытку.',
+  contacts_source_report_review: 'В исходной заявке неоднозначные контактные данные.',
+  contact_source_ambiguous: 'Для этого объекта найдены разные контакты.',
+  contact_source_invalid: 'Контакт из заявки не прошёл проверку.',
+  contact_existing_conflict: 'Контакт из заявки расходится с заполненными полями реестра.',
+  contact_existing_value_unverified: 'Не удалось сопоставить контакт с уже заполненными полями.',
+  contact_role_not_client: 'В заявке указан служебный контакт, а не контакт клиента.',
+  contact_row_ambiguous: 'В реестре несколько действующих строк этого объекта.',
+  contact_row_moved: 'Строка реестра переместилась во время проверки.',
+  contact_cell_conflict: 'Контакт в реестре изменился во время записи.',
+  contact_cell_protected: 'В ячейке контакта есть формула или примечание.',
+  contact_source_changed: 'Контакт в заявке изменился после подготовки записи.',
   access_ip_blocked: 'API-ФНС отклонил исходящий IP сервера.',
   fsrar_access_ip_blocked: 'API-ФНС отклонил исходящий IP сервера.',
   authentication_failed: 'Сервис отклонил ключ доступа.',
@@ -122,6 +135,7 @@ function safeOrganization(value) {
 function normalizeEvent(event) {
   if (!event || !TYPES.has(event.type)) return null;
   if (event.type === 'write_verified' && !['append', 'update'].includes(event.action)) return null;
+  if (event.type === 'contact_write_verified' && event.action !== 'update') return null;
   const incidentId = safeIncidentId(event.incidentId);
   // Recovery is an explicit event from the polling monitor, never inferred
   // from a routine successful send, flush, or startup notification.
@@ -129,11 +143,12 @@ function normalizeEvent(event) {
   return {
     type: event.type, jobId: safeJobId(event.jobId),
     ...(incidentId ? { incidentId } : {}),
-    ...(event.type === 'write_verified' ? {
+    ...(['write_verified','contact_write_verified'].includes(event.type) ? {
       action: event.action,
       columns: [...new Set((Array.isArray(event.cells) ? event.cells : [])
         .filter((value) => typeof value === 'string' && /^[A-Q][1-9]\d{0,7}$/u.test(value))
-        .map((value) => value[0]).filter((column) => Object.hasOwn(COLUMNS, column)))].sort(),
+        .map((value) => value[0]).filter((column) => Object.hasOwn(COLUMNS, column)
+          && (event.type!=='contact_write_verified'||['M','N','O'].includes(column))))].sort(),
     } : ['runtime_initialized', 'telegram_recovered'].includes(event.type) ? {} : { code: safeCode(event.code) }),
     organization: safeOrganization(event.organization),
   };
@@ -148,6 +163,13 @@ function messageOf(event) {
   if (event.type === 'telegram_recovered') return 'Получение сообщений Telegram восстановлено. Очередь сохранена.';
   const organization = event.organization ? `Организация: ${event.organization}.` : '';
   const job = event.jobId ? `Событие: ${event.jobId}.` : '';
+  if(event.type==='contact_write_verified')return ['Заполнен контакт в реестре лицензий.',organization,
+    event.columns.length?`Поля: ${event.columns.map((column)=>COLUMNS[column]).join(', ')}.`:'',
+    'Запись подтверждена обратным чтением Google.'].filter(Boolean).join('\n');
+  if(event.type==='contact_review_required')return ['Нужна проверка контакта в реестре лицензий.',organization,
+    REASONS[event.code]??'Однозначное совпадение контакта не подтверждено.'].filter(Boolean).join('\n');
+  if(event.type==='contact_source_error')return ['Автозаполнение контактов временно недоступно.',
+    REASONS[event.code]??REASONS.contacts_source_failed].join('\n');
   if (event.type === 'write_verified') {
     const action = event.action === 'append' ? 'Добавлена запись в реестр лицензий.' : 'Обновлена запись в реестре лицензий.';
     const columns = event.columns.length ? `Поля: ${event.columns.map((column) => COLUMNS[column]).join(', ')}.` : '';

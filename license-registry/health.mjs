@@ -39,8 +39,9 @@ export function validateFsrarStat(envelope){
   return {total,used,remaining:total-used,limitType:'requests'};
 }
 
-export function createReadiness({now=()=>new Date(),telegramMaxAgeMs=90_000,workerMaxAgeMs=180_000,secrets=[]}={}){
-  const dependencies=Object.fromEntries(NAMES.map((name)=>[name,{ok:false,lastSuccessAt:null,lastFailureAt:null,lastError:null}]));
+export function createReadiness({now=()=>new Date(),telegramMaxAgeMs=90_000,workerMaxAgeMs=180_000,secrets=[],contactsEnabled=false}={}){
+  const names=contactsEnabled?[...NAMES,'contacts']:NAMES;
+  const dependencies=Object.fromEntries(names.map((name)=>[name,{ok:false,lastSuccessAt:null,lastFailureAt:null,lastError:null}]));
   let started=false;let dryRun=false;let phase='starting';let startupError=null;let retryAt=null;
   const stamp=()=>new Date(now()).toISOString();
   function dependency(name){if(!Object.hasOwn(dependencies,name))throw new Error('unknown_health_dependency');return dependencies[name];}
@@ -66,9 +67,9 @@ export function createReadiness({now=()=>new Date(),telegramMaxAgeMs=90_000,work
           result[name].ok=false;result[name].lastError=`${name}_stale`;
         }
       }
-      const ready=started&&NAMES.every((name)=>result[name].ok);
+      const ready=started&&names.every((name)=>result[name].ok);
       return {ready,stage:ready?(dryRun?'dry_run':'running'):started?'degraded':phase,
-        lastError:startupError??NAMES.map((name)=>result[name].lastError).find(Boolean)??null,
+        lastError:startupError??names.map((name)=>result[name].lastError).find(Boolean)??null,
         retryAt,dependencies:result};
     },
   };

@@ -275,3 +275,15 @@ test('raw provider codes, credentials in organization and arbitrary fields never
   assert.ok(!serialized.includes('provider'));
   assert.ok(serialized.includes('unknown_error'));
 });
+
+test('contact confirmation describes only contact columns without exposing their values',async(t)=>{
+  const f=await fixture(t);
+  await f.report({type:'contact_write_verified',action:'update',jobId:jobA,organization:'Client Company',
+    cells:['M12','N12','O12','G12'],phone:'private phone',telegram:'private link'});
+  const sent=f.calls.filter((call)=>call.method==='sendMessage');assert.equal(sent.length,1);
+  assert.equal(sent[0].params.chat_id,owner);assert.match(sent[0].params.text,/контакт/u);
+  assert.match(sent[0].params.text,/Telegram/u);assert.ok(!sent[0].params.text.includes('private'));
+  assert.ok(!sent[0].params.text.includes('ИНН'));assert.ok(!sent[0].params.text.includes(jobA));
+  await f.report({type:'contact_write_verified',action:'noop',jobId:jobB,cells:['M12']});
+  assert.equal(f.calls.filter((call)=>call.method==='sendMessage').length,1);
+});

@@ -11,16 +11,20 @@ import {createNotifier} from './notifier.mjs';
 import {runReadOnlyAcceptance} from './acceptance.mjs';
 import {createPollingMonitor,pollOnce,safeNotification} from './polling.mjs';
 import {importOfficialLicenseEvidence} from './official-evidence.mjs';
+import {prepareContactSource} from './contact-source.mjs';
+import {ContactWorker} from './contact-worker.mjs';
 
 const dir=path.dirname(fileURLToPath(import.meta.url));
 const env=process.env;
 const controller=new AbortController();
 const secrets=[env.BOT_TOKEN,env.FSRAR_API_KEY,env.GOOGLE_SERVICE_ACCOUNT_JSON].filter(Boolean);
-const health=createReadiness({secrets});
+const contactsEnabled=env.CONTACT_SYNC_ENABLED==='true'&&env.DRY_RUN!=='true';
+const health=createReadiness({secrets,contactsEnabled});
 let stopping=false;
 let startupDependency=null;
 let notificationReporter=null;
 let proofStore=null;
+let contactSource=null;
 const seenReports=new Map();
 async function report(event){
   const clean={at:new Date().toISOString(),...event};
@@ -76,8 +80,9 @@ async function initialize(){
   const {keyFile}=await prepareSecrets(env,path.dirname(stateFile));
   const store=await initializeState(stateFile,config,env);
   proofStore=store;
-  const google=monitoredGoogle(new GoogleSheetsClient({spreadsheetId:config.spreadsheetId,sheetName:config.sheetName,
-    sheetId:config.sheetId,credentials:env.GOOGLE_SERVICE_ACCOUNT_JSON||env.GOOGLE_APPLICATION_CREDENTIALS}));
+  const googleClient=new GoogleSheetsClient({spreadsheetId:config.spreadsheetId,sheetName:config.sheetName,
+    sheetId:config.sheetId,credentials:env.GOOGLE_SERVICE_ACCOUNT_JSON||env.GOOGLE_APPLICATION_CREDENTIALS});
+  const google=monitoredGoogle(googleClient);
   const telegram=new TelegramClient({token:env.BOT_TOKEN});
   notificationReporter=createNotifier({telegram,store,ownerChatId:env.NOTIFY_CHAT_ID});
   await notificationReporter.verifyOwner();
@@ -99,13 +104,25 @@ async function initialize(){
   // Explicit one-time acceptance uses private logs, not owner notifications.
   if(env.ACCEPTANCE_SOURCE_JOB_ID)await runReadOnlyAcceptance({sourceJobId:env.ACCEPTANCE_SOURCE_JOB_ID,store,google,api});
   const worker=new LicenseWorker({store,google,api,config,dryRun:env.DRY_RUN==='true',report});
+  const contacts=contactsEnabled?new ContactWorker({store,google:googleClient,report,
+    log:(event)=>console.log(JSON.stringify({at:new Date().toISOString(),...event})),
+    sourceFactory:async()=>{
+      const source=await prepareContactSource({env,dataDir:path.dirname(stateFile),
+        log:(event)=>console.log(JSON.stringify({at:new Date().toISOString(),...event}))});
+      try{
+        const checked=await source.verify();
+        console.log(JSON.stringify({at:new Date().toISOString(),type:'contacts_source_verified',ready:checked.ready,
+          cases:checked.cases,incomingReports:checked.incomingReports}));
+      }catch(error){await source.close().catch(()=>{});throw error;}
+      contactSource=source;return source;
+    }}):null;
   startupDependency=null;health.running({dryRun:env.DRY_RUN==='true'});
   await report({type:'runtime_initialized',targetChatId:String(target.id),dryRun:env.DRY_RUN==='true',
     fsrarQuota:{total:quota.total,used:quota.used,remaining:quota.remaining}});
-  return {store,telegram,worker,config,botId:target.botId};
+  return {store,telegram,worker,contacts,config,botId:target.botId};
 }
 
-async function run({store,telegram,worker,config,botId}){
+async function run({store,telegram,worker,contacts,config,botId}){
   const log=(event)=>console.log(JSON.stringify({at:new Date().toISOString(),...event}));
   const monitor=createPollingMonitor({store,report,log});
   const polling=(async()=>{
@@ -138,10 +155,22 @@ async function run({store,telegram,worker,config,botId}){
       await sleep(60000,undefined,{signal:controller.signal}).catch(()=>{});
     }
   })();
-  await Promise.all([polling,processing]);
+  const enriching=contacts?(async()=>{
+    while(!stopping){
+      try{
+        const result=await contacts.tick();
+        if(!result?.skipped)health.success('contacts');
+      }catch(error){
+        const code=safeErrorCode(error,'contacts_source_failed',secrets);
+        health.failure('contacts',code);await report({type:'contact_source_error',code});
+      }
+      await sleep(60000,undefined,{signal:controller.signal}).catch(()=>{});
+    }
+  })():Promise.resolve();
+  await Promise.all([polling,processing,enriching]);
 }
 
-function stop(){stopping=true;health.stopping();controller.abort();server.close();}
+function stop(){stopping=true;health.stopping();controller.abort();server.close();contactSource?.close().catch(()=>{});}
 process.once('SIGTERM',stop);process.once('SIGINT',stop);
 try{
   const runtime=await retryStartup(initialize,{signal:controller.signal,onFailure:async(error,{delayMs})=>{

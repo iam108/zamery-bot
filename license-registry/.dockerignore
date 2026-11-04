@@ -1,6 +1,7 @@
 # Default deny: never send local data, exports or credentials to the builder.
 **
 !package.json
+!package-lock.json
 !config.json
 !*.mjs
 !network-helper.py

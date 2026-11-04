@@ -157,3 +157,13 @@ test('shutdown aborts startup backoff and never starts another attempt',async()=
   assert.equal(await retryStartup(async()=>{abortedDuringInitialization.abort();return {runtime:'discarded'};},
     {signal:abortedDuringInitialization.signal}),null);
 });
+
+test('enabled contact source is independently visible without invalidating core dependency successes',()=>{
+  const health=createReadiness({contactsEnabled:true});
+  for(const name of ['telegram','google','api','worker'])health.success(name);health.running();
+  assert.equal(health.snapshot().ready,false);assert.equal(health.snapshot().dependencies.worker.ok,true);
+  health.success('contacts');assert.equal(health.snapshot().ready,true);
+  health.failure('contacts','contacts_source_failed');
+  assert.equal(health.snapshot().ready,false);assert.equal(health.snapshot().dependencies.telegram.ok,true);
+  assert.equal(health.snapshot().dependencies.api.ok,true);
+});
