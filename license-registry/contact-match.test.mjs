@@ -145,3 +145,11 @@ test('numeric or non-string populated cells are never treated as empty destinati
   values[13]=0;assert.equal(plan(row({values})).reason,'contact_existing_value_unverified');
   values[13]={formulaValue:'=1'};assert.equal(plan(row({values})).reason,'contact_existing_value_unverified');
 });
+
+test('incoming client forms accept explicit organization INN and object address labels',()=>{
+  const text=['Новая форма заполнена','Имя клиента: Иван Иванов','Номер: +79991234567',
+    'Наименование организации: ООО Тест',`ИНН организации: ${INN}`,`Адрес объекта: ${ADDRESS}`].join('\n');
+  const parsed=parseContactRequest({id:31,text});assert.equal(parsed.status,'ready');
+  assert.equal(parsed.source.inn,INN);assert.equal(parsed.source.address,ADDRESS);
+  assert.equal(planContactEnrichment({row:row(),cases:[parsed.source]}).action,'update');
+});

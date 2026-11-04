@@ -110,7 +110,8 @@ test('bootstrap creates only scoped views and a dedicated reader; verifies witho
   assert.match(ddl,/CREATE ROLE .* LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS/u);
   assert.match(ddl,/ALTER ROLE .* SET default_transaction_read_only = on/u);
   assert.match(ddl,/VIEW license_registry_contacts.cases WITH \(security_barrier=true\) AS SELECT c.id,c.org,c.inn,c.address,c.contacts,c.client,c.phone,c.request_id,c.order_id,c.created_at FROM public.cases c/u);
-  assert.match(ddl,/SELECT r.id,r.text,r.created_at FROM public.reports r WHERE r.chat_id='-1001234567890'::bigint AND NOT COALESCE\(r.dismissed,false\)/u);
+  assert.match(ddl,/SELECT r.id,r.text,r.created_at FROM public.reports r WHERE r.chat_id='-1001234567890'::bigint AND/u);
+  assert.doesNotMatch(ddl,/COALESCE\(r.dismissed,false\)/u);
   assert.match(ddl,/Имя клиента/u);assert.match(ddl,/Адрес лицензирования/u);assert.match(ddl,/Наименование организации/u);
   assert.doesNotMatch(ddl,/orders|lawyer|audit_text|created_by|r.author|REVOKE.*ON public|REVOKE.*ON DATABASE/u);
   assert.equal(h.calls.filter((call)=>call.reader&&call.text==='BEGIN READ ONLY').length,1);

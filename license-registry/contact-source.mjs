@@ -177,14 +177,14 @@ async function bootstrap({pool,url,stored,file,chatId}){
     await client.query(`CREATE OR REPLACE VIEW ${SCHEMA}.cases WITH (security_barrier=true) AS SELECT ${selected} FROM public.cases c`);
     const forms=[
       'Новая форма заполнена|Наименование организации[[:space:]]*:',
-      '(^|\n)[[:space:]]*ИНН[[:space:]]*:',
+      '(^|\n)[[:space:]]*ИНН([[:space:]]+организации)?[[:space:]]*:',
       '(^|\n)[[:space:]]*Имя клиента[[:space:]]*:',
       '(^|\n)[[:space:]]*(Номер|Телефон|Номер телефона|Телефон клиента)[[:space:]]*:',
-      '(^|\n)[[:space:]]*(Адрес|Адрес лицензирования)[[:space:]]*:'
+      '(^|\n)[[:space:]]*(Адрес|Адрес лицензирования|Адрес объекта)[[:space:]]*:'
     ].map((pattern)=>`r.text ~* ${q(pattern)}`).join(' AND ');
     await client.query(`CREATE OR REPLACE VIEW ${SCHEMA}.incoming_reports WITH (security_barrier=true) AS
       SELECT r.id,r.text,r.created_at FROM public.reports r WHERE r.chat_id=${q(chatId)}::bigint
-      ${reports.has('dismissed')?'AND NOT COALESCE(r.dismissed,false)':''} AND ${forms}`);
+      AND ${forms}`);
     for(const name of ['cases','incoming_reports'])await client.query(`COMMENT ON VIEW ${SCHEMA}.${name} IS ${q(expectedMarker)}`);
     // All revokes are limited to objects owned by this component.
     await client.query(`REVOKE ALL ON SCHEMA ${SCHEMA} FROM PUBLIC`);
