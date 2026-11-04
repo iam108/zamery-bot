@@ -7,6 +7,7 @@ import { LicenseWorker, initializeState, classifyApiFailure, prepareSecrets, Fsr
 import { convertUpdate } from './telegram.mjs';
 import { initialState, addJob, createStore, hash } from './state.mjs';
 import { REGISTRY_HEADERS } from './google.mjs';
+import {convertOwnerUpdate} from './contact-reply-input.mjs';
 
 const NOW='2026-11-01T07:00:00.000Z';
 const CONFIG={spreadsheetId:'fixture-registry',sheetName:'Реестр лицензий',timeZone:'Europe/Moscow'};
@@ -546,4 +547,49 @@ test('contact proof includes durable records and reviews without leaking contact
   state.contacts.nextSyncAt='2099-01-01T00:00:00Z';state.contacts.records.one.notificationPending=false;
   state.contacts.reviews.one.notifiedAt=NOW;assert.deepEqual(privateStateProof(state),proof);
   state.contacts.records.one.status='planned';assert.notEqual(privateStateProof(state).sectionHashes.contacts,proof.sectionHashes.contacts);
+});
+
+test('owner inbox and manual intent durability are hashed without exposing contact data',()=>{
+  const state=initialState(CONFIG);const original=privateStateProof(state);
+  state.telegram={offset:123,inbox:[],ownerInbox:[{updateId:122,event:{text:'PRIVATE_CONTACT_REPLY'}}]};
+  const queued=privateStateProof(state);
+  assert.notEqual(queued.sectionHashes.telegram,original.sectionHashes.telegram);
+  state.contactReplies={sessions:{one:{status:'planned',contact:{phone:'PRIVATE_PHONE'}}},outbox:{},processed:{}};
+  const planned=privateStateProof(state);
+  assert.equal(planned.ownerReplyState.sessions,1);assert.equal(planned.ownerReplyState.pendingInbox,1);
+  assert.match(planned.sectionHashes.contactReplies,/^[a-f0-9]{64}$/u);
+  assert.ok(!JSON.stringify(planned).includes('PRIVATE_PHONE'));assert.ok(!JSON.stringify(planned).includes('PRIVATE_CONTACT_REPLY'));
+});
+
+test('owner private messages and callbacks are durably isolated before the shared Telegram offset advances',async(t)=>{
+  const h=await harness(t);const owner='123456789',bot='9127813428';
+  const convertOwner=(u)=>convertOwnerUpdate(u,{ownerChatId:owner,botId:bot});
+  const privateMessage={update_id:11,message:{message_id:100,date:1793876400,chat:{id:Number(owner),type:'private'},
+    from:{id:Number(owner),is_bot:false},text:`ООО «ХОРОШОТ» положительно. ИНН ${INN}`}};
+  const privateCallback={update_id:12,callback_query:{id:'opaque123',from:{id:Number(owner)},data:'cr:confirm:draft123',
+    message:{message_id:101,date:1793876400,chat:{id:Number(owner),type:'private'},from:{id:Number(bot),is_bot:true},text:'preview'}}};
+  const ignored={update_id:13,message:{...privateMessage.message,from:{id:777},chat:{id:777,type:'private'}}};
+  assert.deepEqual(await h.worker.persistUpdates([privateCallback,update(10,42),ignored,privateMessage],convert,convertOwner),{count:1,offset:14});
+  let state=await createStore(h.file).read();assert.equal(state.telegram.offset,14);assert.equal(state.telegram.inbox.length,1);
+  assert.deepEqual(state.telegram.ownerInbox.map(item=>item.updateId),[11,12]);
+  assert.equal(state.telegram.ownerInbox[0].event.kind,'message');assert.equal(state.telegram.ownerInbox[1].event.kind,'callback');
+  await h.worker.ingestInbox(await h.google.context());state=await h.store.read();
+  assert.equal(Object.keys(state.jobs).length,1);assert.equal(state.telegram.ownerInbox.length,2);assert.equal(state.telegram.inbox.length,0);
+  await h.makeWorker().persistUpdates([privateMessage,privateCallback],convert,convertOwner);
+  assert.equal((await h.store.read()).telegram.ownerInbox.length,2);
+});
+
+test('owner conversion failure cannot partly save group/owner events or acknowledge the batch',async(t)=>{
+  const h=await harness(t);const before=await h.store.read();
+  await assert.rejects(h.worker.persistUpdates([update(10,42),update(11,43)],convert,(u)=>{
+    if(u.update_id===11)throw error('owner_update_invalid');return {kind:'message',updateId:u.update_id};
+  }),{code:'owner_update_invalid'});
+  assert.deepEqual(await h.store.read(),before);
+});
+
+test('owner classification takes priority and can never enter licensing ingestion',async(t)=>{
+  const h=await harness(t);
+  await h.worker.persistUpdates([update(10,42)],convert,()=>({kind:'message',updateId:10,text:'positive license'}));
+  const state=await h.store.read();assert.equal(state.telegram.inbox.length,0);assert.equal(state.telegram.ownerInbox.length,1);
+  await h.worker.ingestInbox(await h.google.context());assert.equal(Object.keys((await h.store.read()).jobs).length,0);
 });

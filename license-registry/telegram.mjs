@@ -1,5 +1,5 @@
 const API_ORIGIN = 'https://api.telegram.org';
-const ALLOWED_UPDATES = Object.freeze(['message', 'edited_message', 'my_chat_member']);
+const ALLOWED_UPDATES = Object.freeze(['message', 'edited_message', 'my_chat_member', 'callback_query']);
 const MAX_RESPONSE_BYTES = 8_000_000;
 
 function chatId(value) {

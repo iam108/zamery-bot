@@ -167,3 +167,15 @@ test('enabled contact source is independently visible without invalidating core 
   assert.equal(health.snapshot().ready,false);assert.equal(health.snapshot().dependencies.telegram.ok,true);
   assert.equal(health.snapshot().dependencies.api.ok,true);
 });
+
+test('owner reply processing has independent readiness and stale detection',()=>{
+  let at=Date.parse(INITIAL);
+  const health=createReadiness({contactsEnabled:true,ownerRepliesEnabled:true,now:()=>new Date(at)});
+  for(const name of ['telegram','google','api','worker','contacts'])health.success(name);
+  health.running();assert.equal(health.snapshot().ready,false);
+  health.success('ownerReplies');assert.equal(health.snapshot().ready,true);
+  at+=120001;health.success('telegram');health.success('worker');
+  assert.equal(health.snapshot().ready,false);
+  assert.equal(health.snapshot().dependencies.ownerReplies.lastError,'ownerReplies_stale');
+  health.success('ownerReplies');assert.equal(health.snapshot().ready,true);
+});

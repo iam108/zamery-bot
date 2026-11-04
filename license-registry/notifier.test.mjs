@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createStore } from './state.mjs';
-import { createNotifier } from './notifier.mjs';
+import { createNotifier, renderNotification } from './notifier.mjs';
 
 const owner = '123456789';
 const jobA = 'a'.repeat(24);
@@ -286,4 +286,22 @@ test('contact confirmation describes only contact columns without exposing their
   assert.ok(!sent[0].params.text.includes('ИНН'));assert.ok(!sent[0].params.text.includes(jobA));
   await f.report({type:'contact_write_verified',action:'noop',jobId:jobB,cells:['M12']});
   assert.equal(f.calls.filter((call)=>call.method==='sendMessage').length,1);
+});
+
+test('a verified notification delivery persists its exact Telegram message ID for owner replies',async(t)=>{
+  const f=await fixture(t);
+  const event={type:'contact_review_required',jobId:jobA,organization:'ООО Тест',code:'contact_source_ambiguous'};
+  assert.equal((await f.report(event)).delivery,'sent');
+  const stored=(await records(f.store))[0];assert.equal(stored.telegramMessageId,2);
+  const sent=f.calls.find(call=>call.method==='sendMessage');
+  assert.equal(renderNotification(stored.event),sent.params.text);
+  assert.match(sent.params.text,/Нужна проверка контакта/u);
+  assert.equal(renderNotification(null),null);
+});
+
+test('an unverified Telegram send cannot associate a notification with a message ID',async(t)=>{
+  const f=await fixture(t,{call:async(method)=>method==='getChat'?{id:Number(owner),type:'private'}:
+    {message_id:99,chat:{id:777,type:'private'}}});
+  assert.equal((await f.report({type:'contact_review_required',jobId:jobA,code:'contact_source_ambiguous'})).delivery,'pending');
+  const record=(await records(f.store))[0];assert.equal(record.telegramMessageId,undefined);assert.equal(record.status,'pending');
 });

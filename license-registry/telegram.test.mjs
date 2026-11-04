@@ -89,7 +89,7 @@ test('polling is bounded and preserves updates without acknowledging an offset o
   assert.deepEqual(await client.getUpdates({ offset: 28 }), [update]);
   assert.deepEqual(calls.map((c) => c.method), ['getWebhookInfo', 'getUpdates', 'getUpdates']);
   assert.deepEqual(calls[1].params, { offset: 0, timeout: 30, limit: 100,
-    allowed_updates: ['message', 'edited_message', 'my_chat_member'] });
+    allowed_updates: ['message', 'edited_message', 'my_chat_member', 'callback_query'] });
   assert.equal(calls[2].params.offset, 28);
   await assert.rejects(client.getUpdates({ offset: -1 }), { code: 'invalid_offset' });
 });

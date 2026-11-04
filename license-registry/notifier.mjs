@@ -181,6 +181,12 @@ function messageOf(event) {
 }
 function failure(code) { return Object.assign(new Error(code), { code }); }
 
+/** Render a previously normalized, persisted event exactly as it was delivered. */
+export function renderNotification(event){
+  if(!event||typeof event!=='object'||!TYPES.has(event.type))return null;
+  return messageOf(event);
+}
+
 /** Durable owner-only delivery. The caller invokes flush periodically for retries. */
 export function createNotifier({ telegram, store, ownerChatId, now = () => new Date(),
   log = (entry) => console.log(JSON.stringify(entry)) } = {}) {
@@ -233,6 +239,7 @@ export function createNotifier({ telegram, store, ownerChatId, now = () => new D
     for (const [key] of due.slice(0, 3)) {
       const item = (await store.read()).runtime?.notifications?.[key];
       if (!item || item.status !== 'pending') continue;
+      let telegramMessageId;
       try {
         const message = await telegram.call('sendMessage', { chat_id: owner, text: messageOf(item.event),
           link_preview_options: { is_disabled: true } });
@@ -240,6 +247,7 @@ export function createNotifier({ telegram, store, ownerChatId, now = () => new D
           || String(message.chat?.id) !== owner || message.chat?.type !== 'private') {
           throw failure('notification_delivery_unverified');
         }
+        telegramMessageId=message.message_id;
       } catch (error) { await pendingFailure(key, error); continue; }
       // A failed or uncertain send is never recorded as delivered. If Telegram
       // accepted a send but its response was lost, a retry can repeat the alert.
@@ -247,6 +255,7 @@ export function createNotifier({ telegram, store, ownerChatId, now = () => new D
         const entry = current.runtime?.notifications?.[key];
         if (entry?.status !== 'pending') return;
         entry.status = 'sent'; entry.sentAt = stamp(now); entry.lastError = null;
+        entry.telegramMessageId=telegramMessageId;
         entry.attempts = (entry.attempts ?? 0) + 1; entry.lastAttemptAt = entry.sentAt;
       });
       sent++;

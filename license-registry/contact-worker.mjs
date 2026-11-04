@@ -79,7 +79,7 @@ export class ContactWorker{
         cells:record.receipt.appliedCells.length?record.receipt.appliedCells:record.plan.updates.map((u)=>`${u.column}${record.plan.rowNumber}`)});}catch{continue;}
       if(accepted(result))await this.store.update((current)=>{const entry=initialize(current).records[record.plan.hash];if(entry?.status==='done')entry.notificationPending=false;});
     }
-    const reviews=Object.values((await this.store.read()).contacts?.reviews??{}).filter((item)=>!item.notifiedAt).slice(0,this.maxReviewNotifications);
+    const reviews=Object.values((await this.store.read()).contacts?.reviews??{}).filter((item)=>item.status!=='resolved'&&!item.notifiedAt).slice(0,this.maxReviewNotifications);
     for(const item of reviews){
       let result;try{result=await this.report({type:'contact_review_required',jobId:item.id.slice(0,24),organization:item.organization,code:item.code});}catch{continue;}
       if(accepted(result))await this.store.update((current)=>{const entry=initialize(current).reviews[item.id];if(entry)entry.notifiedAt=stamp(this.now);});

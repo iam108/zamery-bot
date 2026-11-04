@@ -13,13 +13,16 @@ import {createPollingMonitor,pollOnce,safeNotification} from './polling.mjs';
 import {importOfficialLicenseEvidence} from './official-evidence.mjs';
 import {prepareContactSource} from './contact-source.mjs';
 import {ContactWorker,triggerContactSync} from './contact-worker.mjs';
+import {convertOwnerUpdate,contactReplyCoverage} from './contact-reply-input.mjs';
+import {ContactReplyWorker} from './contact-reply-worker.mjs';
 
 const dir=path.dirname(fileURLToPath(import.meta.url));
 const env=process.env;
 const controller=new AbortController();
 const secrets=[env.BOT_TOKEN,env.FSRAR_API_KEY,env.GOOGLE_SERVICE_ACCOUNT_JSON].filter(Boolean);
 const contactsEnabled=env.CONTACT_SYNC_ENABLED==='true'&&env.DRY_RUN!=='true';
-const health=createReadiness({secrets,contactsEnabled});
+const ownerRepliesEnabled=contactsEnabled&&Boolean(env.NOTIFY_CHAT_ID);
+const health=createReadiness({secrets,contactsEnabled,ownerRepliesEnabled});
 let stopping=false;
 let startupDependency=null;
 let notificationReporter=null;
@@ -117,20 +120,40 @@ async function initialize(){
       }catch(error){await source.close().catch(()=>{});throw error;}
       contactSource=source;return source;
     }}):null;
+  const contactReplies=ownerRepliesEnabled?new ContactReplyWorker({store,google:googleClient,telegram,
+    ownerChatId:env.NOTIFY_CHAT_ID,botId:target.botId,
+    log:(event)=>console.log(JSON.stringify({at:new Date().toISOString(),...event}))}):null;
+  if(contactReplies)console.log(JSON.stringify({at:new Date().toISOString(),type:'contact_reply_links_verified',
+    ...contactReplyCoverage(await store.read(),{ownerChatId:env.NOTIFY_CHAT_ID,botId:target.botId})}));
   startupDependency=null;health.running({dryRun:env.DRY_RUN==='true'});
   await report({type:'runtime_initialized',targetChatId:String(target.id),dryRun:env.DRY_RUN==='true',
     fsrarQuota:{total:quota.total,used:quota.used,remaining:quota.remaining}});
-  return {store,telegram,worker,contacts,config,botId:target.botId};
+  return {store,telegram,worker,contacts,contactReplies,config,botId:target.botId};
 }
 
-async function run({store,telegram,worker,contacts,config,botId}){
+async function run({store,telegram,worker,contacts,contactReplies,config,botId}){
   const log=(event)=>console.log(JSON.stringify({at:new Date().toISOString(),...event}));
   const monitor=createPollingMonitor({store,report,log});
+  let wakeOwner=null;let ownerNotified=false;
+  const notifyOwner=()=>{ownerNotified=true;wakeOwner?.();};
+  async function waitOwner(){
+    if(ownerNotified){ownerNotified=false;return;}
+    const waitController=new AbortController();
+    const abort=()=>waitController.abort();controller.signal.addEventListener('abort',abort,{once:true});
+    try{
+      await Promise.race([new Promise((resolve)=>{wakeOwner=resolve;}),
+        sleep(60000,undefined,{signal:waitController.signal}).catch(()=>{})]);
+    }finally{wakeOwner=null;ownerNotified=false;waitController.abort();controller.signal.removeEventListener('abort',abort);}
+  }
   const polling=(async()=>{
     while(!stopping){
       const result=await pollOnce({store,telegram,monitor,health,signal:controller.signal,secrets,log,
-        persist:(updates)=>worker.persistUpdates(updates,(update)=>convertUpdate(update,
-          {targetChatId:config.targetChatId,sourceChatId:config.sourceChatId,botId}))});
+        persist:async(updates)=>{
+          const result=await worker.persistUpdates(updates,(update)=>convertUpdate(update,
+            {targetChatId:config.targetChatId,sourceChatId:config.sourceChatId,botId}),
+            ownerRepliesEnabled?(update)=>convertOwnerUpdate(update,{ownerChatId:env.NOTIFY_CHAT_ID,botId}):undefined);
+          if(contactReplies)notifyOwner();return result;
+        }});
       if(result.stopped)break;
       if(!result.ok)await sleep(result.retryMs,undefined,{signal:controller.signal}).catch(()=>{});
     }
@@ -171,7 +194,18 @@ async function run({store,telegram,worker,contacts,config,botId}){
       await sleep(60000,undefined,{signal:controller.signal}).catch(()=>{});
     }
   })():Promise.resolve();
-  await Promise.all([polling,processing,enriching]);
+  const replying=contactReplies?(async()=>{
+    while(!stopping){
+      try{
+        const result=await contactReplies.tick();health.success('ownerReplies');
+        if(result?.saved)log({type:'state_proof',trigger:'manual_contact_write_verified',...privateStateProof(await store.read())});
+      }
+      catch(error){health.failure('ownerReplies',safeErrorCode(error,'contact_reply_failed',secrets));
+        log({type:'contact_reply_error',code:safeErrorCode(error,'contact_reply_failed',secrets)});}
+      if(!stopping)await waitOwner();
+    }
+  })():Promise.resolve();
+  await Promise.all([polling,processing,enriching,replying]);
 }
 
 function stop(){stopping=true;health.stopping();controller.abort();server.close();contactSource?.close().catch(()=>{});}

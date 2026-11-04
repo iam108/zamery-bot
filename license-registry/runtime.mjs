@@ -51,7 +51,9 @@ function proofOfficialEvidence(evidence){
 export function privateStateProof(state){
   // Periodic lastIngestAt/startup timestamps are telemetry, not queue content.
   const sections={jobs:state.jobs,sources:state.sources,api:state.api,
-    telegram:{offset:state.telegram?.offset??0,inbox:state.telegram?.inbox??[]},cursors:state.cursors??{},journal:state.journal??[]};
+    telegram:{offset:state.telegram?.offset??0,inbox:state.telegram?.inbox??[],
+      ...(state.telegram?.ownerInbox?.length?{ownerInbox:state.telegram.ownerInbox}:{})},cursors:state.cursors??{},journal:state.journal??[]};
+  if(state.contactReplies)sections.contactReplies=state.contactReplies;
   if(state.contacts)sections.contacts={
     records:Object.fromEntries(Object.entries(state.contacts.records??{}).map(([key,{notificationPending:_notificationPending,...record}])=>[key,record])),
     reviews:Object.fromEntries(Object.entries(state.contacts.reviews??{}).map(([key,{notifiedAt:_notifiedAt,...review}])=>[key,review]))};
@@ -69,10 +71,14 @@ export function privateStateProof(state){
     jobs:Object.keys(state.jobs).length,sources:Object.keys(state.sources).length,counts,
     apiAttemptedCalls:safeCount(state.api.attemptedCalls),telegramOffset:safeCount(state.telegram?.offset??0),pendingInbox:state.telegram?.inbox?.length??0,
     jobStates,jobStatesTruncated:Math.max(0,jobs.length-jobStates.length),journalEntries:state.journal?.length??0,
+    ...(state.contactReplies?{ownerReplyState:{pendingInbox:state.telegram?.ownerInbox?.length??0,
+      sessions:Object.keys(state.contactReplies.sessions??{}).length,
+      done:Object.values(state.contactReplies.sessions??{}).filter((item)=>item.status==='done').length,
+      pendingMessages:Object.values(state.contactReplies.outbox??{}).filter((item)=>item.status!=='sent').length}}:{}),
     ...(state.contacts?{contactState:{records:Object.keys(state.contacts.records??{}).length,
       done:Object.values(state.contacts.records??{}).filter((item)=>item.status==='done').length,
       planned:Object.values(state.contacts.records??{}).filter((item)=>item.status==='planned').length,
-      reviews:Object.keys(state.contacts.reviews??{}).length}}:{})};
+      reviews:Object.values(state.contacts.reviews??{}).filter((item)=>item.status!=='resolved').length}}:{})};
 }
 function editedSourceChanged(existing,message,extraction){
   if(!existing||!message.editDate)return false;
@@ -163,7 +169,7 @@ export class LicenseWorker {
     Object.assign(this,{store,google,api,config,now,dryRun,report});
     this.busy=false;
   }
-  async persistUpdates(updates, convert) {
+  async persistUpdates(updates, convert, convertOwner) {
     if (!Array.isArray(updates) || updates.some((u)=>!u||!Number.isSafeInteger(u.update_id)||u.update_id<0)) throw new Error('invalid_telegram_updates');
     const ordered=[...updates].sort((a,b)=>a.update_id-b.update_id);
     return this.store.update((state)=>{
@@ -172,8 +178,15 @@ export class LicenseWorker {
       for (const update of ordered) {
         if (!Number.isSafeInteger(update.update_id) || update.update_id < state.telegram.offset) continue;
         const message=convert(update);
-        if (message && !state.telegram.inbox.some((x)=>x.updateId===update.update_id)) {
+        const ownerEvent=typeof convertOwner==='function'?convertOwner(update):null;
+        if (message && !ownerEvent && !state.telegram.inbox.some((x)=>x.updateId===update.update_id)) {
           state.telegram.inbox.push({updateId:update.update_id,message,receivedAt:instant(this.now)});count++;
+        }
+        if(ownerEvent){
+          state.telegram.ownerInbox??=[];
+          if(!state.telegram.ownerInbox.some((item)=>item.updateId===update.update_id)){
+            state.telegram.ownerInbox.push({updateId:update.update_id,event:ownerEvent,receivedAt:instant(this.now)});
+          }
         }
         // Telegram is acknowledged only by the NEXT request, after this durable save.
         state.telegram.offset=Math.max(state.telegram.offset,update.update_id+1);

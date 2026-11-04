@@ -39,8 +39,8 @@ export function validateFsrarStat(envelope){
   return {total,used,remaining:total-used,limitType:'requests'};
 }
 
-export function createReadiness({now=()=>new Date(),telegramMaxAgeMs=90_000,workerMaxAgeMs=180_000,secrets=[],contactsEnabled=false}={}){
-  const names=contactsEnabled?[...NAMES,'contacts']:NAMES;
+export function createReadiness({now=()=>new Date(),telegramMaxAgeMs=90_000,workerMaxAgeMs=180_000,secrets=[],contactsEnabled=false,ownerRepliesEnabled=false}={}){
+  const names=[...NAMES,...(contactsEnabled?['contacts']:[]),...(ownerRepliesEnabled?['ownerReplies']:[])];
   const dependencies=Object.fromEntries(names.map((name)=>[name,{ok:false,lastSuccessAt:null,lastFailureAt:null,lastError:null}]));
   let started=false;let dryRun=false;let phase='starting';let startupError=null;let retryAt=null;
   const stamp=()=>new Date(now()).toISOString();
@@ -62,8 +62,8 @@ export function createReadiness({now=()=>new Date(),telegramMaxAgeMs=90_000,work
     stopping(){started=false;phase='stopping';retryAt=null;},
     snapshot(){
       const instant=+new Date(now());const result=structuredClone(dependencies);
-      for(const [name,maxAge]of [['telegram',telegramMaxAgeMs],['worker',workerMaxAgeMs]]){
-        if(result[name].ok&&instant-Date.parse(result[name].lastSuccessAt)>maxAge){
+      for(const [name,maxAge]of [['telegram',telegramMaxAgeMs],['worker',workerMaxAgeMs],['ownerReplies',120_000]]){
+        if(result[name]?.ok&&instant-Date.parse(result[name].lastSuccessAt)>maxAge){
           result[name].ok=false;result[name].lastError=`${name}_stale`;
         }
       }
