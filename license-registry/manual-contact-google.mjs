@@ -1,6 +1,7 @@
 import {hash} from './state.mjs';
 import {normalizeAddress,normalizeDate,normalizeLicenseNumber,parseSheetRows,localDate} from './core.mjs';
 import {buildContactPlan} from './contact-google.mjs';
+import {normalizeContactPhone} from './contact-match.mjs';
 
 const COLS={M:12,N:13,O:14};const CONTACT_COLS=Object.keys(COLS);
 const clone=(value)=>JSON.parse(JSON.stringify(value));
@@ -19,7 +20,33 @@ function authorization(input,row){
 function contact(input){
   if(!input||typeof input!=='object'||Array.isArray(input))fail('manual_contact_plan_invalid');
   const text=(value)=>{if(typeof value!=='string'||!value.trim()||value.length>4096||/[\u0000-\u001f\u007f]/u.test(value))fail('manual_contact_plan_invalid');return value.trim();};
-  return {name:text(input.name),phone:text(input.phone),...(input.telegram==null?{}:{telegram:text(input.telegram)})};
+  const lines=(value)=>{
+    if(typeof value!=='string'||!value||value.length>4096||/[\u0000-\u0009\u000b-\u001f\u007f\u2028\u2029]/u.test(value))fail('manual_contact_plan_invalid');
+    const result=value.split('\n');if(!result.length||result.length>5||result.some((line)=>!line.trim()))fail('manual_contact_plan_invalid');
+    return result;
+  };
+  const name=(value)=>{
+    if(typeof value!=='string'||/[\u0000-\u001f\u007f\u2028\u2029]/u.test(value))fail('manual_contact_plan_invalid');
+    const result=value.replace(/\s+/gu,' ').trim();
+    if(!/^[\p{L}\p{M} .’'()\-]{2,160}$/u.test(result)||!/[\p{L}\p{M}]/u.test(result))fail('manual_contact_plan_invalid');return result;
+  };
+  const phone=(value)=>{
+    if(typeof value!=='string'||/[\u0000-\u001f\u007f\u2028\u2029]/u.test(value))fail('manual_contact_plan_invalid');
+    const result=normalizeContactPhone(value);if(!result)fail('manual_contact_plan_invalid');return result;
+  };
+  const names=lines(input.name).map(name);const phones=lines(input.phone).map(phone);
+  if(names.length!==phones.length)fail('manual_contact_plan_invalid');
+  const pairs=names.map((value,index)=>({name:value,phone:phones[index]}));
+  if(input.persons!==undefined){
+    if(!Array.isArray(input.persons)||input.persons.length<1||input.persons.length>5||input.persons.length!==pairs.length)fail('manual_contact_plan_invalid');
+    const provided=input.persons.map((person)=>{
+      if(!person||typeof person!=='object'||Array.isArray(person)||Object.keys(person).some((key)=>!['name','phone'].includes(key)))fail('manual_contact_plan_invalid');
+      return {name:name(person.name),phone:phone(person.phone)};
+    });
+    if(provided.some((person,index)=>person.name!==pairs[index].name||person.phone!==pairs[index].phone))fail('manual_contact_plan_invalid');
+  }
+  return {name:names.join('\n'),phone:phones.join('\n'),
+    ...(input.persons!==undefined||pairs.length>1?{persons:pairs}:{}),...(input.telegram==null?{}:{telegram:text(input.telegram)})};
 }
 function identity(google,input){
   let prepared;

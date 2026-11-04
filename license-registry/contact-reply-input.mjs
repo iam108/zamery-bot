@@ -21,7 +21,8 @@ function frame(message){
 export function convertOwnerUpdate(update,{ownerChatId,botId}={}){
   if(!positive(ownerChatId)||!positive(botId))throw Object.assign(new Error('owner_input_configuration_invalid'),{code:'owner_input_configuration_invalid'});
   const owner=String(ownerChatId),bot=String(botId);
-  const message=update?.message;
+  const message=update?.message??update?.edited_message;
+  const edited=Boolean(update?.edited_message&&!update?.message);
   const callback=update?.callback_query;
   if(!message&&!callback)return null;
   if(message){
@@ -39,6 +40,11 @@ export function convertOwnerUpdate(update,{ownerChatId,botId}={}){
   const raw=message?(typeof message.text==='string'?message.text:typeof message.caption==='string'?message.caption:''):'';
   const result={kind:message?'message':'callback',updateId:update.update_id,ownerChatId:owner,fromId:owner,chatType:'private',botId:bot,
     messageId:Number(current.message_id),date:timestamp(current.date),text:raw.slice(0,MAX_TEXT),...(raw.length>MAX_TEXT?{textTruncated:true}:{})};
+  if(edited){
+    const editDate=timestamp(current.edit_date);
+    if(current.edit_date<current.date)throw Object.assign(new Error('owner_update_invalid'),{code:'owner_update_invalid'});
+    result.editDate=editDate;
+  }
   const reply=frame(message?message.reply_to_message:callback.message);if(reply)result.replyTo=reply;
   if(message?.contact){
     const contact=message.contact;
@@ -96,28 +102,54 @@ export function contactReplyCoverage(state,{ownerChatId,botId}){
   return {notifiedReviews:notified.size,replyableReviews:supported.size,legacyLinks:legacy};
 }
 
-/** Explicit labels or an explicitly shared native contact, never sender profile data. */
+/** Explicit complete name/phone pairs, never sender profile data or unmatched text. */
 export function parseOwnerContactReply(event){
   if(!event||event.kind!=='message'||event.textTruncated)return invalid();
-  const fields={name:[],phone:[],telegram:[],row:[]};
+  const fields={telegram:[],row:[]};
   const labels=new Map([['имя','name'],['контакт','name'],['телефон','phone'],['номер','phone'],['telegram','telegram'],['тг','telegram'],['строка','row']]);
-  for(const line of String(event.text??'').split(/\r?\n/u)){
-    const match=line.match(/^\s*([^:\n]+?)\s*:\s*(.*?)\s*$/u);if(!match)continue;
-    const key=labels.get(clean(match[1]).toLowerCase());if(key)fields[key].push(clean(match[2]));
+  const persons=[];let mode=null;let pending={};
+  const pair=(nameValue,phoneValue)=>{
+    const name=clean(nameValue),phone=normalizeContactPhone(phoneValue);
+    return name&&name.length<=160&&/^\p{L}[\p{L}\p{M} .’'()\-]*$/u.test(name)&&phone?{name,phone}:null;
+  };
+  for(const rawLine of String(event.text??'').split(/\r?\n/u)){
+    const line=clean(rawLine);if(!line)continue;
+    const labelled=line.match(/^([^:\n]+?)\s*:\s*(.*?)\s*$/u);
+    const key=labelled&&labels.get(clean(labelled[1]).toLowerCase());
+    if(key==='telegram'||key==='row'){
+      fields[key].push(clean(labelled[2]));if(fields[key].length>1)return invalid();continue;
+    }
+    if(key==='name'||key==='phone'){
+      if(mode==='plain')return invalid();mode='labelled';
+      if(pending[key]!=null)return invalid();pending[key]=clean(labelled[2]);
+      if(pending.name!=null&&pending.phone!=null){
+        const parsed=pair(pending.name,pending.phone);if(!parsed)return invalid();persons.push(parsed);pending={};
+      }
+      continue;
+    }
+    if(mode==='labelled')return invalid();
+    const plain=line.match(/^(\+?\d[\d ().-]{6,30}\d)\s+(.+)$/u);
+    if(!plain)return invalid();
+    const parsed=pair(plain[2],plain[1]);if(!parsed)return invalid();persons.push(parsed);mode='plain';
   }
-  if(Object.values(fields).some((values)=>values.length>1))return invalid();
-  let name=fields.name[0]??'',phoneRaw=fields.phone[0]??'';
   if(event.nativeContact){
-    if(event.nativeContact.truncated)return invalid();
-    const nativeName=clean([event.nativeContact.firstName,event.nativeContact.lastName].filter(Boolean).join(' '));
-    const nativePhone=normalizeContactPhone(event.nativeContact.phoneNumber);
-    if(!nativePhone)return invalid();
-    if(name&&name.toLowerCase()!==nativeName.toLowerCase())return invalid();
-    if(phoneRaw&&normalizeContactPhone(phoneRaw)!==nativePhone)return invalid();
-    name||=nativeName;phoneRaw||=nativePhone;
+    if(event.nativeContact.truncated||mode==='plain'||persons.length>1)return invalid();
+    const native=pair([event.nativeContact.firstName,event.nativeContact.lastName].filter(Boolean).join(' '),event.nativeContact.phoneNumber);
+    if(!native)return invalid();
+    const provided=persons[0]??pending;
+    if(provided.name&&provided.name.toLowerCase()!==native.name.toLowerCase())return invalid();
+    if(provided.phone&&normalizeContactPhone(provided.phone)!==native.phone)return invalid();
+    persons.splice(0,persons.length,native);pending={};
   }
-  const phone=normalizeContactPhone(phoneRaw);
-  if(!name||name.length>160||!/^\p{L}[\p{L}\p{M} .’'()\-]*$/u.test(name)||!phone)return invalid();
+  if(Object.keys(pending).length||!persons.length)return invalid();
+  const unique=[];const names=new Map(),phones=new Map();
+  for(const person of persons){
+    const key=person.name.toLowerCase().replace(/ё/gu,'е');
+    if(names.has(key)&&names.get(key)!==person.phone||phones.has(person.phone)&&phones.get(person.phone)!==key)return invalid();
+    if(names.get(key)===person.phone)continue;
+    names.set(key,person.phone);phones.set(person.phone,key);unique.push(person);
+  }
+  if(!unique.length||unique.length>5)return invalid();
   const telegram=fields.telegram[0]?normalizeContactTelegram(fields.telegram[0]):null;
   if(fields.telegram.length&&!telegram)return invalid();
   let rowNumber;
@@ -125,5 +157,7 @@ export function parseOwnerContactReply(event){
     if(!/^[1-9]\d{0,5}$/u.test(fields.row[0])||Number(fields.row[0])<2||Number(fields.row[0])>100000)return invalid();
     rowNumber=Number(fields.row[0]);
   }
-  return {status:'contact',contact:{name,phone,...(telegram?{telegram}:{})},...(rowNumber?{rowNumber}:{})};
+  const contact={name:unique.map(person=>person.name).join('\n'),phone:unique.map(person=>person.phone).join('\n'),
+    ...(unique.length>1?{persons:unique}:{}),...(telegram?{telegram}:{})};
+  return {status:'contact',contact,...(rowNumber?{rowNumber}:{})};
 }

@@ -22,14 +22,27 @@ function enqueue(state,session,kind,text,at,keyboard){
   replies.outbox[id]??={id,sessionId:session.id,kind,text,replyToMessageId:session.sourceMessageId,
     ...(keyboard?{keyboard}:{}),status:'pending',createdAt:at,attempts:0};
 }
+function contactPairs(values){
+  const names=String(values?.M??'').split('\n'),phones=String(values?.N??'').split('\n');
+  if(names.length<2||names.length>5||names.length!==phones.length||names.some((name)=>!clean(name))||phones.some((phone)=>!clean(phone)))return null;
+  return names.map((name,index)=>`${index+1}. ${clip(name,160)} — ${clip(phones[index],40)}`).join('\n');
+}
 function preview(session){
   const plan=session.plan;
-  const lines=[`Строка ${plan.rowNumber}. Предлагаю заменить контакт:`,
-    `Имя: ${clip(plan.before.M)} → ${clip(plan.after.M)}`,
-    `Телефон: ${clip(plan.before.N)} → ${clip(plan.after.N)}`];
+  const afterPairs=contactPairs(plan.after);
+  const lines=afterPairs?[`Строка ${plan.rowNumber}. Предлагаю заменить контакты:`,
+    'Сейчас:',contactPairs(plan.before)??`Имя: ${clip(plan.before.M)}\nТелефон: ${clip(plan.before.N)}`,
+    'Новые контакты:',afterPairs]:[`Строка ${plan.rowNumber}. Предлагаю заменить контакт:`,
+      `Имя: ${clip(plan.before.M)} → ${clip(plan.after.M)}`,
+      `Телефон: ${clip(plan.before.N)} → ${clip(plan.after.N)}`];
   lines.push(session.contact.telegram?`Telegram: ${clip(plan.before.O)} → ${clip(plan.after.O)}`:
     `Telegram: ${clip(plan.after.O)} (сохраняется)`);
   lines.push('Подтверди замену кнопкой.');return lines.join('\n');
+}
+function savedText(plan){
+  const pairs=contactPairs(plan.after);
+  return [`${pairs?'Контакты сохранены и проверены':'Контакт сохранён и проверен'} в строке ${plan.rowNumber}.`,
+    pairs??`Имя: ${clip(plan.after.M)}\nТелефон: ${clip(plan.after.N)}`,`Telegram: ${clip(plan.after.O)}`].join('\n');
 }
 function receiptFor(plan,raw){
   if(raw?.verified!==true||raw.planHash!==plan.hash||raw.spreadsheetId!==plan.spreadsheetId
@@ -116,7 +129,7 @@ export class ContactReplyWorker{
         for(const item of Object.values(replies.outbox))if(item.sessionId===assigned.id&&['pending','sending'].includes(item.status))item.status='superseded';
       }
       replies.sessions[id]=session;review.manualReplySession=id;
-      if(parsed.status!=='contact')enqueue(state,session,'help','Пришли контакт одним ответом:\nИмя: Иван Иванов\nТелефон: +79991234567\nTelegram: @username\nСтроку Telegram можно пропустить. Можно также отправить контакт Telegram.',at);
+      if(parsed.status!=='contact')enqueue(state,session,'help','Пришли контакт одним ответом:\nИмя: Иван Иванов\nТелефон: +79991234567\nTelegram: @username\nСтроку Telegram можно пропустить. Несколько контактов можно прислать по одному на строке: +79991234567 Иван Иванов. Можно также отправить контакт Telegram.',at);
       return finish(parsed.status==='contact'?'intent_saved':'needs_contact');
     });
     if(answer)await this.answer(event,answer);
@@ -174,7 +187,7 @@ export class ContactReplyWorker{
       Object.assign(review,{status:'resolved',resolvedAt:stamp(this.now),manualContactPlanHash:session.plan.hash});
       state.journal.push({at:stamp(this.now),type:'manual_contact_write_verified',reviewId:session.reviewId,planHash:session.plan.hash,
         rowNumber:session.plan.rowNumber,cells:session.plan.updates.map((change)=>`${change.column}${session.plan.rowNumber}`)});
-      enqueue(state,session,'done',`Контакт сохранён и проверен в строке ${session.plan.rowNumber}.\nИмя: ${clip(session.plan.after.M)}\nТелефон: ${clip(session.plan.after.N)}\nTelegram: ${clip(session.plan.after.O)}`,stamp(this.now));
+      enqueue(state,session,'done',savedText(session.plan),stamp(this.now));
       return true;
     });
   }

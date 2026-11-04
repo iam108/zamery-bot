@@ -126,7 +126,7 @@ test('a labelled explicit row in the first reply is accepted only within the exa
 });
 
 test('native contacts and replies to the bot follow-up use the same verified review binding',async(t)=>{
-  const h=await fixture(t);await h.reply('Анна +79990000001');await h.worker().tick();
+  const h=await fixture(t);await h.reply('Контакт без номера');await h.worker().tick();
   assert.equal(h.batches.length,0);const help=h.sent.at(-1);assert.match(help.text,/Имя:/u);
   await h.reply('',{replyTo:help.result.message_id,replyText:help.text,contact:{first_name:'Анна',last_name:'Иванова',phone_number:'+79990000001'}});
   assert.equal((await h.worker().tick()).saved,1);assert.equal(h.values[1][12],'Анна Иванова');
@@ -245,4 +245,39 @@ test('reused update IDs from a different bot cannot overwrite an old session or 
   assert.equal(saved.find((session)=>session.botId===newBot).reviewId,newReview);
   assert.equal(sent.length,1);assert.match(sent[0].text,/Мария Петрова/u);assert.doesNotMatch(sent[0].text,/Анна/u);
   assert.equal(h.batches.length,0);
+});
+
+test('two plain phone-name contacts are written as paired multiline M/N values and replay never overwrites a manual edit',async(t)=>{
+  const h=await fixture(t);const event=await h.reply('+7 (999) 000-00-01 Сергей\n+7 (999) 000-00-02 Алёна');
+  assert.equal((await h.worker().tick()).saved,1);
+  assert.equal(h.values[1][12],'Сергей\nАлёна');assert.equal(h.values[1][13],'+79990000001\n+79990000002');
+  assert.equal(h.values[1][14],'');assert.equal(h.batches.length,1);
+  const saved=h.sent.at(-1).text;
+  assert.match(saved,/1\. Сергей — \+79990000001/u);assert.match(saved,/2\. Алёна — \+79990000002/u);
+  h.values[1][12]='Ручной контакт';
+  await h.store.update((state)=>state.telegram.ownerInbox.push({updateId:event.updateId,event}));
+  await h.worker().tick();assert.equal(h.batches.length,1);assert.equal(h.values[1][12],'Ручной контакт');
+});
+
+test('two labelled contact blocks keep name-phone pairing through replacement preview, confirmation and readback',async(t)=>{
+  const h=await fixture(t,{existing:true});
+  await h.reply('Имя: Сергей\nТелефон: +79990000001\n\nИмя: Алёна\nТелефон: +79990000002');
+  await h.worker().tick();const [session]=await sessions(h),notice=h.sent.at(-1);
+  assert.equal(session.status,'awaiting_replace');assert.equal(h.batches.length,0);
+  assert.match(notice.text,/1\. Сергей — \+79990000001/u);assert.match(notice.text,/2\. Алёна — \+79990000002/u);
+  assert.match(notice.text,/https:\/\/t.me\/existing_client \(сохраняется\)/u);
+  await h.callback(`cr:${session.id}:replace`,notice);assert.equal((await h.worker().tick()).saved,1);
+  assert.deepEqual(h.values[1].slice(12,15),['Сергей\nАлёна','+79990000001\n+79990000002','https://t.me/existing_client']);
+  const done=h.sent.at(-1).text;assert.match(done,/1\. Сергей — \+79990000001/u);assert.match(done,/2\. Алёна — \+79990000002/u);
+  await h.callback(`cr:${session.id}:replace`,notice);await h.worker().tick();assert.equal(h.batches.length,1);
+});
+
+test('maximum-length names in both contacts remain visible instead of clipping away the second person',async(t)=>{
+  const h=await fixture(t,{existing:true}),first='А'.repeat(160),second='Б'.repeat(160);
+  await h.reply(`+79990000001 ${first}\n+79990000002 ${second}`);await h.worker().tick();
+  const [session]=await sessions(h),notice=h.sent.at(-1);
+  assert.equal(session.status,'awaiting_replace');assert.ok(notice.text.includes(`1. ${first} — +79990000001`));
+  assert.ok(notice.text.includes(`2. ${second} — +79990000002`));assert.ok(notice.text.length<4096);
+  await h.callback(`cr:${session.id}:replace`,notice);await h.worker().tick();
+  assert.ok(h.sent.at(-1).text.includes(first));assert.ok(h.sent.at(-1).text.includes(second));
 });

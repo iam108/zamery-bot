@@ -24,7 +24,7 @@ test('only the configured human owner in the exact private chat becomes a messag
   for(const changes of[{from:{id:777}},{chat:{id:777,type:'private'}},{chat:{id:Number(owner),type:'group'}},{from:{id:Number(owner),is_bot:true}}]){
     assert.equal(convertOwnerUpdate(message(changes),options),null);
   }
-  const edited=message();edited.edited_message=edited.message;delete edited.message;assert.equal(convertOwnerUpdate(edited,options),null);
+  const edited=message();edited.edited_message={...edited.message,edit_date:edited.message.date+60};delete edited.message;assert.equal(convertOwnerUpdate(edited,options).kind,'message');
   assert.throws(()=>convertOwnerUpdate(message(),{ownerChatId:owner}),{code:'owner_input_configuration_invalid'});
 });
 
@@ -108,4 +108,72 @@ test('real notifier receipts and legacy records both bind to the owner reply wit
   for(const item of Object.values(state.runtime.notifications))delete item.telegramMessageId;
   assert.equal(findContactReview(state,event),id);
   assert.deepEqual(contactReplyCoverage(state,options),{notifiedReviews:1,replyableReviews:1,legacyLinks:1});
+});
+
+test('two plain phone-first contacts keep their exact pairing and order in newline cells',()=>{
+  const event=convertOwnerUpdate(message({text:'+7 (999) 111-22-33 Сергей\n\n+7 999 444 55 66 Алёна'}),options);
+  assert.deepEqual(parseOwnerContactReply(event),{status:'contact',contact:{name:'Сергей\nАлёна',phone:'+79991112233\n+79994445566',
+    persons:[{name:'Сергей',phone:'+79991112233'},{name:'Алёна',phone:'+79994445566'}]}});
+  const reversed=convertOwnerUpdate(message({text:'+7 999 444 55 66 Алёна\n+7 (999) 111-22-33 Сергей'}),options);
+  assert.equal(parseOwnerContactReply(reversed).contact.name,'Алёна\nСергей');
+  assert.equal(parseOwnerContactReply(reversed).contact.phone,'+79994445566\n+79991112233');
+});
+
+test('complete repeated labelled name-phone blocks support both field orders and optional row/Telegram',()=>{
+  const text='Имя: Сергей\nТелефон: +79991112233\n\nНомер: +79994445566\nКонтакт: Алёна\nТГ: @client_contact\nСтрока: 504';
+  const result=parseOwnerContactReply(convertOwnerUpdate(message({text}),options));
+  assert.deepEqual(result,{status:'contact',contact:{name:'Сергей\nАлёна',phone:'+79991112233\n+79994445566',
+    persons:[{name:'Сергей',phone:'+79991112233'},{name:'Алёна',phone:'+79994445566'}],telegram:'https://t.me/client_contact'},rowNumber:504});
+  const single=parseOwnerContactReply(convertOwnerUpdate(message({text:'+7\u00a0999\u00a0111-22-33 Сергей'}),options));
+  assert.deepEqual(single,{status:'contact',contact:{name:'Сергей',phone:'+79991112233'}});
+});
+
+test('multiple contact input never partially accepts unmatched or conflicting names/phones',()=>{
+  for(const text of[
+    '+79991112233 Сергей\nАлёна',
+    '+79991112233\nСергей',
+    '+79991112233 Сергей\nТелефон: +79994445566\nИмя: Алёна',
+    'Имя: Сергей\nИмя: Алёна\nТелефон: +79991112233\nТелефон: +79994445566',
+    'Имя: Сергей\nТелефон: +79991112233\nИмя: Алёна',
+    '+79991112233 Сергей\n+79991112233 Алёна',
+    '+79991112233 Сергей\n+79994445566 Сергей',
+    '+79991112233 Сергей\n+79994445566 Алёна\nнеполный третий контакт',
+  ])assert.deepEqual(parseOwnerContactReply(convertOwnerUpdate(message({text}),options)),{status:'invalid'});
+});
+
+test('exact contact pairs deduplicate while five distinct pairs are accepted and six rejected',()=>{
+  const repeated='+79991112233 Сергей\n+7 (999) 111-22-33 Сергей';
+  assert.deepEqual(parseOwnerContactReply(convertOwnerUpdate(message({text:repeated}),options)),{status:'contact',contact:{name:'Сергей',phone:'+79991112233'}});
+  const names=['Анна','Борис','Вера','Григорий','Дарья','Елена'];
+  const lines=names.map((name,index)=>`+7999000000${index} ${name}`);
+  const five=parseOwnerContactReply(convertOwnerUpdate(message({text:lines.slice(0,5).join('\n')}),options));
+  assert.equal(five.status,'contact');assert.equal(five.contact.persons.length,5);
+  assert.equal(parseOwnerContactReply(convertOwnerUpdate(message({text:lines.join('\n')}),options)).status,'invalid');
+});
+
+test('native single contact remains compatible and cannot be silently merged with another text contact',()=>{
+  const native={first_name:'Анна',last_name:'Иванова',phone_number:'+79991112233'};
+  const same=convertOwnerUpdate(message({text:'Имя: Анна Иванова\nТелефон: +79991112233\nСтрока: 504',contact:native}),options);
+  assert.deepEqual(parseOwnerContactReply(same),{status:'contact',contact:{name:'Анна Иванова',phone:'+79991112233'},rowNumber:504});
+  const mixed=convertOwnerUpdate(message({text:'+79994445566 Сергей',contact:native}),options);
+  assert.equal(parseOwnerContactReply(mixed).status,'invalid');
+});
+
+test('owner private edits preserve original reply identity and record only verified Telegram edit time',()=>{
+  const original=message();const raw=original.message;
+  const edited={update_id:77,edited_message:{...raw,edit_date:raw.date+120,text:'Имя: Сергей\nТелефон: +79991112233\nИмя: Алёна\nТелефон: +79994445566'}};
+  const event=convertOwnerUpdate(edited,options);
+  assert.equal(event.updateId,77);assert.equal(event.messageId,raw.message_id);assert.equal(event.date,new Date(raw.date*1000).toISOString());
+  assert.equal(event.editDate,new Date((raw.date+120)*1000).toISOString());
+  assert.deepEqual(event.replyTo,convertOwnerUpdate(original,options).replyTo);assert.equal(parseOwnerContactReply(event).contact.persons.length,2);
+  assert.equal(convertOwnerUpdate(original,options).editDate,undefined);
+  for(const edit_date of [undefined,raw.date-1,NaN,Infinity,Number.MAX_SAFE_INTEGER]){
+    assert.throws(()=>convertOwnerUpdate({update_id:77,edited_message:{...raw,edit_date}},options),{code:'owner_update_invalid'});
+  }
+  for(const change of [{from:{id:777}},{chat:{id:Number(owner),type:'group'}},{chat:{id:777,type:'private'}}]){
+    assert.equal(convertOwnerUpdate({update_id:77,edited_message:{...edited.edited_message,...change}},options),null);
+  }
+  const foreignReply=convertOwnerUpdate({update_id:77,edited_message:{...edited.edited_message,
+    reply_to_message:{...raw.reply_to_message,from:{id:777,is_bot:true}}}},options);
+  assert.equal(findContactReview(reviewState().state,foreignReply),null);
 });

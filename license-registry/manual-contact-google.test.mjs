@@ -145,3 +145,54 @@ test('invalid authorization, wrong review identity and plan tampering cannot aut
   const plan=await prepareManualContactPlan(h.google,h.input);plan.needsConfirmation=false;
   await assert.rejects(applyManualContactPlan(h.google,plan,{confirmed:true}),{code:'manual_contact_plan_invalid'});assert.equal(h.batches.length,0);
 });
+
+test('two validated people retain their order in multiline M/N string values and full readback',async()=>{
+  const h=fixture();const contact={name:' Сергей \n Алёна ',phone:'+7 (999) 111-22-33\n8 (888) 444-55-66',
+    persons:[{name:'Сергей',phone:'79991112233'},{name:'Алёна',phone:'+78884445566'}]};
+  const plan=await prepareManualContactPlan(h.google,{...h.input,contact});
+  assert.deepEqual(plan.contact.persons,[{name:'Сергей',phone:'+79991112233'},{name:'Алёна',phone:'+78884445566'}]);
+  assert.equal(plan.after.M,'Сергей\nАлёна');assert.equal(plan.after.N,'+79991112233\n+78884445566');
+  assert.equal(plan.after.O,'https://t.me/original_chat');assert.equal(plan.needsConfirmation,true);
+  const result=await applyManualContactPlan(h.google,plan,{confirmed:true});
+  assert.equal(h.row[12],'Сергей\nАлёна');assert.equal(h.row[13],'+79991112233\n+78884445566');
+  assert.equal(result.cells.M2,plan.after.M);assert.equal(result.cells.N2,plan.after.N);assert.deepEqual(result.cells,plan.expectedCells);
+  assert.deepEqual(result.appliedCells,['M2','N2']);assert.equal(h.batches[0].requests.length,2);
+  assert.equal(h.batches[0].requests[1].updateCells.rows[0].values[0].userEnteredValue.stringValue,plan.after.N);
+});
+
+test('paired LF fields can supply up to five people without persons and single-person shape remains compatible',async()=>{
+  const h=fixture({empty:true});const people=Array.from({length:5},(_,index)=>({name:['Иван','Борис','Анна','Алёна','Сергей'][index],phone:`+7999000000${index+1}`}));
+  const plan=await prepareManualContactPlan(h.google,{...h.input,contact:{name:people.map((p)=>p.name).join('\n'),phone:people.map((p)=>p.phone).join('\n')}});
+  assert.deepEqual(plan.contact.persons,people);assert.equal(plan.needsConfirmation,false);
+  assert.equal((await applyManualContactPlan(h.google,plan)).verified,true);assert.equal(h.row[12].split('\n').length,5);
+  const single=fixture();const one=await prepareManualContactPlan(single.google,{...single.input,contact:{name:' Анна  Иванова ',phone:'8 (999) 000-00-01'}});
+  assert.deepEqual(one.contact,{name:'Анна Иванова',phone:'+79990000001'});
+});
+
+test('mismatched persons, swapped labels, unpaired lines, excess people and other controls fail before reading Google',async()=>{
+  const pair={name:'Сергей\nАлёна',phone:'+79990000001\n+79990000002'};
+  for(const contact of[
+    {...pair,persons:[{name:'Алёна',phone:'+79990000002'},{name:'Сергей',phone:'+79990000001'}]},
+    {...pair,persons:[{name:'Сергей',phone:'+79990000001'}]},
+    {...pair,persons:[{name:'Сергей',phone:'+79990000002'},{name:'Алёна',phone:'+79990000001'}]},
+    {...pair,persons:null},{...pair,phone:'+79990000001'},{...pair,name:'Сергей\n\nАлёна'},
+    {...pair,name:'Сергей\r\nАлёна'},{...pair,name:'Сергей\t\nАлёна'},
+    {...pair,persons:[{name:'Сергей\nАлёна',phone:'+79990000001'},{name:'Алёна',phone:'+79990000002'}]},
+    {name:Array(6).fill('Сергей').join('\n'),phone:Array(6).fill('+79990000001').join('\n')},
+    {...pair,persons:[{name:'Сергей',phone:'+79990000001',role:'owner'},{name:'Алёна',phone:'+79990000002'}]},
+  ]){
+    const h=fixture();await assert.rejects(prepareManualContactPlan(h.google,{...h.input,contact}),{code:'manual_contact_plan_invalid'});assert.equal(h.calls.length,0);
+  }
+});
+
+test('a committed two-person update survives an unknown response and readonly replay without another mutation',async()=>{
+  const h=fixture();const contact={name:'Сергей\nАлёна',phone:'+79990000001\n+79990000002',
+    persons:[{name:'Сергей',phone:'+79990000001'},{name:'Алёна',phone:'+79990000002'}]};
+  const plan=await prepareManualContactPlan(h.google,{...h.input,contact});
+  h.controls.afterBatch=()=>{throw new Error('unknown_multiline_commit');};
+  await assert.rejects(applyManualContactPlan(h.google,plan,{confirmed:true}),{code:'manual_contact_write_unconfirmed'});
+  const checked=await verifyManualContactPlan(h.google,plan);assert.equal(checked.verified,true);
+  assert.equal(checked.cells.M2,'Сергей\nАлёна');assert.equal(checked.cells.N2,'+79990000001\n+79990000002');
+  assert.equal(checked.cells.O2,'https://t.me/original_chat');assert.equal(h.batches.length,1);
+  assert.equal((await applyManualContactPlan(h.google,plan,{confirmed:true})).action,'noop');assert.equal(h.batches.length,1);
+});
