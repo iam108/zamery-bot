@@ -151,3 +151,13 @@ test('invalid receipts cannot acknowledge a planned write or modify license stat
   const after=await h.store.read();assert.equal(Object.values(after.contacts.records)[0].status,'planned');
   assert.deepEqual(after.jobs,before.jobs);assert.deepEqual(after.api,before.api);assert.deepEqual(after.journal,before.journal);
 });
+
+test('explicit contact rerun is once-only and preserves licensing and existing contact records',async()=>{
+  const {triggerContactSync}=await import('./contact-worker.mjs');
+  const state={jobs:{keep:{status:'done'}},api:{attemptedCalls:11},contacts:{nextSyncAt:'2099-01-01T00:00:00Z',retryAt:'2099-01-01T00:00:00Z',records:{keep:{status:'done'}}}};
+  const store={update:async(fn)=>fn(state)};
+  assert.equal(await triggerContactSync(store,'test-run'),true);assert.equal(state.contacts.nextSyncAt,null);
+  state.contacts.nextSyncAt='2099-01-01T00:00:00Z';assert.equal(await triggerContactSync(store,'test-run'),false);
+  assert.equal(state.contacts.nextSyncAt,'2099-01-01T00:00:00Z');assert.equal(state.jobs.keep.status,'done');
+  assert.equal(state.api.attemptedCalls,11);assert.equal(state.contacts.records.keep.status,'done');
+});

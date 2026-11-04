@@ -12,7 +12,7 @@ import {runReadOnlyAcceptance} from './acceptance.mjs';
 import {createPollingMonitor,pollOnce,safeNotification} from './polling.mjs';
 import {importOfficialLicenseEvidence} from './official-evidence.mjs';
 import {prepareContactSource} from './contact-source.mjs';
-import {ContactWorker} from './contact-worker.mjs';
+import {ContactWorker,triggerContactSync} from './contact-worker.mjs';
 
 const dir=path.dirname(fileURLToPath(import.meta.url));
 const env=process.env;
@@ -104,6 +104,7 @@ async function initialize(){
   // Explicit one-time acceptance uses private logs, not owner notifications.
   if(env.ACCEPTANCE_SOURCE_JOB_ID)await runReadOnlyAcceptance({sourceJobId:env.ACCEPTANCE_SOURCE_JOB_ID,store,google,api});
   const worker=new LicenseWorker({store,google,api,config,dryRun:env.DRY_RUN==='true',report});
+  if(contactsEnabled&&env.CONTACT_SYNC_RUN_ID)await triggerContactSync(store,env.CONTACT_SYNC_RUN_ID);
   const contacts=contactsEnabled?new ContactWorker({store,google:googleClient,report,
     log:(event)=>console.log(JSON.stringify({at:new Date().toISOString(),...event})),
     sourceFactory:async()=>{

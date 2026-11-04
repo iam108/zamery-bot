@@ -20,6 +20,15 @@ const snapshot=(row)=>({rowNumber:row.rowNumber,inn:row.inn,licenseNumber:row.li
 function initialize(state){
   state.contacts??={};state.contacts.records??={};state.contacts.reviews??={};return state.contacts;
 }
+export async function triggerContactSync(store,runId,now=()=>new Date()){
+  if(typeof runId!=='string'||!/^[-a-zA-Z0-9_]{1,80}$/u.test(runId))throw failure('contact_run_id_invalid');
+  return store.update((state)=>{
+    state.runtime??={};state.runtime.contactRunRequests??={};
+    if(state.runtime.contactRunRequests[runId])return false;
+    state.runtime.contactRunRequests[runId]=stamp(now);
+    Object.assign(initialize(state),{nextSyncAt:null,retryAt:null});return true;
+  });
+}
 function validateReceipt(plan,receipt){
   if(receipt?.verified!==true||receipt.planHash!==plan.hash||receipt.spreadsheetId!==plan.spreadsheetId
     ||receipt.sheetName!==plan.sheetName||receipt.sheetId!==plan.sheetId||receipt.rowNumber!==plan.rowNumber
