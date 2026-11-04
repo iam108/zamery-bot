@@ -213,12 +213,18 @@ export async function prepareContactSource({env=process.env,dataDir,log,poolFact
       if(env.CONTACTS_FORM_DIAGNOSTIC==='true'){
         const patterns={form_title:'Новая форма заполнена',organization:'Наименование организации',inn:'ИНН',
           client_name:'Имя клиента',client:'Клиент[[:space:]]*:',contact:'Контакт',name:'Имя[[:space:]]*:',
-          phone:'Телефон',number:'Номер[[:space:]]*:',address:'Адрес'};
+          phone:'Телефон',number:'Номер[[:space:]]*:',address:'Адрес',
+          line_inn:'(^|\n)[[:space:]]*ИНН[[:space:]]*:',
+          line_name:'(^|\n)[[:space:]]*Имя клиента[[:space:]]*:',
+          line_phone:'(^|\n)[[:space:]]*(Номер|Телефон|Номер телефона|Телефон клиента)[[:space:]]*:',
+          line_address:'(^|\n)[[:space:]]*(Адрес|Адрес лицензирования)[[:space:]]*:'};
         const keys=Object.keys(patterns);
         const counts=await transaction(bootstrapPool,true,async(client)=>(await client.query(
-          `SELECT count(*)::text AS total,${keys.map((key,index)=>`count(*) FILTER (WHERE text ~* $${index+2})::text AS ${key}`).join(',')}
+          `SELECT count(*)::text AS total,
+           count(*) FILTER (WHERE text ~* 'Новая форма заполнена' AND COALESCE((to_jsonb(reports)->>'dismissed')::boolean,false))::text AS hidden_forms,
+           ${keys.map((key,index)=>`count(*) FILTER (WHERE text ~* $${index+2})::text AS ${key}`).join(',')}
            FROM public.reports WHERE chat_id=$1`,[chatId,...Object.values(patterns)])).rows[0]);
-        emit(log,{type:'contacts_form_diagnostic',counts:Object.fromEntries(['total',...keys].map((key)=>[key,Number(counts?.[key]??0)]))});
+        emit(log,{type:'contacts_form_diagnostic',counts:Object.fromEntries(['total','hidden_forms',...keys].map((key)=>[key,Number(counts?.[key]??0)]))});
       }
       stored=await bootstrap({pool:bootstrapPool,url,stored,file,chatId});
       await bootstrapPool.end();bootstrapPool=null;
