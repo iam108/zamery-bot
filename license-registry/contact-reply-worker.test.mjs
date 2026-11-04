@@ -192,3 +192,57 @@ test('a moved or different license never receives a contact based merely on the 
   const h=await fixture(t);h.values[1][11]='Москва, другой адрес';await h.reply();await h.worker().tick();
   assert.equal(h.batches.length,0);assert.equal((await sessions(h))[0].status,'stale');assert.equal(h.values[1][12],'');
 });
+
+test('changed owner or bot cannot process saved intents or send a previous scope pending contact preview',async(t)=>{
+  for(const change of [{ownerChatId:'777666'},{botId:'111222'}]){
+    const h=await fixture(t,{existing:true});h.controls.sendFail=true;
+    await h.reply();await h.worker().tick();h.controls.sendFail=false;h.advance(30_001);
+    let reads=0,sends=0;const context=h.google.context,call=h.telegram.call;
+    h.google.context=async()=>{reads++;return context();};
+    h.telegram.call=async(...args)=>{sends++;return call(...args);};
+    const rotated=new ContactReplyWorker({...h.config,...change});await rotated.tick();
+    assert.equal(reads,0);assert.equal(sends,0);assert.equal(h.batches.length,0);
+    assert.equal((await sessions(h))[0].status,'awaiting_replace');
+    const outbox=Object.values((await h.store.read()).contactReplies.outbox)[0];assert.equal(outbox.status,'sending');
+  }
+});
+
+test('scope rotation also blocks planned Google replay and colliding bot message IDs; missing bot binding fails closed',async(t)=>{
+  for(const change of [{ownerChatId:'777666'},{botId:'111222'},{}]){
+    const h=await fixture(t);h.controls.beforeBatch=async()=>{throw new Error('not sent');};
+    await h.reply();await h.worker().tick();h.controls.beforeBatch=null;
+    if(!Object.keys(change).length)await h.store.update((state)=>{delete Object.values(state.contactReplies.sessions)[0].botId;});
+    let reads=0;const context=h.google.context;h.google.context=async()=>{reads++;return context();};
+    await new ContactReplyWorker({...h.config,...change}).tick();
+    assert.equal(reads,0);assert.equal(h.batches.length,0);assert.equal(h.sent.length,0);
+  }
+  const h=await fixture(t,{existing:true});await h.reply();await h.worker().tick();
+  const preview=h.sent[0],before=(await sessions(h)).length,newBot='111222';
+  await h.store.update((state)=>state.telegram.ownerInbox.push({updateId:900,event:{kind:'message',updateId:900,
+    ownerChatId:OWNER,fromId:OWNER,chatType:'private',botId:newBot,messageId:901,date:'2026-11-05T09:01:00Z',text:CONTACT,
+    replyTo:{messageId:preview.result.message_id,fromBotId:newBot,text:preview.text}}}));
+  await new ContactReplyWorker({...h.config,botId:newBot}).tick();
+  assert.equal((await sessions(h)).length,before);assert.equal(h.batches.length,0);assert.equal(h.sent.length,1);
+});
+
+test('reused update IDs from a different bot cannot overwrite an old session or revive its pending private outbox',async(t)=>{
+  const h=await fixture(t,{existing:true});h.controls.sendFail=true;await h.reply();await h.worker().tick();
+  const old=(await sessions(h))[0],newBot='111222',newReview=hash([ROW_KEY,'another_review']);
+  const notification={type:'contact_review_required',jobId:newReview.slice(0,24),organization:'ООО Новый обзор',code:'contact_source_ambiguous'};
+  await h.store.update((state)=>{
+    state.contacts.reviews[newReview]={id:newReview,rowKey:ROW_KEY,status:'review',inn:INN,organization:'ООО Новый обзор'};
+    state.runtime.notifications.new={event:notification,status:'sent',destinationHash:hash(OWNER)};
+    state.telegram.ownerInbox.push({updateId:old.sourceUpdateId,event:{kind:'message',updateId:old.sourceUpdateId,
+      ownerChatId:OWNER,fromId:OWNER,chatType:'private',botId:newBot,messageId:902,date:'2026-11-05T09:01:00Z',
+      text:'Имя: Мария Петрова\nТелефон: +79990000002',replyTo:{messageId:88888,fromBotId:newBot,text:renderNotification(notification)}}});
+  });
+  const sent=[];const telegram={async call(method,params){
+    assert.equal(method,'sendMessage');sent.push(params);
+    return {message_id:9999,chat:{id:Number(OWNER),type:'private'},from:{id:Number(newBot),is_bot:true}};
+  }};
+  h.advance(30_001);await new ContactReplyWorker({...h.config,botId:newBot,telegram}).tick();
+  const saved=await sessions(h);assert.equal(saved.length,2);assert.equal(saved.find((session)=>session.id===old.id).botId,BOT);
+  assert.equal(saved.find((session)=>session.botId===newBot).reviewId,newReview);
+  assert.equal(sent.length,1);assert.match(sent[0].text,/Мария Петрова/u);assert.doesNotMatch(sent[0].text,/Анна/u);
+  assert.equal(h.batches.length,0);
+});

@@ -53,6 +53,7 @@ export class ContactReplyWorker{
     this.busy=false;
   }
   logCode(code){try{this.log({at:stamp(this.now),type:'contact_reply_error',code});}catch{}}
+  scoped(session){return session?.ownerChatId===this.ownerChatId&&session?.botId===this.botId;}
   authenticated(event){
     return event&&['message','callback'].includes(event.kind)&&event.chatType==='private'
       &&String(event.ownerChatId)===this.ownerChatId&&String(event.fromId)===this.ownerChatId
@@ -66,7 +67,7 @@ export class ContactReplyWorker{
   async consume(entry){
     const event=entry.event;let answer;
     const outcome=await this.store.update((state)=>{
-      const replies=initialize(state);const key=String(entry.updateId);
+      const replies=initialize(state);const key=`${this.botId}:${this.ownerChatId}:${entry.updateId}`;
       const finish=(status)=>{
         replies.processed[key]??={status,at:stamp(this.now)};
         state.telegram.ownerInbox=state.telegram.ownerInbox.filter((item)=>item.updateId!==entry.updateId);
@@ -78,7 +79,7 @@ export class ContactReplyWorker{
       if(event.kind==='callback'){
         const match=String(event.data??'').match(/^cr:([a-f0-9]{32}):(replace|cancel|row:([1-9]\d{0,5}))$/u);
         const session=match&&replies.sessions[match[1]];
-        if(!session||session.ownerChatId!==this.ownerChatId||event.replyTo?.fromBotId!==this.botId
+        if(!this.scoped(session)||event.replyTo?.fromBotId!==this.botId
           ||replies.messageIndex[String(event.replyTo.messageId)]!==session.id){answer='Это действие уже недоступно.';return finish('ignored');}
         const review=state.contacts?.reviews?.[session.reviewId];
         if(review?.manualReplySession!==session.id||!active.has(session.status)){answer='Уже обработано.';return finish('ignored');}
@@ -97,15 +98,17 @@ export class ContactReplyWorker{
       }
       let previous;
       if(event.replyTo?.fromBotId===this.botId)previous=replies.sessions[replies.messageIndex[String(event.replyTo.messageId)]];
+      if(previous&&!this.scoped(previous))return finish('ignored');
       const reviewId=previous?.reviewId??findContactReview(state,event);
       const review=reviewId&&state.contacts?.reviews?.[reviewId];
       if(!review||!/^[a-f0-9]{64}$/u.test(reviewId)||review.status==='resolved')return finish('ignored');
       if(previous?.status==='planned'){return finish('ignored');}
       const assigned=review.manualReplySession&&replies.sessions[review.manualReplySession];
+      if(assigned&&!this.scoped(assigned))return finish('ignored');
       if(assigned?.status==='planned')return finish('ignored');
       const parsed=parseOwnerContactReply(event);
-      const id=hash([this.ownerChatId,entry.updateId]).slice(0,32);
-      const session={id,reviewId,ownerChatId:this.ownerChatId,sourceMessageId:event.messageId,sourceUpdateId:entry.updateId,
+      const id=hash([this.botId,this.ownerChatId,entry.updateId]).slice(0,32);
+      const session={id,reviewId,ownerChatId:this.ownerChatId,botId:this.botId,sourceMessageId:event.messageId,sourceUpdateId:entry.updateId,
         status:parsed.status==='contact'?'preparing':'awaiting_contact',createdAt:at,updatedAt:at,
         ...(parsed.status==='contact'?{contact:structuredClone(parsed.contact),...(parsed.rowNumber?{rowNumber:parsed.rowNumber,explicitRow:parsed.rowNumber}:{})}:{})};
       if(assigned&&active.has(assigned.status)){
@@ -121,14 +124,14 @@ export class ContactReplyWorker{
   }
   async stale(id,reason){
     return this.store.update((state)=>{
-      const session=initialize(state).sessions[id];if(!session||!active.has(session.status))return;
+      const session=initialize(state).sessions[id];if(!this.scoped(session)||!active.has(session.status))return;
       session.status='stale';session.reason=terminal.has(reason)?reason:'manual_contact_plan_stale';session.updatedAt=stamp(this.now);
       enqueue(state,session,'stale','Данные строки изменились или ячейка защищена. Я ничего не заменял повторно. Ответь на это сообщение с именем и телефоном — я подготовлю новую проверку.',stamp(this.now));
     });
   }
   async prepare(id){
     const state=await this.store.read();const session=state.contactReplies?.sessions?.[id];
-    if(session?.status!=='preparing')return;
+    if(!this.scoped(session)||session.status!=='preparing')return;
     const review=state.contacts?.reviews?.[session.reviewId];
     if(!review||review.status==='resolved'||review.manualReplySession!==id)return;
     const context=await this.google.context();
@@ -140,7 +143,7 @@ export class ContactReplyWorker{
     if(!row){
       const choices=rows.map((item)=>item.rowNumber).sort((a,b)=>a-b);
       return this.store.update((current)=>{
-        const saved=initialize(current).sessions[id];if(saved?.status!=='preparing')return;
+        const saved=initialize(current).sessions[id];if(!this.scoped(saved)||saved.status!=='preparing')return;
         saved.status='selecting_row';saved.rowChoices=choices;saved.updatedAt=stamp(this.now);
         const shown=choices.slice(0,20);
         enqueue(current,saved,'choose_row',`Для этой лицензии найдены строки: ${shown.join(', ')}${choices.length>shown.length?' и другие':''}. Выбери строку для контакта.${choices.length>shown.length?' Другую строку укажи в новом ответе вместе с контактом: Строка: номер.':''}`,stamp(this.now),
@@ -154,7 +157,7 @@ export class ContactReplyWorker{
     catch(error){if(terminal.has(error.code))return this.stale(id,error.code);throw error;}
     await this.store.update((current)=>{
       const saved=initialize(current).sessions[id];const target=current.contacts?.reviews?.[session.reviewId];
-      if(saved?.status!=='preparing'||target?.manualReplySession!==id||target.status==='resolved')return;
+      if(!this.scoped(saved)||saved.status!=='preparing'||target?.manualReplySession!==id||target.status==='resolved')return;
       Object.assign(saved,{plan:structuredClone(plan),status:plan.needsConfirmation?'awaiting_replace':'planned',confirmed:false,updatedAt:stamp(this.now)});
       if(plan.needsConfirmation)enqueue(current,saved,'preview',preview(saved),stamp(this.now),[[
         {text:'Заменить',callback_data:`cr:${id}:replace`},{text:'Отмена',callback_data:`cr:${id}:cancel`}]]);
@@ -162,7 +165,8 @@ export class ContactReplyWorker{
   }
   async acknowledge(id,raw){
     return this.store.update((state)=>{
-      const session=initialize(state).sessions[id];if(session?.status==='done')return false;
+      const session=initialize(state).sessions[id];if(!this.scoped(session))throw failure('contact_reply_scope_mismatch');
+      if(session.status==='done')return false;
       if(session?.status!=='planned'||!session.plan)throw failure('manual_contact_receipt_invalid');
       const receipt=receiptFor(session.plan,raw);const review=state.contacts?.reviews?.[session.reviewId];
       if(review?.manualReplySession!==id)throw failure('manual_contact_receipt_invalid');
@@ -175,7 +179,7 @@ export class ContactReplyWorker{
     });
   }
   async apply(id){
-    let session=(await this.store.read()).contactReplies?.sessions?.[id];if(session?.status!=='planned')return false;
+    let session=(await this.store.read()).contactReplies?.sessions?.[id];if(!this.scoped(session)||session.status!=='planned')return false;
     try{return await this.acknowledge(id,await this.verifyPlan(this.google,session.plan));}
     catch(error){
       if(terminal.has(error.code)||terminal.has(error.reason))return this.stale(id,error.reason??error.code);
@@ -183,22 +187,25 @@ export class ContactReplyWorker{
     }
     const allowed=await this.store.update((state)=>{
       const current=initialize(state).sessions[id];const review=current&&state.contacts?.reviews?.[current.reviewId];
-      if(current?.status!=='planned'||review?.manualReplySession!==id||review.status==='resolved')return false;
+      if(!this.scoped(current)||current.status!=='planned'||review?.manualReplySession!==id||review.status==='resolved')return false;
       if(current.plan.needsConfirmation&&!current.confirmed)return false;
       current.writeAttempted=true;current.lastWriteAttemptAt=stamp(this.now);return true;
     });
     if(!allowed)return false;
     session=(await this.store.read()).contactReplies.sessions[id];
+    if(!this.scoped(session)||session.status!=='planned')return false;
     try{return await this.acknowledge(id,await this.applyPlan(this.google,session.plan,{confirmed:session.confirmed===true}));}
     catch(error){if(terminal.has(error.code))return this.stale(id,error.code);throw error;}
   }
   async flushOutbox(){
     let sent=0;
-    const items=Object.values((await this.store.read()).contactReplies?.outbox??{}).filter((entry)=>entry.status==='pending'
-      ||entry.status==='sending'&&Date.parse(entry.leaseUntil)<=+new Date(this.now())).slice(0,10);
+    const snapshot=await this.store.read();
+    const items=Object.values(snapshot.contactReplies?.outbox??{}).filter((entry)=>this.scoped(snapshot.contactReplies?.sessions?.[entry.sessionId])
+      &&(entry.status==='pending'||entry.status==='sending'&&Date.parse(entry.leaseUntil)<=+new Date(this.now()))).slice(0,10);
     for(const item of items){
       const claimed=await this.store.update((state)=>{
-        const current=initialize(state).outbox[item.id];
+        const replies=initialize(state);const current=replies.outbox[item.id];
+        if(!this.scoped(replies.sessions[current?.sessionId]))return false;
         if(!current||!['pending','sending'].includes(current.status)
           ||current.status==='sending'&&Date.parse(current.leaseUntil)>+new Date(this.now()))return false;
         current.status='sending';current.attempts++;current.leaseUntil=new Date(+new Date(this.now())+30_000).toISOString();return true;
@@ -212,7 +219,9 @@ export class ContactReplyWorker{
           ||result.from?.is_bot!==true||String(result.from.id)!==this.botId)throw failure('contact_reply_delivery_unverified');
         await this.store.update((state)=>{
           const replies=initialize(state);const current=replies.outbox[item.id];
+          if(current?.sessionId!==item.sessionId||!this.scoped(replies.sessions[current.sessionId]))throw failure('contact_reply_scope_mismatch');
           current.status='sent';current.sentAt=stamp(this.now);current.telegramMessageId=Number(result.message_id);
+          current.deliveryOwnerChatId=this.ownerChatId;current.deliveryBotId=this.botId;
           replies.messageIndex[String(result.message_id)]=item.sessionId;
         });sent++;
       }catch{this.logCode('contact_reply_delivery_unavailable');break;}
@@ -225,7 +234,7 @@ export class ContactReplyWorker{
     try{
       const inbox=[...((await this.store.read()).telegram?.ownerInbox??[])].sort((a,b)=>a.updateId-b.updateId).slice(0,100);
       for(const entry of inbox){await this.consume(entry);summary.processed++;}
-      const ids=Object.keys((await this.store.read()).contactReplies?.sessions??{});
+      const ids=Object.values((await this.store.read()).contactReplies?.sessions??{}).filter((session)=>this.scoped(session)).map((session)=>session.id);
       for(const id of ids){
         try{
           const status=(await this.store.read()).contactReplies.sessions[id].status;
