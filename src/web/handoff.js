@@ -1179,7 +1179,7 @@ function setupHandoff(app) {
       if (d && d.handoff_version === 2) {
         if (!submitV2) submitV2 = require('./handoff-submit').createHandoffSubmitter({
           pool, ready: ensureTables, packetService, telegram: bot.telegram, loadReport: getReport,
-          pickChecklist, webappUrl: WEBAPP_URL, clientsChatId: process.env.CLIENTS_CHAT_ID,
+          pickChecklist, webappUrl: WEBAPP_URL,
         });
         return res.json(await submitV2({ body: d, user: req.tgUser, staff: req.staff }));
       }
@@ -1211,26 +1211,13 @@ function setupHandoff(app) {
       var text = caseText(c);
       var reqRow = c.request_id ? (await pool.query('SELECT chat_id, msg_ids, first_id FROM reports WHERE id=$1', [c.request_id])).rows[0] : null;
 
-      // 1) Чат «Заявки по клиенту»: файлы аудитора + карточка
-      var CLIENTS = process.env.CLIENTS_CHAT_ID;
-      if (CLIENTS) {
-        if (audit && audit.msg_ids && audit.msg_ids.length) {
-          try { await copyAuditPacket(bot.telegram, CLIENTS, audit); }
-          catch (e) { console.error('copy to clients chat:', e.message); auditWarnings.push('Не все материалы отчёта доставлены в «Заявки по клиенту». Проверьте комплект.'); }
-        }
-        var opts = { parse_mode: 'HTML' };
-        if (auditVideo) opts.reply_markup = { inline_keyboard: [[{ text: '▶ Видео осмотра', url: auditVideo }]] };
-        if (reqRow && String(reqRow.chat_id) === String(CLIENTS)) opts.reply_to_message_id = Number(reqRow.first_id);
-        var cardMsg = null;
-        try { cardMsg = await bot.telegram.sendMessage(CLIENTS, text, opts); }
-        catch (e) { delete opts.reply_to_message_id; cardMsg = await bot.telegram.sendMessage(CLIENTS, text, opts); }
-        if (reqRow && String(reqRow.chat_id) === String(CLIENTS)) {
-          try { await bot.telegram.editMessageReplyMarkup(CLIENTS, Number(reqRow.first_id), undefined, { inline_keyboard: [[{ text: '✅ Передано: ' + lawyer.name, callback_data: 'noop' }]] }); }
-          catch (e) { /* заявка опубликована другим ботом — кнопку не поменять */ }
-        }
+      // Отмечаем исходную заявку без нового сообщения в общем чате.
+      if (reqRow && String(reqRow.chat_id) === String(process.env.CLIENTS_CHAT_ID)) {
+        try { await bot.telegram.editMessageReplyMarkup(reqRow.chat_id, Number(reqRow.first_id), undefined, { inline_keyboard: [[{ text: '✅ Передано: ' + lawyer.name, callback_data: 'noop' }]] }); }
+        catch (e) { /* заявка опубликована другим ботом — кнопку не поменять */ }
       }
 
-      // 2) Юристу в личку: исходная заявка, файлы аудитора, карточка + кнопка чек-листа
+      // Комплект передачи получает только назначенный юрист в личку.
       if (reqRow && reqRow.msg_ids && reqRow.msg_ids.length) {
         try { await bot.telegram.callApi('copyMessages', { chat_id: lawyer.tg_id, from_chat_id: reqRow.chat_id, message_ids: reqRow.msg_ids.map(Number).sort(function (x, y) { return x - y; }) }); }
         catch (e) { console.error('copy request to lawyer:', e.message); }
@@ -1248,10 +1235,10 @@ function setupHandoff(app) {
         lawyerMsg = await bot.telegram.sendMessage(lawyer.tg_id, '🆕 <b>У вас новый клиент</b>\n\n' + text, { parse_mode: 'HTML', reply_markup: kb });
       } catch (e) {
         console.error('lawyer DM:', e.message);
-        dmWarn = 'Карточка отправлена в чат, но юрист не получил личное сообщение — пусть нажмёт /start в боте.';
+        dmWarn = 'Юрист не получил личную карточку клиента — пусть нажмёт /start в боте. Проверьте доставку полного комплекта.';
       }
 
-      // 3) Выписка ЕГРН: есть — прикладываем юристу и в «Заявки по клиенту», нет — заказываем и доставим, когда будет готова
+      // Выписка ЕГРН: прикладываем юристу либо доставим ему после готовности.
       var egrnNote = '';
       if (d.cad_num) {
         try {

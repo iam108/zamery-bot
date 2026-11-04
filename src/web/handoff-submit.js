@@ -66,12 +66,10 @@ function reportUrl(base,state) {
   if(!['https:','http:'].includes(url.protocol)||url.username||url.password)fail(503,'HANDOFF_CONFIG','Не настроена ссылка на карточку передачи.');
   url.search=new URLSearchParams({view:'report',order_id:String(state.body.order_id),report_src:state.body.report_src,report_id:String(state.body.report_id)}).toString();return url.href;
 }
-function cardOptions(base,c,state,target) {
+function cardOptions(base,c,state) {
   const keyboard=[],report=state.packet.report,url=reportUrl(base,state);
-  if(target.role==='lawyer'){
-    if(c.checklist_key)keyboard.push([{text:'📋 Чек-лист клиента',web_app:{url:new URL('/checklist?case_id='+c.id,base).href}}]);
-    keyboard.push([{text:'Отчёт и материалы',web_app:{url}}]);
-  } // Telegram forbids web_app in groups; the group receives the actual report below.
+  if(c.checklist_key)keyboard.push([{text:'📋 Чек-лист клиента',web_app:{url:new URL('/checklist?case_id='+c.id,base).href}}]);
+  keyboard.push([{text:'Отчёт и материалы',web_app:{url}}]);
   const video=https(report.video_url),archive=https(state.packet.archive_url);
   if(video)keyboard.push([{text:'▶ Видео осмотра',url:video}]);
   if(archive)keyboard.push([{text:'Архив объекта',url:archive}]);
@@ -141,11 +139,7 @@ function createHandoffSubmitter(options={}) {
           const alreadyIncluded=new Set(original.chat_id===source.chat_id?source.message_ids:[]);
           request={id:requestId,...original,first_id:Number(row.first_id)||null,copy_ids:original.message_ids.filter(id=>!alreadyIncluded.has(id))};
         }
-        const clients=options.clientsChatId===undefined?process.env.CLIENTS_CHAT_ID:options.clientsChatId;
-        const recipients=[];
-        if(clients)recipients.push({chat:String(clients),role:'clients'});
-        if(!recipients.some(target=>target.chat===String(lawyer.tg_id)))recipients.push({chat:String(lawyer.tg_id),role:'lawyer'});
-        else recipients.find(target=>target.chat===String(lawyer.tg_id)).role='lawyer';
+        const recipients=[{chat:String(lawyer.tg_id),role:'lawyer'}];
         state={version:2,body:JSON.parse(serialized),fields:d,packet,source,request,manager_name:value(staff?.name),recipients,cards:{},auditCopies:{},requestCopies:{},materials:{confirmed:{},completed:false},egrn:{completed:false,order_started:false},completed:false};
         reportUrl(options.webappUrl||process.env.WEBAPP_URL,state);
         c=(await client.query(`INSERT INTO cases(order_id,lawyer_tg_id,lawyer_name,checklist_key,org,inn,client,phone,address,region,kind,service,priority,comment,audit_text,total,created_by,contacts,request_id,handoff_submit_id,handoff_signature,data)
@@ -155,6 +149,9 @@ function createHandoffSubmitter(options={}) {
         if(!c){c=await getExisting(client,owner,submitId);if(!c)throw new Error('No durable handoff case');state=compatible(c,signature);}
       }
       c.contacts=Array.isArray(c.contacts)?c.contacts:json(c.contacts);if(!Array.isArray(c.contacts))c.contacts=state.fields.contacts;
+      // Older checkpoints include shared chats. Rebuild the destination from
+      // the assigned lawyer on every retry, preserving their file receipts.
+      state.recipients=[{chat:String(positive(c.lawyer_tg_id,'Не удалось определить личный чат юриста.')),role:'lawyer'}];
       const save=async()=>{await client.query("UPDATE cases SET data=jsonb_set(COALESCE(data,'{}'::jsonb),'{_handoff}',$1::jsonb,true) WHERE id=$2",[JSON.stringify(state),c.id]);};
       const send=async(operation,run)=>{
         state.inflight=operation;await save();let result;
@@ -168,7 +165,7 @@ function createHandoffSubmitter(options={}) {
       const tg=telegram(),base=options.webappUrl||process.env.WEBAPP_URL;
       for(const target of state.recipients){
         if(state.cards[target.chat])continue;
-        const sent=await send({type:'card',chat:target.chat},()=>tg.sendMessage(target.chat,cardText(c,state),cardOptions(base,c,state,target)));
+        const sent=await send({type:'card',chat:target.chat},()=>tg.sendMessage(target.chat,cardText(c,state),cardOptions(base,c,state)));
         if(!Number.isSafeInteger(Number(sent?.message_id))||Number(sent.message_id)<1)throw new Error('Missing card receipt');
         state.cards[target.chat]=Number(sent.message_id);state.inflight=null;await save();receiptPending=false;
       }
