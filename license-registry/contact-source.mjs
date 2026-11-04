@@ -206,7 +206,7 @@ export async function prepareContactSource({env=process.env,dataDir,log,poolFact
     const directory=path.join(dataDir,'secrets');await fs.mkdir(directory,{recursive:true,mode:0o700});
     const file=path.join(directory,'contacts-db-url');
     let stored=await loadCredential(file);
-    const bootstrapUrl=env.CONTACTS_BOOTSTRAP_DATABASE_URL;
+    const bootstrapUrl=env.CONTACTS_BOOTSTRAP_DATABASE_URL==='disabled'?null:env.CONTACTS_BOOTSTRAP_DATABASE_URL;
     if(bootstrapUrl){
       const url=connection(bootstrapUrl);
       bootstrapPool=handleIdleErrors(await poolFactory(options(url.url.toString(),true)),log);

@@ -265,3 +265,10 @@ test('idle errors from bootstrap and reader pools are handled without a crash or
   assert.doesNotMatch(JSON.stringify(h.logs),/private-password|Иван|postgresql:/u);
   assert.equal((await source.verify()).ready,true);
 });
+
+test('explicit disabled bootstrap uses only the persisted reader credential',async(t)=>{
+  const h=await harness(t);const first=await h.prepare();await first.close();
+  const before=h.pools.length;h.env.CONTACTS_BOOTSTRAP_DATABASE_URL='disabled';
+  const reader=await h.prepare();assert.equal((await reader.verify()).ready,true);await reader.close();
+  assert.ok(h.pools.slice(before).every((pool)=>pool.reader));
+});
