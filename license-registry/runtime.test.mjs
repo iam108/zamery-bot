@@ -536,3 +536,14 @@ test('private job diagnostics are bounded and expose only safe identifiers, reas
   assert.equal(unsafe.id,null);assert.equal(unsafe.status,'unknown');assert.equal(unsafe.reason,'unknown');
   assert.equal(unsafe.attempts,null);assert.equal(unsafe.nextCheckAt,null);assert.equal(unsafe.apiReceivedAt,null);
 });
+
+test('contact proof includes durable records and reviews without leaking contacts or periodic scheduling',()=>{
+  const state=initialState(CONFIG);
+  state.contacts={records:{one:{status:'done',receipt:{phone:'PRIVATE_PHONE'},notificationPending:true}},
+    reviews:{one:{status:'review',name:'PRIVATE_NAME',notifiedAt:null}},nextSyncAt:NOW};
+  const proof=privateStateProof(state);assert.equal(proof.contactState.done,1);assert.equal(proof.contactState.reviews,1);
+  assert.ok(!JSON.stringify(proof).includes('PRIVATE_PHONE'));assert.ok(!JSON.stringify(proof).includes('PRIVATE_NAME'));
+  state.contacts.nextSyncAt='2099-01-01T00:00:00Z';state.contacts.records.one.notificationPending=false;
+  state.contacts.reviews.one.notifiedAt=NOW;assert.deepEqual(privateStateProof(state),proof);
+  state.contacts.records.one.status='planned';assert.notEqual(privateStateProof(state).sectionHashes.contacts,proof.sectionHashes.contacts);
+});

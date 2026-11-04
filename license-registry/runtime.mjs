@@ -52,6 +52,9 @@ export function privateStateProof(state){
   // Periodic lastIngestAt/startup timestamps are telemetry, not queue content.
   const sections={jobs:state.jobs,sources:state.sources,api:state.api,
     telegram:{offset:state.telegram?.offset??0,inbox:state.telegram?.inbox??[]},cursors:state.cursors??{},journal:state.journal??[]};
+  if(state.contacts)sections.contacts={
+    records:Object.fromEntries(Object.entries(state.contacts.records??{}).map(([key,{notificationPending:_notificationPending,...record}])=>[key,record])),
+    reviews:Object.fromEntries(Object.entries(state.contacts.reviews??{}).map(([key,{notifiedAt:_notifiedAt,...review}])=>[key,review]))};
   const digest=(value)=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
   const safeCount=(value)=>Number.isSafeInteger(value)&&value>=0?value:null;
   const jobs=Object.values(state.jobs);
@@ -65,7 +68,11 @@ export function privateStateProof(state){
   return {sha256:digest(sections),sectionHashes:Object.fromEntries(Object.entries(sections).map(([name,value])=>[name,digest(value)])),
     jobs:Object.keys(state.jobs).length,sources:Object.keys(state.sources).length,counts,
     apiAttemptedCalls:safeCount(state.api.attemptedCalls),telegramOffset:safeCount(state.telegram?.offset??0),pendingInbox:state.telegram?.inbox?.length??0,
-    jobStates,jobStatesTruncated:Math.max(0,jobs.length-jobStates.length),journalEntries:state.journal?.length??0};
+    jobStates,jobStatesTruncated:Math.max(0,jobs.length-jobStates.length),journalEntries:state.journal?.length??0,
+    ...(state.contacts?{contactState:{records:Object.keys(state.contacts.records??{}).length,
+      done:Object.values(state.contacts.records??{}).filter((item)=>item.status==='done').length,
+      planned:Object.values(state.contacts.records??{}).filter((item)=>item.status==='planned').length,
+      reviews:Object.keys(state.contacts.reviews??{}).length}}:{})};
 }
 function editedSourceChanged(existing,message,extraction){
   if(!existing||!message.editDate)return false;

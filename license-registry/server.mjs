@@ -157,11 +157,14 @@ async function run({store,telegram,worker,contacts,config,botId}){
     }
   })();
   const enriching=contacts?(async()=>{
+    let verified=false;
     while(!stopping){
       try{
+        if(!verified){const source=await contacts.sourceFactory();await source.close();health.success('contacts');verified=true;}
         const result=await contacts.tick();
         if(!result?.skipped)health.success('contacts');
       }catch(error){
+        verified=false;
         const code=safeErrorCode(error,'contacts_source_failed',secrets);
         health.failure('contacts',code);await report({type:'contact_source_error',code});
       }

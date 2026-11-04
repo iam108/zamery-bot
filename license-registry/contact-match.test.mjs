@@ -153,3 +153,11 @@ test('incoming client forms accept explicit organization INN and object address 
   assert.equal(parsed.source.inn,INN);assert.equal(parsed.source.address,ADDRESS);
   assert.equal(planContactEnrichment({row:row(),cases:[parsed.source]}).action,'update');
 });
+
+test('explicit legal entity INN question variants remain single-organization inputs',()=>{
+  for(const label of ['ИНН организации / ИП','ИНН организации (при наличии)','ИНН юридического лица']){
+    const text=['Новая форма заполнена','Имя клиента: Иван Иванов','Номер: +79991234567',
+      'Наименование организации: ООО Тест',`${label}: ${INN}`,`Адрес объекта: ${ADDRESS}`].join('\n');
+    assert.equal(parseContactRequest({id:32,text}).status,'ready');
+  }
+});

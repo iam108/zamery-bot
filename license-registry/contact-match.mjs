@@ -75,7 +75,9 @@ export function parseContactRequest(report){
   ]);
   for(const line of body.split(/\r?\n/u)){
     const match=line.match(/^\s*([^:\n]+?)\s*:\s*(.*?)\s*$/u);if(!match)continue;
-    const key=labels.get(text(match[1]).toLowerCase());if(key)fields[key].push(text(match[2]));
+    const label=text(match[1]).toLowerCase();
+    const key=labels.get(label)??(/^инн\s+(?:организации|юридического лица|юрлица|ооо|ип)(?:\s|[/,(]|$)/u.test(label)?'inn':null);
+    if(key)fields[key].push(text(match[2]));
   }
   if(['name','phone','org','inn','address'].some((key)=>fields[key].length!==1||!fields[key][0]))return rejected('contact_request_incomplete_or_ambiguous');
   if(fields.tg.length>1)return rejected('contact_request_incomplete_or_ambiguous');
@@ -84,7 +86,8 @@ export function parseContactRequest(report){
   const allInns=[...new Set((body.match(/(?<!\d)\d{10}(?:\d{2})?(?!\d)/gu)??[]).filter(isValidInn))];
   if(allInns.length!==1||allInns[0]!==inn)return rejected('contact_request_incomplete_or_ambiguous');
   const org=fields.org[0];
-  if(org.length>300||org.length<2||(body.match(/(?<!\p{L})(?:ООО|ПАО|ЗАО|АО|ИП)(?!\p{L})/giu)??[]).length>1)return rejected('contact_request_incomplete_or_ambiguous');
+  const answerText=body.split(/\r?\n/u).map((line)=>line.match(/^\s*[^:\n]+?\s*:\s*(.*?)\s*$/u)?.[1]??line).join('\n');
+  if(org.length>300||org.length<2||(answerText.match(/(?<!\p{L})(?:ООО|ПАО|ЗАО|АО|ИП)(?!\p{L})/giu)??[]).length>1)return rejected('contact_request_incomplete_or_ambiguous');
   const phone=normalizeContactPhone(fields.phone[0]);
   const additionalPhones=(body.match(/(?<!\d)(?:\+7|8)[ ()-]*\d{3}[ ()-]*\d{3}[ ()-]*\d{2}[ ()-]*\d{2}(?!\d)|(?<!\d)\+[1-9](?:[ ()-]*\d){7,14}(?![ ()-]*\d)/gu)??[])
     .map(normalizeContactPhone).filter(Boolean);

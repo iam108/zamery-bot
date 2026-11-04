@@ -177,7 +177,7 @@ async function bootstrap({pool,url,stored,file,chatId}){
     await client.query(`CREATE OR REPLACE VIEW ${SCHEMA}.cases WITH (security_barrier=true) AS SELECT ${selected} FROM public.cases c`);
     const forms=[
       'Новая форма заполнена|Наименование организации[[:space:]]*:',
-      '(^|\n)[[:space:]]*ИНН([[:space:]]+организации)?[[:space:]]*:',
+      '(^|\n)[[:space:]]*ИНН[^:\n]{0,80}:',
       '(^|\n)[[:space:]]*Имя клиента[[:space:]]*:',
       '(^|\n)[[:space:]]*(Номер|Телефон|Номер телефона|Телефон клиента)[[:space:]]*:',
       '(^|\n)[[:space:]]*(Адрес|Адрес лицензирования|Адрес объекта)[[:space:]]*:'
