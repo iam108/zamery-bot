@@ -52,9 +52,11 @@ export function createPollingMonitor({store,report,now=()=>new Date(),log=()=>{}
     const state=await store.read();
     const wasAlerted=active.alerted||Object.values(state.runtime?.notifications??{}).some((item)=>
       item.event?.type==='telegram_error'&&item.event.incidentId===active.id);
+    let recoveryDelivery='quiet';
     if(wasAlerted){
       const result=await report({type:'telegram_recovered',incidentId:active.id});
       if(!accepted(result))return;
+      recoveryDelivery=result.delivery;
     }
     const at=stamp(now);const incidentId=active.id;
     await store.update((current)=>{
@@ -62,7 +64,7 @@ export function createPollingMonitor({store,report,now=()=>new Date(),log=()=>{}
       Object.assign(current.runtime.telegramPolling,{active:null,lastRecoveredAt:at,lastIncidentId:incidentId});
     });
     active=null;
-    log({at,type:'telegram_poll_recovered',incidentId,ownerNotified:wasAlerted});
+    log({at,type:'telegram_poll_recovered',incidentId,ownerAlerted:wasAlerted,recoveryDelivery});
   }
   return {failure,success};
 }
