@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 
-const TYPES = new Set(['write_verified', 'processing_error', 'telegram_error', 'worker_error',
+const TYPES = new Set(['write_verified', 'processing_error', 'telegram_error', 'telegram_recovered', 'worker_error',
   'startup_failed', 'runtime_failed', 'api_blocked', 'review_required', 'runtime_initialized']);
 const COLUMNS = Object.freeze({ E: 'организация', G: 'ИНН', H: 'номер лицензии', I: 'дата выдачи',
   J: 'дата окончания', K: 'вид деятельности', L: 'адрес объекта', P: 'email' });
@@ -97,6 +97,8 @@ const REASONS = Object.freeze({
   processing_failed: 'Обработка события прервана; нужна проверка журнала сервера.',
   worker_tick_failed: 'Обработчик очереди прервался; нужна проверка сервера.',
   telegram_poll_failed: 'Получение сообщений Telegram прервалось.',
+  state_locked: 'Сохранение очереди временно недоступно: файл состояния занят. Обработчик повторит попытку.',
+  telegram_persist_failed: 'Новые сообщения пока не удалось сохранить в очередь. Обработчик повторит попытку.',
   startup_failed: 'Обработчик пока не прошёл проверку запуска.',
   runtime_failed: 'Работа обработчика прервана.',
   unknown_error: 'Нужна проверка состояния обработчика.',
@@ -105,6 +107,12 @@ const digest = (value) => createHash('sha256').update(JSON.stringify(value)).dig
 const stamp = (now) => new Date(now()).toISOString();
 const safeCode = (value) => typeof value === 'string' && Object.hasOwn(REASONS, value) ? value : 'unknown_error';
 const safeJobId = (value) => typeof value === 'string' && /^[a-f0-9]{24}$/u.test(value) ? value : null;
+function safeIncidentId(value) {
+  if (typeof value !== 'string') return null;
+  const normalized = value.toLowerCase();
+  return /^(?:[a-f0-9]{32}|[a-f0-9]{64}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$/u.test(normalized)
+    ? normalized : null;
+}
 function safeOrganization(value) {
   if (typeof value !== 'string') return null;
   const text = value.replace(/[\u0000-\u001f\u007f]/gu, ' ').replace(/\s+/gu, ' ').trim();
@@ -114,14 +122,19 @@ function safeOrganization(value) {
 function normalizeEvent(event) {
   if (!event || !TYPES.has(event.type)) return null;
   if (event.type === 'write_verified' && !['append', 'update'].includes(event.action)) return null;
+  const incidentId = safeIncidentId(event.incidentId);
+  // Recovery is an explicit event from the polling monitor, never inferred
+  // from a routine successful send, flush, or startup notification.
+  if (event.type === 'telegram_recovered' && !incidentId) return null;
   return {
     type: event.type, jobId: safeJobId(event.jobId),
+    ...(incidentId ? { incidentId } : {}),
     ...(event.type === 'write_verified' ? {
       action: event.action,
       columns: [...new Set((Array.isArray(event.cells) ? event.cells : [])
         .filter((value) => typeof value === 'string' && /^[A-Q][1-9]\d{0,7}$/u.test(value))
         .map((value) => value[0]).filter((column) => Object.hasOwn(COLUMNS, column)))].sort(),
-    } : event.type === 'runtime_initialized' ? {} : { code: safeCode(event.code) }),
+    } : ['runtime_initialized', 'telegram_recovered'].includes(event.type) ? {} : { code: safeCode(event.code) }),
     organization: safeOrganization(event.organization),
   };
 }
@@ -132,6 +145,7 @@ function metadata(event, at) {
   return { at, ...identifiers };
 }
 function messageOf(event) {
+  if (event.type === 'telegram_recovered') return 'Получение сообщений Telegram восстановлено. Очередь сохранена.';
   const organization = event.organization ? `Организация: ${event.organization}.` : '';
   const job = event.jobId ? `Событие: ${event.jobId}.` : '';
   if (event.type === 'write_verified') {
@@ -227,9 +241,22 @@ export function createNotifier({ telegram, store, ownerChatId, now = () => new D
     if (!event) return { delivery: 'ignored' };
     const logOnly = !owner || event.type === 'runtime_initialized';
     const fingerprint = digest({ destinationHash, type: event.type, jobId: event.jobId,
-      code: event.code ?? null, action: event.action ?? null });
+      code: event.code ?? null, action: event.action ?? null,
+      // Preserve the pre-incident fingerprint for all existing notifications.
+      ...(event.incidentId ? { incidentId: event.incidentId } : {}) });
     const created = await store.update((state) => {
       state.runtime ??= {}; state.runtime.notifications ??= {};
+      if (event.type === 'telegram_recovered') {
+        // Once recovery is durably queued, an unsent outage notice for this
+        // incident must not appear later as though the outage were still live.
+        for (const item of Object.values(state.runtime.notifications)) {
+          if (item.status === 'pending' && item.destinationHash === destinationHash
+            && item.event?.type === 'telegram_error' && item.event.incidentId === event.incidentId) {
+            item.status = 'superseded'; item.supersededAt = stamp(now);
+            item.supersededBy = fingerprint;
+          }
+        }
+      }
       if (state.runtime.notifications[fingerprint]) return false;
       state.runtime.notifications[fingerprint] = { status: logOnly ? 'logged' : 'pending',
         destinationHash, event, createdAt: stamp(now), attempts: 0 };
@@ -239,6 +266,7 @@ export function createNotifier({ telegram, store, ownerChatId, now = () => new D
     if (logOnly) return { delivery: created ? 'log_only' : 'duplicate', fingerprint };
     await flush();
     const entry = (await store.read()).runtime?.notifications?.[fingerprint];
+    if (entry?.status === 'superseded') return { delivery: 'superseded', fingerprint };
     return { delivery: !created && entry?.status === 'sent' ? 'duplicate' : entry?.status === 'sent' ? 'sent' : 'pending', fingerprint };
   }
   report.verifyOwner = verifyOwner;

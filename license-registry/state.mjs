@@ -12,6 +12,19 @@ const iso = (value = new Date()) => new Date(value).toISOString();
 const clone = (value) => JSON.parse(JSON.stringify(value));
 export const hash = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const reclaimers = new Map();
+const writers = new Map();
+async function serializeWriter(file, operation) {
+  const previous = writers.get(file) ?? Promise.resolve();
+  let unlock;
+  const pending = new Promise((resolve) => { unlock = resolve; });
+  writers.set(file, pending);
+  await previous;
+  try { return await operation(); }
+  finally {
+    unlock();
+    if (writers.get(file) === pending) writers.delete(file);
+  }
+}
 const optionalRead = async (file) => fs.readFile(file, 'utf8').then((value) => value.trim()).catch(() => null);
 async function processStart(pid) {
   const stat = await optionalRead(`/proc/${pid}/stat`);
@@ -59,6 +72,13 @@ export function createStore(statePath, { lockTimeoutMs = 5000, staleLockMs = 300
       try {
         const handle = await fs.open(lockPath, 'wx', 0o600);
         try { await handle.writeFile(JSON.stringify({ token, pid: process.pid, ...currentIdentity, createdAt: new Date().toISOString() })); }
+        catch (error) {
+          // Only remove the inode opened exclusively by this call. A failed
+          // metadata write must not leave a live-PID lock owned by nobody.
+          try { if (sameFile(await handle.stat(), await fs.stat(lockPath))) await fs.unlink(lockPath); }
+          catch {}
+          throw error;
+        }
         finally { await handle.close(); }
         return async () => {
           try {
@@ -69,7 +89,7 @@ export function createStore(statePath, { lockTimeoutMs = 5000, staleLockMs = 300
       } catch (error) {
         if (error.code !== 'EEXIST') throw error;
         if (await reclaim(currentIdentity)) continue;
-        if (Date.now() >= until) throw new Error('State is locked by another run; no work was performed');
+        if (Date.now() >= until) throw Object.assign(new Error('State is locked by another run; no work was performed'), { code: 'state_locked' });
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
     }
@@ -120,23 +140,27 @@ export function createStore(statePath, { lockTimeoutMs = 5000, staleLockMs = 300
     }
   }
   async function update(mutator) {
-    const release = await lock();
-    let temporary;
-    try {
-      const state = clone(await read());
-      const result = await mutator(state);
-      validateState(state);
-      temporary = `${absolute}.${process.pid}.${randomUUID()}.tmp`;
-      const handle = await fs.open(temporary, 'wx', 0o600);
-      try { await handle.writeFile(`${JSON.stringify(state, null, 2)}\n`); await handle.sync(); }
-      finally { await handle.close(); }
-      await fs.rename(temporary, absolute);
-      await fs.chmod(absolute, 0o600);
-      return result;
-    } finally {
-      if (temporary) await fs.unlink(temporary).catch(() => {});
-      await release();
-    }
+    // Same-process callers, including different store instances, queue before
+    // their filesystem-lock timeout starts. External ownership is still checked.
+    return serializeWriter(absolute, async () => {
+      const release = await lock();
+      let temporary;
+      try {
+        const state = clone(await read());
+        const result = await mutator(state);
+        validateState(state);
+        temporary = `${absolute}.${process.pid}.${randomUUID()}.tmp`;
+        const handle = await fs.open(temporary, 'wx', 0o600);
+        try { await handle.writeFile(`${JSON.stringify(state, null, 2)}\n`); await handle.sync(); }
+        finally { await handle.close(); }
+        await fs.rename(temporary, absolute);
+        await fs.chmod(absolute, 0o600);
+        return result;
+      } finally {
+        if (temporary) await fs.unlink(temporary).catch(() => {});
+        await release();
+      }
+    });
   }
   return { path: absolute, read, update };
 }

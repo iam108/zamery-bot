@@ -109,6 +109,103 @@ test('new jobs with the same review reason remain separate actionable notificati
   assert.equal((await records(f.store)).length, 2);
 });
 
+test('separate Telegram incidents alert again and each explicit recovery is delivered once across restarts', async (t) => {
+  const f = await fixture(t);
+  const incidentA = 'E0F7C3B1-5EA9-4BCD-A100-000000000001';
+  const incidentB = 'b'.repeat(64);
+  const error = { type: 'telegram_error', code: 'telegram_persist_failed' };
+  assert.equal((await f.report({ ...error, incidentId: incidentA })).delivery, 'sent');
+  assert.equal((await f.report({ ...error, incidentId: incidentA.toLowerCase() })).delivery, 'duplicate');
+  assert.equal((await f.report({ type: 'telegram_recovered', incidentId: incidentA })).delivery, 'sent');
+  const restarted = createNotifier(f.config);
+  assert.equal((await restarted({ type: 'telegram_recovered', incidentId: incidentA.toLowerCase() })).delivery, 'duplicate');
+  assert.equal((await restarted({ ...error, incidentId: incidentB })).delivery, 'sent');
+  assert.equal((await restarted({ type: 'telegram_recovered', incidentId: incidentB })).delivery, 'sent');
+  const sent = f.calls.filter((call) => call.method === 'sendMessage');
+  assert.equal(sent.length, 4);
+  assert.ok(sent.every((call) => call.params.chat_id === owner));
+  const recovered = sent.filter((call) => call.params.text.includes('восстановлено'));
+  assert.equal(recovered.length, 2);
+  assert.ok(recovered.every((call) => call.params.text === 'Получение сообщений Telegram восстановлено. Очередь сохранена.'));
+  assert.deepEqual((await records(f.store)).map((item) => item.event.incidentId),
+    [incidentA.toLowerCase(), incidentA.toLowerCase(), incidentB, incidentB]);
+  assert.ok((await records(f.store)).filter((item) => item.event.type === 'telegram_error')
+    .every((item) => item.status === 'sent' && !item.supersededAt));
+});
+
+test('an explicit recovery supersedes its unsent outage notice before transport recovery can deliver stale error text', async (t) => {
+  let unavailable = true;
+  const delivered = [];
+  const f = await fixture(t, { call: async (method, params) => {
+    if (method === 'getChat') return { id: Number(owner), type: 'private' };
+    if (unavailable) throw Object.assign(new Error('temporary transport failure'), { code: 'network_error' });
+    delivered.push(params.text);
+    return { message_id: 77, chat: { id: Number(owner), type: 'private' } };
+  } });
+  const incidentId = 'a'.repeat(32);
+  const outage = { type: 'telegram_error', code: 'telegram_persist_failed', incidentId };
+  assert.equal((await f.report(outage)).delivery, 'pending');
+  unavailable = false;
+  assert.equal((await f.report({ type: 'telegram_recovered', incidentId })).delivery, 'sent');
+  const entries = await records(f.store);
+  assert.equal(entries[0].status, 'superseded');assert.ok(entries[0].supersededAt);
+  assert.equal(entries[0].attempts, 1);assert.equal(entries[1].status, 'sent');
+  f.advance(60_000);
+  await createNotifier(f.config).flush();
+  assert.equal((await f.report(outage)).delivery, 'superseded');
+  assert.deepEqual(delivered, ['Получение сообщений Telegram восстановлено. Очередь сохранена.']);
+});
+
+test('recovery supersedes only its own pending Telegram incident and destination', async (t) => {
+  let unavailable = true;
+  const f = await fixture(t, { call: async (method) => {
+    if (method === 'getChat') return { id: Number(owner), type: 'private' };
+    if (unavailable) throw Object.assign(new Error('temporary transport failure'), { code: 'network_error' });
+    return { message_id: 77, chat: { id: Number(owner), type: 'private' } };
+  } });
+  const incidentA = 'a'.repeat(32);const incidentB = 'b'.repeat(32);
+  await f.report({ type: 'telegram_error', code: 'timeout', incidentId: incidentA });
+  await f.report({ type: 'telegram_error', code: 'timeout', incidentId: incidentB });
+  await f.report({ type: 'review_required', code: 'organization_not_identified', jobId: jobA, incidentId: incidentA });
+  await f.store.update((state) => {
+    state.runtime.notifications['other-destination'] = { status: 'pending', destinationHash: 'another-owner',
+      event: { type: 'telegram_error', code: 'timeout', incidentId: incidentA } };
+  });
+  unavailable = false;
+  await f.report({ type: 'telegram_recovered', incidentId: incidentA });
+  const entries = await records(f.store);
+  assert.equal(entries[0].status, 'superseded');assert.equal(entries[1].status, 'pending');
+  assert.equal(entries[2].status, 'pending');assert.equal(entries[3].status, 'pending');
+  f.advance(60_000);await f.report.flush();
+  const after = await records(f.store);
+  assert.equal(after[0].status, 'superseded');assert.equal(after[1].status, 'sent');
+  assert.equal(after[2].status, 'sent');assert.equal(after[3].status, 'pending');
+});
+
+test('queue persistence errors explain queue saving rather than a Telegram provider outage', async (t) => {
+  const f = await fixture(t);
+  await f.report({ type: 'telegram_error', code: 'state_locked', incidentId: 'a'.repeat(32) });
+  await f.report({ type: 'telegram_error', code: 'telegram_persist_failed', incidentId: 'b'.repeat(32) });
+  const text = f.calls.filter((call) => call.method === 'sendMessage').map((call) => call.params.text);
+  assert.match(text[0], /Сохранение очереди.*файл состояния занят/u);
+  assert.match(text[1], /сообщения пока не удалось сохранить в очередь/u);
+  assert.ok(text.every((value) => value.includes('Обработчик повторит попытку.')));
+  assert.ok(text.every((value) => !value.includes('Получение сообщений Telegram прервалось')));
+});
+
+test('routine success never fabricates recovery and malformed incident identifiers are not transmitted', async (t) => {
+  const f = await fixture(t);
+  for (const incidentId of [undefined, '', 'https://provider/?key=private', 'k'.repeat(40), 'a'.repeat(40), 42]) {
+    assert.equal((await f.report({ type: 'telegram_recovered', incidentId })).delivery, 'ignored');
+  }
+  await f.report({ type: 'telegram_error', code: 'timeout' });
+  await f.report.flush();
+  await f.report({ type: 'runtime_initialized' });
+  assert.equal(f.calls.filter((call) => call.method === 'sendMessage').length, 1);
+  assert.ok(!JSON.stringify(f.calls).includes('восстановлено'));
+  assert.ok(!JSON.stringify(f.logs).includes('private'));
+});
+
 test('failed send stays pending and is retried after restart even when completed job is never reported again', async (t) => {
   let failed = false;
   const f = await fixture(t, { call: async (method) => {

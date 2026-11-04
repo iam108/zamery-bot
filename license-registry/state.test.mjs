@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { initialState, createStore, addJob, dueJobs, reserveFetch, recordResponse,
@@ -50,12 +51,80 @@ test('concurrent writers serialize and do not lose jobs or journal entries', asy
   const state = await store.read(); assert.equal(Object.keys(state.jobs).length, 16); assert.equal(state.journal.length, 16);
 });
 
+test('same-path store instances queue behind a slow own writer beyond their filesystem lock timeout', async (t) => {
+  const dir = await temporary(t); const file = path.join(dir, 'state.json');
+  const first = createStore(file, { lockTimeoutMs: 5 });
+  const relative = createStore(path.relative(process.cwd(), file), { lockTimeoutMs: 5 });
+  const third = createStore(path.join(dir, 'unused', '..', 'state.json'), { lockTimeoutMs: 5 });
+  let entered; let resume;
+  const active = new Promise((resolve) => { entered = resolve; });
+  const held = new Promise((resolve) => { resume = resolve; });
+  const order = [];
+  const writing = first.update(async (state) => {
+    order.push('first-enter'); entered(); await held;
+    addJob(state, job('first'), { now: NOW }); order.push('first-exit');
+  });
+  await active;
+  const queued = Promise.allSettled([writing,
+    relative.update((state) => { order.push('second'); addJob(state, job('second'), { now: NOW }); }),
+    third.update((state) => { order.push('third'); addJob(state, job('third'), { now: NOW }); })]);
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(order, ['first-enter']);
+  } finally { resume(); }
+  const results = await queued;
+  assert.ok(results.every((result) => result.status === 'fulfilled'));
+  assert.deepEqual(order, ['first-enter', 'first-exit', 'second', 'third']);
+  const state = await first.read();
+  assert.deepEqual(Object.keys(state.jobs), ['first', 'second', 'third']); assert.equal(state.journal.length, 3);
+  assert.deepEqual(await fs.readdir(dir), ['state.json']);
+});
+
+test('a failed own mutator releases the in-process queue for the next store instance', async (t) => {
+  const dir = await temporary(t); const file = path.join(dir, 'state.json');
+  let entered; let resume;
+  const active = new Promise((resolve) => { entered = resolve; });
+  const held = new Promise((resolve) => { resume = resolve; });
+  const first = createStore(file, { lockTimeoutMs: 5 }).update(async (state) => {
+    addJob(state, job('discarded'), { now: NOW }); entered(); await held; throw new Error('mutator_failed');
+  });
+  await active;
+  const results = Promise.allSettled([first, createStore(file, { lockTimeoutMs: 5 }).update((state) => addJob(state, job('retained'), { now: NOW }))]);
+  resume();
+  const settled = await results;
+  assert.equal(settled[0].status, 'rejected'); assert.equal(settled[0].reason.message, 'mutator_failed');
+  assert.equal(settled[1].status, 'fulfilled');
+  const state = await createStore(file).read();
+  assert.deepEqual(Object.keys(state.jobs), ['retained']); assert.equal(state.journal.length, 1);
+  assert.deepEqual(await fs.readdir(dir), ['state.json']);
+});
+
 test('a live lock refuses another run without rewriting the state', async (t) => {
   const dir = await temporary(t); const file = path.join(dir, 'state.json');
   const store = createStore(file, { lockTimeoutMs: 30 });
   await fs.writeFile(`${file}.lock`, JSON.stringify({ pid: process.pid, token: 'another-run' }));
-  await assert.rejects(store.update(() => {}), /locked/u);
+  await assert.rejects(store.update(() => {}), (error) => error.code === 'state_locked' && /locked/u.test(error.message)
+    && !error.message.includes(file) && !error.message.includes('another-run'));
   await assert.rejects(fs.stat(file), { code: 'ENOENT' });
+});
+
+test('a different live process keeps its filesystem lock and returns a safe state_locked error', async (t) => {
+  const dir = await temporary(t); const file = path.join(dir, 'state.json');
+  const store = createStore(file, { lockTimeoutMs: 5, staleLockMs: 1, singleReplica: true });
+  await store.update((state) => addJob(state, job('preserved'), { now: NOW }));
+  const before = await fs.readFile(file, 'utf8');
+  const code = `const fs=require('node:fs'),os=require('node:os');fs.writeFileSync(process.argv[1]+'.lock',JSON.stringify({pid:process.pid,hostname:os.hostname(),token:'external-active'}));process.stdout.write('locked');setInterval(()=>{},1000);`;
+  const child = spawn(process.execPath, ['-e', code, file], { stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    await once(child.stdout, 'data');
+    let invoked = false;
+    await assert.rejects(store.update(() => { invoked = true; }), { code: 'state_locked' });
+    assert.equal(invoked, false); assert.equal(await fs.readFile(file, 'utf8'), before);
+    const owner = JSON.parse(await fs.readFile(`${file}.lock`, 'utf8'));
+    assert.equal(owner.pid, child.pid); assert.equal(owner.token, 'external-active');
+  } finally {
+    const ended = once(child, 'exit'); child.kill(); await ended;
+  }
 });
 
 test('an old live lock is never reclaimed even when single-replica recovery is enabled', async (t) => {
@@ -66,6 +135,43 @@ test('an old live lock is never reclaimed even when single-replica recovery is e
   await fs.utimes(lockFile, new Date(BEFORE), new Date(BEFORE));
   const store = createStore(file, { lockTimeoutMs: 30, staleLockMs: 1, singleReplica: true });
   await assert.rejects(store.update(() => {}), /locked/u);
+  assert.deepEqual(JSON.parse(await fs.readFile(lockFile, 'utf8')), owner);
+  await assert.rejects(fs.stat(file), { code: 'ENOENT' });
+});
+
+test('failed creation of lock metadata removes only its own lock and allows a later writer', async (t) => {
+  const dir = await temporary(t); const file = path.join(dir, 'state.json');
+  const open = fs.open; let injected = false;
+  fs.open = async (name, ...args) => {
+    const handle = await open(name, ...args);
+    if (name === `${file}.lock` && !injected) {
+      injected = true;
+      return { stat: handle.stat.bind(handle), close: handle.close.bind(handle),
+        writeFile: async () => { await handle.writeFile('{'); throw Object.assign(new Error('fixture_io_failure'), { code: 'EIO' }); } };
+    }
+    return handle;
+  };
+  try { await assert.rejects(createStore(file).update(() => {}), { code: 'EIO' }); }
+  finally { fs.open = open; }
+  await assert.rejects(fs.stat(`${file}.lock`), { code: 'ENOENT' });
+  await createStore(file, { lockTimeoutMs: 5 }).update((state) => addJob(state, job(), { now: NOW }));
+  assert.equal(Object.keys((await createStore(file).read()).jobs).length, 1);
+});
+
+test('failed lock creation never unlinks a replacement lock owned by someone else', async (t) => {
+  const dir = await temporary(t); const file = path.join(dir, 'state.json'); const lockFile = `${file}.lock`;
+  const owner = { pid: process.pid, token: 'replacement-owner' }; const open = fs.open;
+  fs.open = async (name, ...args) => {
+    const handle = await open(name, ...args);
+    if (name === lockFile) return { stat: handle.stat.bind(handle), close: handle.close.bind(handle),
+      writeFile: async () => {
+        await fs.unlink(lockFile); await fs.writeFile(lockFile, JSON.stringify(owner));
+        throw Object.assign(new Error('fixture_io_failure'), { code: 'EIO' });
+      } };
+    return handle;
+  };
+  try { await assert.rejects(createStore(file).update(() => {}), { code: 'EIO' }); }
+  finally { fs.open = open; }
   assert.deepEqual(JSON.parse(await fs.readFile(lockFile, 'utf8')), owner);
   await assert.rejects(fs.stat(file), { code: 'ENOENT' });
 });

@@ -9,6 +9,7 @@ import {LicenseWorker,FsrarClient,prepareSecrets,initializeState,classifyApiFail
 import {createReadiness,createHealthHandler,safeErrorCode,validateFsrarStat,retryStartup} from './health.mjs';
 import {createNotifier} from './notifier.mjs';
 import {runReadOnlyAcceptance} from './acceptance.mjs';
+import {createPollingMonitor,pollOnce,safeNotification} from './polling.mjs';
 
 const dir=path.dirname(fileURLToPath(import.meta.url));
 const env=process.env;
@@ -27,7 +28,7 @@ async function report(event){
     try{console.log(JSON.stringify({at:clean.at,type:'state_proof',trigger:clean.type,...privateStateProof(await proofStore.read())}));}
     catch{console.log(JSON.stringify({at:clean.at,type:'state_proof_error',trigger:clean.type,code:'state_read_failed'}));}
   }
-  if(notificationReporter)return notificationReporter(clean);
+  if(notificationReporter)return safeNotification(notificationReporter,{log:(event)=>console.log(JSON.stringify(event))})(clean);
   const fingerprint=JSON.stringify({...clean,at:undefined});
   if(Date.now()-(seenReports.get(fingerprint)||0)<3600000)return;
   seenReports.set(fingerprint,Date.now());
@@ -98,20 +99,15 @@ async function initialize(){
 }
 
 async function run({store,telegram,worker,config,botId}){
+  const log=(event)=>console.log(JSON.stringify({at:new Date().toISOString(),...event}));
+  const monitor=createPollingMonitor({store,report,log});
   const polling=(async()=>{
     while(!stopping){
-      try{
-        const state=await store.read();
-        const updates=await telegram.getUpdates({offset:state.telegram?.offset??0,signal:controller.signal});
-        await worker.persistUpdates(updates,(update)=>convertUpdate(update,{targetChatId:config.targetChatId,sourceChatId:config.sourceChatId,botId}));
-        health.success('telegram');
-      }catch(error){
-        if(stopping)break;
-        const code=safeErrorCode(error,'telegram_poll_failed',secrets);
-        health.failure('telegram',code);
-        await report({type:'telegram_error',code});
-        await sleep(Math.min(60000,Math.max(5000,(error.retryAfter||5)*1000)),undefined,{signal:controller.signal}).catch(()=>{});
-      }
+      const result=await pollOnce({store,telegram,monitor,health,signal:controller.signal,secrets,log,
+        persist:(updates)=>worker.persistUpdates(updates,(update)=>convertUpdate(update,
+          {targetChatId:config.targetChatId,sourceChatId:config.sourceChatId,botId}))});
+      if(result.stopped)break;
+      if(!result.ok)await sleep(result.retryMs,undefined,{signal:controller.signal}).catch(()=>{});
     }
   })();
   const processing=(async()=>{
@@ -131,7 +127,7 @@ async function run({store,telegram,worker,config,botId}){
         health.failure('worker',code);await report({type:'worker_error',code});
       }
       // A notification retry must continue after the licensing job is already done.
-      await notificationReporter?.flush();
+      if(notificationReporter)await safeNotification(()=>notificationReporter.flush(),{log})();
       await sleep(60000,undefined,{signal:controller.signal}).catch(()=>{});
     }
   })();
