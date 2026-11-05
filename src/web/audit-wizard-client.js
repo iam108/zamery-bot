@@ -852,8 +852,9 @@
         status('Оригиналы сохранены на сервере · ' + timeLabel(), 'success'); if (!options.noRender) render(); return saved;
       } catch (error) {
         state.pendingUploads = Math.max(0, state.pendingUploads - remaining);
-        status('Файлы сохранены не полностью · ' + error.message, 'warning');
+        status('Файлы сохранены не полностью' + (saved.length ? ' · сохранено ' + saved.length + ' из ' + files.length : '') + ' · ' + error.message, 'warning');
         if (error.status === 409) { state.conflict = true; $('#conflict-panel').hidden = false; }
+        if (saved.length && !options.noRender) render();
         throw error;
       }
     });

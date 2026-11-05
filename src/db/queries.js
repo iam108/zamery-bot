@@ -178,7 +178,7 @@ async function getStats() {
       COUNT(*) FILTER (WHERE status = 'in_progress') AS in_progress_count,
       COUNT(*) FILTER (WHERE status = 'done')        AS done_count,
       COUNT(*) FILTER (WHERE status = 'cancelled')   AS cancelled_count,
-      COUNT(*) FILTER (WHERE deadline < NOW() AND status NOT IN ('done','cancelled')) AS overdue_count,
+      COUNT(*) FILTER (WHERE deadline < (NOW() AT TIME ZONE 'Europe/Moscow')::date AND status NOT IN ('done','cancelled')) AS overdue_count,
       COUNT(*)                                        AS total_count
     FROM orders
   `);
@@ -187,7 +187,7 @@ async function getStats() {
 async function getStatsByMonth() {
   const { rows } = await pool.query(`
     SELECT 
-      TO_CHAR(created_at, 'YYYY-MM') AS month,
+      TO_CHAR(created_at AT TIME ZONE 'Europe/Moscow', 'YYYY-MM') AS month,
       COUNT(*) AS total,
       COUNT(*) FILTER (WHERE status = 'done') AS done,
       COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled

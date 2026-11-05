@@ -111,6 +111,13 @@ function createManagerHandlers(options = {}) {
         for (const file of await materials.listOrderMaterials(order.id, true)) {
           if (file.telegram_msg_id) continue;
           try {
+            const manual = await require('../bot/manual-order-attachments').manualMaterialDeliveryState(pool, order.id, file.id);
+            if (manual?.stage === 'sending') { warnings.push('Отправка файла «' + file.name + '» ранее началась в боте, но не подтверждена. Проверьте чат и используйте повтор у исходного вложения.'); continue; }
+            if (manual?.stage === 'sent') {
+              if (Number.isSafeInteger(Number(manual.group_message_id)) && Number(manual.group_message_id) > 0) await materials.markOrderMaterialDelivered(order.id, file.id, Number(manual.group_message_id));
+              else warnings.push('Не удалось подтвердить прежнюю отправку файла «' + file.name + '». Проверьте исходное вложение в боте.');
+              continue;
+            }
             const sent = await telegram.sendDocument(process.env.GROUP_CHAT_ID, { source: file.buffer, filename: file.name }, { caption: '📎 Заявка #' + order.id + ' · ' + file.name, reply_to_message_id: order.telegram_msg_id });
             await materials.markOrderMaterialDelivered(order.id, file.id, sent.message_id);
           } catch (e) { console.error('order document delivery:', e.message); warnings.push('Не доставлен в чат файл «' + file.name + '».'); }

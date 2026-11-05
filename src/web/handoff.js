@@ -97,16 +97,8 @@ function checklistCounts(client, data) {
   const items = list.passport.concat(list.sections.flatMap(section => section.i)).filter(item =>
     !item.when || Object.entries(item.when).every(([key, expected]) => key === 'svc'
       ? client.service === expected : data[key] === expected || data[key] === undefined && !item.strict));
-  const resolved = item => {
-    const value = data[item.id];
-    if (item.t === 'k') return value && ['ok', 'bad', 'na'].includes(value.s);
-    if (item.t === 'flag') return value && ['yes', 'no'].includes(value.s);
-    if (item.t === 'term') return value && validCalendarDate(value.from) && validCalendarDate(value.to);
-    if (item.t === 'sig') return value && typeof value.at === 'string' && value.at.trim();
-    if (item.t === 'docs') return value && value.m && item.o.every(name => ['ok', 'bad'].includes(value.m[name]));
-    if (item.t === 'p' || item.t === 'r') return item.o.includes(value);
-    return typeof value === 'string' && value.trim().length > 0;
-  };
+  const { isChecklistItemResolved } = require('../checklist-progress');
+  const resolved = item => isChecklistItemResolved(item, data[item.id], validCalendarDate);
   return { done: items.filter(resolved).length, total: items.length };
 }
 
@@ -803,7 +795,7 @@ function mskToday() { return new Date(Date.now() + 3 * 3600 * 1000).toISOString(
 function mskHour() { return new Date(Date.now() + 3 * 3600 * 1000).getUTCHours(); }
 function ruDate(s) { return s ? s.slice(8, 10) + '.' + s.slice(5, 7) + '.' + s.slice(0, 4) : ''; }
 function ruShort(s) { return s ? s.slice(8, 10) + '.' + s.slice(5, 7) : ''; }
-function storedDate(value) { return value && typeof value.toISOString === 'function' ? value.toISOString().slice(0,10) : String(value || '').slice(0,10); }
+function storedDate(value) { return require('../calendar-date').calendarDate(value); }
 function reminderRetryAt(when, workdaysOnly) {
   var local = new Date(when+3*3600000), day = local.toISOString().slice(0,10);
   if (workdaysOnly && !isWorkday(new Date(day+'T00:00:00Z'))) {

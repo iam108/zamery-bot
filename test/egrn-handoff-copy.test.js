@@ -7,7 +7,7 @@ const vm = require('node:vm');
 const CAD = '77:01:0004016:1064';
 function native(key, id = 5) { return { key, chat: -1001001, id, name: 'statement.pdf' }; }
 function link(key = 'large') { return { kind: 'link', key, original_id: '11111111-1111-4111-8111-111111111111', name: 'large.pdf', bytes: 100 * 1024 * 1024 }; }
-function harness({ files = [native('small')], fail, receipt, sender = true } = {}) {
+function harness({ files = [native('small')], fail, receipt, sender = true, persistError, evidence, registerLinks } = {}) {
   const calls = [], queries = [], events = [], errors = [];
   let apiCalls = 0, sequence = 50;
   const order = { id: 1, cad_num: CAD, files_sent: files.length, file_msgs: files, status: 'done' };
@@ -18,7 +18,7 @@ function harness({ files = [native('small')], fail, receipt, sender = true } = {
     if (failure) throw failure;
     return receipt ? receipt(call) : { message_id: ++sequence };
   };
-  const telegram = { callApi(method, value) {
+  const telegram = { async sendDocument(chat, file, extra) { return transport('restore', {file_id:file}, {chat,reply:extra?.reply_parameters?.message_id}); }, callApi(method, value) {
     assert.equal(method, 'copyMessage');
     return transport('native', { chat: value.from_chat_id, id: value.message_id }, { chat: value.chat_id, reply: value.reply_parameters?.message_id });
   } };
@@ -32,12 +32,14 @@ function harness({ files = [native('small')], fail, receipt, sender = true } = {
         if(sql.startsWith('UPDATE egrn_orders SET processing_token=gen_random_uuid()')) {order.processing_token='11111111-1111-4111-8111-111111111111';return {rows:[order]};}
         if(sql.startsWith('UPDATE egrn_orders SET delivery_manifest=$1')) {order.delivery_manifest=JSON.parse(params[0]);return {rows:[]};}
         if(sql.startsWith('UPDATE egrn_orders SET processing_token=NULL')) {order.processing_token=null;return {rows:[]};}
-        if(sql.startsWith('UPDATE egrn_orders SET file_msgs=$1')) {order.file_msgs=JSON.parse(params[0]);return {rows:[]};}
+        if(sql.startsWith('UPDATE egrn_orders SET file_msgs=$1')) {const failure=persistError?.();if(failure)throw failure;order.file_msgs=JSON.parse(params[0]);return {rows:[]};}
         if(sql.startsWith('UPDATE egrn_orders SET deliver=(')) {order.deliver=(order.deliver||[]).concat(JSON.parse(params[0]));order.delivery_revision=(order.delivery_revision||0)+1;if(order.files_sent>0)order.files_sent=0;return {rows:[order]};}
         if (sql.startsWith('SELECT * FROM egrn_orders WHERE cad_num=')) return { rows: [order] };
         return { rows: [] };
       } };
       if (name === './formatter') return { esc: String };
+      if (name === './order-evidence' && evidence) return evidence;
+      if (name === '../web/order-egrn-links' && registerLinks) return { registerOrderLinks: registerLinks };
       if (name === './egrn-large-delivery') return { createLargeDelivery() { return { copy(record, target) { return transport('link', record, target); } }; } };
       throw new Error('Unexpected require ' + name);
     },
@@ -183,4 +185,41 @@ test('a confirmed source is sent once within a strict call even when its saved d
   await h.attach({ copyOptions: { strict: true, onCopied(key) { saved.push(key); } } });
   assert.equal(h.calls.length, 1); assert.deepEqual(saved, [copyKey(20, file)]);
   h.noPaidOrder();
+});
+
+test('a confirmed missing native source is repaired from its saved file_id without a provider or paid request',async()=>{
+  const original={...native('native',5),file_id:'SAVED_FILE_ID',mime:'application/pdf',bytes:35*1024*1024};
+  const h=harness({files:[original],fail:call=>call.kind==='native'&&call.file.id===5?Object.assign(new Error('message to copy not found'),{response:{error_code:400,description:'Bad Request: message to copy not found'}}):null});
+  assert.equal((await h.attach()).result,'attached');
+  assert.deepEqual(h.calls.map(call=>call.kind),['native','restore','native']);
+  assert.equal(h.calls[1].file.file_id,'SAVED_FILE_ID');assert.equal(h.calls[1].target.chat,original.chat);
+  const repaired=h.order.file_msgs[0];assert.equal(repaired.reference_chat,-1001001);assert.equal(repaired.reference_id,5);assert.equal(repaired.id,51);
+  const count=h.calls.length;await h.attach();assert.equal(h.calls.length,count,'Confirmed target receipt survives the source repair');
+  await h.attach({targets:[{chat:30}]});assert.equal(h.calls.at(-1).file.id,51);assert.equal(h.calls.filter(call=>call.kind==='restore').length,1);h.noPaidOrder();
+});
+
+test('repairing directly into an explicit workgroup supplies that original once and preserves the old stable reference source',async()=>{
+  const h=harness({files:[{...native('pdf',5),file_id:'SAVED_FILE_ID'}],fail:call=>call.kind==='native'?Object.assign(new Error('missing'),{response:{error_code:400,description:'message to copy not found'}}):null});
+  assert.equal((await h.attach({targets:[{chat:-1002222,reply:99}]})).result,'attached');
+  assert.deepEqual(h.calls.map(call=>call.kind),['native','restore']);assert.equal(h.calls[1].target.chat,-1002222);assert.equal(h.calls[1].target.reply,99);
+  assert.equal(h.order.file_msgs[0].reference_chat,-1001001);assert.equal(h.order.file_msgs[0].reference_id,5);assert.equal(h.order.file_msgs[0].chat,-1002222);h.noPaidOrder();
+});
+
+for(const response of [{error_code:403,description:'bot was blocked'},{error_code:400,description:'chat not found'}])test('another Telegram rejection never triggers native file repair: '+response.description,async()=>{
+  const h=harness({files:[{...native('pdf'),file_id:'SAVED_FILE_ID'}],fail:()=>Object.assign(new Error(response.description),{response})});
+  await assert.rejects(h.attach(),error=>error.response===response&&error.uncertain===false);assert.deepEqual(h.calls.map(call=>call.kind),['native']);h.noPaidOrder();
+});
+
+test('a repaired source checkpoint failure stops before another recipient and remains an uncertain acknowledgement',async()=>{
+  const h=harness({files:[{...native('pdf',5),file_id:'SAVED_FILE_ID'}],fail:call=>call.kind==='native'&&call.file.id===5?Object.assign(new Error('missing'),{response:{error_code:400,description:'message to copy not found'}}):null,persistError:()=>new Error('Source checkpoint unavailable')});
+  await assert.rejects(h.attach({targets:[{chat:20},{chat:30}]}),error=>error.code==='EGRN_COPY_CHECKPOINT'&&error.uncertain===true);
+  assert.deepEqual(h.calls.map(call=>call.kind),['native','restore']);h.noPaidOrder();
+});
+
+test('a medium native original linked to the request does not falsely request a second small-file upload',async()=>{
+  let linked=0;
+  const evidence=require('../src/bot/order-evidence').createOrderEvidence({log(){},fetch:()=>assert.fail('Medium original must remain Telegram-only')});
+  const h=harness({files:[{...native('pdf'),file_id:'FILE_ID',mime:'application/pdf',bytes:35*1024*1024}],evidence,registerLinks:async()=>{linked++;}});
+  const result=await h.attach({targets:[{chat:-100200,order_id:58}]});
+  assert.equal(result.result,'attached');assert.equal(result.packet_warning,undefined);assert.ok(linked>0);h.noPaidOrder();
 });

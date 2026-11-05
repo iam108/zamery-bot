@@ -4,7 +4,7 @@ const { parseArchiveUrl, downloadArchive, setupOrderArchive } = require('../src/
 
 const URL = 'https://disk.360.yandex.ru/d/RPoUCOS6PFusPQ/%D0%9B/%D0%9B%D0%95%D0%9E%D0%9D';
 const json = value => new Response(JSON.stringify(value), { headers: { 'content-type': 'application/json' } });
-const folderZip = Buffer.from('504b0304140000000000', 'hex');
+const folderZip = Buffer.concat([...require('../src/web/order-materials').zipParts([{name:'Original.txt',buffer:Buffer.from('Original archive fixture')}])]);
 function mockDownload({ metadata, href, body, finalResponse } = {}) {
   const calls = [];
   return { calls, fetch: async (url, options) => {
@@ -39,6 +39,43 @@ test('single PDF preserves original bytes and file name', async () => {
   const file = await downloadArchive('https://yadi.sk/i/abcdefghi', mockDownload({ metadata: { type: 'file', name: 'Акт.pdf', mime_type: 'application/pdf', size: original.length }, body: original, finalResponse: new Response(original, { headers: { 'content-type': 'application/pdf' } }) }));
   assert.equal(file.name, 'Акт.pdf');
   assert.ok(file.buffer.equals(original));
+});
+
+test('shortening a valid long archive filename preserves its PDF extension and original bytes',async()=>{
+  const body=Buffer.from('%PDF-1.7\noriginal'),name='План помещения '.repeat(20)+'.pdf';
+  const result=await downloadArchive('https://yadi.sk/i/abcdefghi',mockDownload({metadata:{type:'file',name,mime_type:'application/pdf',size:body.length},body}));
+  assert.ok(Array.from(result.name).length<=160);assert.ok(result.name.endsWith('.pdf'));assert.ok(result.buffer.equals(body));
+});
+
+test('a truncated source file cannot be accepted merely because its PDF header is present',async()=>{
+  const body=Buffer.from('%PDF-1.7\ntruncated');
+  await assert.rejects(downloadArchive('https://yadi.sk/i/abcdefghi',mockDownload({metadata:{type:'file',name:'План.pdf',mime_type:'application/pdf',size:body.length+100},body})),e=>e.code==='ARCHIVE_INCOMPLETE');
+});
+
+test('a short HTTP response with a declared original size is rejected even without file metadata',async()=>{
+  const response=new Response(folderZip,{headers:{'Content-Type':'application/zip','Content-Length':String(folderZip.length+100)}});
+  await assert.rejects(downloadArchive(URL,mockDownload({finalResponse:response})),e=>e.code==='ARCHIVE_INCOMPLETE');
+});
+
+test('a folder ZIP without its complete directory is rejected even if its PK prefix is valid',async()=>{
+  for(const body of [Buffer.from('504b0304140000000000','hex'),folderZip.subarray(0,folderZip.length-10)])
+    await assert.rejects(downloadArchive(URL,mockDownload({body})),e=>e.code==='ARCHIVE_INCOMPLETE');
+});
+
+test('a source file must match its published checksums, not only its size and PDF header',async()=>{
+  const {createHash}=require('node:crypto'),body=Buffer.from('%PDF-1.7\ncomplete original');
+  const metadata={type:'file',name:'План.pdf',mime_type:'application/pdf',size:body.length,sha256:createHash('sha256').update(body).digest('hex'),md5:createHash('md5').update(body).digest('hex')};
+  const complete=await downloadArchive('https://yadi.sk/i/abcdefghi',mockDownload({metadata,body}));assert.ok(complete.buffer.equals(body));
+  for(const field of ['sha256','md5'])await assert.rejects(downloadArchive('https://yadi.sk/i/abcdefghi',mockDownload({metadata:{...metadata,[field]:'0'.repeat(field==='sha256'?64:32)},body})),e=>e.code==='ARCHIVE_INTEGRITY');
+});
+
+test('decoded HTTP content is checked against the original metadata rather than compressed transfer length',async()=>{
+  const body=Buffer.from('%PDF-1.7\ncomplete original');
+  for(const length of [10,body.length+100]){
+    const response=new Response(body,{headers:{'Content-Type':'application/pdf','Content-Encoding':'gzip','Content-Length':String(length)}});
+    const result=await downloadArchive('https://yadi.sk/i/abcdefghi',{...mockDownload({metadata:{type:'file',name:'План.pdf',mime_type:'application/pdf',size:body.length},finalResponse:response}),maxBytes:body.length});
+    assert.ok(result.buffer.equals(body));
+  }
 });
 
 test('provider download links and redirects cannot escape trusted HTTPS hosts', async () => {

@@ -17,7 +17,7 @@ function trustedTelegramUrl(value) {
   if (url.protocol !== 'https:' || url.hostname !== 'api.telegram.org' || url.username || url.password || url.port || !url.pathname.startsWith('/file/')) throw new Error('Invalid Telegram document URL');
   return url;
 }
-async function telegramOriginal(value, fetchImpl = globalThis.fetch) {
+async function telegramOriginal(value, fetchImpl = globalThis.fetch, expectedBytes) {
   let url = trustedTelegramUrl(value);
   const signal = AbortSignal.timeout(15000);
   for (let redirect = 0; redirect <= 3; redirect++) {
@@ -30,7 +30,8 @@ async function telegramOriginal(value, fetchImpl = globalThis.fetch) {
       continue;
     }
     if (!response.ok) { await response.body?.cancel().catch(() => {}); throw new Error('Telegram original unavailable'); }
-    const length = Number(response.headers.get('content-length'));
+    const rawLength = response.headers.get('content-length'), encoded = String(response.headers.get('content-encoding') || 'identity').toLowerCase().trim();
+    const length = encoded === 'identity' && /^\d+$/.test(rawLength || '') ? Number(rawLength) : null;
     if (length > MAX_BYTES) { await response.body?.cancel().catch(() => {}); throw new Error('EGRN document too large'); }
     if (!response.body || typeof response.body.getReader !== 'function') throw new Error('Telegram body unavailable');
     const reader = response.body.getReader(), chunks = [];
@@ -45,6 +46,7 @@ async function telegramOriginal(value, fetchImpl = globalThis.fetch) {
       }
     } finally { reader.releaseLock(); }
     if (!bytes) throw new Error('Empty EGRN document');
+    if (length !== null && bytes !== length || Number(expectedBytes) > 0 && bytes !== Number(expectedBytes)) throw new Error('Incomplete Telegram original length');
     return Buffer.concat(chunks, bytes);
   }
 }
@@ -75,7 +77,7 @@ function createOrderEvidence(options = {}) {
       try {
         if (!file.file_id || !file.name || !telegram || !telegram.getFileLink || Number(file.bytes) > MAX_BYTES) throw new Error('Cached original unavailable');
         const link = await telegram.getFileLink(file.file_id);
-        const buffer = await telegramOriginal(link, options.fetch || globalThis.fetch);
+        const buffer = await telegramOriginal(link, options.fetch || globalThis.fetch, file.bytes);
         const result = await registerOriginal(targets, { name: file.name, buffer });
         if (result.packet_warning) failed = true;
       } catch (e) { failed = true; report(); }

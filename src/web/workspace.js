@@ -1,5 +1,6 @@
 const { createHash } = require('node:crypto');
 const { LISTS, STAGES } = require('../checklists');
+const { isChecklistItemResolved } = require('../checklist-progress');
 
 const PAIRING_LIFETIME = 10 * 60;
 const MAX_NOTE_LENGTH = 16_000;
@@ -117,6 +118,8 @@ function makeSnapshot(account, cases, now) {
     const stage = row.stage || STAGES[0];
     const sections = checklistSections(row);
     const checklistItems = sections.flatMap(section => section.items);
+    const list = Object.hasOwn(LISTS,row.checklist_key) ? LISTS[row.checklist_key] : null;
+    const definitions = new Map((list ? list.passport.concat(list.sections.flatMap(section => section.i)) : []).map(item => [item.id,item]));
     clients.push({
       id,
       name: row.org || 'Клиент #' + id,
@@ -127,7 +130,7 @@ function makeSnapshot(account, cases, now) {
       checklist: checklistItems.map(item => item.title),
       checklistSections: sections,
       note: row.note || '',
-      done: checklistItems.filter(item => item.state !== 'pending').length,
+      done: checklistItems.filter(item => isChecklistItemResolved(definitions.get(item.id), row.checklist_choices?.[item.id])).length,
       total: checklistItems.length,
     });
     for (const reminder of row.reminders || []) {

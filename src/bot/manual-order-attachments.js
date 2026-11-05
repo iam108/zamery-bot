@@ -1,6 +1,7 @@
 const defaultPool = require('../db/pool');
 const defaultMaterials = require('../web/order-materials');
 const { telegramOriginal } = require('./order-evidence');
+const { createOrderDeliveryLock } = require('../db/order-delivery-lock');
 
 // Receipts contain Telegram identifiers only. File bytes use order_materials and
 // its existing size limits; no second original or large-file store is created.
@@ -14,6 +15,13 @@ const DDL = `CREATE TABLE IF NOT EXISTS manual_order_attachments (
   PRIMARY KEY(source_chat_id,source_message_id)
 );`;
 const OPEN = "status NOT IN ('done','cancelled')";
+const materialStateReady = new WeakMap();
+async function manualMaterialDeliveryState(pool, orderId, materialId) {
+  if (typeof pool.query !== 'function') return null;
+  if (!materialStateReady.has(pool)) materialStateReady.set(pool, pool.query(DDL).catch(error => { materialStateReady.delete(pool); throw error; }));
+  await materialStateReady.get(pool);
+  return (await pool.query("SELECT stage,group_message_id FROM manual_order_attachments WHERE order_id=$1 AND material_id=$2 ORDER BY CASE WHEN stage='sent' AND group_message_id IS NOT NULL THEN 0 WHEN stage='sending' THEN 1 ELSE 2 END,updated_at DESC LIMIT 1", [orderId, materialId])).rows[0] || null;
+}
 const sourceNumber = value => Number.isSafeInteger(Number(value)) && Number(value) > 0;
 function sourceFile(message) {
   if (Array.isArray(message.photo) && message.photo.length) {
@@ -32,6 +40,7 @@ function sourceFile(message) {
 function createManualOrderAttachments(options = {}) {
   const pool = options.pool || defaultPool, materials = options.materials || defaultMaterials;
   const groupId = options.groupId || process.env.GROUP_CHAT_ID;
+  const withOrderLock = options.withOrderDeliveryLock || createOrderDeliveryLock(pool);
   const log = () => (options.log || console.error)('manual attachment: operation unavailable');
   let ready;
   function ensure() {
@@ -67,7 +76,21 @@ function createManualOrderAttachments(options = {}) {
     const keyboard = orders.slice(0, 30).map(order => [{ text: ('#' + order.id + ' · ' + (order.object_name || order.owner_name || order.address || 'Заявка')).slice(0, 64), callback_data: 'manual_attach:' + row.source_message_id + ':' + order.id }]);
     return notify(ctx, row, 'selection', 'К какой заявке прикрепить файл «' + row.file.name + '»? Выберите заявку ниже. До выбора файл никуда не отправляется.' + (orders.length > 30 ? ' Показаны последние 30 открытых заявок; остальные доступны через форму заявки.' : ''), { reply_markup: { inline_keyboard: keyboard } });
   }
+  async function confirmDelivery(row, messageId) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const original = await client.query('UPDATE order_materials SET telegram_msg_id=$1 WHERE order_id=$2 AND id=$3 RETURNING id', [messageId, row.order_id, row.material_id]);
+      if (!original.rows.length) throw new Error('Original no longer available');
+      await client.query("UPDATE manual_order_attachments SET stage='sent',group_message_id=$3,lease_until=NULL,updated_at=NOW() WHERE source_chat_id=$1 AND source_message_id=$2", [row.source_chat_id, row.source_message_id, messageId]);
+      await client.query('COMMIT');
+    } catch (error) { await client.query('ROLLBACK').catch(() => {}); throw error; }
+    finally { client.release(); }
+  }
   async function process(ctx, initial, orderId, explicitRetry = false) {
+    return withOrderLock(orderId, () => processLocked(ctx, initial, orderId, explicitRetry));
+  }
+  async function processLocked(ctx, initial, orderId, explicitRetry = false) {
     let row = await receipt(initial.source_chat_id, initial.source_message_id);
     if (!row || String(row.actor_tg_id) !== String(ctx.from.id)) return;
     if (row.order_id && Number(row.order_id) !== Number(orderId)) return ctx.reply('Этот файл уже относится к заявке #' + row.order_id + '. Для другой заявки отправьте его отдельным сообщением.');
@@ -86,10 +109,16 @@ function createManualOrderAttachments(options = {}) {
       if (!row.material_id) {
         const link = await ctx.telegram.getFileLink(row.file.file_id);
         const buffer = await (options.download || telegramOriginal)(link, options.fetch || globalThis.fetch);
+        if (Number(row.file.bytes) > 0 && buffer.length !== Number(row.file.bytes)) throw new Error('Incomplete Telegram original');
         const prepared = materials.prepareMaterials([{ originalname: row.file.name, mimetype: row.file.mime, buffer }]);
         await materials.saveOrderMaterials(order.id, prepared);
         row.material_id = prepared[0].id;
         await pool.query("UPDATE manual_order_attachments SET material_id=$3,updated_at=NOW() WHERE source_chat_id=$1 AND source_message_id=$2", [row.source_chat_id, row.source_message_id, row.material_id]);
+      }
+      const publishedOriginal = (await pool.query('SELECT telegram_msg_id FROM order_materials WHERE order_id=$1 AND id=$2', [order.id, row.material_id])).rows[0];
+      if (sourceNumber(publishedOriginal?.telegram_msg_id)) {
+        await confirmDelivery(row, Number(publishedOriginal.telegram_msg_id)); published = true;
+        return notify(ctx, row, 'sent', '✅ Файл сохранён в документах заявки #' + order.id + ' и отправлен в рабочий чат.');
       }
       if (!groupId) {
         await pool.query("UPDATE manual_order_attachments SET stage='saved',lease_until=NULL WHERE source_chat_id=$1 AND source_message_id=$2", [row.source_chat_id, row.source_message_id]);
@@ -103,7 +132,7 @@ function createManualOrderAttachments(options = {}) {
       if (sourceNumber(order.telegram_msg_id)) Object.assign(extra, { reply_to_message_id: Number(order.telegram_msg_id), allow_sending_without_reply: true });
       const delivered = row.file.photo ? await ctx.telegram.sendPhoto(groupId, row.file.file_id, extra) : await ctx.telegram.sendDocument(groupId, row.file.file_id, extra);
       if (!sourceNumber(delivered?.message_id)) throw new Error('Telegram acknowledgement unavailable');
-      await pool.query("UPDATE manual_order_attachments SET stage='sent',group_message_id=$3,updated_at=NOW() WHERE source_chat_id=$1 AND source_message_id=$2", [row.source_chat_id, row.source_message_id, delivered.message_id]);
+      await confirmDelivery(row, Number(delivered.message_id));
       published = true;
       await notify(ctx, row, 'sent', '✅ Файл сохранён в документах заявки #' + order.id + ' и отправлен в рабочий чат.');
     } catch (error) {
@@ -120,7 +149,7 @@ function createManualOrderAttachments(options = {}) {
   }
   async function safe(ctx, run) {
     try { if (await authorized(ctx)) { await ensure(); await run(); } }
-    catch (error) { log(); await ctx.reply('Не удалось обработать вложение. Оригинал остаётся в этом чате. Повторите действие.'); }
+    catch (error) { log(); await ctx.reply(error.code === 'ORDER_DELIVERY_BUSY' ? 'Заявка сейчас обновляется. Повторите прикрепление через несколько секунд; оригинал остаётся в этом чате.' : 'Не удалось обработать вложение. Оригинал остаётся в этом чате. Повторите действие.'); }
   }
   async function receive(ctx) {
     return safe(ctx, async () => {
@@ -161,4 +190,4 @@ function setupManualOrderAttachments(bot, options) {
   bot.action(/^manual_retry:\d+$/, handler.retry);
   return handler;
 }
-module.exports = { DDL, sourceFile, createManualOrderAttachments, setupManualOrderAttachments };
+module.exports = { DDL, sourceFile, createManualOrderAttachments, setupManualOrderAttachments, manualMaterialDeliveryState };

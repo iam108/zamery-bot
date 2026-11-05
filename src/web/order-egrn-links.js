@@ -41,9 +41,13 @@ function telegramMessage(value) {
     ? 'https://t.me/c/' + chat.slice(4) + '/' + message : '';
 }
 function telegramReferenceId(record) {
-  let hex = createHash('sha1').update('egrn-telegram-reference:v1\n' + record.chat + ':' + record.id).digest('hex').slice(0,32);
+  let hex = createHash('sha1').update('egrn-telegram-reference:v1\n' + (record.reference_chat ?? record.chat) + ':' + (record.reference_id ?? record.id)).digest('hex').slice(0,32);
   hex = hex.slice(0,12) + '5' + hex.slice(13,16) + '8' + hex.slice(17);
   return [hex.slice(0,8),hex.slice(8,12),hex.slice(12,16),hex.slice(16,20),hex.slice(20)].join('-');
+}
+function telegramSource(record) {
+  if (telegramMessage(record)) return { chat: record.chat, id: record.id };
+  return (Array.isArray(record.deliveries) ? record.deliveries : []).find(value => telegramMessage(value)) || null;
 }
 function createOrderEgrnLinks(options = {}) {
   const pool = options.pool || require('../db/pool');
@@ -65,7 +69,7 @@ function createOrderEgrnLinks(options = {}) {
       const targets = [...new Set((order.deliver || []).map(value => Number(value?.order_id)).filter(id => Number.isSafeInteger(id) && id > 0 && id <= 2147483647))];
       if (!targets.length) return;
       const saved = (records || []).filter(record => record?.kind === 'link');
-      const telegram = (records || []).filter(record => record && record.kind !== 'link' && Number(record.bytes) > MATERIAL_BYTES && telegramMessage(record));
+      const telegram = (records || []).filter(record => record && record.kind !== 'link' && Number(record.bytes) > MATERIAL_BYTES && telegramSource(record));
       if (!saved.length && !telegram.length) return;
       await ensure();
       for (const record of saved) {
@@ -77,9 +81,12 @@ function createOrderEgrnLinks(options = {}) {
       // so the auditor can open the exact original without another stored copy.
       for (const record of telegram) {
         if (typeof record.name !== 'string' || !record.name || !['application/pdf','application/zip'].includes(record.mime) || !Number.isSafeInteger(Number(record.bytes))) throw failure('Не подтверждены сведения о выписке в Telegram.', 409);
+        const source = telegramSource(record);
         for (const target of targets) await pool.query(`INSERT INTO order_egrn_telegram_links(order_id,id,egrn_order_id,chat_id,message_id,name,mime,bytes)
-          VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`,
-        [target, telegramReferenceId(record), order.id, record.chat, record.id, record.name, record.mime, record.bytes]);
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(order_id,id) DO UPDATE SET chat_id=EXCLUDED.chat_id,message_id=EXCLUDED.message_id
+          WHERE order_egrn_telegram_links.egrn_order_id=EXCLUDED.egrn_order_id AND order_egrn_telegram_links.name=EXCLUDED.name
+            AND order_egrn_telegram_links.mime=EXCLUDED.mime AND order_egrn_telegram_links.bytes=EXCLUDED.bytes`,
+        [target, telegramReferenceId(record), order.id, source.chat, source.id, record.name, record.mime, record.bytes]);
       }
     },
     async list(order) {
@@ -105,6 +112,37 @@ function createOrderEgrnLinks(options = {}) {
       if (!file) throw failure('Оригинал выписки больше недоступен.', 404);
       return { ok: true, url: await makeUrl(original) };
     },
+    async delivery(order, original, expected) {
+      order = orderId(order); original = originalId(original); await ensure();
+      const stored = (await pool.query('SELECT 1 FROM order_egrn_links WHERE order_id=$1 AND original_id=$2', [order, original])).rows.length > 0;
+      let result, egrnOrder, record;
+      if (stored) {
+        const file = await files.get(original);
+        if (!file) throw failure('Оригинал выписки больше недоступен.', 404);
+        result = { ...metadata(file, order), kind: 'link', url: await makeUrl(original) };
+        egrnOrder = file.egrn_order_id;
+      } else {
+        const native = (await pool.query('SELECT * FROM order_egrn_telegram_links WHERE order_id=$1 AND id=$2', [order, original])).rows[0];
+        if (!native || !telegramMessage(native)) throw failure('Выписка не относится к этой заявке.', 404);
+        result = { id: original, kind: 'telegram', name: native.name, mime: native.mime, bytes: Number(native.bytes), role: 'egrn', source: 'telegram', chat_id: native.chat_id, message_id: Number(native.message_id) };
+        egrnOrder = native.egrn_order_id;
+      }
+      for (const key of ['id','source','name','mime']) if (expected && expected[key] != null && String(expected[key]) !== String(result[key])) throw failure('Сведения об оригинале выписки изменились. Обновите пакет.', 409);
+      if (expected?.bytes != null && Number(expected.bytes) !== result.bytes || expected?.sha256 && expected.sha256 !== result.sha256) throw failure('Сведения об оригинале выписки изменились. Обновите пакет.', 409);
+      if (egrnOrder != null) {
+        const source = (await pool.query('SELECT file_msgs FROM egrn_orders WHERE id=$1', [egrnOrder])).rows[0];
+        record = (Array.isArray(source?.file_msgs) ? source.file_msgs : []).find(value => stored
+          ? value.kind === 'link' && value.original_id === original
+          : value.kind !== 'link' && telegramReferenceId(value) === original && value.name === result.name && value.mime === result.mime && Number(value.bytes) === result.bytes);
+      }
+      if (record) {
+        const key = record.key || String(record.reference_chat ?? record.chat) + ':' + String(record.reference_id ?? record.id);
+        result.source_key = key;
+        result.legacy_receipt_keys = [...new Set([record.chat, ...(record.deliveries || []).map(value => value.chat)].filter(value => value != null).map(chat => JSON.stringify([String(chat), key])))];
+        if (!stored && typeof record.file_id === 'string' && record.file_id) result.file_id = record.file_id;
+      }
+      return result;
+    },
   };
 }
 let singleton;
@@ -117,4 +155,6 @@ function setupOrderEgrnLinks(app, service = store()) {
   });
 }
 module.exports = { DDL, createOrderEgrnLinks, setupOrderEgrnLinks,
-  listOrderLinks: order => store().list(order), registerOrderLinks: (order, records) => store().register(order, records) };
+  listOrderLinks: order => store().list(order), registerOrderLinks: (order, records) => store().register(order, records),
+  resolveOrderLink: (order, original) => store().link(order, original),
+  resolveOrderLinkForDelivery: (order, original, expected) => store().delivery(order, original, expected) };

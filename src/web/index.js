@@ -5,6 +5,7 @@ const session = require('express-session');
 const PgSession = require('connect-pg-simple')(session);
 const pool = require('../db/pool');
 const path = require('path');
+const { calendarRu, isOrderOverdue } = require('../calendar-date');
 const { getOrders, getOrderById, getOrderLogs, getStats } = require('../db/queries');
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, function (ch) {
@@ -219,9 +220,9 @@ function adminPage({ orders, stats, status, search, page, totalPages, total }) {
   const statusColors = { new:'#6366f1', in_progress:'#f59e0b', done:'#22c55e', cancelled:'#6b7280' };
   const statusLabels = { new:'Новая', in_progress:'В работе', done:'Готово', cancelled:'Отменена' };
   const rows = orders.map(o => {
-    const d = o.deadline ? new Date(o.deadline).toLocaleDateString('ru-RU') : '—';
-    const created = new Date(o.created_at).toLocaleDateString('ru-RU', { day:'numeric', month:'short' });
-    const isOverdue = o.deadline && new Date(o.deadline) < new Date() && !['done','cancelled'].includes(o.status);
+    const d = calendarRu(o.deadline);
+    const created = new Date(o.created_at).toLocaleDateString('ru-RU', { day:'numeric', month:'short', timeZone:'Europe/Moscow' });
+    const isOverdue = isOrderOverdue(o, Date.now());
     return `<tr onclick="location='/admin/order/${parseInt(o.id)}'" style="cursor:pointer">
       <td><strong>#${o.id}</strong></td><td>${esc(o.owner_name)}</td>
       <td style="max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(o.address)}</td>
@@ -298,10 +299,10 @@ function adminPage({ orders, stats, status, search, page, totalPages, total }) {
 function orderDetailPage(order, logs) {
   const statusColors = { new:'#6366f1', in_progress:'#f59e0b', done:'#22c55e', cancelled:'#6b7280' };
   const statusLabels = { new:'Новая', in_progress:'В работе', done:'Готово', cancelled:'Отменена' };
-  const deadline = order.deadline ? new Date(order.deadline).toLocaleDateString('ru-RU') : '—';
-  const created = new Date(order.created_at).toLocaleString('ru-RU');
+  const deadline = calendarRu(order.deadline);
+  const created = new Date(order.created_at).toLocaleString('ru-RU', { timeZone:'Europe/Moscow' });
   const logRows = logs.map(l => {
-    const t = new Date(l.created_at).toLocaleString('ru-RU');
+    const t = new Date(l.created_at).toLocaleString('ru-RU', { timeZone:'Europe/Moscow' });
     return `<div class="log-row"><span class="log-time">${t}</span><span class="log-actor">${esc(l.actor)}</span><span class="log-action">${esc(l.details||l.action)}</span></div>`;
   }).join('') || '<div style="color:#64748b;padding:16px">Нет записей</div>';
   return `<!DOCTYPE html><html lang="ru"><head>
@@ -749,7 +750,7 @@ function statsPage({ byMonth, byType }) {
   const statusColors = { new:'#6366f1', in_progress:'#f59e0b', done:'#22c55e', cancelled:'#6b7280' };
   
   const monthRows = byMonth.map(r => {
-    const d = new Date(r.month + '-01').toLocaleDateString('ru-RU', { month: 'long', year: 'numeric' });
+    const d = new Date(r.month + '-01').toLocaleDateString('ru-RU', { month: 'long', year: 'numeric', timeZone:'UTC' });
     const pct = r.total > 0 ? Math.round(r.done / r.total * 100) : 0;
     return `<tr>
       <td>${d}</td>
@@ -835,7 +836,7 @@ function statsPage({ byMonth, byType }) {
 
 function objectsPage({ objects, search }) {
   const rows = objects.map(o => {
-    const last = new Date(o.last_visit).toLocaleDateString('ru-RU', { day:'numeric', month:'short', year:'numeric' });
+    const last = new Date(o.last_visit).toLocaleDateString('ru-RU', { day:'numeric', month:'short', year:'numeric', timeZone:'Europe/Moscow' });
     const name = o.object_name || '—';
     const params = new URLSearchParams({ address: o.address, name: o.object_name || '' });
     return `<tr onclick="location='/admin/objects/detail?${params}'" style="cursor:pointer">
@@ -898,8 +899,8 @@ function objectDetailPage({ orders, address, name }) {
   const statusLabels = { new:'Новая', in_progress:'В работе', done:'Готово', cancelled:'Отменена' };
 
   const rows = orders.map(o => {
-    const d = new Date(o.created_at).toLocaleDateString('ru-RU', { day:'numeric', month:'short', year:'numeric' });
-    const deadline = o.deadline ? new Date(o.deadline).toLocaleDateString('ru-RU') : '—';
+    const d = new Date(o.created_at).toLocaleDateString('ru-RU', { day:'numeric', month:'short', year:'numeric', timeZone:'Europe/Moscow' });
+    const deadline = calendarRu(o.deadline);
     return `<tr onclick="location='/admin/order/${parseInt(o.id)}'" style="cursor:pointer">
       <td><strong>#${o.id}</strong></td>
       <td style="color:#64748b;font-size:13px">${d}</td>

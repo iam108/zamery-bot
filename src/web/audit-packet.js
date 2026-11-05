@@ -1,3 +1,4 @@
+const { calendarDate } = require('../calendar-date');
 function packetFromOrder(order, materials, egrnLinks = []) {
   const id = Number(order.id);
   const type = String(order.object_type || '').toLowerCase();
@@ -8,7 +9,7 @@ function packetFromOrder(order, materials, egrnLinks = []) {
     order_id: id, org: order.owner_name || order.object_name || '', object_name: order.object_name || '', address: order.address || '',
     object_category: /табак/.test(type) ? 'tobacco' : /общепит/.test(type) ? 'catering' : /магазин|рознич|торговл/.test(type) ? 'retail' : 'other',
     service: order.service || '', cad_num: order.cad_num || '', region: 'МСК', contacts: order.contacts || '',
-    deadline: order.deadline ? new Date(order.deadline).toISOString().slice(0, 10) : '', zones_info: order.zones_info || '',
+    deadline: calendarDate(order.deadline), zones_info: order.zones_info || '',
     video_required: !!order.has_video, has_video: !!order.has_video, archive_url: archiveUrl, materials: files, egrn_links: egrnLinks,
     materials_download_url: '/api/audit/orders/' + id + '/materials/download-all',
     archive_download_url: order.service === 'Продление' ? (archiveFiles ? '/api/audit/orders/' + id + '/materials/download-all?role=archive' : archiveUrl ? '/api/audit/orders/' + id + '/archive/download' : '') : '',

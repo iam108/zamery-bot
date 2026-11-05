@@ -1,5 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
 const { createManualOrderAttachments, sourceFile } = require('../src/bot/manual-order-attachments');
 const { createMaterialsStore, prepareMaterials, LIMITS } = require('../src/web/order-materials');
 const pg = { skip: !process.env.PGLITE_TEST_MODULE };
@@ -33,6 +35,7 @@ test('an attachment preserves the exact original in its own single open order be
   const files=await h.store.list(58,true);assert.equal(files.length,1);assert.ok(files[0].buffer.equals(h.original));assert.equal(files[0].role,'egrn');
   assert.equal(h.downloads.length,1);assert.equal(h.saves.length,1);assert.equal(h.sends.length,1);assert.equal(h.sends[0].extra.reply_to_message_id,901);
   assert.equal((await h.row()).stage,'sent');assert.equal(h.replies.length,1);assert.match(h.replies[0].text,/сохранён в документах заявки #58 и отправлен/);
+  assert.equal(Number(files[0].telegram_msg_id),Number((await h.row()).group_message_id));
 }));
 
 test('multiple open orders require explicit selection and cannot attach to another employee or a closed order',pg,async()=>fixture(async h=>{
@@ -98,7 +101,7 @@ test('a failed private success message never downgrades a delivered group post i
 test('simultaneous repeated updates never download or publish the same source twice',pg,async()=>fixture(async h=>{
   let release;h.downloadWait=new Promise(resolve=>{release=resolve;});const handler=h.create(),first=handler.receive(h.context());
   while(!h.downloads.length)await new Promise(resolve=>setTimeout(resolve,5));
-  await handler.receive(h.context());assert.equal(h.downloads.length,1);assert.equal(h.sends.length,0);release();await first;assert.equal(h.sends.length,1);assert.equal((await h.store.list(58)).length,1);
+  const second=handler.receive(h.context());await new Promise(resolve=>setImmediate(resolve));assert.equal(h.downloads.length,1);assert.equal(h.sends.length,0);release();await Promise.all([first,second]);assert.equal(h.sends.length,1);assert.equal((await h.store.list(58)).length,1);
 }));
 
 test('a crash during active sending requires an expired lease and explicit retry, preserving the original',pg,async()=>fixture(async h=>{
@@ -110,7 +113,43 @@ test('a crash during active sending requires an expired lease and explicit retry
 }));
 
 test('photo selection uses the largest Telegram original, while image documents with missing MIME remain accepted',pg,async()=>fixture(async h=>{
-  const ctx=h.context();ctx.message.document={file_id:'image-original',file_name:'ЗАМЕРЫ.PNG',file_size:42,mime_type:'application/octet-stream'};
+  const ctx=h.context();ctx.message.document={file_id:'image-original',file_name:'ЗАМЕРЫ.PNG',file_size:h.original.length,mime_type:'application/octet-stream'};
   await h.create().receive(ctx);assert.equal((await h.store.list(58))[0].mime,'image/png');assert.equal(h.sends[0].kind,'document');
   assert.deepEqual(sourceFile({message_id:99,photo:[{file_id:'small',file_size:1},{file_id:'large',file_size:2}]}),{file_id:'large',bytes:2,name:'Фото-99.jpg',mime:'image/jpeg',photo:true});
+}));
+
+test('known Telegram file size must match downloaded bytes before storage or publication',pg,async()=>fixture(async h=>{
+  const ctx=h.context();ctx.message.document.file_size=h.original.length+1;await h.create().receive(ctx);
+  assert.equal(h.saves.length,0);assert.equal(h.sends.length,0);assert.equal((await h.row()).stage,'pending');assert.match(h.replies.at(-1).text,/Не удалось сохранить/);
+}));
+
+async function managerSave(h) {
+  await h.db.exec("ALTER TABLE orders ADD COLUMN IF NOT EXISTS object_type TEXT; ALTER TABLE orders ADD COLUMN IF NOT EXISTS has_video BOOLEAN; ALTER TABLE orders ADD COLUMN IF NOT EXISTS zones_info TEXT; ALTER TABLE orders ADD COLUMN IF NOT EXISTS deadline DATE; ALTER TABLE orders ADD COLUMN IF NOT EXISTS contacts TEXT; CREATE TABLE IF NOT EXISTS logs(order_id INT,action TEXT,actor TEXT,details TEXT); UPDATE orders SET owner_name='Client',object_type='Общепит алкоголь',service='Получение' WHERE id=58;");
+  const originals=require('../src/web/order-materials'),materials={...originals,ensureOrderMaterials:h.store.ensure,saveOrderMaterials:h.store.save,saveOrderMaterialsInTransaction:h.store.saveInTransaction,listOrderMaterials:h.store.list,markOrderMaterialDelivered:h.store.delivered};
+  const context=vm.createContext({module:{exports:{}},require(name){if(name==='./pool')return h.pool;if(name==='../web/order-materials')return materials;throw new Error(name);}});
+  vm.runInContext(fs.readFileSync(require.resolve('../src/db/queries'),'utf8'),context);
+  const telegram=h.context().telegram;telegram.editMessageText=async()=>{};
+  const handlers=require('../src/web/manager-orders').createManagerHandlers({pool:h.pool,materials,queries:context.module.exports,getTelegram:()=>telegram,format:()=> 'order',attachOrOrder:()=>assert.fail('No paid API')});
+  const row=(await h.pool.query('SELECT * FROM orders WHERE id=58')).rows[0],response={statusCode:200,status(code){this.statusCode=code;return this;},json(body){this.body=body;return this;}};
+  await handlers.save({params:{id:'58'},tgUser:{id:108},staff:{name:'Author',role:'manager'},files:[],body:{address:row.address,owner_name:'Client',object_type:'Общепит алкоголь',service:'Получение',submit_id:'manager-save',packet_revision:row.packet_revision}},response);
+  return response;
+}
+
+for(const historical of [false,true])test('manager save does not reupload a manually published original, historical receipt='+historical,pg,async()=>fixture(async h=>{
+  await h.create().receive(h.context());if(historical)await h.pool.query('UPDATE order_materials SET telegram_msg_id=NULL WHERE order_id=58');
+  const saved=await managerSave(h);assert.equal(saved.body.ok,true);assert.equal(saved.body.warning,undefined);assert.equal(h.sends.length,1);
+  assert.equal(Number((await h.store.list(58))[0].telegram_msg_id),Number((await h.row()).group_message_id));
+}));
+
+test('a lost manual publication checkpoint stays unknown to manager delivery and both receipt writes roll back',pg,async()=>fixture(async h=>{
+  const query=h.pool.query;let fail=true;h.pool.query=async(sql,args)=>{if(fail&&sql.includes("SET stage='sent'")){fail=false;throw new Error('Synthetic receipt failure');}return query(sql,args);};
+  await h.create().receive(h.context());assert.equal((await h.row()).stage,'sending');assert.equal((await h.store.list(58))[0].telegram_msg_id,null);
+  const saved=await managerSave(h);assert.equal(saved.body.ok,true);assert.match(saved.body.warning,/не подтверждена/);assert.equal(h.sends.length,1);
+}));
+
+test('a manual retry adopts a confirmed manager publication rather than forwarding the same file again',pg,async()=>fixture(async h=>{
+  h.sendError=Object.assign(new Error('Telegram rejected'),{response:{error_code:400}});await h.create().receive(h.context());assert.equal((await h.row()).stage,'saved');
+  h.sendError=null;const saved=await managerSave(h);assert.equal(saved.body.ok,true);assert.equal(h.sends.length,2);
+  await h.create().retry(h.callback('manual_retry:321'));assert.equal(h.sends.length,2);assert.equal((await h.row()).stage,'sent');
+  assert.equal(Number((await h.row()).group_message_id),Number((await h.store.list(58))[0].telegram_msg_id));
 }));

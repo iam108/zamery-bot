@@ -36,7 +36,7 @@ async function choosePdf(page, pdf, number = 4) {
   await editor.getByRole('button', { name: 'Выбрать лист PDF / изображение', exact: true }).click();
   const dialog = editor.locator('dialog'); await dialog.locator('input[type=file]').setInputFiles({ name: 'Synthetic-plan.pdf', mimeType: 'application/octet-stream', buffer: pdf });
   const use = dialog.getByRole('button', { name: 'Использовать этот лист', exact: true });
-  await until(() => use.isEnabled(), 'PDF page preview');
+  await until(async () => !await dialog.getByRole('button', { name: 'Добавить файл', exact: true }).isDisabled() && await use.isEnabled() && /Страница 1 из 6/.test(await dialog.locator('.ape-pages').innerText()), 'Uploaded PDF page preview');
   for (let index = 1; index < number; index++) { await dialog.getByRole('button', { name: 'Следующая страница' }).click(); await until(() => use.isEnabled(), 'Selected PDF page'); }
   await use.click(); await dialog.waitFor({ state: 'hidden' });
   await editor.locator('.ape-source').getByText(new RegExp('лист ' + number)).waitFor();
@@ -124,4 +124,86 @@ test('a newly supplied source packet blocks delivery until the auditor explicitl
   page.once('dialog',dialog=>dialog.accept());await page.locator('#accept-packet-update').click();await page.getByText('Менеджер изменил данные объекта',{exact:true}).waitFor({state:'hidden'});
   const checked=await service.draft(59);assert.ok(checked.data.request_packet.materials.some(file=>file.id===id));assert.ok(checked.data.packet_rechecks.length);assert.deepEqual(checked.data.plan.annotations,before.data.plan.annotations);
   await page.locator('#submit-audit').click();await page.getByRole('heading',{name:'Отчёт отправлен'}).waitFor();const audit=(await service.pool.query('SELECT report_data FROM audits WHERE order_id=59')).rows[0];assert.ok(audit.report_data.request_packet.materials.some(file=>file.id===id));assert.ok(service.messages.length>messages);clean(visit);
+}));
+
+test('failed or unacknowledged sheet changes keep source state and raster aligned through close zoom retry and restore', { timeout:60000 }, t => run(t,async()=>{
+  for(const mode of ['failed-save','lost-ack']){
+    const visit=await openPage(browser,service),{page}=visit;await page.locator('#step-content[aria-busy=false]').waitFor();await step(page,1);
+    let selected=await choosePdf(page,multiPagePdf(),4);if(!(await service.draft(58)).data.plan.annotations.length)await annotate(page,selected.canvas);await save(page);
+    const before=await service.draft(58),url='**/api/audit/drafts/'+before.id;
+    function rejectedSave(target){let sent=false;return async route=>{
+      if(route.request().method()!=='PUT')return route.continue();
+      if(mode==='lost-ack'&&!sent&&route.request().postDataJSON().data.plan.page===target){sent=true;const response=await route.fetch();assert.equal(response.status(),200);return route.abort('failed');}
+      return route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({ok:false,error:'Synthetic failed sheet save'})});
+    };}
+    const fail=rejectedSave(1);await page.route(url,fail);
+    let editor=page.locator('#plan-editor'),dialog=editor.locator('dialog');await editor.getByRole('button',{name:'Выбрать лист PDF / изображение',exact:true}).click();
+    const use=dialog.getByRole('button',{name:'Использовать этот лист',exact:true});await until(()=>use.isEnabled(),'Existing sheet preview');
+    for(let index=0;index<3;index++){await dialog.getByRole('button',{name:'Предыдущая страница'}).click();await until(()=>use.isEnabled(),'Previous PDF page');}
+    await use.click();await dialog.locator('.ape-sheet-status').getByText('Не удалось сохранить выбранный лист. Повторите.',{exact:true}).waitFor();
+    await dialog.getByRole('button',{name:'Закрыть',exact:true}).click();await editor.getByRole('button',{name:'Увеличить масштаб'}).click();
+    await editor.locator('.ape-source').getByText(/лист 1/).waitFor();
+    const color=await editor.getByLabel('План помещения для разметки').evaluate(element=>Array.from(element.getContext('2d').getImageData(10,10,1,1).data));
+    assert.ok(color[0]>100&&color[1]<20,'Local sheet1 must show its red raster even when its PUT failed');
+    assert.equal(await page.evaluate(()=>JSON.parse(localStorage.getItem('audit-wizard-v3:1001:58')).data.plan.page),1);
+    await editor.getByRole('button',{name:'Повторить',exact:true}).waitFor({state:'visible'});await page.unroute(url,fail);
+    if(mode==='failed-save'){await editor.getByRole('button',{name:'Повторить',exact:true}).click();await until(async()=>(await service.draft(58)).data.plan.page===1,'Retry saves local sheet1');}
+    await page.reload();await page.locator('#plan-editor .ape-source').getByText(/лист 1/).waitFor();assert.equal(await page.locator('#conflict-panel').isVisible(),false);
+    editor=page.locator('#plan-editor');await until(async()=>{const pixel=await editor.getByLabel('План помещения для разметки').evaluate(element=>Array.from(element.getContext('2d').getImageData(10,10,1,1).data));return pixel[0]>100&&pixel[1]<20;},'Reopening recovers the selected red sheet');
+    const restoreFailure=rejectedSave(4);await page.route(url,restoreFailure);await editor.locator('.ape-drawer summary').click();await editor.getByRole('button',{name:'Вернуть предыдущий лист',exact:true}).click();
+    await editor.getByRole('button',{name:'Повторить',exact:true}).waitFor({state:'visible'});await editor.getByRole('button',{name:'Увеличить масштаб'}).click();
+    await until(async()=>{const pixel=await editor.getByLabel('План помещения для разметки').evaluate(element=>Array.from(element.getContext('2d').getImageData(10,10,1,1).data));return pixel[1]>100&&pixel[0]<20&&/лист 4/.test(await editor.locator('.ape-source').innerText());},'Failed restore still displays its locally selected green sheet4');
+    await page.unroute(url,restoreFailure);await editor.getByRole('button',{name:'Повторить',exact:true}).click();await until(async()=>(await service.draft(58)).data.plan.page===4,'Restore recovery reaches server');
+    assert.deepEqual((await service.draft(58)).data.plan.annotations,before.data.plan.annotations);clean(visit);await visit.context.close();
+  }
+}));
+
+test('partial photo uploads show saved originals immediately and retry deletion and subject changes retain the correct files', { timeout:60000 }, t => run(t,async()=>{
+  const visit=await openPage(browser,service,1001,{pathname:'/audit?order_id=61'}),{page}=visit;await page.locator('#step-content[aria-busy=false]').waitFor();
+  await choice(page,'workflow.territory_result','clear').click();await page.locator('[data-add-entrance]').click();await field(page,'entrances.0.label').fill('First photo subject');
+  const jpg=await sampleImage(page,'image/jpeg'),files=[1,2,3].map(index=>({name:'Synthetic-batch-'+index+'.jpg',mimeType:'image/jpeg',buffer:jpg})),posts=[];let failed=false;
+  await page.route('**/api/audit/drafts/*/evidence',route=>{
+    if(route.request().method()!=='POST')return route.continue();const name=route.request().postDataJSON().name;posts.push(name);
+    if(name===files[2].name&&!failed){failed=true;return route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({ok:false,error:'Synthetic third photo failed'})});}return route.continue();
+  });
+  await page.locator('input[data-upload-role="entrance"]:not([capture])').first().setInputFiles(files);
+  await page.locator('#save-state').getByText(/сохранено 2 из 3.*Synthetic third photo failed/).waitFor();
+  for(const file of files.slice(0,2))await page.getByText(file.name,{exact:true}).waitFor();assert.equal(await page.getByText(files[2].name,{exact:true}).count(),0);
+  let draft=await service.draft(61),stored=(await service.pool.query('SELECT * FROM audit_evidence WHERE draft_id=$1 AND deleted_at IS NULL',[draft.id])).rows;assert.equal(stored.length,2);
+  await page.locator('input[data-upload-role="entrance"]:not([capture])').first().setInputFiles(files[2]);await page.getByText(files[2].name,{exact:true}).waitFor();
+  stored=(await service.pool.query('SELECT * FROM audit_evidence WHERE draft_id=$1 AND deleted_at IS NULL',[draft.id])).rows;assert.equal(stored.length,3);assert.deepEqual(posts,files.map(file=>file.name).concat(files[2].name));
+  for(const file of stored)assert.ok(service.objects.get(file.object_key).equals(jpg));
+  page.once('dialog',dialog=>dialog.accept());await page.getByRole('button',{name:'Удалить '+files[1].name,exact:true}).click();await page.getByText(files[1].name,{exact:true}).waitFor({state:'hidden'});
+  await page.locator('[data-add-entrance]').click();await field(page,'entrances.1.label').fill('Second photo subject');
+  await page.locator('input[data-upload-role="entrance"]:not([capture])').nth(1).setInputFiles({name:'Synthetic-second-subject.jpg',mimeType:'image/jpeg',buffer:jpg});await page.getByText('Synthetic-second-subject.jpg',{exact:true}).waitFor();
+  draft=await service.draft(61);stored=(await service.pool.query('SELECT * FROM audit_evidence WHERE draft_id=$1 AND deleted_at IS NULL',[draft.id])).rows;
+  assert.equal(stored.filter(file=>file.subject_id===draft.data.entrances[0].id).length,2);assert.equal(stored.filter(file=>file.subject_id===draft.data.entrances[1].id).length,1);assert.equal(stored.find(file=>file.name==='Synthetic-second-subject.jpg').subject_id,draft.data.entrances[1].id);clean(visit);
+}));
+
+test('late source uploads preserve newer chooser selections cancellation reopening and editor navigation', { timeout:60000 }, t => run(t,async()=>{
+  const visit=await openPage(browser,service,1001,{pathname:'/audit?order_id=62'}),{page}=visit;await page.locator('#step-content[aria-busy=false]').waitFor();await step(page,1);
+  const pdf=multiPagePdf();await choosePdf(page,pdf,4);const initial=await service.draft(62);
+  let editor=page.locator('#plan-editor'),dialog=editor.locator('dialog');
+  const open=async()=>{await editor.getByRole('button',{name:'Выбрать лист PDF / изображение',exact:true}).click();await until(()=>dialog.getByRole('button',{name:'Использовать этот лист',exact:true}).isEnabled(),'Reopened chooser ready');};
+  await open();await dialog.locator('input[type=file]').setInputFiles({name:'Synthetic-choice-B.png',mimeType:'image/png',buffer:await sampleImage(page,'image/png')});
+  const select=dialog.getByLabel('Исходный документ'),use=dialog.getByRole('button',{name:'Использовать этот лист',exact:true});
+  await until(async()=>await select.locator('option:checked').innerText()==='Synthetic-choice-B.png'&&await use.isEnabled(),'Uploaded image B ready');const bID=await select.inputValue();
+  await select.selectOption(initial.data.plan.evidence_id);await until(()=>use.isEnabled(),'A is selected before starting C upload');
+  const held=new Map(),releases=[];
+  await page.route('**/api/audit/drafts/*/evidence',async route=>{
+    const data=route.request().method()==='POST'&&route.request().postDataJSON();if(!data||!/^Synthetic-late-/.test(data.name))return route.continue();
+    const response=await route.fetch();let release;const gate=new Promise(resolve=>{release=resolve;});held.set(data.name,release);releases.push(release);await gate;return route.fulfill({response});
+  });
+  async function uploadHeld(name){await dialog.locator('input[type=file]').setInputFiles({name,mimeType:'application/pdf',buffer:pdf});await until(()=>held.has(name),'Source upload committed before its held acknowledgement');}
+  async function sourceExists(name){return Number((await service.pool.query('SELECT COUNT(*) AS n FROM audit_evidence WHERE draft_id=$1 AND name=$2 AND deleted_at IS NULL',[initial.id,name])).rows[0].n)===1;}
+  try{
+    await uploadHeld('Synthetic-late-C.pdf');await select.selectOption(bID);await until(()=>use.isEnabled(),'Newer manual image B preview');held.get('Synthetic-late-C.pdf')();
+    await until(async()=>await select.locator('option',{hasText:'Synthetic-late-C.pdf'}).count()===1&&!await dialog.getByRole('button',{name:'Добавить файл',exact:true}).isDisabled(),'Uploaded C registered without changing current candidate');assert.equal(await select.inputValue(),bID);assert.ok(await sourceExists('Synthetic-late-C.pdf'));
+    await dialog.getByRole('button',{name:'Закрыть',exact:true}).click();await open();await uploadHeld('Synthetic-late-D.pdf');await dialog.getByRole('button',{name:'Закрыть',exact:true}).click();await open();const reopened=await select.inputValue();held.get('Synthetic-late-D.pdf')();
+    await until(async()=>await select.locator('option',{hasText:'Synthetic-late-D.pdf'}).count()===1&&!await dialog.getByRole('button',{name:'Добавить файл',exact:true}).isDisabled(),'Old upload registered after chooser reopened');assert.equal(await select.inputValue(),reopened);assert.equal(reopened,initial.data.plan.evidence_id);
+    await uploadHeld('Synthetic-late-E.pdf');await dialog.getByRole('button',{name:'Закрыть',exact:true}).click();await step(page,0);held.get('Synthetic-late-E.pdf')();await page.locator('#save-state').getByText(/Оригиналы сохранены на сервере/).waitFor();assert.ok(await sourceExists('Synthetic-late-E.pdf'));
+    await step(page,1);editor=page.locator('#plan-editor');dialog=editor.locator('dialog');await editor.locator('.ape-source').getByText(/лист 4/).waitFor();await open();
+    await until(async()=>await dialog.getByLabel('Исходный документ').locator('option',{hasText:'Synthetic-late-E.pdf'}).count()===1,'Fresh editor lists original uploaded by the old editor');assert.equal(await dialog.getByLabel('Исходный документ').inputValue(),initial.data.plan.evidence_id);
+    const final=await service.draft(62);assert.equal(final.data.plan.evidence_id,initial.data.plan.evidence_id);assert.equal(final.data.plan.page,4);clean(visit);
+  }finally{releases.forEach(release=>release());}
 }));

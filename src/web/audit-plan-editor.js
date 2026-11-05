@@ -238,7 +238,7 @@
     let activeTool = kind === 'map' ? 'edit' : 'boundary', selected = null, selectedVertex = -1, zoom = 1, fitScale = 1;
     let choosing = false;
     let past = [], future = [], saveTail = Promise.resolve(), saveError = null, revision = 0, pointer = null;
-    let chooserToken = 0, candidate = null, renderTask = null;
+    let chooserToken = 0, chooserIntent = 0, candidate = null, renderTask = null;
     const el = (tag, text, cls) => { const n = document.createElement(tag); if (text !== undefined && text !== null) n.textContent = text; if (cls) n.className = cls; return n; };
     const on = (node, event, fn) => node.addEventListener(event, fn, { signal });
     const button = (text, cls, fn) => { const b = el('button', text, 'ape-button ' + (cls || '')); b.type = 'button'; if (fn) on(b, 'click', fn); return b; };
@@ -281,7 +281,7 @@
     const uploadInput = el('input'); uploadInput.type = 'file'; uploadInput.accept = kind === 'map' ? 'image/*' : 'image/*,application/pdf'; uploadInput.hidden = true;
     const upload = button('Добавить файл', 'ape-secondary', () => uploadInput.click()); upload.hidden = typeof options.onUpload !== 'function';
     const chooserControls = el('div', null, 'ape-sheet-controls'); chooserControls.append(sourceSelect, upload, uploadInput);
-    const pageControls = el('div', null, 'ape-pages'), prev = button('←', '', () => candidatePage((candidate?.page || 1) - 1)), next = button('→', '', () => candidatePage((candidate?.page || 1) + 1)), pageLabel = el('span', 'Страница —'); prev.setAttribute('aria-label', 'Предыдущая страница'); next.setAttribute('aria-label', 'Следующая страница'); pageControls.append(prev, pageLabel, next);
+    const pageControls = el('div', null, 'ape-pages'), prev = button('←', '', () => { chooserIntent++; return candidatePage((candidate?.page || 1) - 1); }), next = button('→', '', () => { chooserIntent++; return candidatePage((candidate?.page || 1) + 1); }), pageLabel = el('span', 'Страница —'); prev.setAttribute('aria-label', 'Предыдущая страница'); next.setAttribute('aria-label', 'Следующая страница'); pageControls.append(prev, pageLabel, next);
     const chooserStatus = el('p', 'Выберите исходный файл.', 'ape-sheet-status'); chooserStatus.setAttribute('aria-live', 'polite');
     const preview = el('div', null, 'ape-sheet-preview'), previewCanvas = el('canvas'); preview.append(previewCanvas);
     const chooserFoot = el('div', null, 'ape-sheet-foot'), selectPage = button('Использовать этот лист', 'ape-primary', async () => { await useCandidate(); }); selectPage.disabled = true; chooserFoot.append(selectPage);
@@ -363,7 +363,7 @@
         }
         (kind === 'map' ? selectedPanel : markList).append(item);
       });
-      if (state.versions?.length) markList.append(button(kind === 'map' ? 'Вернуть предыдущий скриншот' : 'Вернуть предыдущий лист', 'ape-secondary', async () => { try { state = restoreSource(state); past = []; future = []; await persist(); await (ready = loadSelected()); } catch (e) { notice(e.message, true); } }));
+      if (state.versions?.length) markList.append(button(kind === 'map' ? 'Вернуть предыдущий скриншот' : 'Вернуть предыдущий лист', 'ape-secondary', async () => { try { state = restoreSource(state); past = []; future = []; const loading = (ready = loadSelected()), saving = persist(); await Promise.all([loading, saving]); } catch (e) { notice(e.message, true); } }));
     }
     function refreshEndpointLabels() { panel.querySelectorAll('[data-endpoint]').forEach(select => Array.from(select.options).forEach(option => { const m = state.annotations.find(m => String(m.id) === option.value); if (m) option.textContent = m.code + ' · ' + (m.label || TOOLS[m.tool].label); })); }
     async function sourceResource(evidence, page) {
@@ -396,6 +396,7 @@
     function availableEvidence() { return (options.evidence || []).filter(e => eligible(e, kind) || String(e.id) === String(state.evidence_id)); }
     async function openChooser() {
       if (state.pending) { notice('Сначала замкните контур или отмените его точки.', true); return; }
+      chooserIntent++;
       sourceSelect.replaceChildren(new Option('Выберите файл', '')); availableEvidence().forEach(e => sourceSelect.append(new Option(e.name || 'Документ', e.id))); sourceSelect.value = state.evidence_id || '';
       chooser.showModal(); if (state.evidence_id) await loadCandidate(state.evidence_id, state.page);
     }
@@ -421,17 +422,23 @@
     }
     async function useCandidate() {
       if (choosing || !candidate?.rendered || candidate.renderedPage !== candidate.page) return;
+      chooserIntent++;
       const chosenImage = candidate.rendered;
       const nextState = selectSource(state, candidate.evidence.id, candidate.page);
       const changed = String(state.evidence_id) !== String(nextState.evidence_id) || state.page !== nextState.page;
       state = nextState;
+      // The snapshot is retained locally before its server acknowledgement.
+      // Keep its raster and history in the same version even when saving fails
+      // or the response is lost and the auditor closes the chooser meanwhile.
+      image = chosenImage;
+      sourceLoading = false;
+      if (changed) { past = []; future = []; selected = null; selectedVertex = -1; }
+      draw();
+      requestAnimationFrame(fitImage);
       choosing = true;
       selectPage.disabled = prev.disabled = next.disabled = sourceSelect.disabled = upload.disabled = true;
       try {
         await persist();
-        image = chosenImage;
-        sourceLoading = false;
-        if (changed) { past = []; future = []; selected = null; selectedVertex = -1; }
         chooser.close();
         draw();
         requestAnimationFrame(fitImage);
@@ -445,13 +452,17 @@
         if (candidate) { prev.disabled = candidate.page <= 1; next.disabled = candidate.page >= candidate.pages; }
       }
     }
-    on(sourceSelect, 'change', () => loadCandidate(sourceSelect.value, 1));
-    on(uploadInput, 'change', async () => { const file = uploadInput.files?.[0]; if (!file) return; chooserStatus.textContent = 'Загружаю оригинал…'; upload.disabled = true; try {
+    on(sourceSelect, 'change', () => { chooserIntent++; return loadCandidate(sourceSelect.value, 1); });
+    on(uploadInput, 'change', async () => { const file = uploadInput.files?.[0]; if (!file) return; const token = ++chooserIntent; chooserStatus.textContent = 'Загружаю оригинал…'; upload.disabled = true; try {
       const result = await options.onUpload(file, { role: kind === 'map' ? 'map-source' : 'plan-source' });
       const evidence = Array.isArray(result) ? result.at(-1) : result?.id ? result : Array.isArray(result?.evidence) ? result.evidence.at(-1) : result?.evidence;
-      if (!evidence?.id) throw new Error('Загрузка не вернула исходный файл.'); options.evidence = [...(options.evidence || []).filter(e => String(e.id) !== String(evidence.id)), evidence]; sourceSelect.append(new Option(evidence.name || file.name, evidence.id)); sourceSelect.value = evidence.id; await loadCandidate(evidence.id, 1);
-    } catch (e) { chooserStatus.textContent = e.message || 'Файл не загружен.'; } finally { upload.disabled = false; uploadInput.value = ''; } });
-    on(chooser, 'close', () => { chooserToken++; renderTask?.cancel(); renderTask = null; candidate?.pdf?.destroy(); candidate = null; });
+      if (!evidence?.id) throw new Error('Загрузка не вернула исходный файл.');
+      if (!alive) return;
+      options.evidence = [...(options.evidence || []).filter(e => String(e.id) !== String(evidence.id)), evidence]; sourceSelect.append(new Option(evidence.name || file.name, evidence.id));
+      if (!chooser.open || token !== chooserIntent) return;
+      sourceSelect.value = evidence.id; await loadCandidate(evidence.id, 1);
+    } catch (e) { if (alive && chooser.open && token === chooserIntent) chooserStatus.textContent = e.message || 'Файл не загружен.'; } finally { upload.disabled = false; uploadInput.value = ''; } });
+    on(chooser, 'close', () => { chooserIntent++; chooserToken++; renderTask?.cancel(); renderTask = null; candidate?.pdf?.destroy(); candidate = null; });
     on(toolSelect, 'change', () => setTool(toolSelect.value));
     function eventPoint(e) { const rect = canvas.getBoundingClientRect(); return point({ x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height }); }
     on(canvas, 'pointerdown', e => {
@@ -492,7 +503,7 @@
     return {
       refresh(nextOptions) { if (nextOptions) Object.assign(options, nextOptions); return ready = saveTail.catch(() => {}).then(() => { state = normalise(options.getState?.() || state); return loadSelected(); }); },
       flush, exportPreview,
-      destroy() { alive = false; loadToken++; chooserToken++; renderTask?.cancel(); candidate?.pdf?.destroy(); controller.abort(); if (chooser.open) chooser.close(); container.replaceChildren(); image = null; },
+      destroy() { alive = false; loadToken++; chooserIntent++; chooserToken++; renderTask?.cancel(); candidate?.pdf?.destroy(); controller.abort(); if (chooser.open) chooser.close(); container.replaceChildren(); image = null; },
     };
   }
   return { mount, helpers: { normalise, addMark, selectSource, restoreSource, assertExportable, eligible, isPDF, toolNames, legendEntries, hitTest, renderScene, wrapText, pathMidpoint, createSaveQueue, measurementEndpoints, removeAnnotation }, tools: TOOLS };

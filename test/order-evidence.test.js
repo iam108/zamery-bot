@@ -69,6 +69,18 @@ test('cached download enforces header and streamed byte limits', async () => {
   await assert.rejects(() => telegramOriginal('https://api.telegram.org/file/botT/a.pdf', async () => new Response(body)), /large/);
 });
 
+test('a short Telegram original is rejected using both the HTTP length and known file metadata',async()=>{
+  await assert.rejects(telegramOriginal('https://api.telegram.org/file/botT/a.pdf',async()=>new Response(pdf,{headers:{'Content-Length':String(pdf.length+1)}})),/incomplete|length|size/i);
+  const materials=memoryMaterials(),service=createOrderEvidence({materials,log(){},fetch:async()=>new Response(pdf)});
+  const result=await service.registerCached([{order_id:7}],[{file_id:'doc-id',name:'ЕГРН.pdf',bytes:pdf.length+1}],{getFileLink:async()=>new URL('https://api.telegram.org/file/botT/a.pdf')});
+  assert.ok(result.packet_warning);assert.equal(materials.stored.size,0);
+});
+
+test('decoded Telegram content is compared with its original bytes, not a compressed HTTP length',async()=>{
+  const fetched=await telegramOriginal('https://api.telegram.org/file/botT/a.pdf',async()=>new Response(pdf,{headers:{'Content-Encoding':'gzip','Content-Length':'10'}}),pdf.length);
+  assert.deepEqual(fetched,pdf);
+});
+
 function egrnHarness({ registerError = false, cached = false } = {}) {
   const registrations = [], sent = [], logs = [];
   const order = { id: 1, id_statement: 9, cad_num: '77:17:0120316:1', status: 'done', status_text: 'готова', polls: 1, chat_id: 10, ordered_by: 10,

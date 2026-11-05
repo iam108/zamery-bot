@@ -59,3 +59,55 @@ test('medium native Telegram originals retain only source metadata and expose no
     assert.equal((await db.query('SELECT COUNT(*)::int AS n FROM egrn_files')).rows[0].n,0);
   } finally {await db.close();}
 });
+
+test('a medium original received privately links its confirmed workgroup copy to each explicit order', { skip: !process.env.PGLITE_TEST_MODULE }, async () => {
+  const {PGlite}=require(process.env.PGLITE_TEST_MODULE),db=new PGlite(),pool={query:(sql,args)=>args?db.query(sql,args):db.exec(sql).then(results=>results.at(-1))};
+  try{
+    await db.exec('CREATE TABLE orders(id INT PRIMARY KEY); INSERT INTO orders VALUES(1),(2); CREATE TABLE egrn_files(id UUID PRIMARY KEY,name TEXT,mime TEXT,bytes BIGINT,sha256 TEXT); CREATE TABLE egrn_orders(id BIGINT PRIMARY KEY,file_msgs JSONB);');
+    const record={key:'embedded:0:statement.pdf',chat:108,id:77,file_id:'SAVED_NATIVE_FILE_ID',name:'statement.pdf',mime:'application/pdf',bytes:35*1024*1024,deliveries:[{chat:-10012345,id:88}]};
+    await db.query('INSERT INTO egrn_orders VALUES(19,$1)',[JSON.stringify([record])]);
+    const service=createOrderEgrnLinks({pool,files:{ensure:async()=>{}},makeUrl:()=>assert.fail('No stored copy or paid lookup')});
+    await service.register({id:19,deliver:[{order_id:1,chat:-10012345},{order_id:2,chat:-10012345}]},[record]);
+    for(const order of [1,2]){
+      const refs=await service.list(order);assert.equal(refs.length,1);assert.equal(refs[0].source,'telegram');assert.equal(refs[0].sha256,undefined);
+      assert.deepEqual(await service.link(order,refs[0].id),{ok:true,url:'https://t.me/c/12345/88'});
+      const delivery=await service.delivery(order,refs[0].id,refs[0]);assert.equal(delivery.kind,'telegram');assert.equal(delivery.file_id,record.file_id);assert.equal(delivery.message_id,88);assert.equal(String(delivery.chat_id),'-10012345');assert.equal(delivery.source_key,record.key);
+      assert.ok(delivery.legacy_receipt_keys.includes(JSON.stringify(['-10012345',record.key])));
+      assert.equal(JSON.stringify(refs).includes('SAVED_NATIVE_FILE_ID'),false);
+      await assert.rejects(service.delivery(order,refs[0].id,{...refs[0],bytes:1}),error=>error.status===409);
+    }
+  }finally{await db.close();}
+});
+
+test('repairing a deleted Telegram source refreshes existing references without changing their reviewed identity', { skip: !process.env.PGLITE_TEST_MODULE }, async () => {
+  const {PGlite}=require(process.env.PGLITE_TEST_MODULE),db=new PGlite(),pool={query:(sql,args)=>args?db.query(sql,args):db.exec(sql).then(results=>results.at(-1))};
+  try{
+    await db.exec('CREATE TABLE orders(id INT PRIMARY KEY); INSERT INTO orders VALUES(1),(2); CREATE TABLE egrn_files(id UUID PRIMARY KEY,name TEXT,mime TEXT,bytes BIGINT,sha256 TEXT); CREATE TABLE egrn_orders(id BIGINT PRIMARY KEY,file_msgs JSONB);');
+    const service=createOrderEgrnLinks({pool,files:{ensure:async()=>{}}}),order={id:19,deliver:[{order_id:1},{order_id:2}]};
+    const original={key:'pdf',chat:-10012345,id:77,file_id:'FILE_ID',name:'statement.pdf',mime:'application/pdf',bytes:35*1024*1024};
+    await service.register(order,[original]);const reviewed=(await service.list(1))[0];
+    const repaired={...original,reference_chat:original.chat,reference_id:original.id,chat:-10098765,id:99,deliveries:[{chat:2001,id:100}]};
+    await db.query('INSERT INTO egrn_orders VALUES(19,$1)',[JSON.stringify([repaired])]);await service.register(order,[repaired]);
+    for(const id of [1,2]){const refs=await service.list(id);assert.equal(refs.length,1);assert.equal(refs[0].id,reviewed.id);assert.deepEqual(await service.link(id,reviewed.id),{ok:true,url:'https://t.me/c/98765/99'});}
+    const delivered=await service.delivery(1,reviewed.id,reviewed);assert.equal(delivered.file_id,'FILE_ID');assert.ok(delivered.legacy_receipt_keys.includes(JSON.stringify(['2001','pdf'])));
+    await service.register(order,[{...repaired,name:'Different original.pdf',id:123}]);
+    assert.deepEqual(await service.link(1,reviewed.id),{ok:true,url:'https://t.me/c/98765/99'},'Another original cannot retarget the reviewed reference');
+    assert.equal(Number((await db.query('SELECT COUNT(*) AS count FROM order_egrn_telegram_links')).rows[0].count),2);
+  }finally{await db.close();}
+});
+
+test('delivery of a stored reviewed original refreshes its signed URL and exposes only exact legacy receipt keys', { skip: !process.env.PGLITE_TEST_MODULE }, async () => {
+  const {PGlite}=require(process.env.PGLITE_TEST_MODULE),db=new PGlite(),pool={query:(sql,args)=>args?db.query(sql,args):db.exec(sql).then(results=>results.at(-1))};
+  try{
+    await db.exec('CREATE TABLE orders(id INT PRIMARY KEY); INSERT INTO orders VALUES(1); CREATE TABLE egrn_files(id UUID PRIMARY KEY,name TEXT,mime TEXT,bytes BIGINT,sha256 TEXT); CREATE TABLE egrn_orders(id BIGINT PRIMARY KEY,file_msgs JSONB);');
+    const file={id:ID,egrn_order_id:19,source_key:'url:0',name:'large.pdf',mime:'application/pdf',bytes:350*1024*1024,sha256:'a'.repeat(64)};
+    await db.query('INSERT INTO egrn_files VALUES($1,$2,$3,$4,$5)',[ID,file.name,file.mime,file.bytes,file.sha256]);
+    await db.query('INSERT INTO egrn_orders VALUES(19,$1)',[JSON.stringify([{kind:'link',key:'url:0',original_id:ID,deliveries:[{chat:2001,id:1}]}])]);
+    let signed=0;const service=createOrderEgrnLinks({pool,files:{ensure:async()=>{},get:async()=>file},makeUrl:()=> 'https://bot.example/large?fresh='+(++signed)});
+    await service.register({id:19,deliver:[{order_id:1}]},[{kind:'link',original_id:ID}]);const expected=(await service.list(1))[0];
+    const a=await service.delivery(1,ID,expected),b=await service.delivery(1,ID,expected);assert.equal(a.kind,'link');assert.notEqual(a.url,b.url);assert.equal(a.source_key,'url:0');assert.deepEqual(a.legacy_receipt_keys,[JSON.stringify(['2001','url:0'])]);
+    await db.query('UPDATE egrn_orders SET file_msgs=$1 WHERE id=19',[JSON.stringify([{kind:'link',key:'url:0',original_id:OTHER,deliveries:[{chat:2001,id:1}]}])]);
+    const different=await service.delivery(1,ID,expected);assert.equal(different.source_key,undefined);assert.equal(different.legacy_receipt_keys,undefined);
+    await assert.rejects(service.delivery(1,ID,{...expected,sha256:'b'.repeat(64)}),error=>error.status===409);
+  }finally{await db.close();}
+});

@@ -218,9 +218,9 @@ function createPacketService(options = {}) {
         try{
           // to_jsonb keeps this read compatible with a legacy cases table
           // before the first V2 submit adds its optional checkpoint columns.
-          const row=(await pool.query("SELECT id,lawyer_name,data->'_handoff'->>'completed' AS delivery_complete,data->'_handoff'->>'manual_review' AS manual_review,to_jsonb(cases)->>'handoff_submit_id' AS submit_id FROM cases WHERE order_id=$1 ORDER BY id DESC LIMIT 1",[orderId])).rows[0];
+          const row=(await pool.query("SELECT id,lawyer_name,lawyer_tg_id,data->'_handoff' AS checkpoint,data->'_handoff'->>'completed' AS delivery_complete,data->'_handoff'->>'manual_review' AS manual_review,to_jsonb(cases)->>'handoff_submit_id' AS submit_id FROM cases WHERE order_id=$1 ORDER BY id DESC LIMIT 1",[orderId])).rows[0];
           if(row)assignment={case_id:Number(row.id),lawyer_name:text(row.lawyer_name),submit_id:text(row.submit_id)||null,...(row.manual_review?{manual_review:true}:{}),
-            ...(['true','false'].includes(String(row.delivery_complete))?{delivery_complete:String(row.delivery_complete)==='true'}:{})};
+            ...(['true','false'].includes(String(row.delivery_complete))?{delivery_complete:String(row.delivery_complete)==='true'&&!require('./handoff-submit').hasPendingLinkedEgrn(object(row.checkpoint),row.lawyer_tg_id)}:{})};
         }catch(error){if(error.code!=='42P01')throw error;}
       }
       const requestId = integer(query.request_id, true);

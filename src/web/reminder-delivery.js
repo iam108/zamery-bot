@@ -4,7 +4,7 @@ const LEASE_MS = 2 * 60 * 1000;
 const RETRY_MS = 10 * 60 * 1000;
 const MAX_RETRY_MS = 60 * 60 * 1000;
 const validReceipt = value => Number.isSafeInteger(Number(value)) && Number(value) > 0;
-const dateOnly = value => value && typeof value.toISOString === 'function' ? value.toISOString().slice(0,10) : String(value || '').slice(0,10);
+const { calendarDate: dateOnly } = require('../calendar-date');
 const retryDelay = attempt => Math.min(MAX_RETRY_MS, RETRY_MS * 2 ** Math.min(6, Math.max(0, attempt-1)));
 
 function createReminderDelivery(options = {}) {

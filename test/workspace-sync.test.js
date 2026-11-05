@@ -172,7 +172,7 @@ test('workspace checklist keeps actual answers and missing documents grouped and
   const result = id => items.find(item => item.id === id);
   assert.equal(client.checklistSections[0].title, 'Паспорт объекта');
   assert.equal(client.total, items.length, 'Progress counts the same currently applicable items as the sheet');
-  assert.equal(client.done, items.filter(item => item.state !== 'pending').length, 'Stale stored progress cannot contradict saved answers');
+  assert.equal(client.done, 6, 'An attention document group with unchecked options is not resolved; stale stored progress cannot override saved answers');
   assert.deepEqual(client.checklist, items.map(item => item.title));
   assert.deepEqual(result('basis'), { id: 'basis', title: 'Основание', state: 'complete', value: 'Собственность' });
   assert.equal(result('graph_egrn').state, 'pending');
@@ -222,4 +222,35 @@ test('reminder writes are owner scoped and note writes are compare-and-swap', pg
   await db.exec('UPDATE cases SET lawyer_tg_id=102 WHERE id=1');
   assert.equal((await mark('11', true)).status, 404);
   assert.equal((await note('1', 'Новая', 'Новая')).status, 404);
+}));
+
+test('workspace document progress matches web checklist counts while retaining partial missing-document alerts', pg, async () => database(async ({ db, pool, request, connect }) => {
+  const fs = require('node:fs'), vm = require('node:vm');
+  const context = vm.createContext({ module: { exports: {} }, require(name) {
+    if (name === '../db/pool') return pool;
+    if (name === '../checklists') return require('../src/checklists');
+    if (name === '../checklist-progress') return require('../src/checklist-progress');
+    if (name === './auth' || name === './http-errors') return {};
+    throw new Error('Unexpected dependency: '+name);
+  } });
+  vm.runInContext(fs.readFileSync(require.resolve('../src/web/handoff'),'utf8')+'\nmodule.exports.count=checklistCounts;',context);
+  const list = LISTS.MSK_OBSH, docs = list.passport.concat(list.sections.flatMap(section => section.i)).find(item => item.t === 'docs');
+  const credential = await connect(101);
+  for (const [title,answer,expectedDone,expectedState] of [
+    ['partial missing',{ m: { [docs.o[0]]: 'bad' } },0,'attention'],
+    ['partial present',{ m: { [docs.o[0]]: 'ok' } },0,'pending'],
+    ['extra missing before checking',{ m: {}, other: 'Нужен акт осмотра' },0,'attention'],
+    ['all present',{ m: Object.fromEntries(docs.o.map(name => [name,'ok'])) },1,'complete'],
+    ['all checked with one missing',{ m: Object.fromEntries(docs.o.map((name,index) => [name,index ? 'ok' : 'bad'])) },1,'attention'],
+  ]) {
+    const choices = { docs: answer };
+    await db.query('UPDATE cases SET checklist_key=$1,service=$2,data=$3,done=999,total=999 WHERE id=1',['MSK_OBSH','Получение',choices]);
+    const client = (await request('GET','snapshot',credential)).body.clients[0];
+    const web = context.module.exports.count({ checklist_key: 'MSK_OBSH', service: 'Получение' },choices);
+    assert.equal(client.done,expectedDone,title); assert.equal(web.done,expectedDone,title); assert.equal(client.total,web.total,title);
+    const item = client.checklistSections.flatMap(section => section.items).find(item => item.id === docs.id);
+    assert.equal(item.state,expectedState,title);
+    if (answer.m[docs.o[0]] === 'bad') assert.match(item.value,new RegExp('Нет: '+docs.o[0]),title);
+    if (answer.other) assert.ok(item.value.includes(answer.other),title);
+  }
 }));

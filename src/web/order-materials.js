@@ -154,14 +154,21 @@ function createMaterialsStore(pool = defaultPool) {
 }
 
 const CRC_TABLE = Array.from({ length: 256 }, (_, n) => { for (let i = 0; i < 8; i++) n = n & 1 ? 0xedb88320 ^ (n >>> 1) : n >>> 1; return n >>> 0; });
-function crc32(buffer) { let value = 0xffffffff; for (const byte of buffer) value = CRC_TABLE[(value ^ byte) & 255] ^ (value >>> 8); return (value ^ 0xffffffff) >>> 0; }
-function* zipParts(files) {
-  const central = []; let offset = 0;
+function crc32(buffer, previous = 0) { let value = (previous ^ 0xffffffff) >>> 0; for (const byte of buffer) value = CRC_TABLE[(value ^ byte) & 255] ^ (value >>> 8); return (value ^ 0xffffffff) >>> 0; }
+function* zipParts(files, options = {}) {
+  const central = [], names = new Set(); let offset = 0;
   files.forEach((file, i) => { // Names are unique even when two supplied documents share a filename.
-    const name = Buffer.from(String(i + 1).padStart(2, '0') + '-' + cleanName(file.name), 'utf8');
+    const path = options.preservePaths ? file.relative_path : String(i + 1).padStart(2, '0') + '-' + cleanName(file.name);
+    if (options.preservePaths) {
+      const parts = typeof path === 'string' ? path.replace(/\/$/, '').split('/') : [];
+      if (!parts.length || parts.some(part => !part || part === '.' || part === '..' || /[\\\u0000-\u001f\u007f]/.test(part)) || /^[a-z]:/i.test(path) || names.has(path.replace(/\/$/, '')) || Boolean(file.directory) !== path.endsWith('/')) throw error('Некорректный или повторяющийся путь файла в архиве.');
+      names.add(path.replace(/\/$/, ''));
+    }
+    const name = Buffer.from(path, 'utf8');
+    if (name.length > 65535 || files.length > 65535) throw error('Слишком длинное имя или слишком много файлов в архиве.');
     const crc = crc32(file.buffer); const header = Buffer.alloc(30);
     header.writeUInt32LE(0x04034b50, 0); header.writeUInt16LE(20, 4); header.writeUInt16LE(0x800, 6); header.writeUInt16LE(33, 12); header.writeUInt32LE(crc, 14); header.writeUInt32LE(file.buffer.length, 18); header.writeUInt32LE(file.buffer.length, 22); header.writeUInt16LE(name.length, 26);
-    const entry = Buffer.alloc(46); entry.writeUInt32LE(0x02014b50, 0); entry.writeUInt16LE(20, 4); entry.writeUInt16LE(20, 6); entry.writeUInt16LE(0x800, 8); entry.writeUInt16LE(33, 14); entry.writeUInt32LE(crc, 16); entry.writeUInt32LE(file.buffer.length, 20); entry.writeUInt32LE(file.buffer.length, 24); entry.writeUInt16LE(name.length, 28); entry.writeUInt32LE(offset, 42);
+    const entry = Buffer.alloc(46); entry.writeUInt32LE(0x02014b50, 0); entry.writeUInt16LE(20, 4); entry.writeUInt16LE(20, 6); entry.writeUInt16LE(0x800, 8); entry.writeUInt16LE(33, 14); entry.writeUInt32LE(crc, 16); entry.writeUInt32LE(file.buffer.length, 20); entry.writeUInt32LE(file.buffer.length, 24); entry.writeUInt16LE(name.length, 28); if (file.directory) entry.writeUInt32LE(0x10, 38); entry.writeUInt32LE(offset, 42);
     central.push({ header, name, content: file.buffer, directory: Buffer.concat([entry, name]) }); offset += header.length + name.length + file.buffer.length;
   });
   for (const entry of central) { yield entry.header; yield entry.name; yield entry.content; }
@@ -190,5 +197,5 @@ function setupOrderMaterials(app, materials = store) {
   app.get('/api/audit/orders/:id/materials/:fileId', route(async (req, res) => { const file = await materials.download(req.params.id, req.params.fileId); attachment(res, file.name); res.type(file.mime).send(file.buffer); }));
 }
 
-module.exports = { COMMON_ARCHIVE_URL, SERVICES, ROLES, LIMITS, DDL, prepareMaterials, normalizeManagerOrder, normalizeArchive, guessRole, zipParts, createMaterialsStore, setupOrderMaterials,
+module.exports = { COMMON_ARCHIVE_URL, SERVICES, ROLES, LIMITS, DDL, prepareMaterials, normalizeManagerOrder, normalizeArchive, guessRole, zipParts, crc32, createMaterialsStore, setupOrderMaterials,
   ensureOrderMaterials: store.ensure, saveOrderMaterials: store.save, saveOrderMaterialsInTransaction: store.saveInTransaction, listOrderMaterials: store.list, loadOrderMaterials, downloadOrderMaterial: store.download, markOrderMaterialDelivered: store.delivered };

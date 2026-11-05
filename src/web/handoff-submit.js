@@ -57,6 +57,28 @@ function sourceReport(picked) {
   return {...sources[0],sources,hashes};
 }
 function sourceParts(source) {return Array.isArray(source.sources)?source.sources:[source];}
+function linkedOriginals(packet) {
+  if(packet.egrn_links==null)return [];
+  if(!Array.isArray(packet.egrn_links))fail(409,'HANDOFF_EGRN_LINKS','Не удалось подтвердить связанные выписки заявки.');
+  const files=new Map();
+  for(const file of packet.egrn_links){
+    if(!file||!UUID.test(file.id||'')||!['stored','telegram'].includes(file.source)||typeof file.name!=='string'||!file.name.trim()||
+      !['application/pdf','application/zip','application/x-zip-compressed'].includes(file.mime)||!Number.isSafeInteger(Number(file.bytes))||Number(file.bytes)<1||
+      file.sha256!=null&&file.sha256!==''&&!/^[a-f\d]{64}$/i.test(file.sha256))fail(409,'HANDOFF_EGRN_LINKS','Проверьте сохранённый состав связанных выписок заявки.');
+    const expected={id:file.id.toLowerCase(),name:file.name,mime:file.mime,bytes:Number(file.bytes),source:file.source,...(file.sha256?{sha256:file.sha256.toLowerCase()}:{})};
+    if(files.has(expected.id)&&canonical(files.get(expected.id))!==canonical(expected))fail(409,'HANDOFF_EGRN_LINKS','Сведения о связанной выписке расходятся.');
+    files.set(expected.id,expected);
+  }
+  return [...files.values()];
+}
+function linkedReceipt(state,chat,id) {
+  const receipt=state.linkedEgrn?.confirmed?.[String(chat)]?.[id];
+  return Number.isSafeInteger(Number(receipt?.message_id))&&Number(receipt.message_id)>0||typeof receipt?.legacy_receipt==='string'&&receipt.legacy_receipt.length>0;
+}
+function hasPendingLinkedEgrn(state,chat) {
+  const files=state.linkedEgrn?.files||state.packet?.egrn_links||[];
+  return Array.isArray(files)&&files.some(file=>!linkedReceipt(state,chat,String(file?.id||'').toLowerCase()));
+}
 function short(item,limit) {const s=value(item);return s.length>limit?s.slice(0,limit-1).replace(/[\uD800-\uDBFF]$/,'')+'…':s;}
 function cardText(c,state) {
   const report=state.packet.report,lines=['⚖️ <b>Клиент передан юристу</b>','🏢 <b>'+esc(c.org)+'</b>','📍 '+esc(c.address),esc([c.kind,c.service,c.region].join(' · '))];
@@ -133,12 +155,12 @@ function createHandoffSubmitter(options={}) {
     try {
       await ensure();
       c=await getExisting(pool,owner,submitId);
-      if(c){state=compatible(c,signature);if(state.completed)return completed(c,state);if(state.manual_review)return partial(c,state,state.manual_review,false);}
+      if(c){state=compatible(c,signature);if(state.completed&&!hasPendingLinkedEgrn(state,c.lawyer_tg_id))return completed(c,state);if(state.manual_review)return partial(c,state,state.manual_review,false);}
       client=await getSessionLockPool(pool,options.lockPool).connect();
       locked=!!(await client.query('SELECT pg_try_advisory_lock(111,hashtext($1)) AS locked',[owner+':'+submitId])).rows[0]?.locked;
       if(!locked){if(c)return partial(c,state,'Передача уже выполняется. Повторите проверку результата.',true);const busy=new HandoffError(409,'HANDOFF_BUSY','Передача уже выполняется. Повторите проверку результата.');delete busy.case_created;throw busy;}
       c=await getExisting(client,owner,submitId);
-      if(c){state=compatible(c,signature);if(state.completed)return completed(c,state);if(state.inflight||state.materials?.inflight)state.manual_review='Не удалось сохранить подтверждение предыдущей отправки. Проверьте уже доставленные сообщения вручную; автоматический повтор остановлен, чтобы не создавать дубли.';if(state.manual_review)return partial(c,state,state.manual_review,false);}
+      if(c){state=compatible(c,signature);if(state.completed&&!hasPendingLinkedEgrn(state,c.lawyer_tg_id))return completed(c,state);if(state.inflight||state.materials?.inflight)state.manual_review='Не удалось сохранить подтверждение предыдущей отправки. Проверьте уже доставленные сообщения вручную; автоматический повтор остановлен, чтобы не создавать дубли.';if(state.manual_review)return partial(c,state,state.manual_review,false);}
       else {
         orderLocked=!!(await client.query('SELECT pg_try_advisory_lock(112,$1) AS locked',[orderId])).rows[0]?.locked;
         const assigned=(await client.query('SELECT * FROM cases WHERE order_id=$1 ORDER BY id DESC LIMIT 1',[orderId])).rows[0];
@@ -146,8 +168,8 @@ function createHandoffSubmitter(options={}) {
           const error=new HandoffError(409,'HANDOFF_ALREADY_ASSIGNED','Заявка уже передана юристу «'+(value(assigned.lawyer_name)||'не указан')+'», клиент №'+assigned.id+'.');
           const assignedState = json(json(assigned.data)._handoff);
           if (assignedState.version === 2) {
-            error.delivery_complete = assignedState.completed === true;
-            error.can_resume = assignedState.completed !== true && !assignedState.manual_review;
+            error.delivery_complete = assignedState.completed === true && !hasPendingLinkedEgrn(assignedState,assigned.lawyer_tg_id);
+            error.can_resume = !error.delivery_complete && !assignedState.manual_review;
           }
           error.case_created=true;error.case_id=Number(assigned.id);error.retry=false;throw error;
         }
@@ -172,7 +194,7 @@ function createHandoffSubmitter(options={}) {
           request={id:requestId,...original,first_id:Number(row.first_id)||null,copy_ids:original.message_ids.filter(id=>!alreadyIncluded.has(id))};
         }
         const recipients=[{chat:String(lawyer.tg_id),role:'lawyer'}];
-        state={version:2,body:JSON.parse(serialized),fields:d,packet,source,request,manager_name:value(staff?.name),recipients,cards:{},auditCopies:{},requestCopies:{},materials:{confirmed:{},completed:false},egrn:{completed:false,order_started:false},completed:false};
+        state={version:2,body:JSON.parse(serialized),fields:d,packet,source,request,manager_name:value(staff?.name),recipients,cards:{},auditCopies:{},requestCopies:{},materials:{confirmed:{},completed:false},linkedEgrn:{files:linkedOriginals(packet),confirmed:{},completed:false},egrn:{completed:false,order_started:false},completed:false};
         reportUrl(options.webappUrl||process.env.WEBAPP_URL,state);
         c=(await client.query(`INSERT INTO cases(order_id,lawyer_tg_id,lawyer_name,checklist_key,org,inn,client,phone,address,region,kind,service,priority,comment,audit_text,total,created_by,contacts,request_id,handoff_submit_id,handoff_signature,data)
           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,0,$16,$17,$18,$19,$20,$21)
@@ -195,6 +217,8 @@ function createHandoffSubmitter(options={}) {
         receiptPending=true;return result;
       };
       const tg=telegram(),base=options.webappUrl||process.env.WEBAPP_URL;
+      state.linkedEgrn||={files:linkedOriginals(state.packet),confirmed:{},completed:false};
+      if(hasPendingLinkedEgrn(state,c.lawyer_tg_id)&&state.completed){state.completed=false;await save();}
       for(const target of state.recipients){
         if(state.cards[target.chat])continue;
         const sent=await send({type:'card',chat:target.chat},()=>tg.sendMessage(target.chat,cardText(c,state),cardOptions(base,c,state)));
@@ -250,6 +274,41 @@ function createHandoffSubmitter(options={}) {
         }
         state.materials.completed=true;state.materials.inflight=false;await save();
       }
+      if(state.linkedEgrn.files.length){
+        const links=state.linkedEgrn,target=String(c.lawyer_tg_id);
+        links.confirmed||={};links.confirmed[target]||={};
+        const resolve=options.resolveEgrnLinkForDelivery||require('./order-egrn-links').resolveOrderLinkForDelivery;
+        for(const file of links.files){
+          if(linkedReceipt(state,target,file.id))continue;
+          let original;
+          try{original=await resolve(Number(state.body.order_id),file.id,file);}
+          catch(_){return partial(c,state,'Не удалось открыть связанную выписку ЕГРН из просмотренного комплекта. Она ещё не доставлена; повторите передачу. Новый заказ не создавался.',true);}
+          // Old strict EGRN copies used [recipient, original source key]. Only
+          // an exact original resolved by the server may reuse that receipt.
+          const legacy=typeof original?.source_key==='string'&&original.source_key?JSON.stringify([target,original.source_key]):null;
+          if(legacy&&state.egrn.copies?.[legacy]===true){links.confirmed[target][file.id]={legacy_receipt:legacy};await save();continue;}
+          const url=original?.kind==='link'&&https(original.url);
+          const native=original?.kind==='telegram'&&/^-?\d+$/.test(String(original.chat_id))&&Number.isSafeInteger(Number(original.message_id))&&Number(original.message_id)>0;
+          if(!url&&!native)return partial(c,state,'Не удалось подтвердить источник связанной выписки ЕГРН. Выписка ещё не доставлена; повторите передачу. Новый заказ не создавался.',true);
+          const sent=await send({type:'linked-egrn',chat:target,original_id:file.id},async()=>{
+            let receipt;
+            if(url){
+              receipt=await tg.sendMessage(target,'📄 Выписка ЕГРН: '+file.name+'\nОригинал: '+file.bytes+' байт. Если срок ссылки истёк, обновите её кнопкой ниже.',{
+                reply_to_message_id:state.cards[target],reply_markup:{inline_keyboard:[[{text:'Скачать оригинал',url}],[{text:'Обновить ссылку',callback_data:'egf:'+file.id}]]}});
+            }else{
+              try{receipt=await tg.callApi('copyMessage',{chat_id:target,from_chat_id:original.chat_id,message_id:Number(original.message_id),reply_parameters:{message_id:state.cards[target],allow_sending_without_reply:true}});}
+              catch(error){
+                if(Number(error?.response?.error_code)!==400||!/message to copy not found/i.test(error.response.description||'')||typeof original.file_id!=='string'||!original.file_id)throw error;
+                receipt=await tg.sendDocument(target,original.file_id,{caption:file.name,reply_to_message_id:state.cards[target]});
+              }
+            }
+            if(!Number.isSafeInteger(Number(receipt?.message_id))||Number(receipt.message_id)<1)throw new Error('Missing linked EGRN receipt');
+            return receipt;
+          });
+          links.confirmed[target][file.id]={message_id:Number(sent.message_id)};state.inflight=null;await save();receiptPending=false;
+        }
+        links.completed=true;state.egrn.completed=true;state.egrn.result='included-links';state.egrn.note='Связанные выписки ЕГРН доставлены юристу.';await save();
+      }
       if(!state.egrn.completed){
         const egrn=state.egrn,cad=state.fields.cad_num;
         if(state.packet.materials.some(file=>file.role==='egrn')){egrn.completed=true;egrn.result='included';}
@@ -289,4 +348,4 @@ function createHandoffSubmitter(options={}) {
     }
   };
 }
-module.exports={createHandoffSubmitter,HandoffError,DDL};
+module.exports={createHandoffSubmitter,HandoffError,DDL,hasPendingLinkedEgrn};

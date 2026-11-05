@@ -105,6 +105,7 @@ async function deliverNativeRecord(order, record, records) {
     if (receipt && receipt.id) confirmed[JSON.stringify([String(receipt.chat), record.key || String(record.chat) + ':' + String(record.id)])] = true;
   }
   await copyFiles([record], nativeDeliveryTargets(order, record), { strict: true, confirmed,
+    onSourceRepaired: () => persistFileRecords(order, records),
     async onCopied(key, message) {
       const chat = JSON.parse(key)[0];
       record.deliveries = deliveries;
@@ -869,6 +870,32 @@ function setupEgrn(bot) {
   setInterval(poll, 3 * 60 * 1000);
 }
 
+async function copyNativeOriginal(record, destination, options) {
+  const copy = () => tgApi.callApi('copyMessage', Object.assign({ chat_id: destination.chat, from_chat_id: record.chat, message_id: record.id },
+    destination.reply ? { reply_parameters: { message_id: Number(destination.reply), allow_sending_without_reply: true } } : {}));
+  try { return await copy(); }
+  catch (error) {
+    const missing = Number(error.response?.error_code) === 400 && /message to copy not found/i.test(error.response?.description || error.message || '');
+    if (!missing || typeof record.file_id !== 'string' || !record.file_id || typeof tgApi.sendDocument !== 'function') throw error;
+    // A deleted message does not delete Telegram's reusable original. Repair
+    // only this exact file and retain its original reference identity.
+    const originChat = record.chat, originId = record.id, key = sourceKey(record);
+    const repairChat = /^-100[1-9]\d+$/.test(String(destination.chat)) ? destination.chat : originChat;
+    const sameChat = String(repairChat) === String(destination.chat);
+    const extra = { disable_notification: true, caption: '📄 ' + String(record.name || 'Выписка ЕГРН').slice(0, 220) };
+    if (sameChat && destination.reply) extra.reply_parameters = { message_id: Number(destination.reply), allow_sending_without_reply: true };
+    const repaired = await tgApi.sendDocument(repairChat, record.file_id, extra);
+    if (!Number.isSafeInteger(Number(repaired?.message_id)) || Number(repaired.message_id) < 1)
+      throw Object.assign(new Error('Telegram не подтвердил восстановление оригинала выписки.'), { code: 'EGRN_COPY_SOURCE_RECEIPT', uncertain: true });
+    record.reference_chat ??= originChat; record.reference_id ??= originId;
+    record.key ||= key; record.chat = repairChat; record.id = Number(repaired.message_id);
+    if (repaired.document?.file_id) record.file_id = repaired.document.file_id;
+    try { if (options.onSourceRepaired) await options.onSourceRepaired(record); }
+    catch (failure) { failure.uncertain = true; failure.code ||= 'EGRN_COPY_CHECKPOINT'; throw failure; }
+    return sameChat ? repaired : await copy();
+  }
+}
+
 async function copyFiles(fileMsgs, targets, options = {}) {
   options = { ...options, strict: options.strict !== false };
   if (!tgApi) {
@@ -885,9 +912,7 @@ async function copyFiles(fileMsgs, targets, options = {}) {
       if (confirmed[key] === true) continue;
       let stage = 'telegram';
       try {
-        const message = fm.kind === 'link' ? await largeDelivery().copy(fm, t) :
-          await tgApi.callApi('copyMessage', Object.assign({ chat_id: t.chat, from_chat_id: fm.chat, message_id: fm.id },
-            t.reply ? { reply_parameters: { message_id: Number(t.reply), allow_sending_without_reply: true } } : {}));
+        const message = fm.kind === 'link' ? await largeDelivery().copy(fm, t) : await copyNativeOriginal(fm, t, options);
         if (options.strict && !(fm.kind === 'link' && message === true) && (!Number.isSafeInteger(Number(message?.message_id)) || Number(message.message_id) < 1)) {
           throw Object.assign(new Error('Telegram не подтвердил доставку выписки.'), { code: 'EGRN_COPY_RECEIPT', uncertain: true });
         }
@@ -934,6 +959,7 @@ async function deliverCachedCopy(order, targets, copyOptions = {}) {
   for (const target of targets) for (const record of records) {
     await renewDelivery(order);
     await copyFiles([record], [target], { ...copyOptions, strict: true, confirmed,
+      onSourceRepaired: () => persistFileRecords(order, records),
       async onCopied(key, message) {
         if (message?.message_id) {
           const chat = JSON.parse(key)[0];
@@ -998,8 +1024,11 @@ async function attachOrOrder(opts) {
       const records = await deliverCachedCopy(leased, opts.targets || [], opts.copyOptions);
       if ((leased.deliver || []).some(target => target && target.order_id) && records.some(file => file.kind === 'link' || Number(file.bytes)>12*1024*1024)) await require('../web/order-egrn-links').registerOrderLinks(leased, records);
       let packet = {};
-      if ((opts.targets || []).some(target => target && target.order_id) && records.some(file => file.kind !== 'link')) {
-        try { packet = await require('./order-evidence').registerCached(opts.targets, records.filter(file => file.kind !== 'link'), tgApi); }
+      // Medium originals already belong to the packet through Telegram refs.
+      // Only small originals need another byte copy in order_materials.
+      const smallOriginals = records.filter(file => file.kind !== 'link' && !(Number(file.bytes) > 12 * 1024 * 1024));
+      if ((opts.targets || []).some(target => target && target.order_id) && smallOriginals.length) {
+        try { packet = await require('./order-evidence').registerCached(opts.targets, smallOriginals, tgApi); }
         catch (error) { console.error('egrn packet: original unavailable'); packet = { packet_warning: 'Оригинал выписки не добавлен к документам заявки. Прикрепите его к заявке.' }; }
       }
       // The cached order was already complete before these targets joined.
