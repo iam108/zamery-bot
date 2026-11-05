@@ -217,6 +217,35 @@ test('restoring a frozen server snapshot preserves its UI version, source page a
   assert.equal(c.state.data.ui_version,4);assert.equal(c.state.data.plan.page,6);assert.equal(c.state.data.plan.annotations[0].id,'old-valid-mark');assert.equal(c.state.draft.revision,17);assert.equal(c.state.viewStep,1);assert.equal(c.state.frozen,true);assert.equal(c.state.dirty,false);assert.deepEqual(copy(c.state.evidence),remote.evidence);assert.equal(c.state.packet.org,remote.data.request_packet.org);
 });
 
+test('restoring a frozen server submission discards an editable packet-review prompt and permits exact retry',async()=>{
+  const c=harness();load(c,'merge','restoreData','frozenSnapshot');
+  c.state.pendingPacket={org:'New manager packet'};c.state.packetError='Сверьте обновление';
+  c.renderPacketUpdate=()=>c.calls.push(['review-panel']);
+  const remote={...c.state.draft,revision:17,submitting:true,data:copy(c.state.data),evidence:[]};
+  c.frozenSnapshot(remote);await c.submit();
+  assert.equal(c.state.pendingPacket,null);assert.equal(c.state.packetError,'');assert.equal(c.state.completed,true);
+  const sent=c.calls.find(call=>call[0]==='request'&&call[1]==='/api/audit');assert.equal(JSON.parse(sent[2].body).revision,17);
+  assert.equal(c.calls.some(call=>['flush','export','upload'].includes(call[0])),false);
+});
+
+test('an explicit server reload clears old packet-review state when another window froze the draft',async()=>{
+  const c=harness();load(c,'merge','restoreData','reloadServer');c.window.confirm=()=>true;
+  c.state.pendingPacket={org:'New manager packet'};c.state.packetError='Сверьте обновление';c.renderPacketUpdate=()=>{};
+  const remote={...c.state.draft,revision:17,submitting:true,data:copy(c.state.data),evidence:[]};
+  c.request=async(url,options)=>{c.calls.push(['request',url,options]);return options?{ok:true}:{draft:remote};};
+  await c.reloadServer();await c.submit();
+  assert.equal(c.state.pendingPacket,null);assert.equal(c.state.packetError,'');assert.equal(c.state.completed,true);
+});
+
+test('a packet fetch finishing after submission froze cannot replace or reopen review of that frozen packet',async()=>{
+  const c=harness();c.state.data.request_packet={org:'Original',address:'Original address',service:'Получение',object_category:'catering',materials:[]};
+  const before=copy(c.state.data);let finish;
+  c.request=()=>new Promise(resolve=>{finish=resolve;});c.renderPacketUpdate=()=>assert.fail('Frozen retry cannot reopen editable packet review');
+  load(c,'packetIdentity','hasInspectionWork','fetchPacket');const fetching=c.fetchPacket();
+  c.state.frozen=true;finish({...before.request_packet,address:'New manager address'});await fetching;
+  assert.deepEqual(copy(c.state.data),before);assert.equal(c.state.pendingPacket,undefined);assert.equal(c.state.packet.address,'Original address');
+});
+
 test('unchanged editor snapshot retries a previously failed write instead of falsely acknowledging save',async()=>{
   const c=harness();c.state.data.workflow.step=1;let options,writes=0;
   c.window.AuditPlanEditor={mount(container,value){options=value;return {};}};
@@ -428,6 +457,68 @@ test('manager identity changes keep original observations until an explicit mate
   assert.equal(c.state.data.packet_rechecks[0].previous.address,'Old address');
   assert.equal(c.state.data.packet_rechecks[0].current.cad_num,'77:01:1:2');
   assert.equal(c.state.pendingPacket,null);
+});
+
+test('browser and server compare the same reviewed source facts while ignoring delivery URLs and file order',()=>{
+  const c=harness();load(c,'packetIdentity');
+  const {packetReviewIdentity}=require('../src/bot/audit-packet-review');
+  const packet={org:' ООО Тест ',address:'Москва',service:'Продление',object_category:'catering',cad_num:'77:01:1:2',archive_url:'https://disk.yandex.ru/d/archive',zones_info:'Проверить школу',video_required:true,
+    materials:[{id:'two',name:'План.pdf',role:'plan',mime:'application/pdf',bytes:'20',sha256:'hash2',url:'/private-link'},{id:'one',name:'Договор.pdf',role:'document',bytes:10,sha256:'hash1'}],
+    egrn_links:[{id:'large',role:'egrn',bytes:300000000,name:'Выписка.pdf',url:'/fresh-signed-link'}]};
+  assert.deepEqual(copy(c.packetIdentity(packet)),packetReviewIdentity(packet));
+  assert.deepEqual(copy(c.packetIdentity({...packet,contacts:'Новый контакт',deadline:'2026-12-01',packet_revision:20,materials:packet.materials.toReversed().map(file=>({...file,url:'/new-download-url'}))})),packetReviewIdentity(packet));
+});
+
+test('an updated public archive is inspectable before accepting its packet while the original snapshot stays intact',()=>{
+  const c=harness();load(c,'esc','packetIdentity','renderPacketUpdate');
+  c.state.data.request_packet={org:'Company',address:'Address',service:'Продление',archive_url:'https://disk.yandex.ru/d/old-archive',materials:[]};
+  c.state.pendingPacket={...c.state.data.request_packet,archive_url:'https://disk.yandex.ru/d/new-archive'};
+  c.managerFilesHtml=()=>'';c.largeEgrnFilesHtml=()=>'';c.acceptPacketUpdate=()=>{};
+  c.renderPacketUpdate();
+  assert.ok(c.$('#app-notice').innerHTML.includes('href="https://disk.yandex.ru/d/new-archive"'));
+  assert.equal(c.state.data.request_packet.archive_url,'https://disk.yandex.ru/d/old-archive');
+});
+
+test('an invalid updated archive remains visible as a problem without creating an executable or credential-bearing link',()=>{
+  for(const archive of ['javascript:alert(1)','https://user:secret@disk.yandex.ru/d/archive','not-a-url']){
+    const c=harness();load(c,'esc','packetIdentity','renderPacketUpdate');
+    c.state.data.request_packet={org:'Company',address:'Address',service:'Продление',archive_url:'https://disk.yandex.ru/d/old',materials:[]};
+    c.state.pendingPacket={...c.state.data.request_packet,archive_url:archive};c.managerFilesHtml=()=>'';c.largeEgrnFilesHtml=()=>'';c.acceptPacketUpdate=()=>{};
+    c.renderPacketUpdate();assert.match(c.$('#app-notice').innerHTML,/Ссылка некорректна/);assert.doesNotMatch(c.$('#app-notice').innerHTML,/href=/);
+  }
+});
+
+for(const observation of ['territory result','video link','plan note'])test('a saved '+observation+' requires explicit review when the manager changes the source object',async()=>{
+  const c=harness();c.state.evidence=[];
+  c.state.data={inspection:{org:'Company',address:'Old address',service:'Получение',region:'МСК'},workflow:{step:0},conclusion:'',entrances:[],zones:[],plan:{annotations:[]},map:{annotations:[]},additional_plans:[],object_category:'catering',request_packet:{org:'Company',address:'Old address',service:'Получение',object_category:'catering',materials:[]}};
+  if(observation==='territory result')c.state.data.workflow.territory_result='clear';
+  if(observation==='video link')c.state.data.workflow.video_url='https://disk.yandex.ru/i/visit-video';
+  if(observation==='plan note')c.state.data.inspection.plan_note='Стена на плане отсутствует по факту';
+  const before=copy(c.state.data),updated={...before.request_packet,address:'New address'};
+  c.request=async()=>updated;c.renderPacketUpdate=()=>{};c.prefillContact=()=>{};c.sanitizeService=()=>{};
+  load(c,'packetIdentity','hasInspectionWork','applyPacket','fetchPacket');await c.fetchPacket();
+  assert.deepEqual(copy(c.state.data),before);assert.equal(c.state.pendingPacket,updated);
+});
+
+for(const change of ['materials','egrn_links','archive_url','zones_info'])test('updated manager '+change+' requires review without losing auditor observations',async()=>{
+  const c=harness();c.state.data.request_packet={org:'Company',address:'Address',service:'Получение',object_category:'catering',cad_num:'77:01:1:1',materials:[]};
+  const original=copy(c.state.data),next={...original.request_packet,[change]:change.endsWith('links')||change==='materials'?[{id:'fresh-source',role:'egrn',name:'Свежая выписка.pdf'}]:'Новые сведения'};
+  c.request=async()=>next;c.renderPacketUpdate=()=>{};
+  load(c,'packetIdentity','hasInspectionWork','fetchPacket');await c.fetchPacket();
+  assert.deepEqual(copy(c.state.data),original);assert.equal(c.state.pendingPacket,next);
+  await c.submit();assert.equal(c.state.completed,false);assert.equal(c.calls.some(call=>['flush','export','upload'].includes(call[0])),false);
+});
+
+test('a source-update submission response opens source review instead of a false draft conflict',async()=>{
+  const c=harness(),original=copy(c.state.data);let fetched=0;
+  c.checkSubmissionState=async()=>{c.state.frozen=false;};
+  c.fetchPacket=async()=>{fetched++;c.state.pendingPacket={address:'updated'};};
+  c.request=async(url,options)=>{
+    if(options?.method==='DELETE')return{ok:true,revision:++c.state.draft.revision};
+    throw Object.assign(new Error('Документы обновлены'),{status:409,payload:{code:'AUDIT_PACKET_CHANGED'}});
+  };
+  await c.submit();assert.equal(fetched,1);assert.notEqual(c.state.conflict,true);assert.equal(c.state.frozen,false);assert.equal(c.state.completed,false);
+  assert.equal(c.state.data.conclusion,original.conclusion);assert.equal(c.state.data.plan.evidence_id,original.plan.evidence_id);
 });
 
 test('a local-only draft is discoverable from the same employee general menu', async () => {

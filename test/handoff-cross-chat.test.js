@@ -104,3 +104,13 @@ test('a stored V2 single-chat cursor without a sources list resumes without repe
   assert.deepEqual(h.events.slice(before).map(event => [event.source,event.ids]), [[CLIENTS,[82,83]]]);
   assert.equal((await h.cases()).length, 1);
 }));
+
+test('V2 privately forwards captionless nested photo and audio replies from every linked source exactly once', pg, async () => fixture(async h => {
+  await h.db.exec("INSERT INTO reports(id,chat_id,first_id,msg_ids,text,author,reply_to) VALUES(11,-100200,84,'{84}','','Synthetic auditor',82),(12,-100100,300,'{300}','Nested photo caption','Synthetic auditor',184),(13,-100100,301,'{301}','','Synthetic auditor',300)");
+  const result = await h.submit(); assert.equal(result.delivery_complete,true);
+  const copies = h.events.filter(event => event.type === 'copy');
+  assert.deepEqual(copies.filter(event => event.source === CLIENTS).flatMap(event => event.ids),[80,81,82,83,84]);
+  assert.deepEqual(copies.filter(event => event.source === AUDITS).flatMap(event => event.ids),h.auditIds.concat(300,301));
+  const rows = await h.cases(); assert.equal(rows.length,1); assert.match(rows[0].audit_text,/Nested photo caption/);
+  const before = h.events.length; await h.submit(); assert.equal(h.events.length,before);
+}));

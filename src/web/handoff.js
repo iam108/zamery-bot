@@ -255,7 +255,7 @@ function setupReportsBot(bot) {
     if (cid === String(process.env.GROUP_CHAT_ID) || cid === String(process.env.CLIENTS_CHAT_ID)) {
       var m = ctx.message;
       var text = m.text || m.caption || '';
-      var hasMedia = !!(m.photo || m.document || m.video);
+      var hasMedia = !!(m.photo || m.document || m.video || m.audio || m.voice || m.video_note || m.animation);
       if (text || hasMedia) {
         var author = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ') || 'аудитор';
         try { await addToReports(ctx.chat.id, m.message_id, text, author, ctx.from.id, m.media_group_id, new Date(m.date * 1000), m.reply_to_message ? m.reply_to_message.message_id : null); }
@@ -324,35 +324,10 @@ async function getReport(src, id) {
     var a = (await pool.query('SELECT * FROM audits WHERE id=$1', [id])).rows[0];
     return a ? { chat_id: a.chat_id, msg_ids: a.msg_ids, sources: [{ chat_id: a.chat_id, msg_ids: a.msg_ids || [] }], text: a.text, linked: 0, metadata: auditMetadata(a), report_data: a.report_data } : null;
   }
-  var r = (await pool.query('SELECT * FROM reports WHERE id=$1', [id])).rows[0];
-  if (!r) return null;
-  var ids = (r.msg_ids || []).map(Number);
-  var replies = (await pool.query(
-    'SELECT * FROM reports WHERE chat_id=$1 AND reply_to = ANY($2::bigint[]) AND id <> $3 ORDER BY first_id', [r.chat_id, ids, r.id])).rows;
-  var num = isOrderCard(r.text) ? orderNum(r.text) : null;
-  var audits = num ? (await pool.query('SELECT * FROM audits WHERE order_id=$1 ORDER BY created_at', [num])).rows : [];
-  var texts = replies.map(function (x) { return x.text; }).filter(Boolean).concat(audits.map(function (x) { return x.text; }));
-  replies.forEach(function (x) { ids = ids.concat((x.msg_ids || []).map(Number)); });
-  var sources = new Map();
-  function addSource(chat, messages) {
-    var key = String(chat);
-    if (!sources.has(key)) sources.set(key, { chat_id: chat, msg_ids: [] });
-    var source = sources.get(key);
-    source.msg_ids = Array.from(new Set(source.msg_ids.concat((messages || []).map(Number)))).sort(function (a, b) { return a - b; });
-  }
-  addSource(r.chat_id, ids);
-  audits.forEach(function (audit) { addSource(audit.chat_id, audit.msg_ids); });
-  return {
-    chat_id: r.chat_id,
-    msg_ids: ids,
-    sources: Array.from(sources.values()),
-    extra: audits.filter(function (x) { return String(x.chat_id) === String(r.chat_id); }).reduce(function (acc, x) { return acc.concat((x.msg_ids || []).map(Number)); }, []),
-    text: isOrderCard(r.text) ? (texts.join('\n\n') || '') : [r.text].concat(texts).join('\n\n'),
-    linked: replies.length + audits.length,
-    metadata: auditMetadata(audits.length ? audits[audits.length - 1] : { text: [r.text].concat(texts).join('\n\n') }),
-    report_data: audits.length ? audits[audits.length - 1].report_data : undefined,
-    report_data_sources: audits.map(function (audit) { return audit.report_data; })
-  };
+  var aggregate = await require('./legacy-report').loadReportAggregate(pool, id);
+  if (!aggregate) return null;
+  var { metadata_source, ...report } = aggregate;
+  return Object.assign(report, { metadata: auditMetadata(metadata_source) });
 }
 
 // copyMessages preserves albums, but callers must provide the recipient's
@@ -439,69 +414,10 @@ function parseExport(buf, name) {
   return out;
 }
 
-async function importReportMessages(chatId, messages) {
+async function importReportMessages(chatId, prepared, options) {
   if (!chatId) throw new Error('Чат для импорта не настроен.');
-  var unique = new Map();
-  messages.forEach(function (m) {
-    if (!Number.isSafeInteger(Number(m.id)) || Number(m.id) <= 0 || !Number.isFinite(m.date.getTime())) {
-      throw new Error('В выгрузке есть сообщение с некорректным номером или датой.');
-    }
-    m.id = Number(m.id);
-    if (!unique.has(m.id)) unique.set(m.id, m);
-  });
-  var msgs = Array.from(unique.values()).sort(function (a, b) { return a.id - b.id; });
-  var groups = [], cur = null;
-  msgs.forEach(function (m) {
-    if (!m.text && !m.media) return;
-    var author = m.author || 'аудитор';
-    var sameThread = cur && (m.reply || null) === (cur.reply || null);
-    var sameAlbum = cur && m.mgid && m.mgid === cur.mgid;
-    var elapsed = cur ? m.date - cur.last : Infinity;
-    if (cur && (sameAlbum || ((m.sender || author) === cur.sender && elapsed >= 0 && elapsed <= MERGE_SEC * 1000 && sameThread && !startsReport(m.text)))) {
-      cur.messages.push(m); cur.last = m.date; cur.mgid = cur.mgid || m.mgid || null;
-    } else {
-      cur = { messages: [m], author: author, authorId: m.authorId || null, sender: m.sender || author, mgid: m.mgid || null,
-        date: m.date, last: m.date, reply: m.reply || null };
-      groups.push(cur);
-    }
-  });
-  return withReportChat(chatId, async function (db) {
-    var known = new Map();
-    var existing = (await db.query('SELECT id,msg_ids FROM reports WHERE chat_id=$1 AND msg_ids && $2::bigint[] ORDER BY id FOR UPDATE', [chatId, msgs.map(function (m) { return m.id; })])).rows;
-    existing.forEach(function (r) { (r.msg_ids || []).forEach(function (id) { if (!known.has(Number(id))) known.set(Number(id), r.id); }); });
-    var updates = new Map(), inserts = [];
-    groups.forEach(function (g) {
-      var overlap = g.messages.find(function (m) { return known.has(m.id); });
-      if (!overlap) { inserts.push(g); return; }
-      // Extend the existing report instead of discarding the whole group.
-      // Its ID can already be referenced by a case or a handoff draft.
-      var owner = known.get(overlap.id);
-      g.messages.forEach(function (m) {
-        if (known.has(m.id)) { owner = known.get(m.id); return; }
-        if (!updates.has(owner)) updates.set(owner, []);
-        updates.get(owner).push(m); known.set(m.id, owner);
-      });
-    });
-    var added = 0;
-    for (const [id, missing] of updates) {
-      var text = missing.map(function (m) { return m.text; }).filter(Boolean).join('\n');
-      var last = new Date(missing.reduce(function (latest, m) { return Math.max(latest, m.date.getTime()); }, 0));
-      await db.query("UPDATE reports SET msg_ids=ARRAY(SELECT DISTINCT n FROM unnest(msg_ids || $1::bigint[]) AS n ORDER BY n), text=CASE WHEN $2='' THEN text WHEN text='' THEN $2 ELSE text || E'\\n' || $2 END, last_message_at=GREATEST(COALESCE(last_message_at,created_at),$4::timestamptz) WHERE id=$3",
-        [missing.map(function (m) { return m.id; }), text, id, last]);
-      added++;
-    }
-    for (var i = 0; i < inserts.length; i += 500) {
-      var part = inserts.slice(i, i + 500);
-      var r = await db.query(
-        "INSERT INTO reports (chat_id,first_id,msg_ids,text,author,created_at,reply_to,author_id,mgid,last_message_at) " +
-        "SELECT $1,f,string_to_array(ids,',')::bigint[],t,a,d,NULLIF(rp,0),au,mg,last FROM unnest($2::bigint[],$3::text[],$4::text[],$5::text[],$6::timestamptz[],$7::bigint[],$8::bigint[],$9::text[],$10::timestamptz[]) AS x(f,ids,t,a,d,rp,au,mg,last) ON CONFLICT (chat_id,first_id) DO NOTHING",
-        [chatId, part.map(function (g) { return g.messages[0].id; }), part.map(function (g) { return g.messages.map(function (m) { return m.id; }).join(','); }),
-          part.map(function (g) { return g.messages.map(function (m) { return m.text; }).filter(Boolean).join('\n'); }), part.map(function (g) { return g.author; }),
-          part.map(function (g) { return g.date.toISOString(); }), part.map(function (g) { return g.reply || 0; }),
-          part.map(function (g) { return g.authorId; }), part.map(function (g) { return g.mgid; }), part.map(function (g) { return g.last.toISOString(); })]);
-      added += r.rowCount;
-    }
-    return { added: added, messages: msgs.length };
+  return withReportChat(chatId, function (db) {
+    return require('./report-import-store').importPreparedReports(db, chatId, prepared, options);
   });
 }
 
@@ -523,7 +439,7 @@ function adminImportPage(msg, isErr) {
     '<p style="color:#94a3b8;font-size:13px">Повторная загрузка не создаёт дублей.</p></div></body></html>';
 }
 
-function setupReportsWeb(app, upload) {
+function setupReportsWeb(app) {
   setupRequestsWeb(app);
   ensureReports().catch(function (e) { console.error('reports table:', e.message); });
 
@@ -544,18 +460,32 @@ function setupReportsWeb(app, upload) {
 
   function auth(req, res, next) { if (req.session && req.session.auth) return next(); res.redirect('/admin/login'); }
   app.get('/admin/import', auth, function (req, res) { res.send(adminImportPage()); });
-  app.post('/admin/import', auth, upload.array('files', 50), async function (req, res) {
+  const importUploads = require('./report-import-upload').createReportImportUpload({
+    sendError: function (req, res, message, status) { return res.status(status).send(adminImportPage(message, true)); }
+  });
+  app.post('/admin/import', auth, importUploads, async function (req, res) {
+    const work = req.reportImportWork;
+    function aborted() { return !!(work && work.aborted); }
     try {
-      await ensureReports(); await ensureTables(); await ensureRequests();
       var files = req.files || [];
       if (!files.length) return res.send(adminImportPage('Файлы не выбраны. Нажмите «Выберите файлы» и отметьте messages.html.', true));
-      var msgs = [];
-      files.forEach(function (f) { msgs = msgs.concat(parseExport(f.buffer, f.originalname)); });
+      const prepared = await require('./report-import-spool').prepareReportImport(files, {
+        parseExport: parseExport, startsReport: startsReport, parentDirectory: work.directory, isAborted: aborted
+      });
+      if (aborted()) throw Object.assign(new Error('Импорт прерван.'), { code: 'UPLOAD_ABORTED' });
+      await ensureReports(); await ensureTables(); await ensureRequests();
       var chatId = req.body.chat === 'clients' ? process.env.CLIENTS_CHAT_ID : process.env.GROUP_CHAT_ID;
-      var imported = await importReportMessages(chatId, msgs);
+      var imported = await importReportMessages(chatId, prepared, { isAborted: aborted });
       var cnt = (await pool.query('SELECT COUNT(*)::int AS c FROM reports WHERE chat_id=$1', [chatId])).rows[0].c;
-      res.send(adminImportPage('Готово. Файлов: ' + files.length + ', сообщений: ' + imported.messages + ', отчётов загружено: ' + imported.added + '. Всего в базе: ' + cnt + '.'));
-    } catch (e) { console.error('import:', e); res.send(adminImportPage('Ошибка: ' + e.message, true)); }
+      if (!aborted() && !res.destroyed) res.send(adminImportPage('Готово. Файлов: ' + files.length + ', сообщений: ' + imported.messages + ', отчётов загружено: ' + imported.added + '. Всего в базе: ' + cnt + '.'));
+    } catch (e) {
+      console.error('import:', e.code || e.message);
+      if (!aborted() && !res.destroyed) {
+        const message = e.code === 'ENOSPC' ? 'Недостаточно места для импорта. Повторите позже.' :
+          /некорректным номером или датой|не больше 50 МБ|Проверьте файлы импорта/.test(e.message || '') ? e.message : 'Не удалось прочитать файлы или сохранить импорт. Проверьте выгрузку и повторите.';
+        res.status(e.code === 'ENOSPC' ? 503 : 400).send(adminImportPage('Ошибка: ' + message, true));
+      }
+    } finally { await require('./report-import-upload').cleanupReportImport(req).catch(function (error) { console.error('import cleanup:', error.code || 'error'); }); }
   });
 }
 
@@ -873,6 +803,15 @@ function mskToday() { return new Date(Date.now() + 3 * 3600 * 1000).toISOString(
 function mskHour() { return new Date(Date.now() + 3 * 3600 * 1000).getUTCHours(); }
 function ruDate(s) { return s ? s.slice(8, 10) + '.' + s.slice(5, 7) + '.' + s.slice(0, 4) : ''; }
 function ruShort(s) { return s ? s.slice(8, 10) + '.' + s.slice(5, 7) : ''; }
+function storedDate(value) { return value && typeof value.toISOString === 'function' ? value.toISOString().slice(0,10) : String(value || '').slice(0,10); }
+function reminderRetryAt(when, workdaysOnly) {
+  var local = new Date(when+3*3600000), day = local.toISOString().slice(0,10);
+  if (workdaysOnly && !isWorkday(new Date(day+'T00:00:00Z'))) {
+    do { local.setUTCDate(local.getUTCDate()+1); day = local.toISOString().slice(0,10); } while (!isWorkday(new Date(day+'T00:00:00Z')));
+    return Date.parse(day+'T06:00:00Z');
+  }
+  return local.getUTCHours() < 9 ? Date.parse(day+'T06:00:00Z') : when;
+}
 
 let deadlinesReady;
 function ensureDeadlines() {
@@ -914,7 +853,7 @@ async function sendCaseReminders(bot) {
       var locked = (await client.query('SELECT * FROM case_reminders WHERE id=$1 AND done=false AND sent_at IS NULL', [rows[i].id])).rows[0];
       if (!locked) continue;
       var r = Object.assign({}, rows[i], locked);
-      var due = r.remind_on instanceof Date ? r.remind_on.toISOString().slice(0, 10) : String(r.remind_on).slice(0, 10);
+      var due = storedDate(r.remind_on);
       var text = '⏰ <b>Напоминание</b>\n🏢 ' + esc(r.org) + (r.inn ? ' · ИНН ' + esc(r.inn) : '') + '\n\n' + esc(r.text) +
         '\n\n<i>' + (due < today ? 'на ' + ruDate(due) + ' · ' : '') + 'поставил(а) ' + esc(r.created_name || '') + '</i>';
       var kb = { inline_keyboard: [[
@@ -923,19 +862,41 @@ async function sendCaseReminders(bot) {
       ]] };
       var to = [...new Set([r.lawyer_tg_id, r.created_by].filter(value => /^[1-9]\d*$/.test(String(value))).map(String))];
       var receipts = Object.assign({}, r.delivery || {});
+      var currentCase = null;
+      var refreshAccess = async function () {
+        currentCase = (await client.query('SELECT * FROM cases WHERE id=$1', [r.case_id])).rows[0];
+        var checked = await require('./reminder-recipients').loadRecipientAccess(client, currentCase, [r.created_by], Date.now());
+        currentCase = checked.client;
+        var access = checked.access;
+        access.next_at = reminderRetryAt(access.next_at,false);
+        receipts._access = access;
+        return access;
+      };
       for (var j = 0; j < to.length; j++) {
         var current = (await client.query('SELECT done FROM case_reminders WHERE id=$1', [r.id])).rows[0];
         if (!current || current.done) break;
-        if (Number.isSafeInteger(Number(receipts[to[j]])) && Number(receipts[to[j]]) > 0) continue;
         try {
-          var message = await bot.telegram.sendMessage(to[j], text, { parse_mode: 'HTML', reply_markup: kb });
-          if (!Number.isSafeInteger(Number(message && message.message_id)) || Number(message.message_id) < 1) throw new Error('Missing Telegram receipt');
-          receipts[to[j]] = Number(message.message_id);
-          await client.query('UPDATE case_reminders SET delivery=$1 WHERE id=$2', [JSON.stringify(receipts), r.id]);
+          const chat = to[j];
+          var access = await refreshAccess();
+          if (!access.checked || !access.allowed.includes(chat)) continue;
+          await require('./reminder-delivery').deliverRecipient({
+            key: 'case:'+r.id+':'+(r.created_at && r.created_at.toISOString ? r.created_at.toISOString() : r.created_at)+':'+chat,
+            slot: chat, window: due, delivery: receipts, now: Date.now(), nextRetryAt: when => reminderRetryAt(when,false),
+            acknowledged: () => Number.isSafeInteger(Number(receipts[chat])) && Number(receipts[chat]) > 0,
+            acknowledge: id => { receipts[chat] = id; },
+            persist: () => client.query('UPDATE case_reminders SET delivery=$1 WHERE id=$2', [JSON.stringify(receipts), r.id]),
+            beforeSend: async () => {
+              var latest = (await client.query('SELECT done FROM case_reminders WHERE id=$1', [r.id])).rows[0];
+              var gate = await refreshAccess();
+              return !!latest && !latest.done && gate.checked && gate.allowed.includes(chat);
+            },
+            send: () => bot.telegram.sendMessage(chat, text, { parse_mode: 'HTML', reply_markup: kb }),
+          });
         } catch (e) { console.error('case reminder delivery failed', e.response && e.response.error_code || e.code || 'send_failed'); }
       }
-      var complete = to.length > 0 && to.every(chat => Number(receipts[chat]) > 0);
-      await client.query('UPDATE case_reminders SET delivery=$1, sent_at=CASE WHEN $2 THEN NOW() ELSE NULL END WHERE id=$3', [JSON.stringify(receipts), complete, r.id]);
+      var finalAccess = await refreshAccess();
+      var complete = finalAccess.checked && finalAccess.allowed.length > 0 && finalAccess.allowed.every(chat => Number(receipts[chat]) > 0);
+      await client.query('UPDATE case_reminders SET delivery=$1, sent_at=CASE WHEN $2 THEN NOW() ELSE NULL END WHERE id=$3 AND done=false AND EXISTS (SELECT 1 FROM cases WHERE id=case_reminders.case_id AND lawyer_tg_id IS NOT DISTINCT FROM $4::bigint)', [JSON.stringify(receipts), complete, r.id, currentCase && currentCase.lawyer_tg_id]);
     } catch (e) {
       console.error('case reminder checkpoint failed', e.code || 'storage_failed');
     } finally {
@@ -964,8 +925,8 @@ async function sendDecisionReminders(bot) {
       if (!ownsLock) continue;
       var c = (await client.query("SELECT * FROM cases WHERE id=$1 AND decision_due <= $2::date AND (reminded_on IS NULL OR reminded_on < $2::date) AND COALESCE(data->>'_stage','') IN ('Подано','Выездная проверка')", [rows[i].id, today])).rows[0];
       if (!c) continue;
-      var due = c.decision_due instanceof Date ? c.decision_due.toISOString().slice(0, 10) : String(c.decision_due).slice(0, 10);
-      var sub = c.submitted_on instanceof Date ? c.submitted_on.toISOString().slice(0, 10) : String(c.submitted_on || '').slice(0, 10);
+      var due = storedDate(c.decision_due);
+      var sub = storedDate(c.submitted_on);
       var late = workdaysBetween(due, today);
       var when = late === 0 ? 'срок сегодня' : 'срок был ' + ruDate(due) + ', прошло ' + late + ' раб. ' + (late === 1 ? 'день' : late < 5 ? 'дня' : 'дней');
       var text = '⏰ <b>Проверить решение</b>\n🏢 ' + esc(c.org) + (c.inn ? ' · ИНН ' + esc(c.inn) : '') +
@@ -981,28 +942,55 @@ async function sendDecisionReminders(bot) {
         return (await client.query('UPDATE cases SET decision_reminder_delivery=$1::jsonb' + condition, [JSON.stringify(receipts)].concat(params))).rowCount > 0;
       };
       var lawyer = String(c.lawyer_tg_id || '');
+      var refreshAccess = async function () {
+        var currentCase = (await client.query("SELECT * FROM cases WHERE id=$1 AND decision_due=$2::date AND lawyer_tg_id IS NOT DISTINCT FROM $3::bigint AND COALESCE(data->>'_stage','') IN ('Подано','Выездная проверка')", params)).rows[0];
+        if (!currentCase) return null;
+        var checked = await require('./reminder-recipients').loadRecipientAccess(client, currentCase, [], Date.now());
+        var access = checked.access;
+        access.next_at = reminderRetryAt(access.next_at,true);
+        receipts._access = access;
+        if (!checked.client || String(checked.client.lawyer_tg_id) !== lawyer || storedDate(checked.client.decision_due) !== due || !['Подано','Выездная проверка'].includes(checked.client.data && checked.client.data._stage)) return null;
+        return access;
+      };
+      var access = await refreshAccess();
+      if (!access) continue;
       if (!(receipts.dm && receipts.dm.on === today && receipts.dm.chat === lawyer && receipts.dm.message_id > 0)) {
         if (!await active()) continue;
         try {
-          var message = await bot.telegram.sendMessage(c.lawyer_tg_id, text + '\n\nКогда решение будет — поставьте этап «Решение получено».', {
-            parse_mode: 'HTML',
-            reply_markup: { inline_keyboard: [[{ text: '📋 Открыть чек-лист', web_app: { url: process.env.WEBAPP_URL + '/checklist?case_id=' + c.id } }]] }
-          });
-          if (!Number.isSafeInteger(Number(message && message.message_id)) || Number(message.message_id) < 1) throw new Error('Missing Telegram receipt');
-          receipts.dm = { on: today, chat: lawyer, message_id: Number(message.message_id) };
-          if (!await checkpoint()) continue;
+          if (access.checked && access.allowed.includes(lawyer)) {
+            await require('./reminder-delivery').deliverRecipient({
+              key: 'decision:'+c.id+':'+due+':'+today+':dm:'+lawyer, slot: 'dm:'+lawyer, window: today, delivery: receipts, now: Date.now(), nextRetryAt: when => reminderRetryAt(when,true),
+              acknowledged: () => receipts.dm && receipts.dm.on === today && receipts.dm.chat === lawyer && receipts.dm.message_id > 0,
+              acknowledge: id => { receipts.dm = { on: today, chat: lawyer, message_id: id }; }, persist: checkpoint,
+              beforeSend: async () => { var gate = await refreshAccess(); return gate && gate.checked && gate.allowed.includes(lawyer); },
+              send: () => bot.telegram.sendMessage(c.lawyer_tg_id, text + '\n\nКогда решение будет — поставьте этап «Решение получено».', {
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '📋 Открыть чек-лист', web_app: { url: process.env.WEBAPP_URL + '/checklist?case_id=' + c.id } }]] }
+              }),
+            });
+          } else await checkpoint();
         } catch (e) { console.error('reminder DM:', e.message); }
       }
       if (receipts.group_required && !receipts.group) {
         if (!await active()) continue;
         try {
-          var notice = await bot.telegram.sendMessage(process.env.CLIENTS_CHAT_ID, text, { parse_mode: 'HTML' });
-          if (!Number.isSafeInteger(Number(notice && notice.message_id)) || Number(notice.message_id) < 1) throw new Error('Missing Telegram receipt');
-          receipts.group = { chat: String(process.env.CLIENTS_CHAT_ID), message_id: Number(notice.message_id) };
-          if (!await checkpoint()) continue;
+          const group = String(process.env.CLIENTS_CHAT_ID);
+          access = await refreshAccess();
+          if (!access) continue;
+          const notice = text + (access.checked && access.allowed.includes(lawyer) ? '' : '\n\n⚠️ Личный получатель недоступен. Проверьте назначенного юриста и его доступ.');
+          await require('./reminder-delivery').deliverRecipient({
+            key: 'decision:'+c.id+':'+due+':group:'+group, slot: 'group:'+group, window: due, delivery: receipts, now: Date.now(), nextRetryAt: when => reminderRetryAt(when,true),
+            acknowledged: () => receipts.group && receipts.group.message_id > 0,
+            acknowledge: id => { receipts.group = { chat: group, message_id: id }; }, persist: checkpoint,
+            beforeSend: active,
+            send: () => bot.telegram.sendMessage(group, notice, { parse_mode: 'HTML' }),
+          });
         } catch (e) { console.error('reminder chat:', e.message); }
       }
-      if (receipts.dm && receipts.dm.on === today && receipts.dm.chat === lawyer && receipts.dm.message_id > 0 && (!receipts.group_required || receipts.group && receipts.group.message_id > 0)) {
+      access = await refreshAccess();
+      if (!access) continue;
+      await checkpoint();
+      if (access.checked && access.allowed.includes(lawyer) && receipts.dm && receipts.dm.on === today && receipts.dm.chat === lawyer && receipts.dm.message_id > 0 && (!receipts.group_required || receipts.group && receipts.group.message_id > 0)) {
         await client.query('UPDATE cases SET reminded_on=$1::date' + condition, [today].concat(params));
       }
     } catch (e) { console.error('decision reminder checkpoint:', e.message); }
@@ -1647,8 +1635,20 @@ function setupHandoff(app) {
       await ensureTables(); await ensureDeadlines();
       var client = (await pool.query('SELECT * FROM cases WHERE id=$1', [parseInt(req.query.case_id) || 0])).rows[0];
       if (!requireCase(req, res, client)) return;
-      var rows = (await pool.query('SELECT id, remind_on, text, created_name, sent_at FROM case_reminders WHERE case_id=$1 AND done = false ORDER BY remind_on, id', [parseInt(req.query.case_id) || 0])).rows;
-      res.json({ ok: true, items: rows.map(function (r) { return { id: r.id, date: (r.remind_on instanceof Date ? r.remind_on.toISOString() : String(r.remind_on)).slice(0, 10), text: r.text, by: r.created_name, sent: !!r.sent_at }; }) });
+      var rows = (await pool.query('SELECT id, remind_on, text, created_name, sent_at, delivery, created_by, created_at FROM case_reminders WHERE case_id=$1 AND done = false ORDER BY remind_on, id', [parseInt(req.query.case_id) || 0])).rows;
+      var delivery = require('./reminder-delivery');
+      var recipients = require('./reminder-recipients');
+      var checked = await recipients.loadRecipientAccess(pool, client, rows.map(r => r.created_by), Date.now());
+      client = checked.client;
+      if (!requireCase(req, res, client)) return;
+      var access = checked.access;
+      var decisionAccess = Object.assign({}, access, { allowed: access.allowed.filter(id => id === String(client.lawyer_tg_id)), next_at: reminderRetryAt(access.next_at,true) });
+      res.json({ ok: true, decisionDeliveryStatus: delivery.decisionReminderStatus(client, process.env.CLIENTS_CHAT_ID, Date.now(), when => reminderRetryAt(when,true), decisionAccess), items: rows.map(function (r) {
+        var wanted = recipients.recipientIds([client.lawyer_tg_id,r.created_by]);
+        var currentAccess = Object.assign({}, access, { allowed: access.allowed.filter(id => wanted.includes(id)), next_at: reminderRetryAt(access.next_at,false) });
+        var status = delivery.caseReminderStatus(r, client.lawyer_tg_id, Date.now(), when => reminderRetryAt(when,false), currentAccess);
+        return { id: r.id, date: storedDate(r.remind_on), text: r.text, by: r.created_name, sent: status.state === 'confirmed', deliveryStatus: status };
+      }) });
     } catch (e) { console.error(e); res.json({ ok: false, error: e.message }); }
   });
   app.post('/api/checklist/reminders', async function (req, res) {
@@ -2079,6 +2079,7 @@ function checklistClient() {
     : CASE.lawyer;
   var root = document.getElementById('list');
   var REM = null; // напоминания по клиенту (с сервера)
+  var DECISION_DELIVERY = null;
   var REM_PRESETS = [
     ['Проверить регистрацию договора аренды в Росреестре', 7],
     ['Уточнить у клиента готовность ремонта', 3],
@@ -2161,9 +2162,22 @@ function checklistClient() {
   }
   function updateEcp() { var old = document.getElementById('g-ecp'); if (old) old.replaceWith(buildEcp()); }
   function isoPlus(days) { var d = new Date(mskToday() + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); }
+  function reminderStatusLabel(status, sent, date) {
+    if (!status) return sent ? 'доставка подтверждена' : date > mskToday() ? 'запланировано на 9:00 МСК' : 'ожидает отправки';
+    var nextDate = status.nextAt && new Date(status.nextAt);
+    var next = nextDate ? (new Date(nextDate.getTime()+3*3600000).toISOString().slice(0,10) === mskToday() ? '' : nextDate.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', timeZone: 'Europe/Moscow' })+' ') + 'в ' + nextDate.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Moscow' }) + ' МСК' : '';
+    if (status.state === 'confirmed') return 'доставка подтверждена';
+    if (status.state === 'no_recipient') return 'Нет доступного получателя. Проверьте назначенного юриста и его доступ; проверим снова.';
+    if (status.state === 'recipient_check_failed') return 'Не удалось проверить доступ получателя; повторим проверку.';
+    if (status.state === 'unknown') return 'Доставка не подтверждена' + (next ? '; повтор ' + next : '; ожидает повтора') + '. Возможно повторное сообщение.';
+    if (status.state === 'partial') return 'Доставлено ' + status.confirmed + ' из ' + status.total + (next ? '; повтор ' + next : '; ожидает отправки');
+    if (status.state === 'retrying') return 'Не удалось отправить' + (next ? '; повтор ' + next : '; ожидает повтора');
+    if (status.state === 'sending') return 'отправляю…';
+    return status.state === 'scheduled' ? 'запланировано на 9:00 МСК' : 'ожидает отправки';
+  }
   function loadReminders() {
     fetch('/api/checklist/reminders?case_id=' + CASE.id).then(function (r) { return r.json(); })
-      .then(function (j) { if (j.ok) { REM = j.items; render(); } }).catch(function () {});
+      .then(function (j) { if (j.ok) { REM = j.items; DECISION_DELIVERY = j.decisionDeliveryStatus || null; render(); } }).catch(function () {});
   }
 
   function haptic(kind) {
@@ -2235,11 +2249,12 @@ function checklistClient() {
     var rg = group('rem', '⏰ Напоминания' + (REM && REM.length ? ' (' + REM.length + ')' : ''), null);
     if (REM === null) rg.body.appendChild(el('div', 'row meta', 'Загружаю…'));
     else {
+      if (DECISION_DELIVERY) rg.body.appendChild(el('div', 'row meta', 'Проверить решение · ' + reminderStatusLabel(DECISION_DELIVERY)));
       REM.forEach(function (r) {
         var row = el('div', 'row remrow' + (r.date <= mskToday() ? ' due' : ''));
         var tx = el('div', 'line');
         tx.appendChild(el('div', 'lbl', r.text));
-        tx.appendChild(el('div', 'meta', ruDate(r.date) + (r.date < mskToday() ? ' · просрочено' : r.date === mskToday() ? ' · сегодня' : '') + (r.sent ? ' · отправлено' : ' · придёт в 9:00') + (r.by ? ' · ' + r.by : '')));
+        tx.appendChild(el('div', 'meta', ruDate(r.date) + (r.date < mskToday() ? ' · просрочено' : r.date === mskToday() ? ' · сегодня' : '') + ' · ' + reminderStatusLabel(r.deliveryStatus, r.sent, r.date) + (r.by ? ' · ' + r.by : '')));
         row.appendChild(tx);
         var x = el('button', 'remx', '✓'); x.type = 'button'; x.title = 'Сделано — убрать';
         x.onclick = function () {

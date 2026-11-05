@@ -12,7 +12,17 @@ const DDL = `
   ALTER TABLE orders ADD COLUMN IF NOT EXISTS archive_url TEXT;
   ALTER TABLE orders ADD COLUMN IF NOT EXISTS request_submit_id TEXT;
   ALTER TABLE orders ADD COLUMN IF NOT EXISTS request_signature TEXT;
+  ALTER TABLE orders ADD COLUMN IF NOT EXISTS packet_revision INTEGER NOT NULL DEFAULT 1;
   CREATE UNIQUE INDEX IF NOT EXISTS orders_request_submit ON orders(submitted_by,request_submit_id);
+  CREATE TABLE IF NOT EXISTS order_packet_submissions (
+    order_id INT NOT NULL REFERENCES orders(id),
+    actor_id BIGINT NOT NULL,
+    submit_id TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    packet_revision INT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(order_id,actor_id,submit_id)
+  );
   CREATE TABLE IF NOT EXISTS order_materials (
     order_id INT NOT NULL REFERENCES orders(id),
     id UUID NOT NULL,

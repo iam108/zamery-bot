@@ -1,5 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { execFileSync } = require('node:child_process');
 const { formatOrderMessage } = require('../src/bot/formatter');
 const { normalizeManagerOrder } = require('../src/web/order-materials');
 
@@ -36,4 +37,12 @@ test('ordinary cards retain complete addresses, contact names and short archive 
   const original = order({ contacts: 'Иван +7 (999) 555-44-33', zones_info: 'Проверить школу рядом' }), text = formatOrderMessage(original);
   for (const value of [original.address, original.owner_name, original.contacts, original.zones_info, original.archive_url]) assert.ok(text.includes(value), value);
   assert.doesNotMatch(text, /…/);
+});
+
+for (const zone of ['UTC', 'America/Los_Angeles']) test('Moscow creation time and calendar deadline stay correct on a server in ' + zone, () => {
+  const script = 'const f=require(' + JSON.stringify(require.resolve('../src/bot/formatter')) + ');process.stdout.write(f.formatOrderMessage(' +
+    JSON.stringify(order({ created_at:'2026-11-05T22:30:00.000Z', deadline:'2026-11-12' })) + '));';
+  const text = execFileSync(process.execPath, ['-e', script], { env:{...process.env,TZ:zone},encoding:'utf8' });
+  assert.match(text, /Создана: 6 нояб\.? 01:30/);
+  assert.match(text, /Крайний срок:<\/b> 12 ноября 2026/);
 });

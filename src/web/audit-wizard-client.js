@@ -536,7 +536,7 @@
   function normalizeLayout(){if(!state.frozen){state.data.ui_version=5;state.data.inspection.region='МСК';state.data.map=state.data.map||{evidence_id:'',page:1,annotations:[]};state.data.additional_plans=state.data.additional_plans||[];}}
 
   function renderPacketUpdate() {
-    if(!state.pendingPacket)return;
+    if(!state.pendingPacket||state.frozen)return;
     var previous=state.data.request_packet||state.packet||{},next=state.pendingPacket;
     var labels={org:'Организация',address:'Адрес',service:'Услуга',object_category:'Тип объекта',cad_num:'Кадастровый номер'};
     var categories={catering:'Алкоголь · общепит',retail:'Алкоголь · магазин',tobacco:'Табак',other:'Другой объект'};
@@ -544,6 +544,13 @@
       var oldValue=key==='object_category'?categories[previous[key]]:previous[key],newValue=key==='object_category'?categories[next[key]]:next[key];
       return '<p><strong>'+labels[key]+'</strong> · '+esc(oldValue||'Не указано')+' → '+esc(newValue||'Не указано')+'</p>';
     }).join('');
+    if(String(previous.zones_info||'').trim()!==String(next.zones_info||'').trim())changes+='<p><strong>Задание менеджера изменилось.</strong></p><details><summary>Посмотреть новое задание</summary><p>'+esc(next.zones_info||'Комментарий убран')+'</p></details>';
+    if(String(previous.archive_url||'').trim()!==String(next.archive_url||'').trim()){
+      var archiveHref='';try{var archiveUrl=new URL(next.archive_url);if(archiveUrl.protocol==='https:'&&!archiveUrl.username&&!archiveUrl.password)archiveHref=archiveUrl.href;}catch(_){}
+      changes+='<p><strong>Изменилась ссылка на архив объекта.</strong> '+(archiveHref?'<a class="inline-link" target="_blank" rel="noopener" href="'+esc(archiveHref)+'">Открыть обновлённый архив ↗</a>':next.archive_url?'Ссылка некорректна. Менеджеру нужно проверить архив.':'Ссылка убрана из заявки.')+'</p>';
+    }
+    if(sameData(packetIdentity(previous),packetIdentity(next))===false&&JSON.stringify(packetIdentity(previous).materials)!==JSON.stringify(packetIdentity(next).materials))changes+='<p><strong>Комплект документов изменился.</strong> Сверьте свежий план и другие новые материалы.</p>';
+    if(!!(previous.video_required||previous.has_video)!==!!(next.video_required||next.has_video))changes+='<p><strong>Видео осмотра:</strong> '+(next.video_required||next.has_video?'теперь требуется':'менеджер больше не запрашивает')+'</p>';
     var noticeBox=$('#app-notice');noticeBox.hidden=false;
     var files=Array.isArray(next.materials)?next.materials:[];
     noticeBox.innerHTML='<strong>Менеджер изменил данные объекта</strong><p>В черновике сохранены прежние сведения и материалы. Перед отправкой сверьте их с обновлённой заявкой.</p>'+changes+
@@ -916,6 +923,7 @@
   }
   function frozenSnapshot(remote){
     clearTimeout(timer);var currentStep=step();
+    state.pendingPacket=null;state.packetError='';
     if(remote){state.draft=remote;state.data=restoreData(remote.data,true);state.viewStep=currentStep;state.packet=state.data.request_packet||null;state.evidence=remote.evidence||[];}
     state.frozen=true;state.dirty=false;render();status('Версия зафиксирована · повторите отправку без изменений','warning');
   }
@@ -935,7 +943,7 @@
   }
   async function submit(outcome){
     if(state.submitting)return;
-    if(state.pendingPacket){renderPacketUpdate();notify(state.packetError);return;}
+    if(state.pendingPacket&&!state.frozen){renderPacketUpdate();notify(state.packetError);return;}
     if(state.pendingUploads){notify('Дождитесь загрузки выбранных файлов.');return;}
     try{if(editor&&editor.flush)await editor.flush();}catch(error){notify(error.message);return;}
     var p=state.data.inspection;
@@ -979,7 +987,9 @@
       state.submitting=false;updateClosingConfirmation();document.body.classList.remove('submitting');
       await checkSubmissionState(enteredSubmission,error);
       refreshChrome();
-      if(error.status===409&&!state.frozen){state.conflict=true;$('#conflict-panel').hidden=false;}
+      if(error.payload&&error.payload.code==='AUDIT_PACKET_CHANGED'&&!state.frozen){
+        try{await fetchPacket();render();}catch(packetError){state.packetError=packetError.message;notify(packetError.message);}
+      }else if(error.status===409&&!state.frozen){state.conflict=true;$('#conflict-panel').hidden=false;}
       submitStatus=$('#submit-status');
       if(submitStatus)submitStatus.textContent='Отправка не подтверждена: '+error.message+(state.frozen?' Повторите отправку этой версии без изменений.':' Исправьте замечания и повторите.');
       notify('Отправка не подтверждена. '+error.message);
@@ -989,7 +999,7 @@
   function downloadCopy(){var data=JSON.stringify({exported_at:new Date().toISOString(),draft_id:state.draft&&state.draft.id,data:state.recoveryData||state.data,evidence:state.evidence.map(function(e){return{id:e.id,name:e.name,role:e.role,subject_id:e.subject_id};})},null,2);var link=document.createElement('a');var url=URL.createObjectURL(new Blob([data],{type:'application/json'}));link.href=url;link.download='audit-draft-'+(state.draft&&state.draft.id||'local')+'.json';link.click();setTimeout(function(){URL.revokeObjectURL(url);},1000);}
   async function reloadServer(){
     if(!window.confirm('Загрузить серверную версию вместо локальных правок? При необходимости сначала скачайте свою копию.'))return;
-    try{var result=await request('/api/audit/drafts/current?order_id='+encodeURIComponent(orderId));if(!result.draft)throw new Error('Серверная версия не найдена.');state.data=restoreData(result.draft.data,!!result.draft.submitting);state.draft=result.draft;state.evidence=result.draft.evidence||[];state.conflict=false;state.dirty=false;state.attempt=null;state.frozen=!!result.draft.submitting;state.viewStep=state.frozen?2:null;state.packet=state.data.request_packet||null;$('#conflict-panel').hidden=true;if(!state.frozen)await fetchPacket();localSave();render();status(state.frozen?'Повторите отправку этой версии':'Загружено с сервера',state.frozen?'warning':'success');}catch(error){notify(error.message);}
+    try{var result=await request('/api/audit/drafts/current?order_id='+encodeURIComponent(orderId));if(!result.draft)throw new Error('Серверная версия не найдена.');state.data=restoreData(result.draft.data,!!result.draft.submitting);state.draft=result.draft;state.evidence=result.draft.evidence||[];state.conflict=false;state.dirty=false;state.attempt=null;state.frozen=!!result.draft.submitting;state.pendingPacket=null;state.packetError='';state.viewStep=state.frozen?2:null;state.packet=state.data.request_packet||null;$('#conflict-panel').hidden=true;if(!state.frozen)await fetchPacket();localSave();render();status(state.frozen?'Повторите отправку этой версии':'Загружено с сервера',state.frozen?'warning':'success');}catch(error){notify(error.message);}
   }
   function prefillContact(raw){
     if(!raw)return;
@@ -1013,13 +1023,20 @@
     next.ui_version=preserveVersion&&raw&&raw.ui_version?raw.ui_version:5;next.inspection.region='МСК';return next;
   }
   function packetIdentity(packet) {
-    var identity={};
-    ['org','address','service','object_category','cad_num'].forEach(function(key){identity[key]=String(packet&&packet[key]||'').trim();});
+    packet=packet||{};var identity={};
+    ['org','address','service','object_category','cad_num','archive_url','zones_info'].forEach(function(key){identity[key]=String(packet[key]||'').trim();});
+    identity.video_required=!!(packet.video_required||packet.has_video);
+    identity.materials=['materials','egrn_links'].flatMap(function(source){return(Array.isArray(packet[source])?packet[source]:[]).map(function(file){return{source:source,id:String(file.id||''),role:String(file.role||''),name:String(file.name||''),mime:String(file.mime||''),bytes:Number(file.bytes)||0,sha256:String(file.sha256||'')};});}).sort(function(a,b){var left=JSON.stringify(a),right=JSON.stringify(b);return left<right?-1:left>right?1:0;});
     return identity;
   }
   function hasInspectionWork() {
-    if(state.evidence.length||state.data.entrances.length||state.data.zones.length||state.data.building_type||state.data.bti||state.data.to||state.data.conclusion.trim())return true;
-    return ['visit_date','floor_plan','floor_actual','alcohol_present','within_cadastral','cadastral_count','rooms_complete','kkt_count','kkt_ip'].some(function(key){return !!state.data.inspection[key];});
+    if(state.evidence.length||state.data.entrances.length||state.data.zones.length)return true;
+    if(['building_type','boundaries','bti','to','nearby','veranda','patz','passport','owner_info','conclusion'].some(function(key){return !!state.data[key];}))return true;
+    var sourceFields=['org','address','service','region','archive_url','archive_available'];
+    if(Object.keys(state.data.inspection).some(function(key){return !sourceFields.includes(key)&&!!state.data.inspection[key];}))return true;
+    var workflow=state.data.workflow||{};
+    if(['territory_result','video_url','conclusion_status','followup_notes','mitigation','archive_skipped','preliminary_status','precheck_notes','call_status','appointment_at'].some(function(key){return !!workflow[key];}))return true;
+    return [state.data.plan,state.data.map].concat(state.data.additional_plans||[]).some(function(plan){return plan&&(plan.evidence_id||plan.annotations&&plan.annotations.length);})||Object.values(workflow.documents||{}).some(Boolean);
   }
   function applyPacket(packet) {
     state.packet=packet;
@@ -1033,6 +1050,7 @@
   async function fetchPacket(){
     if(state.frozen){state.packet=state.data.request_packet||state.packet;return;}
     var packet=await request('/api/audit/prefill?order_id='+encodeURIComponent(orderId));
+    if(state.frozen){state.packet=state.data.request_packet||state.packet;return;}
     var previous=state.data.request_packet;
     if(!previous&&hasInspectionWork())previous={org:state.data.inspection.org,address:state.data.inspection.address,service:state.data.inspection.service,object_category:state.data.object_category,cad_num:''};
     if(previous&&hasInspectionWork()&&!sameData(packetIdentity(previous),packetIdentity(packet))){
@@ -1094,6 +1112,7 @@
   function reconcileDraft(local,remote) {
     state.draft=remote;state.evidence=remote.evidence||[];
     if(remote.submitting){
+      state.pendingPacket=null;state.packetError='';
       if(local&&local.dirty&&!sameData(local.data,remote.data)){state.recoveryData=clone(local.data);state.conflict=true;}
       state.data=restoreData(remote.data,true);state.frozen=true;state.viewStep=2;state.dirty=false;
     }else if(local&&local.dirty){

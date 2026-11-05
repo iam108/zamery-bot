@@ -32,6 +32,7 @@ function createManagerHandlers(options = {}) {
   const getTelegram = options.getTelegram || (() => require('../bot/instance').telegram);
   const format = options.format || require('../bot/formatter').formatOrderMessage;
   const attachOrOrder = options.attachOrOrder || (data => require('../bot/egrn').attachOrOrder(data));
+  const withOrderLock = options.withOrderDeliveryLock || require('../db/order-delivery-lock').createOrderDeliveryLock(pool, options.orderLockOptions);
   const recent = new Map();
 
   async function read(req, res) {
@@ -40,16 +41,16 @@ function createManagerHandlers(options = {}) {
       const order = await queries.getOrderById(orderId(req.params.id));
       if (!order) return res.status(404).json({ ok: false, error: 'Заявка не найдена.' });
       const packet = {};
-      for (const field of ['id', 'address', 'owner_name', 'object_type', 'object_name', 'service', 'cad_num', 'archive_url', 'zones_info', 'contacts', 'deadline', 'has_video', 'submitted_name', 'status']) packet[field] = order[field] == null ? '' : order[field];
+      for (const field of ['id', 'address', 'owner_name', 'object_type', 'object_name', 'service', 'cad_num', 'archive_url', 'zones_info', 'contacts', 'deadline', 'has_video', 'submitted_name', 'status', 'packet_revision']) packet[field] = order[field] == null ? '' : order[field];
       res.set('Cache-Control', 'no-store').json({ ok: true, order: packet, materials: await materials.listOrderMaterials(order.id), can_edit: canEditPacket(order, req) });
     } catch (e) { res.status(e.status || 500).json({ ok: false, error: e.status ? e.message : 'Не удалось загрузить заявку.' }); }
   }
 
-  async function save(req, res) {
-    let order, key, signature, ownsRecent = false;
+  async function savePacket(req, res) {
+    let order, key, signature, ownsRecent = false, savedRevision, replayed = false;
     const edit = req.params.id != null;
     const finish = (body, status = 200) => {
-      if (key && ownsRecent) { if (body.ok && !body.warning) recent.set(key, { signature, body }); else recent.delete(key); }
+      if (key && ownsRecent) { if (!edit && body.ok && !body.warning) recent.set(key, { signature, body }); else recent.delete(key); }
       return res.status(status).json(body);
     };
     try {
@@ -75,21 +76,25 @@ function createManagerHandlers(options = {}) {
       if (recent.size > 500) for (const [cachedKey, cached] of recent) { if (!cached.pending) { recent.delete(cachedKey); break; } }
       if (key) { recent.set(key, { signature, pending: true }); ownsRecent = true; }
       if (edit) {
-        // Сначала добавляем оригиналы: ошибка лимитов не меняет поля заявки.
-        await materials.saveOrderMaterials(order.id, prepared);
-        order = await queries.updateOrderPacket(order.id, data);
-        if (!order) throw Object.assign(new Error('Заявка не найдена.'), { status: 404 });
-        await queries.addLog(order.id, 'packet_updated', req.staff.name, 'Менеджер обновил данные и пакет документов заявки');
+        const saved = await queries.updateOrderPacketWithMaterials(order.id, data, prepared, { actorId: req.tgUser.id, actorName: req.staff.name, submitId: sid, signature, expectedRevision: req.body.packet_revision });
+        order = saved.order; savedRevision = saved.saved_revision; replayed = saved.replayed;
       } else {
         order = await queries.createOrderWithMaterials({ ...data, submitted_by: req.tgUser.id }, prepared);
+        // Creation is revision 1 even when a late duplicate returns a row that
+        // another manager has already edited. The old form must not inherit it.
+        savedRevision = 1; replayed = Number(order.packet_revision) > 1;
         if (!order.submitted_name) {
           order.submitted_name = req.staff.name;
           await pool.query('UPDATE orders SET submitted_name=$1 WHERE id=$2 AND submitted_name IS NULL', [req.staff.name, order.id]);
         }
       }
 
+      const publish = async () => {
+      order = await queries.getOrderById(order.id);
+      if (!order) throw Object.assign(new Error('Заявка не найдена.'), { status: 404 });
       const telegram = getTelegram();
       const warnings = [];
+      if (replayed && savedRevision !== Number(order.packet_revision)) warnings.push('Ваше сохранение подтверждено. После него заявку изменил другой менеджер; доставка использует актуальные данные.');
       const newCard = !order.telegram_msg_id;
       if (newCard) {
         try {
@@ -98,7 +103,7 @@ function createManagerHandlers(options = {}) {
           order.telegram_msg_id = msg.message_id;
           await queries.addLog(order.id, 'created', req.staff.name, 'Заявка и материалы сохранены; карточка отправлена в чат');
         } catch (e) { console.error('order card delivery:', e.message); warnings.push('Карточка не доставлена в чат.'); }
-      } else if (edit) {
+      } else {
         try { await telegram.editMessageText(process.env.GROUP_CHAT_ID, Number(order.telegram_msg_id), undefined, format(order), cardOptions(order)); }
         catch (e) { if (!/message is not modified/i.test(e.message)) { console.error('order card update:', e.message); warnings.push('Не удалось обновить карточку в чате.'); } }
       }
@@ -111,12 +116,14 @@ function createManagerHandlers(options = {}) {
           } catch (e) { console.error('order document delivery:', e.message); warnings.push('Не доставлен в чат файл «' + file.name + '».'); }
         }
         const orderEgrn = data.egrn_order === true || data.egrn_order === '1' || data.egrn_order === 'true';
+        const sameCad = data.cad_num === String(order.cad_num || '');
+        if (orderEgrn && !sameCad) warnings.push('Кадастровый номер в заявке изменился. Проверьте его перед заказом ЕГРН; повторный платный заказ не создавался.');
         // Проверка безопасна и для повтора: ЕГРН хранит заказ и квитанции доставки.
         // Номер и карточка могли сохраниться до временной ошибки прошлого запроса.
-        if (data.cad_num) {
+        if (order.cad_num && sameCad) {
           try {
-            const egrn = await attachOrOrder({ cad: data.cad_num, label: [data.owner_name, data.object_name].filter(Boolean).join(' · '), order: orderEgrn,
-              requestKey: 'manager-order:' + order.id + ':' + data.cad_num,
+            const egrn = await attachOrOrder({ cad: order.cad_num, label: [order.owner_name, order.object_name].filter(Boolean).join(' · '), order: orderEgrn,
+              requestKey: 'manager-order:' + order.id + ':' + order.cad_num,
               orderedBy: req.tgUser.id, orderedName: req.staff.name,
               targets: [{ chat: Number(process.env.GROUP_CHAT_ID), reply: order.telegram_msg_id, order_id: order.id }], note: 'Для заявки на замер #' + order.id });
             if (egrn.packet_warning) warnings.push(egrn.packet_warning);
@@ -128,19 +135,37 @@ function createManagerHandlers(options = {}) {
           } catch (e) { console.error('egrn for order:', e.message); warnings.push('Не удалось проверить доставку выписки ЕГРН.'); }
         }
       }
-      finish({ ok: true, id: order.id, warning: warnings.length ? 'Заявка #' + order.id + ' и документы сохранены. ' + warnings.join(' ') + ' Повторите доставку — новая заявка не создастся.' : undefined });
+      finish({ ok: true, id: order.id, packet_revision: savedRevision, current_revision: Number(order.packet_revision), replayed, warning: warnings.length ? 'Заявка #' + order.id + ' и документы сохранены. ' + warnings.join(' ') + ' Повторите доставку — новая заявка не создастся.' : undefined });
+      };
+      return edit ? await publish() : await withOrderLock(order.id, publish);
     } catch (e) {
       console.error('api/order error:', e.message);
-      finish({ ok: false, id: order && order.id, error: e.message }, e.status || 400);
+      finish({ ok: false, id: order && order.id, error: e.message, code: e.code, packet_revision: e.packet_revision, busy: e.busy }, e.status || 400);
     }
+  }
+  async function save(req, res) {
+    if (req.params.id == null) return savePacket(req, res);
+    try { return await withOrderLock(orderId(req.params.id), () => savePacket(req, res)); }
+    catch (error) { return res.status(error.status || 500).json({ ok: false, error: error.message, code: error.code, busy: error.busy }); }
   }
   return { read, save };
 }
 
-function setupManagerOrders(app) {
-  const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 12 * 1024 * 1024, files: 20 } });
-  const parse = (req, res, next) => upload.array('files', 20)(req, res, err => {
-    if (err) return res.status(413).json({ ok: false, error: 'Можно добавить до 20 файлов, каждый не больше 12 МБ.' });
+function setupManagerOrders(app, options = {}) {
+  const limits = Object.assign({ files: 20, fileBytes: 12 * 1024 * 1024, totalBytes: 100 * 1024 * 1024, fields: 64, fieldBytes: 64 * 1024 }, options.uploadLimits);
+  const storage = require('./bounded-memory-storage').boundedMemoryStorage({ totalBytes: limits.totalBytes });
+  const upload = multer({ storage, limits: { fileSize: limits.fileBytes, files: limits.files, fields: limits.fields, fieldSize: limits.fieldBytes, parts: limits.files + limits.fields + 1 } });
+  const parse = (req, res, next) => upload.array('files', limits.files)(req, res, err => {
+    if (err) {
+      storage.cleanup(req, err);
+      if (!req.destroyed) req.resume();
+      if (req.aborted || res.destroyed || req.destroyed && err.code === 'UPLOAD_ABORTED') return;
+      const message = err.code === 'LIMIT_TOTAL_FILE_SIZE' ? 'Общий объём документов заявки не должен превышать 100 МБ.' :
+        /^LIMIT_(?:FIELD|PART)/.test(err.code || '') ? 'В форме слишком много текста или полей. Сократите текст и повторите отправку.' :
+        /^LIMIT_/.test(err.code || '') ? 'Можно добавить до 20 файлов, каждый не больше 12 МБ.' : 'Загрузка прервалась. Повторите отправку файлов.';
+      return res.status(/^LIMIT_/.test(err.code || '') ? 413 : 400).json({ ok: false, error: message });
+    }
+    storage.complete(req);
     // Браузеры передают filename в UTF-8, а Multer 1.x читает его как Latin-1.
     for (const file of req.files || []) {
       if (!/^[\x00-\xff]*$/.test(file.originalname)) continue;

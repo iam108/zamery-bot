@@ -5,8 +5,9 @@ const originalMaterials = require('../src/web/order-materials');
 const { Readable } = require('node:stream');
 
 function fixture(options = {}) {
-  let order = { id: 58, submitted_by: 108, submitted_name: 'Автор', status: 'in_progress', telegram_msg_id: 900, address: 'Москва, старый адрес', owner_name: 'Клиент', object_type: 'Общепит алкоголь', service: null, cad_num: '', created_at: new Date(), request_submit_id: 'original', request_signature: 'original-signature' };
+  let order = { id: 58, packet_revision: 1, submitted_by: 108, submitted_name: 'Автор', status: 'in_progress', telegram_msg_id: 900, address: 'Москва, старый адрес', owner_name: 'Клиент', object_type: 'Общепит алкоголь', service: null, cad_num: '', created_at: new Date(), request_submit_id: 'original', request_signature: 'original-signature' };
   const files = new Map();
+  const receipts = new Map();
   const calls = [];
   const refs = () => [...files.values()].map(({ buffer, ...file }) => file);
   const materials = {
@@ -18,7 +19,18 @@ function fixture(options = {}) {
   const queries = {
     getOrderById: async id => id === 58 ? { ...order } : null,
     createOrder: async () => { throw new Error('Editing must not create another order'); },
-    updateOrderPacket: async (id, data) => { calls.push('update-packet'); const old = order; order = { ...order, ...data, request_submit_id: old.request_submit_id, request_signature: old.request_signature }; return { ...order }; },
+    updateOrderPacketWithMaterials: async (id, data, prepared, intent) => {
+      const key = intent.actorId + ':' + intent.submitId, receipt = receipts.get(key);
+      if (receipt) {
+        if (receipt.signature !== intent.signature) throw Object.assign(new Error('Заявка сохранена с другими данными.'), { status: 409 });
+        return { order: { ...order }, saved_revision: receipt.revision, replayed: true };
+      }
+      assert.equal(Number(intent.expectedRevision), order.packet_revision);
+      await materials.saveOrderMaterials(id, prepared); calls.push('update-packet');
+      const old = order; order = { ...order, ...data, packet_revision: old.packet_revision + 1, request_submit_id: old.request_submit_id, request_signature: old.request_signature };
+      calls.push('packet_updated'); receipts.set(key, { signature: intent.signature, revision: order.packet_revision });
+      return { order: { ...order }, saved_revision: order.packet_revision, replayed: false };
+    },
     addLog: async (id, action) => calls.push(action),
     setTelegramMsgId: async () => { throw new Error('Existing card must be edited'); },
   };
@@ -28,7 +40,7 @@ function fixture(options = {}) {
     sendMessage: async () => { throw new Error('Existing order must not create another card'); },
   };
   const handlers = createManagerHandlers({ materials, queries, pool: {}, getTelegram: () => telegram, format: item => 'order ' + item.id, attachOrOrder: async () => { throw new Error('No EGRN requested'); }, ...options });
-  const request = (role = 'manager', uid = 109) => ({ params: { id: '58' }, tgUser: { id: uid }, staff: { name: 'Менеджер', role }, files: [], body: { address: 'Москва, новый адрес', owner_name: 'Клиент', object_type: 'Общепит алкоголь', service: 'Продление', archive_url: '', submit_id: 'edit-1' } });
+  const request = (role = 'manager', uid = 109) => ({ params: { id: '58' }, tgUser: { id: uid }, staff: { name: 'Менеджер', role }, files: [], body: { address: 'Москва, новый адрес', owner_name: 'Клиент', object_type: 'Общепит алкоголь', service: 'Продление', archive_url: '', submit_id: 'edit-1', packet_revision: 1 } });
   const response = () => ({ statusCode: 200, headers: {}, status(n) { this.statusCode = n; return this; }, set(k,v) { this.headers[k] = v; return this; }, json(value) { this.body = value; return this; } });
   return { handlers, request, response, files, calls, telegram, order: () => order };
 }
@@ -98,17 +110,17 @@ for (const result of ['none', 'unavailable', 'failed', 'unknown', 'uncertain']) 
 });
 
 for (const edit of [false, true]) test('EGRN delivery failure remains retryable after the card and cadastral number are saved, edit=' + edit, async () => {
-  let order = { id: 58, submitted_by: 108, submitted_name: 'Автор', status: 'new', telegram_msg_id: edit ? 900 : null, cad_num: '', created_at: new Date() };
+  let order = { id: 58, packet_revision: 1, submitted_by: 108, submitted_name: 'Автор', status: 'new', telegram_msg_id: edit ? 900 : null, cad_num: '', created_at: new Date() };
   let attempts = 0, creates = 0, cards = 0;
   const handlers = createManagerHandlers({
     materials: { ...originalMaterials, ensureOrderMaterials: async () => {}, listOrderMaterials: async () => [], saveOrderMaterials: async () => {} },
     queries: { getOrderById: async () => ({ ...order }), createOrderWithMaterials: async data => { creates++; order = { ...order, ...data }; return { ...order }; },
-      updateOrderPacket: async (id, data) => { order = { ...order, ...data }; return { ...order }; }, setTelegramMsgId: async (id, msg) => { order.telegram_msg_id = msg; }, addLog: async () => {} },
+      updateOrderPacketWithMaterials: async (id, data) => { order = { ...order, ...data, packet_revision: 2 }; return { order: { ...order }, saved_revision: 2, replayed: false }; }, setTelegramMsgId: async (id, msg) => { order.telegram_msg_id = msg; }, addLog: async () => {} },
     pool: {}, format: () => 'order', getTelegram: () => ({ sendMessage: async () => { cards++; return { message_id: 900 }; }, editMessageText: async () => {} }),
     attachOrOrder: async options => { assert.equal(options.requestKey, 'manager-order:58:77:01:0000001:12'); attempts++; if (attempts === 1) throw new Error('Synthetic EGRN connection failure'); return { result: 'none' }; },
   });
   const req = { params: edit ? { id: '58' } : {}, tgUser: { id: 108 }, staff: { name: 'Автор', role: 'manager' }, files: [],
-    body: { address: 'Москва, адрес', owner_name: 'Клиент', object_type: 'Общепит алкоголь', service: 'Получение', cad_num: '77:01:0000001:12', submit_id: 'egrn-retry' } };
+    body: { address: 'Москва, адрес', owner_name: 'Клиент', object_type: 'Общепит алкоголь', service: 'Получение', cad_num: '77:01:0000001:12', submit_id: 'egrn-retry', packet_revision: 1 } };
   const response = fixture().response;
   const first = response(); await handlers.save(req, first); assert.match(first.body.warning, /ЕГРН/);
   const second = response(); await handlers.save(req, second);
@@ -138,4 +150,28 @@ test('manager edit form generates valid client script and provides an existing-p
   assert.match(html, /id="existing-files"/);
   assert.match(html, /function loadExistingPacket/);
   assert.match(html, /existingFiles\.some\(function\(f\)\{return f\.role === 'archive';\}\)/);
+});
+
+test('overlapping manager saves cannot replace the newest Telegram card with an earlier packet', async () => {
+  const f = fixture({ format: order => order.address });
+  let startFirst, releaseFirst, card;
+  const firstStarted = new Promise(resolve => { startFirst = resolve; });
+  const firstGate = new Promise(resolve => { releaseFirst = resolve; });
+  let attempts = 0;
+  f.telegram.editMessageText = async (chat, message, unused, text) => {
+    if (++attempts === 1) { startFirst(); await firstGate; }
+    card = text;
+  };
+  const first = f.request(); first.body.service = 'Получение';
+  const savingFirst = f.handlers.save(first, f.response());
+  await firstStarted;
+  const second = f.request(); Object.assign(second.body, { service: 'Получение', submit_id: 'edit-2', packet_revision: 2, address: 'Москва, окончательный адрес' });
+  const savingSecond = f.handlers.save(second, f.response());
+  // Let the newer database commit run while the older Telegram request is pending.
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.order().address, first.body.address, 'The later mutation must wait until the earlier delivery completes');
+  releaseFirst();
+  await Promise.all([savingFirst, savingSecond]);
+  assert.equal(f.order().address, second.body.address);
+  assert.equal(card, second.body.address);
 });

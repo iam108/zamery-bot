@@ -43,7 +43,7 @@ test('a new-client packet honestly has null order / report and needs no database
 
 async function database(run) {
   const { PGlite } = require(process.env.PGLITE_TEST_MODULE), db = new PGlite(), sql = [], gets = [];
-  const pool = { async query(query, params) { sql.push(query); assert.match(query, /^SELECT\b/, 'The packet service is read-only'); return db.query(query, params); } };
+  const pool = { async query(query, params) { sql.push(query); assert.match(query, /^(?:SELECT|WITH RECURSIVE)\b/, 'The packet service is read-only'); return db.query(query, params); } };
   const draftId = randomUUID(), otherDraft = randomUUID(), originals = new Map();
   const files = [
     { id:randomUUID(), name:'Поэтажный план (6 листов).pdf', mime:'application/pdf', role:'plan-source', subject_id:'plan', content:Buffer.from('%PDF-1.7\ncomplete original\n%%EOF'), storage:'postgres' },

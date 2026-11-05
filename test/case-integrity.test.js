@@ -6,11 +6,13 @@ const { randomUUID } = require('node:crypto');
 const source = fs.readFileSync(require.resolve('../src/web/handoff'), 'utf8');
 const pg = { skip: !process.env.PGLITE_TEST_MODULE };
 const fixedNow = Date.parse('2026-11-05T10:30:00Z');
+let currentNow = fixedNow;
 class TestDate extends Date {
-  constructor(...args) { super(...(args.length ? args : [fixedNow])); }
-  static now() { return fixedNow; }
+  constructor(...args) { super(...(args.length ? args : [currentNow])); }
+  static now() { return currentNow; }
 }
 async function fixture(run) {
+  currentNow = fixedNow;
   const { PGlite } = require(process.env.PGLITE_TEST_MODULE);
   const db = new PGlite(), pending = [], routes = new Map(), deliveries = [], locks = new Map();
   let failChat = null, sequence = 1;
@@ -66,7 +68,7 @@ async function fixture(run) {
       Promise.resolve(routes.get(method + ' ' + path)(req, res, reject)).catch(reject);
     });
   }
-  try { await run({ db, call, deliveries, reminder: context.module.exports.testReminders, report: context.module.exports.testReport, telegram, fail(chat) { failChat = chat; } }); }
+  try { await run({ db, call, deliveries, reminder: context.module.exports.testReminders, report: context.module.exports.testReport, telegram, fail(chat) { failChat = chat; }, advance(ms) { currentNow += ms; } }); }
   finally { await Promise.allSettled(pending); await db.close(); }
 }
 
@@ -117,7 +119,7 @@ test('reminder retries target only unacknowledged recipients and never mark all-
   h.fail(101); await h.reminder({ telegram: h.telegram });
   let row = (await h.db.query('SELECT * FROM case_reminders WHERE id=1')).rows[0];
   assert.equal(row.sent_at, null); assert.ok(row.delivery['808']); assert.equal(row.delivery['101'], undefined);
-  h.fail(null); await h.reminder({ telegram: h.telegram });
+  h.fail(null); h.advance(10*60*1000); await h.reminder({ telegram: h.telegram });
   row = (await h.db.query('SELECT * FROM case_reminders WHERE id=1')).rows[0];
   assert.ok(row.sent_at);
   assert.equal(h.deliveries.filter(d => d.chat === '808').length, 1);

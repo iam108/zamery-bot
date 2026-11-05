@@ -5,6 +5,7 @@
   "main": "src/index.js",
   "scripts": {
     "test": "node --test test/*.test.js",
+    "test:e2e": "node --test --test-concurrency=1 test/e2e/*.test.js",
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
     "migrate": "node src/db/migrate.js"
@@ -24,6 +25,8 @@
     "yauzl": "3.4.0"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "0.3.14",
+    "playwright": "1.64.1",
     "nodemon": "^3.0.3"
   },
   "engines": {

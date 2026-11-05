@@ -86,14 +86,48 @@ async function getOrderById(id) {
   return rows[0] || null;
 }
 
-async function updateOrderPacket(id, data) {
-  await require('../web/order-materials').ensureOrderMaterials();
-  const { rows } = await pool.query(`UPDATE orders SET address=$1,owner_name=$2,object_type=$3,object_name=$4,
-    has_video=$5,zones_info=$6,deadline=$7,contacts=$8,service=$9,cad_num=$10,archive_url=$11
+async function updateOrderPacket(id, data, client) {
+  if (!client) await require('../web/order-materials').ensureOrderMaterials();
+  const { rows } = await (client || pool).query(`UPDATE orders SET address=$1,owner_name=$2,object_type=$3,object_name=$4,
+    has_video=$5,zones_info=$6,deadline=$7,contacts=$8,service=$9,cad_num=$10,archive_url=$11,packet_revision=packet_revision+1
     WHERE id=$12 RETURNING *`, [data.address, data.owner_name, data.object_type, data.object_name || null,
     data.has_video || false, data.zones_info || null, data.deadline || null, data.contacts || null,
     data.service || null, data.cad_num || null, data.archive_url || null, id]);
   return rows[0] || null;
+}
+
+async function updateOrderPacketWithMaterials(id, data, prepared, intent) {
+  const revision = Number(intent.expectedRevision), actor = Number(intent.actorId);
+  const fail = (message, status, code, current) => Object.assign(new Error(message), { status, code, packet_revision: current });
+  if (!Number.isSafeInteger(revision) || revision < 1 || revision > 2147483647) throw fail('Откройте актуальную версию заявки перед сохранением. Ваши данные остались в форме.', 400, 'ORDER_PACKET_REVISION_REQUIRED');
+  if (!Number.isSafeInteger(actor) || actor < 1 || typeof intent.submitId !== 'string' || !intent.submitId || intent.submitId.length > 40 || typeof intent.signature !== 'string' || !intent.signature) throw fail('Не удалось подтвердить сохранение. Обновите форму заявки.', 400, 'ORDER_PACKET_INTENT_REQUIRED');
+  const materials = require('../web/order-materials');
+  await materials.ensureOrderMaterials();
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const current = (await client.query('SELECT * FROM orders WHERE id=$1 FOR UPDATE', [id])).rows[0];
+    if (!current) throw fail('Заявка не найдена.', 404, 'ORDER_NOT_FOUND');
+    const receipt = (await client.query('SELECT signature,packet_revision FROM order_packet_submissions WHERE order_id=$1 AND actor_id=$2 AND submit_id=$3', [id, actor, intent.submitId])).rows[0];
+    // A lost acknowledgement can replay after a restart or another edit.
+    // The receipt confirms the original write; it never restores its old fields.
+    if (receipt) {
+      if (receipt.signature !== intent.signature) throw fail('Эта заявка уже сохранена с другими данными. Откройте заявку для изменения.', 409, 'ORDER_PACKET_SUBMISSION_CONFLICT', current.packet_revision);
+      await client.query('COMMIT');
+      return { order: current, replayed: true, saved_revision: Number(receipt.packet_revision) };
+    }
+    if (Number(current.packet_revision) !== revision) throw fail('Заявка уже изменена другим менеджером. Ваши данные остались в форме. Загрузите актуальную версию перед сохранением.', 409, 'ORDER_PACKET_CONFLICT', current.packet_revision);
+    // Version validation, originals, fields, log and receipt share one commit.
+    await materials.saveOrderMaterialsInTransaction(client, id, prepared);
+    const order = await updateOrderPacket(id, data, client);
+    await client.query('INSERT INTO logs(order_id,action,actor,details) VALUES($1,$2,$3,$4)', [id, 'packet_updated', intent.actorName || String(actor), 'Менеджер обновил данные и пакет документов заявки']);
+    await client.query('INSERT INTO order_packet_submissions(order_id,actor_id,submit_id,signature,packet_revision) VALUES($1,$2,$3,$4,$5)', [id, actor, intent.submitId, intent.signature, order.packet_revision]);
+    await client.query('COMMIT');
+    return { order, replayed: false, saved_revision: Number(order.packet_revision) };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally { client.release(); }
 }
 
 async function updateOrderStatus(id, status, actor = 'admin', expectedStatuses = null) {
@@ -209,7 +243,7 @@ async function getOrdersByObject(address, objectName) {
   return rows;
 }
 module.exports = { 
-  createOrder, createOrderWithMaterials, getOrders, getOrderById, updateOrderPacket, updateOrderStatus,
+  createOrder, createOrderWithMaterials, getOrders, getOrderById, updateOrderPacket, updateOrderPacketWithMaterials, updateOrderStatus,
   setTelegramMsgId, addLog, getOrderLogs, getStats,
   getStatsByMonth, getStatsByType, searchObjects, getOrdersByObject
 };

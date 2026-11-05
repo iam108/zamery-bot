@@ -180,7 +180,7 @@ test('V5 submits the trusted complete manager packet and resumes the exact packe
   h.snapshot.evidence = data.evidence.map((file, i) => ({ ...file, buffer: Buffer.from('V5_ORIGINAL_' + i) }));
   const packet = { ...data.request_packet,
     materials: [...data.request_packet.materials, { id: randomUUID(), role: 'document', name: 'Договор.pdf' }] };
-  h.snapshot.data.request_packet = { ...data.request_packet, materials: [] };
+  h.snapshot.data.request_packet = structuredClone(packet);
   h.snapshot.data.inspection = { ...data.inspection, org: 'Подмена', address: 'Не адрес из заявки' };
   let loads = 0;
   const first = createAuditSubmitter(h.drafts, async (ctx, report) => {
@@ -263,4 +263,20 @@ test('a blank tobacco task cannot silently adopt a new manager task at submissio
   });
   await assert.rejects(submit(108,h.id,4,h.context),error=>error.status===409);
   assert.equal(h.state.frozen,false);
+});
+
+for (const change of ['plan','archive','zone task','large EGRN','video requirement']) test('V5 requires renewed review when manager changes the ' + change + ' after inspection', async () => {
+  const data=compactVisit('catering','Продление'),h=harness(data);
+  h.snapshot.evidence=data.evidence.map(file=>({...file,buffer:Buffer.from('original')}));
+  const packet=structuredClone(data.request_packet);
+  if(change==='plan')packet.materials.push({id:randomUUID(),role:'plan',name:'Свежая поэтажка.pdf',sha256:'b'.repeat(64)});
+  if(change==='archive')packet.archive_url='https://disk.yandex.ru/d/new-archive';
+  if(change==='zone task')packet.zones_info='Проверить новую организацию у соседнего входа';
+  if(change==='large EGRN')packet.egrn_links=[{id:randomUUID(),role:'egrn',name:'Свежая выписка.pdf',bytes:300000000}];
+  if(change==='video requirement')packet.video_required=true;
+  let deliveries=0;
+  const submit=createAuditSubmitter(h.drafts,async()=>{deliveries++;},{loadPacket:async()=>packet});
+  await assert.rejects(submit(108,h.id,4,h.context),error=>error.status===409&&error.code==='AUDIT_PACKET_CHANGED');
+  assert.equal(deliveries,0);assert.equal(h.state.frozen,false);assert.deepEqual(h.state.delivery,{});
+  assert.deepEqual(h.snapshot.data.request_packet,data.request_packet);
 });

@@ -1,8 +1,8 @@
 const { Telegraf, Markup } = require('telegraf');
-const { createOrder, updateOrderStatus, getOrderById, addLog, getStats, setTelegramMsgId } = require('../db/queries');
+const { updateOrderStatus, getOrderById, getStats } = require('../db/queries');
 const { formatOrderMessage, STATUS_EMOJI } = require('./formatter');
-const { handleAuditReport } = require('./audit-handler');
 const { cardOptions } = require('../web/manager-orders');
+const { withOrderDeliveryLock } = require('../db/order-delivery-lock');
 
 function setupBot() {
   const bot = new Telegraf(process.env.BOT_TOKEN);
@@ -183,42 +183,10 @@ function setupBot() {
   });
 
   bot.on('web_app_data', async (ctx) => {
-    try {
-      if (ctx.chat.type !== 'private' || !await approvedActor(ctx)) return;
-      const raw = ctx.webAppData && ctx.webAppData.data && ctx.webAppData.data.text();
-      if (!raw) return;
-      const data = JSON.parse(raw);
-
-      if (data.type === 'audit') {
-        await handleAuditReport(ctx, data);
-        return;
-      }
-
-      data.submitted_by = ctx.from.id;
-      const order = await createOrder(data);
-      await addLog(order.id, 'created', String(ctx.from.id), 'Заявка создана через Mini App');
-
-      await ctx.reply(
-        '✅ Заявка #' + order.id + ' принята!\n\nМы получили её и скоро свяжемся.',
-        Markup.removeKeyboard()
-      );
-
-      const text = formatOrderMessage(order);
-      const msg = await ctx.telegram.sendMessage(GROUP_ID, text, {
-        parse_mode: 'HTML',
-        reply_markup: {
-          inline_keyboard: [[
-            { text: '🔧 Взять в работу', callback_data: 'status:in_progress:' + order.id },
-            { text: '✅ Готово', callback_data: 'status:done:' + order.id },
-          ]],
-        },
-      });
-      await setTelegramMsgId(order.id, msg.message_id);
-
-    } catch (err) {
-      console.error('web_app_data error:', err);
-      await ctx.reply('❌ Ошибка при сохранении. Попробуйте ещё раз.');
-    }
+    if (ctx.chat.type !== 'private' || !await approvedActor(ctx)) return;
+    // Current forms use HTTP saves. Delayed sendData events from old pages
+    // must not create another order or bypass the frozen report workflow.
+    await ctx.reply('Эта версия формы устарела. Откройте /start и отправьте заявку или отчёт через новые кнопки.');
   });
 
   // Кнопка "Написать отчёт" — отправляем ссылку в личку аудитору
@@ -256,6 +224,7 @@ function setupBot() {
     const actor = ctx.from.username ? '@' + ctx.from.username : [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ') || String(ctx.from.id);
 
     try {
+      await withOrderDeliveryLock(Number(orderId), async () => {
       const current = await getOrderById(Number(orderId));
       if (!current) return ctx.answerCbQuery('Заявка не найдена');
       if (current.status === newStatus) {
@@ -282,10 +251,11 @@ function setupBot() {
 
       const labels = { in_progress: 'взял в работу', done: 'закрыл', cancelled: 'отменил' };
       await ctx.answerCbQuery(STATUS_EMOJI[newStatus] + ' ' + (ctx.from.username ? '@' + ctx.from.username : (ctx.from.first_name || '')) + ' ' + (labels[newStatus] || newStatus));
+      });
 
     } catch (err) {
       console.error('callback error:', err);
-      await ctx.answerCbQuery('Ошибка, попробуйте ещё раз');
+      await ctx.answerCbQuery(err.code === 'ORDER_DELIVERY_BUSY' ? 'Заявка сейчас обновляется. Дождитесь результата и нажмите кнопку ещё раз.' : 'Ошибка, попробуйте ещё раз');
     }
   });
   require('./manual-order-attachments').setupManualOrderAttachments(bot, { pool, getMe, groupId: GROUP_ID });

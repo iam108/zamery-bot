@@ -20,7 +20,7 @@ function harness(options = {}) {
     if (sql.startsWith('SELECT * FROM audits WHERE id=')) return { rows: options.noAudit ? [] : [audit] };
     if (sql.startsWith('SELECT * FROM reports WHERE id=')) return { rows: [request] };
     if (sql.startsWith('SELECT chat_id, msg_ids, first_id FROM reports WHERE id=')) return { rows: [request] };
-    if (sql.startsWith('SELECT * FROM reports WHERE chat_id=')) return { rows: [] };
+    if (sql.startsWith('WITH RECURSIVE seeds AS')) return { rows: [] };
     if (sql.startsWith('SELECT * FROM audits WHERE order_id=')) return { rows: options.noAudit ? [] : [audit] };
     if (sql.startsWith('INSERT INTO cases ')) {
       writes.push({ sql, params });
@@ -49,6 +49,7 @@ function harness(options = {}) {
       if (name === '../bot/instance') return bot;
       if (name === './auth') return require('../src/web/auth');
       if (name === './http-errors') return require('../src/web/http-errors');
+      if (name === './legacy-report') return require('../src/web/legacy-report');
       if (name === './handoff-packet') return { setupHandoffPacket: () => ({}) };
       if (name === '../bot/egrn') return { async attachOrOrder(input) { calls.push({ method: 'attachOrOrder', input }); return { result: 'attached' }; } };
       throw new Error('Unexpected handoff dependency: ' + name);

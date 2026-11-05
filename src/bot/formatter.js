@@ -1,5 +1,26 @@
 const { format } = require('date-fns');
 const { ru } = require('date-fns/locale');
+const MOSCOW_CREATED = new Intl.DateTimeFormat('ru-RU', { timeZone:'Europe/Moscow', day:'numeric', month:'short', hour:'2-digit', minute:'2-digit', hourCycle:'h23' });
+const CALENDAR_DEADLINE = new Intl.DateTimeFormat('ru-RU', { timeZone:'UTC', day:'numeric', month:'long', year:'numeric' });
+
+function deadlineLabel(value) {
+  if (!value) return '—';
+  if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    const date = new Date(value + 'T12:00:00Z');
+    if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0,10) !== value) return '—';
+    const parts = Object.fromEntries(CALENDAR_DEADLINE.formatToParts(date).map(part => [part.type,part.value]));
+    return parts.day + ' ' + parts.month + ' ' + parts.year;
+  }
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? format(date, 'd MMMM yyyy', { locale: ru }) : '—';
+}
+function creationLabel(value) {
+  if (!value) return '—';
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return '—';
+  const parts = Object.fromEntries(MOSCOW_CREATED.formatToParts(date).map(part => [part.type,part.value]));
+  return parts.day + ' ' + parts.month + ' ' + parts.hour + ':' + parts.minute;
+}
 
 const STATUS_EMOJI = {
   new:         '🆕',
@@ -51,9 +72,7 @@ function contactPreview(value) {
 }
 
 function formatOrderMessage(order) {
-  const deadline = order.deadline
-    ? format(new Date(order.deadline), 'd MMMM yyyy', { locale: ru })
-    : '—';
+  const deadline = deadlineLabel(order.deadline);
 
   const lines = [
     '📋 <b>Заявка #' + order.id + '</b>',
@@ -75,7 +94,7 @@ function formatOrderMessage(order) {
   lines.push('');
   lines.push(STATUS_EMOJI[order.status] + ' <b>Статус:</b> ' + STATUS_LABEL[order.status]);
 
-  const createdAt = format(new Date(order.created_at), 'd MMM HH:mm', { locale: ru });
+  const createdAt = creationLabel(order.created_at);
   if (order.submitted_name) lines.push('👤 <b>Заявку оставил(а):</b> ' + preview(order.submitted_name, 160));
   lines.push('🕐 <i>Создана: ' + createdAt + '</i>');
 

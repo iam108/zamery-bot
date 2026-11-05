@@ -5,9 +5,7 @@ const session = require('express-session');
 const PgSession = require('connect-pg-simple')(session);
 const pool = require('../db/pool');
 const path = require('path');
-const { getOrders, getOrderById, updateOrderStatus, getOrderLogs, getStats } = require('../db/queries');
-const multer = require('multer');
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
+const { getOrders, getOrderById, getOrderLogs, getStats } = require('../db/queries');
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, function (ch) {
     return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch];
@@ -89,12 +87,7 @@ function setupWeb(app) {
     res.send(orderDetailPage(order, logs));
   }));
 
-  app.post('/admin/api/status', requireAuth, asyncHandler(async (req, res) => {
-    const { id, status } = req.body;
-    if (['new', 'in_progress', 'done', 'cancelled'].indexOf(status) === -1) return res.status(400).json({ ok: false });
-    const order = await updateOrderStatus(parseInt(id), status, 'admin-web');
-    res.json({ ok: true, order });
-  }));
+  app.post('/admin/api/status', requireAuth, asyncHandler(require('./admin-order-status').createAdminOrderStatus()));
 
   // Общий пакет менеджера: новая заявка или дополнение существующей.
   require('./manager-orders').setupManagerOrders(app);
@@ -149,7 +142,7 @@ function setupWeb(app) {
     res.json({ ok: true });
   } catch (e) {
     console.error('api/audit error:', e);
-    res.status(e.status || 400).json({ ok: false, error: e.message });
+    res.status(e.status || 400).json({ ok: false, error: e.message, ...(e.code==='AUDIT_PACKET_CHANGED'?{code:e.code}:{}) });
   }
 });
   // ── Stats page ───────────────────────────────────────────
@@ -184,7 +177,7 @@ function setupWeb(app) {
   app.get('/audit-wizard-client.js', (req, res) => res.type('application/javascript').send(auditWizard.client()));
   app.get('/audit-plan-editor.js', (req, res) => res.sendFile(require('path').join(__dirname, 'audit-plan-editor.js')));
     require('./handoff').setupHandoff(app);
-    require('./handoff').setupReportsWeb(app, upload);
+    require('./handoff').setupReportsWeb(app);
   app.use(errorHandler);
 }
 
@@ -364,8 +357,13 @@ function orderDetailPage(order, logs) {
 </div>
 <script>
 async function setStatus(status) {
-  const r = await fetch('/admin/api/status', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id: ${parseInt(order.id)}, status }) });
-  if (r.ok) location.reload();
+  try {
+    const r = await fetch('/admin/api/status', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id: ${parseInt(order.id)}, status }) });
+    const result = await r.json();
+    if (!r.ok || !result.ok) return alert(result.error || 'Не удалось изменить статус. Повторите попытку.');
+    if (result.warning) alert(result.warning);
+    location.reload();
+  } catch (_) { alert('Связь прервалась. Повторите действие для проверки статуса.'); }
 }
 </script></body></html>`;
 }
@@ -514,7 +512,38 @@ var existingFiles = [];
 var editOrderId = new URLSearchParams(location.search).get('order_id');
 var packetReady = !editOrderId, packetCanEdit = !editOrderId;
 var preservePacketInputs = false;
+var packetRevision = null;
 var submitId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+var pendingManagerSubmission = null, activeManagerSubmission = null;
+async function managerFetch(url, options, consume, timeoutMs) {
+  var controller=typeof AbortController==='function'?new AbortController():null, source=options&&options.signal;
+  var requestOptions=Object.assign({},options||{}), timer, rejectStopped;
+  if(controller) requestOptions.signal=controller.signal;
+  var stopped=new Promise(function(resolve,reject){rejectStopped=reject;});
+  var onStop=function(){var error=source.reason || Object.assign(new Error('Ожидание прекращено.'),{code:'MANAGER_WAIT_STOPPED'});if(controller)controller.abort(error);rejectStopped(error);};
+  if(source){if(source.aborted)onStop();else source.addEventListener('abort',onStop,{once:true});}
+  var deadline=new Promise(function(resolve,reject){timer=setTimeout(function(){
+    var error=new Error('Сервер долго не отвечает.');error.code='MANAGER_REQUEST_TIMEOUT';
+    if(controller)controller.abort(error);reject(error);
+  },timeoutMs);});
+  try{return await Promise.race([Promise.resolve().then(function(){if(source&&source.aborted)throw source.reason;return fetch(url,requestOptions);}).then(consume),deadline,stopped]);}
+  finally{clearTimeout(timer);if(source)source.removeEventListener('abort',onStop);}
+}
+function managerRetryDelay(ms, signal) {
+  return new Promise(function(resolve,reject){
+    var timer,stop=function(){clearTimeout(timer);signal.removeEventListener('abort',stop);reject(signal.reason || Object.assign(new Error('Ожидание прекращено.'),{code:'MANAGER_WAIT_STOPPED'}));};
+    if(signal.aborted)return stop();
+    signal.addEventListener('abort',stop,{once:true});
+    timer=setTimeout(function(){signal.removeEventListener('abort',stop);resolve();},ms);
+  });
+}
+function managerFormSnapshot() {
+  var values={};
+  ['address','owner_name','object_type','object_name','service','archive_url','zones_info','deadline','contacts','cad_num'].forEach(function(id){values[id]=document.getElementById(id).value;});
+  ['has_video','egrn_order'].forEach(function(id){values[id]=document.getElementById(id).checked;});
+  values.files=attachedFiles.map(function(file){return {name:file.name,size:file.size,lastModified:file.lastModified,role:file.materialRole};});
+  return JSON.stringify(values);
+}
 function enablePacketEditing(enabled) {
   document.querySelectorAll('input,select,textarea').forEach(function(el){el.disabled=!enabled;});
   document.getElementById('submit-btn').disabled = !enabled;
@@ -544,7 +573,8 @@ async function loadExistingPacket(preserveInputs) {
   document.getElementById('form-heading').textContent='📋 Заявка #'+editOrderId+' · Москва';
   document.getElementById('submit-btn').textContent='Сохранить изменения';
   try {
-    var response=await fetch('/api/order/'+encodeURIComponent(editOrderId)), data=await response.json();
+    var loaded=await managerFetch('/api/order/'+encodeURIComponent(editOrderId),undefined,async function(response){return {response:response,data:await response.json()};},30000);
+    var response=loaded.response,data=loaded.data;
     if(!response.ok || !data.ok) throw new Error(data.error || 'Не удалось открыть заявку.');
     var order=data.order;
     if(!preservePacketInputs) {
@@ -556,11 +586,15 @@ async function loadExistingPacket(preserveInputs) {
     document.getElementById('deadline').value=order.deadline ? String(order.deadline).slice(0,10) : '';
     document.getElementById('has_video').checked=!!order.has_video;
     document.getElementById('egrn_order').checked=false;
+    packetRevision=Number(order.packet_revision);
+    submitId=Date.now().toString(36)+Math.random().toString(36).slice(2,8);
     }
     existingFiles=data.materials || [];renderExistingFiles();renderFiles();updateService();
     packetReady=true;packetCanEdit=!!data.can_edit;enablePacketEditing(packetCanEdit);
     preservePacketInputs=false;
-    status.textContent=packetCanEdit ? 'Изменения попадут в эту же заявку. Можно добавить документы — сохранённые файлы останутся в пакете аудитора.' : 'Просмотр заявки. Дополнить её может автор или менеджер.';
+    var stale=packetCanEdit && Number(order.packet_revision)!==packetRevision;
+    status.textContent=stale ? 'После вашего сохранения заявку изменил другой менеджер. Ваш текст остался в форме; загрузите актуальную версию перед следующими изменениями.' : packetCanEdit ? 'Изменения попадут в эту же заявку. Можно добавить документы — сохранённые файлы останутся в пакете аудитора.' : 'Просмотр заявки. Дополнить её может автор или менеджер.';
+    if(stale){document.getElementById('packet-retry').hidden=false;document.getElementById('packet-retry').textContent='Загрузить актуальную версию';}
   } catch(e) { status.textContent=e.message;document.getElementById('packet-retry').hidden=false; }
 }
 function updateService() {
@@ -595,7 +629,9 @@ function fileToBase64(file) {
   return new Promise(function(res) { var r = new FileReader(); r.onload = function() { res(r.result.split(',')[1]); }; r.readAsDataURL(file); });
 }
 async function submitForm() {
+  if(activeManagerSubmission){var stopped=new Error('Ожидание прекращено.');stopped.code='MANAGER_WAIT_STOPPED';activeManagerSubmission.abort(stopped);return;}
   if(!packetReady || !packetCanEdit) return;
+  if(!pendingManagerSubmission) {
   var valid = true;
   ['address','owner_name','object_type'].forEach(function(id) {
     var el = document.getElementById(id);
@@ -610,10 +646,12 @@ async function submitForm() {
   var archiveMissing = service === 'Продление' && !document.getElementById('archive_url').value.trim() && !attachedFiles.some(function(f){return f.materialRole === 'archive';}) && !existingFiles.some(function(f){return f.role === 'archive';});
   document.getElementById('err-archive_url').classList.toggle('show', archiveMissing); if (archiveMissing) valid=false;
   if (!valid) return;
+  }
   var btn = document.getElementById('submit-btn');
   if (btn.disabled) return;
-  btn.disabled = true; btn.textContent = 'Отправляем...';
+  var controller;
   try {
+  if(!pendingManagerSubmission) {
   var submittedFiles = attachedFiles.slice();
   var formData = new FormData();
 formData.append('address', document.getElementById('address').value.trim());
@@ -634,24 +672,40 @@ submittedFiles.forEach(function(f) {
   formData.append('files', f, f.name);
 });
 formData.append('submit_id', submitId);
+if(editOrderId) formData.append('packet_revision', packetRevision == null ? '' : String(packetRevision));
+pendingManagerSubmission={url:'/api/order'+(editOrderId?'/'+encodeURIComponent(editOrderId):''),body:formData,files:submittedFiles,snapshot:managerFormSnapshot()};
+  }
+var pending=pendingManagerSubmission,submittedFiles=pending.files,formData=pending.body;
+controller=new AbortController();activeManagerSubmission=controller;
+btn.disabled=false;btn.textContent='Прекратить ожидание';
+var feedback=document.getElementById('packet-status');feedback.hidden=false;
+feedback.textContent='Сохраняем заявку и документы. Это может занять несколько минут. Можно прекратить ожидание; заявка при этом может сохраниться.';
+document.getElementById('packet-retry').hidden=true;
+var expires=Date.now()+900000;
 var result = null, lastErr = '';
 var waits = [0, 8, 15, 30];
 for (var attempt = 0; attempt < waits.length; attempt++) {
-  for (var s = waits[attempt]; s > 0; s--) { btn.textContent = 'Сервер занят, повтор через ' + s + ' с…'; await new Promise(function (ok) { setTimeout(ok, 1000); }); }
-  btn.textContent = attempt ? 'Отправляем ещё раз…' : 'Отправляем...';
+  // A retry needs the server's full five-minute body budget plus delivery time.
+  if(attempt && expires-Date.now()<600000){lastErr='Недостаточно времени для полной повторной загрузки документов.';break;}
+  for (var s = waits[attempt]; s > 0; s--) { feedback.textContent='Сервер занят, повтор той же отправки через '+s+' с. Ожидание можно прекратить.'; await managerRetryDelay(1000,controller.signal); }
+  if(expires-Date.now()<600000){lastErr='Недостаточно времени для загрузки и доставки документов.';break;}
+  feedback.textContent=attempt?'Повторяем ту же отправку. Ожидание можно прекратить.':'Сохраняем заявку и документы. Ожидание можно прекратить; заявка при этом может сохраниться.';
   try {
-    var r = await fetch('/api/order'+(editOrderId ? '/'+encodeURIComponent(editOrderId) : ''), { method: 'POST', body: formData });
-    var txt = await r.text();
+    var received=await managerFetch(pending.url,{method:'POST',body:formData,signal:controller.signal},async function(response){return {response:response,text:await response.text()};},expires-Date.now());
+    var r=received.response,txt=received.text;
     try { result = JSON.parse(txt); } catch (pe) { result = null; }
     if (result && result.ok) break;
     var snippet = String(txt || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80);
     lastErr = result ? (result.error || 'ошибка сервера') + ' [' + r.status + ']' : 'сервер ответил ' + r.status + (snippet ? ': ' + snippet : '');
     var retry = r.status === 429 || r.status >= 500 || !result || (result && result.busy);
-    if (!retry) break;
-  } catch (ne) { lastErr = 'нет связи (' + ne.message + ')'; }
+    if (!retry) {pendingManagerSubmission=null;break;}
+  } catch (ne) { lastErr = 'нет связи (' + ne.message + ')'; if(ne.code==='MANAGER_REQUEST_TIMEOUT'||ne.code==='MANAGER_WAIT_STOPPED')break; }
   result = null;
 }
     if (result && result.ok) {
+      var newerInput=pending.snapshot!==managerFormSnapshot();
+      pendingManagerSubmission=null;activeManagerSubmission=null;btn.disabled=true;
+      packetRevision=Number(result.packet_revision);
       if (result.warning) {
         editOrderId=String(result.id);
         attachedFiles=attachedFiles.filter(function(file){return submittedFiles.indexOf(file)<0;});
@@ -660,9 +714,10 @@ for (var attempt = 0; attempt < waits.length; attempt++) {
         if(packetReady && packetCanEdit) btn.textContent='Повторить доставку';
         tg.showAlert(result.warning);return;
       }
-      if(editOrderId) {
+      if(editOrderId || newerInput) {
+        var justCreated=!editOrderId;editOrderId=String(result.id);
         attachedFiles=attachedFiles.filter(function(file){return submittedFiles.indexOf(file)<0;});submitId=Date.now().toString(36)+Math.random().toString(36).slice(2,8);
-        await loadExistingPacket(true);tg.showAlert('Заявка #'+result.id+' обновлена. Пакет документов доступен аудитору.');return;
+        await loadExistingPacket(true);tg.showAlert(justCreated?'Заявка #'+result.id+' сохранена. Новые правки остались в форме — сохраните их отдельно.':'Заявка #'+result.id+' обновлена. Пакет документов доступен аудитору.');return;
       }
       btn.textContent = '✅ Заявка отправлена!';
 if (attachedFiles.length > 0) {
@@ -670,10 +725,21 @@ if (attachedFiles.length > 0) {
 } else {
   setTimeout(function() { tg.close(); }, 1500);
 }
-    } else { throw new Error(lastErr || 'ошибка сервера'); }
+    } else {
+      if(result && ['ORDER_PACKET_CONFLICT','ORDER_PACKET_REVISION_REQUIRED','ORDER_PACKET_SUBMISSION_CONFLICT'].indexOf(result.code)>=0){
+        var status=document.getElementById('packet-status');status.hidden=false;status.textContent=result.error;
+        var reload=document.getElementById('packet-retry');reload.hidden=false;reload.textContent='Загрузить актуальную версию';
+      }
+      throw new Error(lastErr || 'ошибка сервера');
+    }
   } catch(e) {
-    btn.disabled = false; btn.textContent = editOrderId ? 'Сохранить изменения' : 'Отправить заявку';
-    tg.showAlert('Заявка не отправлена: ' + e.message + '. Данные остались в форме — попробуйте ещё раз.');
+    btn.disabled = false; btn.textContent = pendingManagerSubmission ? 'Повторить подтверждение' : editOrderId ? 'Сохранить изменения' : 'Отправить заявку';
+    if(pendingManagerSubmission){
+      var note=e.message+'. Подтверждение не получено. Заявка может быть сохранена на сервере. Повторите подтверждение этой же отправки; новые правки остаются в форме.';
+      var status=document.getElementById('packet-status');status.hidden=false;status.textContent=note;tg.showAlert(note);
+    }else tg.showAlert('Заявка не отправлена: ' + e.message + '. Данные остались в форме — попробуйте ещё раз.');
+  } finally {
+    if(activeManagerSubmission===controller)activeManagerSubmission=null;
   }
 }
 if(editOrderId) loadExistingPacket();

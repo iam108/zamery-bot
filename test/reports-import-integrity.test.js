@@ -4,6 +4,10 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
+const fsp = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
+const { EventEmitter } = require('node:events');
 const source = fs.readFileSync(require.resolve('../src/web/handoff'), 'utf8');
 const pg = { skip: !process.env.PGLITE_TEST_MODULE };
 
@@ -23,8 +27,10 @@ function load(pool) {
 
 async function fixture(run) {
   const { PGlite } = require(process.env.PGLITE_TEST_MODULE), db = new PGlite();
-  const pending = []; let failWrite = null;
+  const pending = [], stagedBatches = []; let failWrite = null, reportAggregations = 0;
   const query = (sql, values) => {
+    if (/INSERT INTO report_import_pending/.test(sql)) stagedBatches.push(values[0].length);
+    if (/^WITH incoming/.test(sql)) reportAggregations++;
     if (failWrite && failWrite.test(sql)) { failWrite = null; return Promise.reject(new Error('Synthetic write failure')); }
     const result = (!values && sql.split(';').filter(s => s.trim()).length > 1 ? db.exec(sql) : db.query(sql, values)).then(value => {
       if (!Array.isArray(value)) value.rowCount = value.affectedRows;
@@ -39,12 +45,16 @@ async function fixture(run) {
     await Promise.all(pending); await new Promise(resolve => setImmediate(resolve)); await Promise.all(pending);
     async function importFiles(messages, extraFiles = []) {
       let html;
-      const files = [{ originalname: 'result.json', buffer: Buffer.from(JSON.stringify({ messages })) }, ...extraFiles];
-      await h.routes.get('POST /admin/import')({ body: { chat: 'zamery' }, files, session: { auth: true } }, { send(value) { html = value; } });
+      const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'zamery-import-db-test-'));
+      const supplied = [{ originalname: 'result.json', buffer: Buffer.from(JSON.stringify({ messages })) }, ...extraFiles], files = [];
+      for (let index = 0; index < supplied.length; index++) { const file = supplied[index], target = path.join(directory, String(index)); await fsp.writeFile(target, file.buffer); files.push({ originalname: file.originalname, path: target }); }
+      const req = Object.assign(new EventEmitter(), { body: { chat: 'zamery' }, files, session: { auth: true }, reportImportWork: { directory, active: new Set(), closing: new Set(), release() {}, abort() {} } });
+      await h.routes.get('POST /admin/import')(req, { status() { return this; }, send(value) { html = value; } });
+      assert.equal(fs.existsSync(directory), false, 'Every import outcome removes source uploads and prepared runs');
       return html;
     }
     const rows = async () => (await db.query('SELECT * FROM reports ORDER BY first_id')).rows;
-    await run({ ...h, db, rows, importFiles, failSQL(pattern) { failWrite = pattern; } });
+    await run({ ...h, db, rows, importFiles, stagedBatches, get reportAggregations() { return reportAggregations; }, failSQL(pattern) { failWrite = pattern; } });
   } finally { await Promise.allSettled(pending); await db.close(); }
 }
 const msg = (id, text, extra = {}) => ({ id, type: 'message', date: '2026-11-05T10:00:00+03:00', from: 'Synthetic auditor', text, ...extra });
@@ -128,3 +138,36 @@ test('Telegram export timestamps prefer epoch data and preserve the HTML UTC off
   const html = h.parseExport(Buffer.from('<div class="message default clearfix" id="message1"><div class="pull_right date details" title="05.11.2026 10:00:00 UTC+05:00"></div><div class="from_name">Auditor</div><div class="text">Caption &amp; detail<br>Line 2</div>'), 'messages.html');
   assert.equal(html[0].date.toISOString(), '2026-11-05T05:00:00.000Z'); assert.equal(html[0].text, 'Caption & detail\nLine 2');
 });
+
+test('all fifty disk uploads form one cross-file report and keep captions in global message order',pg,async()=>fixture(async h=>{
+  const extras=Array.from({length:49},(_,index)=>({originalname:'messages-'+index+'.json',buffer:Buffer.from(JSON.stringify({messages:[msg(50-index,'Caption '+(50-index))]}))}));
+  const html=await h.importFiles([msg(1,'Caption 1')],extras);assert.match(html,/Файлов: 50/);
+  const rows=await h.rows();assert.equal(rows.length,1);assert.deepEqual(rows[0].msg_ids.map(Number),Array.from({length:50},(_,index)=>index+1));
+  assert.equal(rows[0].text,Array.from({length:50},(_,index)=>'Caption '+(index+1)).join('\n'));
+}));
+
+test('an unseen prefix uses the first late overlap, then follows later existing owners without changing case references',pg,async()=>fixture(async h=>{
+  await h.db.exec("INSERT INTO reports(id,chat_id,first_id,msg_ids,text,author) VALUES(1,-100100,100,'{100}','Existing A','Auditor'),(2,-100100,120,'{120}','Existing B','Auditor'); INSERT INTO cases(id,request_id) VALUES(7,2); SELECT setval('reports_id_seq',10)");
+  await h.importFiles([msg(90,'Unseen prefix'),msg(100,'Existing A'),msg(110,'Unseen A'),msg(120,'Existing B'),msg(130,'Unseen B')]);
+  const rows=await h.rows();assert.equal(rows.length,2);assert.deepEqual(rows[0].msg_ids.map(Number),[90,100,110]);assert.equal(rows[0].text,'Existing A\nUnseen prefix\nUnseen A');
+  assert.deepEqual(rows[1].msg_ids.map(Number),[120,130]);assert.equal(rows[1].text,'Existing B\nUnseen B');assert.equal(Number((await h.db.query('SELECT request_id FROM cases WHERE id=7')).rows[0].request_id),2);
+}));
+
+test('a large continuous group with a late overlap stages bounded batches and updates growing report fields only once',pg,async()=>fixture(async h=>{
+  await h.db.exec("INSERT INTO reports(id,chat_id,first_id,msg_ids,text,author) VALUES(1,-100100,3000,'{3000}','Existing anchor','Auditor'); INSERT INTO cases(id,request_id) VALUES(7,1); SELECT setval('reports_id_seq',10)");
+  const records=Array.from({length:5000},(_,index)=>msg(index+1,'Caption '+(index+1)+' '+'.'.repeat(400)));
+  await h.importFiles(records.slice(0,1000),Array.from({length:4},(_,index)=>({originalname:'messages-'+index+'.json',buffer:Buffer.from(JSON.stringify({messages:records.slice((index+1)*1000,(index+2)*1000)}))})));
+  const rows=await h.rows();assert.equal(rows.length,1);assert.equal(rows[0].id,1);assert.equal(rows[0].msg_ids.length,5000);assert.ok(rows[0].text.startsWith('Existing anchor\nCaption 1 '));assert.ok(rows[0].text.endsWith('Caption 5000 '+'.'.repeat(400)));
+  assert.ok(h.stagedBatches.length>1);assert.ok(h.stagedBatches.every(size=>size<=500));assert.equal(h.stagedBatches.reduce((sum,size)=>sum+size,0),4999);assert.equal(h.reportAggregations,1);
+}));
+
+test('invalid data in the final upload leaves every previously saved report unchanged',pg,async()=>fixture(async h=>{
+  await h.db.exec("INSERT INTO reports(id,chat_id,first_id,msg_ids,text,author) VALUES(1,-100100,100,'{100}','Existing anchor','Auditor')");
+  const html=await h.importFiles([msg(100,'Existing anchor'),msg(101,'Would extend')],[{originalname:'messages-last.json',buffer:Buffer.from(JSON.stringify({messages:[msg(200,'Invalid',{date:'invalid'})]}))}]);
+  assert.match(html,/Ошибка/);const rows=await h.rows();assert.equal(rows.length,1);assert.equal(rows[0].text,'Existing anchor');assert.deepEqual(rows[0].msg_ids.map(Number),[100]);assert.equal(h.stagedBatches.length,0);assert.equal(h.reportAggregations,0);
+}));
+
+test('a newly imported album preserves its final message timestamp even when export timestamps go backwards',pg,async()=>fixture(async h=>{
+  await h.importFiles([msg(100,'First album part',{media_group_id:'album-1',date:'2026-11-05T10:10:00+03:00'}),msg(101,'Final album part',{media_group_id:'album-1',date:'2026-11-05T10:00:00+03:00'})]);
+  const rows=await h.rows();assert.equal(rows.length,1);assert.equal(rows[0].last_message_at.toISOString(),'2026-11-05T07:00:00.000Z');assert.deepEqual(rows[0].msg_ids.map(Number),[100,101]);
+}));

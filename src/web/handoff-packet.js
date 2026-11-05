@@ -182,16 +182,9 @@ function createPacketService(options = {}) {
     });
   }
   async function legacy(id) {
-    const row = (await pool.query('SELECT * FROM reports WHERE id=$1', [integer(id)])).rows[0];
-    if (!row) fail(404, 'REPORT_NOT_FOUND', 'Сохранённый отчёт не найден.');
-    const replies = (await pool.query('SELECT id,text,msg_ids,author,created_at FROM reports WHERE chat_id=$1 AND reply_to=ANY($2::bigint[]) AND id<>$3 ORDER BY first_id,id', [row.chat_id, row.msg_ids || [], row.id])).rows;
-    const card = /^[^\wА-Яа-я]*(?:Новая заявка|Заявка\s*#\d+)/i.test(row.text || '') || /Чей объект\s*:/.test(row.text || '');
-    const cardOrder = card ? (String(row.text || '').match(/Заявка\s*#(\d+)/i) || [])[1] : null;
-    const linkedOrder = row.reply_to ? (await pool.query('SELECT id FROM orders WHERE telegram_msg_id=$1 ORDER BY id DESC LIMIT 1', [row.reply_to])).rows[0] : null;
-    const orderId = cardOrder ? integer(cardOrder) : linkedOrder?.id || null;
-    const audits = card && orderId ? (await pool.query('SELECT id,text,report_data,created_at FROM audits WHERE order_id=$1 ORDER BY created_at,id', [orderId])).rows : [];
-    return { ...row, order_id: orderId, text: [...(card ? [] : [row.text]), ...replies.map(item => item.text), ...audits.map(item=>item.text)].filter(Boolean).join('\n\n'),
-      linked: replies.length + audits.length, report_data: audits.length ? audits[audits.length-1].report_data : undefined };
+    const report = await require('./legacy-report').loadReportAggregate(pool, integer(id));
+    if (!report) fail(404, 'REPORT_NOT_FOUND', 'Сохранённый отчёт не найден.');
+    return report;
   }
   return {
     async packet(query = {}) {

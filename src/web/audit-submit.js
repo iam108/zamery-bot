@@ -20,12 +20,15 @@ function createAuditSubmitter(drafts, deliver, options = {}) {
           const requested = snapshot.data.ui_version === 5 ? undefined : snapshot.data.request_packet?.materials?.map(f => f.id);
           trustedPacket = await options.loadPacket(snapshot.order_id, requested);
           const originalPacket = snapshot.data.request_packet || { ...snapshot.data.inspection, object_category: snapshot.data.object_category };
-          if (originalPacket.service && originalPacket.service !== trustedPacket.service) throw Object.assign(new Error('Менеджер изменил услугу в заявке. Обновите проверку перед отправкой.'), { status: 409 });
+          if (originalPacket.service && originalPacket.service !== trustedPacket.service) throw Object.assign(new Error('Менеджер изменил услугу в заявке. Обновите проверку перед отправкой.'), { status: 409, code:'AUDIT_PACKET_CHANGED' });
           if (snapshot.data.ui_version === 5) {
             for (const [field, label] of [['address', 'адрес'], ['object_category', 'тип объекта'], ['org', 'организацию'], ['cad_num', 'кадастровый номер'], ['service', 'услугу']]) {
               const original = originalPacket[field];
-              if (original != null && String(original).trim() !== String(trustedPacket[field] || '').trim()) throw Object.assign(new Error('Менеджер изменил ' + label + ' в заявке. Обновите проверку и сверьте материалы объекта перед отправкой.'), { status: 409 });
+              if (original != null && String(original).trim() !== String(trustedPacket[field] || '').trim()) throw Object.assign(new Error('Менеджер изменил ' + label + ' в заявке. Обновите проверку и сверьте материалы объекта перед отправкой.'), { status: 409, code:'AUDIT_PACKET_CHANGED' });
             }
+            const { packetReviewIdentity } = require('../bot/audit-packet-review');
+            if (JSON.stringify(packetReviewIdentity(originalPacket)) !== JSON.stringify(packetReviewIdentity(trustedPacket)))
+              throw Object.assign(new Error('Менеджер обновил задание или документы. Сверьте их с материалами осмотра перед отправкой.'), { status:409, code:'AUDIT_PACKET_CHANGED' });
           }
         }
         if (snapshot.data.ui_version === 5 && !trustedPacket) throw new Error('Не удалось проверить заявку менеджера. Обновите форму и повторите отправку.');
