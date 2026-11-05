@@ -16,7 +16,7 @@ function harness() {
   const calls=[],nodes=new Map();
   const node=key=>{if(!nodes.has(key))nodes.set(key,{textContent:'',innerHTML:'',dataset:{},style:{},disabled:false,hidden:false,querySelector:()=>null,querySelectorAll:()=>[],remove(){calls.push(['host-removed']);}});return nodes.get(key);};
   const c={
-    state:{data:{schema_version:3,ui_version:5,object_category:'catering',inspection:{org:'Тест',address:'Москва',service:'Получение',visit_date:'2026-10-30'},workflow:{step:2,conclusion_status:'actions'},conclusion:'Есть замечания',entrances:[],zones:[],plan:{evidence_id:'plan-original',page:6,annotations:[{id:'p1',tool:'boundary'}]},map:{evidence_id:'map-original',page:1,annotations:[{id:'e1',tool:'entrance'}]},additional_plans:[]},draft:{id:'draft-test',revision:10},evidence:[],dirty:false,serverError:'',version:0,frozen:false,submitting:false,completed:false,packet:{materials:[]}},
+    state:{data:{schema_version:3,ui_version:5,object_category:'catering',inspection:{org:'Тест',address:'Москва',service:'Получение',visit_date:'2026-10-30'},workflow:{step:2,conclusion_status:'actions',territory_result:'findings'},conclusion:'Есть замечания',entrances:[],zones:[],plan:{evidence_id:'plan-original',page:6,annotations:[{id:'p1',tool:'boundary'}]},map:{evidence_id:'map-original',page:1,annotations:[{id:'e1',tool:'entrance'}]},additional_plans:[]},draft:{id:'draft-test',revision:10},evidence:[],dirty:false,serverError:'',version:0,frozen:false,submitting:false,completed:false,packet:{materials:[]}},
     $:node,root:node('#root'),calls,tail:Promise.resolve(),timer:null,editor:null,activePlanId:'main',orderId:'123',localKey:'test-only',tg:null,
     clone:copy,clearTimeout,setTimeout,console,
     document:{body:{classList:{add(){},remove(){}},appendChild(){calls.push(['host-added']);}},createElement:()=>node('export-host')},
@@ -28,9 +28,10 @@ function harness() {
     postEvidence:async(file,role,subject,data)=>{const e={id:'new-'+role+'-'+subject,role,subject_id:subject};c.state.evidence.push(e);c.state.draft.revision++;calls.push(['upload',e.id,data]);return e;},
     request:async(url,options)=>{calls.push(['request',url,options]);if(options?.method==='DELETE')return {ok:true,revision:c.state.draft.revision+1};return {ok:true};},
     checkSubmissionState:async entered=>{calls.push(['check-submission',entered]);},
+    territoryIssues(){},
     defaults:{inspection:{region:'МСК'},workflow:{step:0},plan:{},map:{},additional_plans:[]}
   };
-  vm.createContext(c);load(c,'queue','step','isRenewal','evidenceFor','adoptRevision','removeGeneratedEvidence','submit','currentPlan','setCurrentPlan');return c;
+  vm.createContext(c);load(c,'queue','step','isRenewal','evidenceFor','mapMode','adoptRevision','removeGeneratedEvidence','submit','currentPlan','setCurrentPlan');return c;
 }
 
 test('the first Call click dispatches the one-shot dial URL without opening a contact dialog',()=>{
@@ -107,6 +108,23 @@ test('route click opens the start-point chooser rather than sending an empty ori
   c.showRoute=()=>{opened++;};c.openExternal=()=>{assert.fail('No empty-origin route should be dispatched by the first click');};
   const scope={querySelectorAll:()=>[],querySelector:s=>s==='[data-route]'?button:null};load(c,'bind');c.bind(scope);
   let prevented=false;button.onclick({preventDefault(){prevented=true;}});assert.equal(prevented,true);assert.equal(opened,1);
+});
+
+test('the territory picker retains its Android file handle until upload settles',async()=>{
+  for(const outcome of ['success','failure']){
+    const c=harness(),file={name:'карта.png'};
+    const control={files:[file],value:file.name,dataset:{territoryUpload:'draw'}};
+    let finish;
+    c.uploadTerritoryImage=(selected,mode)=>{
+      assert.equal(selected,file);assert.equal(mode,'draw');
+      return new Promise((resolve,reject)=>{finish=outcome==='success'?resolve:()=>reject(new Error('upload failed'));});
+    };
+    load(c,'bind');c.bind({querySelectorAll:selector=>selector==='[data-territory-upload]'?[control]:[],querySelector:()=>null});
+    control.onchange();assert.equal(control.value,file.name);
+    finish();await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(control.value,'');
+    assert.equal(c.calls.some(([action])=>action==='notify'),outcome==='failure');
+  }
 });
 
 test('retry exports only current images and retires removed extra artifacts while keeping originals',async()=>{
@@ -205,16 +223,19 @@ test('late callback from a removed extra editor cannot overwrite the main plan',
   assert.equal(accepted,false,'A callback for a removed plan must explicitly refuse the save');
 });
 
-test('numeric input persists before blur and only rebuilds dependent controls on change',async()=>{
+test('numeric input updates its dependent controls without swallowing the next tap on blur',async()=>{
   const c=harness(),listeners={};
   const control={tagName:'INPUT',type:'number',value:'2',dataset:{bind:'inspection.cadastral_count'},addEventListener(name,fn){(listeners[name]??=[]).push(fn);}};
   const scope={querySelectorAll:selector=>selector==='[data-bind]'?[control]:[],querySelector:()=>null};
+  const boundary={hidden:true};c.root.querySelector=selector=>selector==='[data-cadastral-boundary]'?boundary:null;
   load(c,'set','sanitizeService','bind','flush','saveNow');c.bind(scope);
   for(const handle of listeners.input)handle();
+  assert.equal(boundary.hidden,false);
   assert.equal(c.state.data.inspection.cadastral_count,'2');assert.equal(c.state.dirty,true);assert.equal(c.calls.some(call=>call[0]==='render'),false,'Typing must not destroy/recreate the focused number input');
   await c.saveNow();const write=c.calls.find(call=>call[0]==='request');assert.equal(JSON.parse(write[2].body).data.inspection.cadastral_count,'2');
-  for(const handle of listeners.change)await handle();assert.equal(c.calls.filter(call=>call[0]==='render').length,1);
-  c.state.frozen=true;control.value='3';for(const handle of listeners.input)handle();assert.equal(c.state.data.inspection.cadastral_count,'2');
+  assert.equal(listeners.change,undefined);
+  control.value='1';for(const handle of listeners.input)handle();assert.equal(boundary.hidden,true);
+  c.state.frozen=true;control.value='3';for(const handle of listeners.input)handle();assert.equal(c.state.data.inspection.cadastral_count,'1');
 });
 
 for(const deleted of [false,true])test('manager PDF download keeps its captured extra target when user '+(deleted?'removes it':'switches to main'),async()=>{

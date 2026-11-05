@@ -1,5 +1,5 @@
 const { esc } = require('./formatter');
-const { followupTasks, CONCLUSIONS } = require('./audit-workflow');
+const { followupTasks, CONCLUSIONS, TERRITORY_CLEAR_LABEL } = require('./audit-workflow');
 
 const value = item => typeof item === 'string' || typeof item === 'number' ? String(item).trim() : '';
 const answer = (item, yes, no, unknown = 'не проверено') => item === 'Да' ? yes : item === 'Нет' ? no : unknown;
@@ -95,6 +95,8 @@ function buildAuditSummary(data, actor) {
   }
 
   blank(); heading('Территория');
+  if (w.territory_result === 'clear') line(TERRITORY_CLEAR_LABEL);
+  if (w.territory_result === 'findings' && data.map?.mode === 'attached') line('Готовая схема территории приложена.');
   const entranceNames = entrances.map(item => {
     const mark = code(item, 'entrance'), name = value(item.label);
     return mark ? mark + (name && !/^Вход\s*\d+$/i.test(name) && name !== mark ? ' — ' + name : '') : name || 'без отметки';
@@ -105,12 +107,14 @@ function buildAuditSummary(data, actor) {
     if (notes.length) field(code(item, 'entrance') || value(item.label) || 'Вход', notes.join(' · '));
   }
   const measurements = marks.filter(mark => ['route', 'straight'].includes(mark.tool));
-  if (!zones.length) line('Организации не перечислены.');
+  if (!zones.length && w.territory_result !== 'clear') line('Организации не перечислены.');
   for (const zone of zones) {
     const status = { clear: 'без замечаний', checked: 'без замечаний', licensed: 'есть сведения о лицензии', disputed: 'спорное место', confirmed: 'отмечено ограничение', pending: 'нужно уточнить', other: 'наблюдение' }[zone.status] || 'результат не указан';
     const distances = measurements.filter(mark => mark.toObjectId === zone.id || mark.toObjectId === zone.mark_id).map(mark => value(mark.distance));
     const dist = value(zone.dist), distance = dist && !distances.includes(dist) ? '; ' + (dist === 'Не проверено' ? 'расстояние не проверено' : dist + ' м') : '';
-    line('• ' + [code(zone, 'hazard'), value(zone.name) || 'Организация'].filter(Boolean).join(' · ') + ' — ' + status + distance);
+    const entrance = w.territory_result === 'findings' && !distances.length && entrances.find(item => item.id === zone.entrance_id);
+    const origin = entrance && (code(entrance, 'entrance') || value(entrance.label));
+    line('• ' + [code(zone, 'hazard'), value(zone.name) || 'Организация'].filter(Boolean).join(' · ') + ' — ' + status + distance + (origin ? ' от входа «' + origin + '»' : ''));
     if (value(zone.source)) pair('  ' + sourceLink(value(zone.source)), 'Источник: ' + value(zone.source));
     unique([zone.resolution, zone.note, zone.info]).forEach(note => line('  ' + note));
     if (value(zone.method) && !distances.length) field('Способ замера', zone.method);

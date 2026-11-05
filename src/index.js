@@ -17,9 +17,6 @@ async function main() {
 
   const app = express();
 
-  app.use(express.json({ limit: '50mb' }));
-  app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-
   setupWeb(app);
 
   app.listen(PORT, '0.0.0.0', function() {

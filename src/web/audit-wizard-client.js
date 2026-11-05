@@ -11,11 +11,13 @@
   var uid = tg && tg.initDataUnsafe && tg.initDataUnsafe.user ? String(tg.initDataUnsafe.user.id) : (params.get('u') || storedUid || 'staff');
   var localKey = 'audit-wizard-v3:' + uid + ':' + (orderId || 'new');
   var STEPS = [
-    ['Территория', 'Схема и фотографии', 'Отметьте входы, проверенные организации и замеры на скриншоте Яндекс Карт.'],
+    ['Территория', 'Входы и проверка территории', 'Укажите результат проверки территории и приложите фото каждого входа.'],
     ['Помещение', 'План помещения', 'Выберите нужный лист PDF и отметьте фактическую планировку.'],
     ['Отчёт', 'Результат проверки', 'Краткий вывод и вопросы, которые осталось решить.']
   ];
   var TRI = ['', 'Да', 'Нет', 'Не проверено'];
+  var ZONE_STATUS = {clear:'Без замечаний',licensed:'Есть сведения о лицензии',disputed:'Спорное место',confirmed:'Есть ограничение',pending:'Нужно уточнить',other:'Наблюдение'};
+  var MAP_IMAGE_TYPES = ['image/jpeg','image/png'];
   var defaults = {
     schema_version: 3, ui_version: 5, object_category: 'catering', order_id: orderId,
     inspection: {service:'',org:'',address:'',visit_date:'',region:'МСК',floor_plan:'',floor_actual:'',plan_source:'',plan_note:'',structural_elements:'',archive_available:'',archive_match:'',archive_url:'',alcohol_present:'',alcohol_within_licensed:'',within_cadastral:'',licensed_boundaries_match:'',entrances_plan:'',entrances_actual:'',all_entrances_checked:'',zones_checked:'',video_status:'',repair_state:'',risks:''},
@@ -72,8 +74,15 @@
     clearTimeout(timer);timer=setTimeout(function(){saveNow().catch(function(){});},800);
   }
   async function request(url,options) {
-    var response=await fetch(url,options||{});var text=await response.text();var data;
-    try{data=JSON.parse(text);}catch(e){throw new Error('Сервер вернул непонятный ответ. Черновик остался на устройстве.');}
+    var response,text,data;
+    try{response=await fetch(url,options||{});text=await response.text();}
+    catch(e){throw new Error('Нет связи с ботом. Проверьте интернет и повторите действие.');}
+    try{data=JSON.parse(text);}catch(e){
+      if(/checking your browser|turnstile|rate limited/i.test(text)||response.status===429)throw new Error('Сервис временно ограничил доступ. Повторите действие через минуту.');
+      if(response.status===413)throw new Error('Файл слишком большой. Максимум 12 МБ на файл.');
+      throw new Error('Сервер не ответил как ожидалось. Повторите действие. Если файл не появился в отчёте, выберите его заново.');
+    }
+    if(!data||typeof data!=='object'||Array.isArray(data))throw new Error('Сервер вернул некорректные данные. Повторите действие.');
     if(!response.ok||data.ok===false){var error=new Error(data.error||'Не удалось выполнить запрос.');error.status=response.status;error.payload=data;throw error;}
     return data;
   }
@@ -120,10 +129,10 @@
   function checkbox(label,path) {return '<label class="check-field"><input type="checkbox" data-bind="'+esc(path)+'"'+(get(path)?' checked':'')+'><span>'+esc(label)+'</span></label>';}
   function select(label,path,options,help,wide){return input(label,path,{options:[''].concat(options),help:help,wide:wide});}
   function heading(index){return '<div class="step-heading"><h2>'+esc(STEPS[index][1])+'</h2><p>'+esc(STEPS[index][2])+'</p></div>';}
-  function uploader(role,subject,label,imagesOnly){var uid=id('upload');return '<label class="upload-control" for="'+uid+'"><input type="file" id="'+uid+'" data-upload-role="'+esc(role)+'" data-upload-subject="'+esc(subject||'')+'" accept="'+(imagesOnly?'image/jpeg,image/png,image/webp,image/gif,image/heic,image/heif,image/avif,image/tiff,image/bmp':'image/jpeg,image/png,image/webp,image/gif,image/heic,image/heif,image/avif,image/tiff,image/bmp,application/pdf')+'"'+(imagesOnly?' capture="environment"':'')+' multiple><span class="upload-label">'+esc(label||'Добавить файл или фото')+'</span></label>';}
+  function uploader(role,subject,label,camera,imageEvidence){var uid=id('upload'),accept='image/jpeg,image/png,image/webp,image/gif,image/heic,image/heif,image/avif,image/tiff,image/bmp';return '<label class="upload-control" for="'+uid+'"><input type="file" id="'+uid+'" data-upload-role="'+esc(role)+'" data-upload-subject="'+esc(subject||'')+'" accept="'+accept+(camera||imageEvidence?'':',application/pdf')+'"'+(camera?' capture="environment"':'')+' multiple><span class="upload-label">'+esc(label||'Добавить файл или фото')+'</span></label>';}
   function evidenceFor(role,subject){return state.evidence.filter(function(e){return e.role===role&&(subject==null||String(e.subject_id||'')===String(subject));});}
-  function evidenceCards(role,subject){var files=evidenceFor(role,subject);if(!files.length)return '';return '<div class="evidence-grid">'+files.map(function(e){var image=/^image\//.test(e.mime||e.mime_type||'');return '<article class="evidence-card"><div class="evidence-preview">'+(image?'<img alt="'+esc(e.name||'Фото')+'" data-evidence-image="'+esc(e.id)+'">':'PDF')+'</div><div class="evidence-details"><div class="evidence-name">'+esc(e.name||'Файл')+'</div><div class="evidence-meta">Оригинал · '+bytes(e.size||e.bytes||0)+'</div><div class="evidence-actions"><button type="button" data-open-evidence="'+esc(e.id)+'">Открыть</button><button type="button" class="remove-evidence" data-delete-evidence="'+esc(e.id)+'" aria-label="Удалить '+esc(e.name||'файл')+'">Убрать</button></div></div></article>';}).join('')+'</div>';}
-  function evidenceBlock(role,subject,title,help){return '<div class="section-heading"><div><h3>'+esc(title)+'</h3>'+(help?'<p>'+esc(help)+'</p>':'')+'</div></div><div class="upload-row">'+uploader(role,subject,'Сделать фото',true)+uploader(role,subject,'Выбрать файл')+'</div>'+evidenceCards(role,subject);}
+  function evidenceCards(role,subject,evidenceId){var files=evidenceFor(role,subject);if(evidenceId!=null)files=files.filter(function(e){return String(e.id)===String(evidenceId);});if(!files.length)return '';return '<div class="evidence-grid">'+files.map(function(e){var image=/^image\//.test(e.mime||e.mime_type||'');return '<article class="evidence-card"><div class="evidence-preview">'+(image?'<img alt="'+esc(e.name||'Фото')+'" data-evidence-image="'+esc(e.id)+'">':'PDF')+'</div><div class="evidence-details"><div class="evidence-name">'+esc(e.name||'Файл')+'</div><div class="evidence-meta">Оригинал · '+bytes(e.size||e.bytes||0)+'</div><div class="evidence-actions"><button type="button" data-open-evidence="'+esc(e.id)+'">Открыть</button><button type="button" class="remove-evidence" data-delete-evidence="'+esc(e.id)+'" aria-label="Удалить '+esc(e.name||'файл')+'">Убрать</button></div></div></article>';}).join('')+'</div>';}
+  function evidenceBlock(role,subject,title,help){var imageEvidence=role==='entrance'||role==='zone';return '<div class="section-heading"><div><h3>'+esc(title)+'</h3>'+(help?'<p>'+esc(help)+'</p>':'')+'</div></div><div class="upload-row">'+uploader(role,subject,'Сделать фото',true)+uploader(role,subject,imageEvidence?'Выбрать фото':'Выбрать файл',false,imageEvidence)+'</div>'+evidenceCards(role,subject);}
 
   function packetFiles() { return state.packet && Array.isArray(state.packet.materials) ? state.packet.materials : []; }
   function packetContactText(raw) {
@@ -174,18 +183,97 @@
   }
   function choices(path,label,options){return '<div class="choice-field"><span class="field-label">'+esc(label)+'</span><div class="choice-options" role="group" aria-label="'+esc(label)+'">'+options.map(function(o){return '<button type="button" class="button secondary'+(String(get(path))===o[0]?' selected':'')+'" aria-pressed="'+(String(get(path))===o[0])+'" data-choice="'+esc(path)+'" data-value="'+esc(o[0])+'">'+esc(o[1])+'</button>';}).join('')+'</div></div>';}
 
-  function entranceCards(){return '<section class="capture-section"><h3>Входы</h3>'+(state.data.entrances.length?state.data.entrances.map(function(e){return '<article class="repeat-card"><h3>'+esc(e.label||'Вход')+'</h3>'+evidenceBlock('entrance',e.id,'Фото входа','')+'</article>';}).join(''):'<p class="field-note">Отметьте вход на схеме — появится место для его фотографий.</p>')+'</section>';}
-
-  function zoneCards(){return '<section class="capture-section"><h3>Проверенные организации</h3>'+(state.data.zones.length?state.data.zones.map(function(z){return '<article class="repeat-card"><div class="card-top"><h3>'+esc(z.name||'Организация')+'</h3><span class="tag">'+esc(({clear:'Без замечаний',licensed:'Есть сведения о лицензии',disputed:'Спорное место',confirmed:'Есть ограничение',pending:'Нужно уточнить'})[z.status]||'Не проверено')+'</span></div>'+(z.dist?'<p>'+esc(z.dist)+' м</p>':'')+(z.info?'<p>'+esc(z.info)+'</p>':'')+evidenceBlock('zone',z.id,'Фото организации','')+'</article>';}).join(''):'<p class="field-note">Название, результат и замеры указываются у отметки организации на схеме.</p>')+'</section>';}
-
-  function outsideStep(){return packetSummary()+heading(0)+'<div class="plan-editor-shell" id="map-editor"></div><div id="territory-evidence">'+entranceCards()+zoneCards()+'</div>'+input('Дополнение по территории · необязательно','workflow.territory_notes',{type:'textarea',maxlength:2000});}
+  function mapMode() { var map=state.data.map||{};return map.mode||(map.evidence_id||(map.annotations||[]).length?'draw':''); }
+  function manualTerritory() { return state.data.workflow.territory_result==='clear'||mapMode()==='attached'; }
+  function territoryUpload(mode,label) {
+    var uid=id('map-upload');
+    return '<label class="upload-control" for="'+uid+'"><input type="file" id="'+uid+'" data-territory-upload="'+mode+'" accept="image/jpeg,image/png,.jpg,.jpeg,.png"><span class="upload-label">'+esc(label)+'</span></label>';
+  }
+  function entranceCards() {
+    var manual=manualTerritory();
+    return '<section class="capture-section"><h3>Входы</h3>'+(manual?'<p class="field-note">Добавьте отдельную карточку с названием и фото для каждого входа.</p>':(!state.data.entrances.length?'<p class="field-note">Отметьте вход на схеме, чтобы добавить его фото.</p>':''))+
+      state.data.entrances.map(function(e,i){
+        var title=manual?'<div class="card-top"><h3 tabindex="-1" data-entrance-title="'+i+'">Вход '+(i+1)+'</h3><button type="button" class="button secondary card-remove" data-remove-entrance="'+esc(e.id)+'" aria-label="Убрать '+esc(e.label||'вход')+'">Убрать</button></div>'+input('Название входа','entrances.'+i+'.label',{maxlength:200,placeholder:'Например, главный вход'}):'<h3>'+esc(e.label||'Вход')+'</h3>';
+        return '<article class="repeat-card">'+title+evidenceBlock('entrance',e.id,'Фото входа','')+'</article>';
+      }).join('')+(manual?'<button type="button" class="button secondary full" data-add-entrance>Добавить вход</button>':'')+'</section>';
+  }
+  function zoneCards() {
+    var manual=manualTerritory(),entrances=state.data.entrances.map(function(e,i){return{value:e.id,label:e.label||'Вход '+(i+1)};}),statuses=Object.keys(ZONE_STATUS).map(function(value){return{value:value,label:ZONE_STATUS[value]};});
+    return '<section class="capture-section"><h3>Организации и спорные места</h3>'+(state.data.zones.length?'':'<p class="field-note">'+(manual?'Добавьте организацию, выберите вход, запишите расстояние и приложите фото.':'Отметьте организацию и линию замера на схеме.')+'</p>')+
+      state.data.zones.map(function(z,i){
+        var path='zones.'+i+'.',title;
+        if(manual)title='<div class="card-top"><h3>Организация '+(i+1)+'</h3><button type="button" class="button secondary card-remove" data-remove-zone="'+esc(z.id)+'" aria-label="Убрать '+esc(z.name||'организацию')+'">Убрать</button></div><div class="fields">'+
+          input('Название или адрес',path+'name',{maxlength:200,wide:true})+select('Результат проверки',path+'status',statuses,'',true)+select('Вход, от которого измеряли',path+'entrance_id',entrances,'',true)+
+          input('Расстояние, м',path+'dist',{maxlength:20,help:'Укажите число или «Не проверено».'})+select('Как измерили · необязательно',path+'method',['Пешеходный маршрут','Прямая линия'])+
+          input('Источник сведений о лицензии',path+'source',{maxlength:1000,help:'Заполните, если отмечены сведения о лицензии.',wide:true})+
+          input('Комментарий или основание ограничения',path+'resolution',{type:'textarea',maxlength:2000,wide:true})+'</div>';
+        else title='<div class="card-top"><h3>'+esc(z.name||'Организация')+'</h3><span class="tag">'+esc(ZONE_STATUS[z.status]||'Не проверено')+'</span></div>'+(z.dist?'<p>'+esc(z.dist)+(z.dist==='Не проверено'?'':' м')+'</p>':'')+(z.info?'<p>'+esc(z.info)+'</p>':'');
+        return '<article class="repeat-card">'+title+evidenceBlock('zone',z.id,'Фото организации','')+'</article>';
+      }).join('')+(manual?'<button type="button" class="button secondary full" data-add-zone>Добавить организацию</button>':'')+'</section>';
+  }
+  function territoryCards() {
+    var result=state.data.workflow.territory_result;
+    if(result==='clear')return entranceCards();
+    return (result==='findings'&&mapMode())||(!result&&state.frozen)?entranceCards()+zoneCards():'';
+  }
+  function outsideStep(){
+    var result=state.data.workflow.territory_result,mode=mapMode(),html=packetSummary()+heading(0);
+    html+=choices('workflow.territory_result','Что нашли при проверке?',[['clear','Зон нет'],['findings','Есть организации или спорные места']]);
+    if(!result&&!state.frozen&&(mode||state.data.entrances.length||state.data.zones.length))html+='<p class="field-note">Материалы прошлой версии сохранены в черновике. Выберите результат проверки, чтобы продолжить.</p>';
+    if(result==='findings'){
+      html+=choices('map.mode','Как оформить схему?',[['draw','Рисовать на скриншоте'],['attached','Приложить готовую схему']]);
+      if(mode==='draw'){
+        if(!state.data.map.evidence_id)html+='<p class="field-note">Выберите скриншот карты в JPG или PNG. Редактор откроется после загрузки.</p><div class="upload-row">'+territoryUpload('draw','Выбрать скриншот карты')+'</div>';
+        else html+='<p class="field-note">Поставьте отметку организации у её входа. Проведите линию замера от входа объекта до входа соседней организации.</p>';
+      }
+      if(mode==='attached')html+='<p class="field-note">Приложите JPG или PNG, на котором видны вход объекта, вход соседней организации и расстояние между ними. Заполните карточки ниже.</p><div class="upload-row">'+territoryUpload('attached',state.data.map.evidence_id?'Заменить готовую схему':'Выбрать готовую схему')+'</div>'+evidenceCards('map','attached',state.data.map.evidence_id);
+    }
+    if((result==='findings'&&mode==='draw'&&state.data.map.evidence_id)||(!result&&state.frozen))html+='<div class="plan-editor-shell" id="map-editor"></div>';
+    return html+'<div id="territory-evidence">'+territoryCards()+'</div>'+input('Дополнение по территории · необязательно','workflow.territory_notes',{type:'textarea',maxlength:2000});
+  }
+  function rememberTerritory(mode) {
+    var versions=state.data.territory_versions||(state.data.territory_versions={});
+    if(mode){
+      versions[mode]={map:clone(state.data.map),zones:clone(state.data.zones)};
+      versions.last_mode=mode;
+    }
+    if(mode==='draw')versions.draw.entrances=clone(state.data.entrances);
+    else if(mode==='attached'||state.data.entrances.length||state.data.workflow.territory_result==='clear')versions.manual_entrances=clone(state.data.entrances);
+    if(!mode&&state.data.zones.length)versions.unmapped_zones=clone(state.data.zones);
+    return versions;
+  }
+  function switchTerritoryMode(mode) {
+    var previousMode=mapMode();
+    if(previousMode===mode){state.data.map.mode=mode;return;}
+    var versions=rememberTerritory(previousMode),previous=versions[mode];
+    state.data.map=previous?clone(previous.map):clone(defaults.map);
+    state.data.map.mode=mode;
+    state.data.zones=previous?clone(previous.zones):mode==='attached'?clone(versions.unmapped_zones||state.data.zones):[];
+    if(mode==='draw')state.data.entrances=previous?clone(previous.entrances):[];
+    else if(previousMode==='draw')state.data.entrances=clone(versions.manual_entrances||state.data.entrances);
+    if(mode==='attached')state.data.zones.forEach(function(z){if(z.entrance_id&&!state.data.entrances.some(function(e){return e.id===z.entrance_id;})){z.entrance_id='';z.dist='';}});
+    delete versions[mode];
+  }
+  function chooseTerritory(result) {
+    var previous=state.data.workflow.territory_result,mode=mapMode();
+    if(previous===result)return;
+    if(result==='clear'){
+      // A report without zones keeps the entrances and parks any prior map work.
+      var versions=rememberTerritory(mode||(!previous&&state.data.zones.length?'draw':''));
+      if(versions.manual_entrances)state.data.entrances=clone(versions.manual_entrances);
+      state.data.map=clone(defaults.map);state.data.zones=[];
+    }else if(previous==='clear'&&state.data.territory_versions&&state.data.territory_versions.last_mode){
+      switchTerritoryMode(state.data.territory_versions.last_mode);
+    }else if(mode){state.data.map.mode=mode;}
+    state.data.workflow.territory_result=result;
+  }
   function currentPlan(planId){planId=planId||activePlanId;if(planId==='main')return state.data.plan;return state.data.additional_plans.find(function(p){return p.id===planId;});}
   function setCurrentPlan(plan,planId){planId=planId||activePlanId;if(planId==='main')state.data.plan=plan;else{var i=state.data.additional_plans.findIndex(function(p){return p.id===planId;});if(i>=0)state.data.additional_plans[i]=Object.assign({},plan,{id:planId});}}
 
   function insideStep(){
     var p=state.data.inspection,files=packetFiles().filter(function(f){return ['plan','egrn','archive'].includes(f.role);}),renewalArchive=isRenewal()&&state.data.workflow.archive_skipped!=='Да'&&files.concat(state.evidence).some(function(f){return f.role==='archive';});
     var html=heading(1)+'<details class="details-block"><summary>Выбрать документ из заявки</summary>'+managerFilesHtml(files,true)+'</details><div class="plan-contexts"><button type="button" class="button secondary'+(activePlanId==='main'?' selected':'')+'" data-plan-context="main">Основной план</button>'+state.data.additional_plans.map(function(plan,i){return '<button type="button" class="button secondary'+(activePlanId===plan.id?' selected':'')+'" data-plan-context="'+esc(plan.id)+'">Доп. лист '+(i+1)+'</button>';}).join('')+'<button type="button" class="button secondary" data-add-plan>+ Ещё лист</button></div>'+(activePlanId!=='main'?'<button type="button" class="text-button" data-remove-plan>Убрать дополнительный лист</button>':'')+'<div class="plan-editor-shell" id="plan-editor"></div>';
-    html+='<section class="capture-section"><h3>Помещение по факту</h3><div class="fields">'+input('Этаж на плане','inspection.floor_plan',{maxlength:100})+input('Фактический этаж','inspection.floor_actual',{maxlength:100})+input('Количество кадастров','inspection.cadastral_count',{type:'number',step:'1',maxlength:2})+'</div>'+choices('inspection.within_cadastral','Внешние границы помещения',[['Да','Соблюдены'],['Нет','Нарушены']])+(Number(p.cadastral_count)>1?choices('inspection.inter_cadastral_boundary','Граница между кадастрами',[['Сохранена','Сохранена'],['Объединены','Объединены']]):'')+choices('inspection.rooms_complete','Вся площадь по плану входит в объект',[['Да','Входит целиком'],['Нет','Часть не входит']])+'<p class="field-note">«Часть не входит» — часть площади отрезана или занята соседями. Если убрана только внутренняя перегородка, отметьте это ниже как изменение планировки.</p>'+choices('to','Нужно техническое описание (ТО)',[['Нужно','Да'],['Не нужно','Нет']])+choices('bti','Планировка по выбранному плану',[['Да','Совпадает'],['Нет','Есть изменения']])+(state.data.bti==='Нет'?input('Что отличается','inspection.plan_note',{type:'textarea',wide:true,maxlength:2000,placeholder:'Кратко. Перегородки и границы отметьте на плане.'}):'')+'</section>';
+    html+='<section class="capture-section"><h3>Помещение по факту</h3><div class="fields">'+input('Этаж на плане','inspection.floor_plan',{maxlength:100})+input('Фактический этаж','inspection.floor_actual',{maxlength:100})+input('Количество кадастров','inspection.cadastral_count',{type:'number',step:'1',maxlength:2})+'</div>'+choices('inspection.within_cadastral','Внешние границы помещения',[['Да','Соблюдены'],['Нет','Нарушены']])+'<div data-cadastral-boundary'+(Number(p.cadastral_count)>1?'':' hidden')+'>'+choices('inspection.inter_cadastral_boundary','Граница между кадастрами',[['Сохранена','Сохранена'],['Объединены','Объединены']])+'</div>'+choices('inspection.rooms_complete','Вся площадь по плану входит в объект',[['Да','Входит целиком'],['Нет','Часть не входит']])+'<p class="field-note">«Часть не входит» — часть площади отрезана или занята соседями. Если убрана только внутренняя перегородка, отметьте это ниже как изменение планировки.</p>'+choices('to','Нужно техническое описание (ТО)',[['Нужно','Да'],['Не нужно','Нет']])+choices('bti','Планировка по выбранному плану',[['Да','Совпадает'],['Нет','Есть изменения']])+(state.data.bti==='Нет'?input('Что отличается','inspection.plan_note',{type:'textarea',wide:true,maxlength:2000,placeholder:'Кратко. Перегородки и границы отметьте на плане.'}):'')+'</section>';
     if(renewalArchive)html+='<details class="details-block"><summary>Сверка с архивом</summary>'+managerFilesHtml(files.filter(function(f){return f.role==='archive';}),false)+choices('inspection.archive_match','Планировка совпадает с архивом',[['Да','Да'],['Нет','Нет']])+choices('inspection.licensed_boundaries_match','Лицензированные границы сохранены',[['Да','Да'],['Нет','Нет']])+'</details>';
     html+=evidenceBlock('interior','rooms','Фото помещения · необязательно','Общий вид зала, бара или помещений. Можно добавить несколько фото.');
     if(state.data.object_category==='tobacco')html+='<section class="capture-section"><h3>Табак</h3><div class="fields">'+select('Выкладка / хранение','inspection.tobacco_display',['Закрытая','Открытая','Товара нет','Не проверено'])+select('Перечень с ценами','inspection.tobacco_price_list',['Есть','Нет','Не проверено'])+select('Реклама продукции','inspection.tobacco_advertising',['Есть','Нет','Не проверено'])+'</div></section>';
@@ -197,21 +285,54 @@
     var marks=state.data.map.annotations||[],oldEntrances=state.data.entrances||[],oldZones=state.data.zones||[],before=JSON.stringify([oldEntrances,oldZones]);
     var entrances=marks.filter(function(m){return m.tool==='entrance';}).map(function(m,i){var prior=oldEntrances.find(function(e){return e.id===m.id;})||{};return Object.assign({},prior,{id:String(m.id),label:String(m.label||'Вход '+(i+1)),kind:prior.kind||'',location:prior.location||'',facing:prior.facing||'',access:prior.access||'Осмотрен',notes:prior.notes||''});});
     var zones=marks.filter(function(m){return m.tool==='hazard';}).map(function(m){var prior=oldZones.find(function(z){return z.id===m.id;})||{},measurement=marks.find(function(x){return ['route','straight'].includes(x.tool)&&x.toObjectId===m.id;});return Object.assign({},prior,{id:String(m.id),name:String(m.label||''),type:prior.type||'',status:String(m.status||'pending'),entrance_id:String(measurement&&measurement.fromEntranceId||''),dist:String(measurement&&measurement.distance||''),method:measurement?(measurement.tool==='straight'?'Прямая линия':'Пешеходный маршрут'):'',points:measurement?String(measurement.code||''):'',license:m.status==='licensed'?String(m.source||'Сведения аудитора'):'',source:String(m.source||''),info:String(m.note||''),resolution:String(m.note||'')});});
-    // Legacy cards remain recoverable until their own marks are created.
-    if(!marks.length&&(oldEntrances.length||oldZones.length)){state.data.legacy_territory=state.data.legacy_territory||{entrances:clone(oldEntrances),zones:clone(oldZones)};return;}
+    if(!marks.length&&(oldEntrances.length||oldZones.length))state.data.legacy_territory=state.data.legacy_territory||{entrances:clone(oldEntrances),zones:clone(oldZones)};
     state.data.entrances=entrances;state.data.zones=zones;
-    if(before!==JSON.stringify([entrances,zones])){var host=$('#territory-evidence');if(host){host.innerHTML=entranceCards()+zoneCards();bind(host);loadThumbnails(host);}}
+    if(before!==JSON.stringify([entrances,zones])){var host=$('#territory-evidence');if(host){host.innerHTML=territoryCards();bind(host);loadThumbnails(host);}}
+  }
+
+  function hasEvidenceImage(role,subject){return evidenceFor(role,subject).some(function(e){return /^image\//.test(e.mime||e.mime_type||'');});}
+  function validDistance(value){return /^\d{1,6}(?:[.,]\d{1,2})?$/.test(value)&&Number(String(value).replace(',','.'))>0;}
+  function territoryIssues(add,requiredOnly){
+    var result=state.data.workflow.territory_result,mode=mapMode(),map=state.data.map;
+    if(!result){if(!state.frozen)add('territory','Выберите результат проверки территории',0);return;}
+    if(result==='findings'){
+      if(!mode){add('map-mode','Выберите, как оформить схему территории',0);return;}
+      if(mode==='attached'){
+        var attached=evidenceFor('map','attached').find(function(e){return String(e.id)===String(map.evidence_id)&&MAP_IMAGE_TYPES.includes(e.mime||e.mime_type);});
+        if(!attached)add('map','Приложите готовую схему в JPG или PNG',0);
+      }else if(!map.evidence_id||!map.annotations.length||map.pending&&map.pending.points.length)add('map','Сохраните разметку на скриншоте карты',0);
+      if(!state.data.zones.length)add('organizations','Добавьте хотя бы одну проверенную организацию или спорное место',0);
+    }
+    if(!state.data.entrances.length)add('entrances',mode==='draw'?'Отметьте входы на схеме':'Добавьте карточку входа',0);
+    state.data.entrances.forEach(function(e){
+      if(!String(e.label||'').trim())add('entrance-name-'+e.id,'Укажите название входа',0);
+      if(!hasEvidenceImage('entrance',e.id))add('photo-'+e.id,(e.label||'Вход')+': добавьте фото',0);
+      if(!requiredOnly&&['Нет доступа','Не осмотрен'].includes(e.access))add('entrance-'+e.id,(e.label||'Вход')+': осмотр не завершён',0);
+    });
+    if(result==='clear')return;
+    var marks=mode==='draw'?map.annotations:[],measurements=marks.filter(function(m){return ['route','straight'].includes(m.tool);});
+    state.data.zones.forEach(function(z){
+      var name=z.name||'Организация',drawn=measurements.some(function(m){return m.toObjectId===z.id;});
+      if(!String(z.name||'').trim())add('name-'+z.id,'Укажите название проверенной организации',0);
+      if(!hasEvidenceImage('zone',z.id))add('photo-'+z.id,name+': добавьте фото',0);
+      if(!ZONE_STATUS[z.status])add('zone-status-'+z.id,name+': укажите результат проверки',0);
+      else if(!requiredOnly&&['pending','disputed','confirmed'].includes(z.status))add('zone-'+z.id,name+': '+(z.status==='confirmed'?'есть ограничение':'нужно уточнить'),0);
+      if(z.status==='licensed'&&!String(z.source||'').trim())add('source-'+z.id,name+': укажите источник лицензии',0);
+      if(z.status==='confirmed'&&![z.source,z.resolution,z.note].some(function(v){return String(v||'').trim();}))add('resolution-'+z.id,name+': укажите основание ограничения',0);
+      if(!drawn){
+        if(!state.data.entrances.some(function(e){return e.id===z.entrance_id;}))add('measure-entrance-'+z.id,name+': '+(mode==='draw'?'свяжите замер с входом на схеме':'выберите вход для замера'),0);
+        if(z.dist==='Не проверено'){if(!requiredOnly)add('measure-distance-'+z.id,name+': расстояние не проверено',0);}
+        else if(!validDistance(z.dist))add('measure-distance-'+z.id,name+': '+(mode==='draw'?'укажите расстояние на схеме':'укажите расстояние или «Не проверено»'),0);
+      }
+    });
+    measurements.forEach(function(m){if(!validDistance(m.distance)||!state.data.entrances.some(function(e){return e.id===m.fromEntranceId;})||!state.data.zones.some(function(z){return z.id===m.toObjectId;}))add('measure-'+m.id,'Замер '+(m.code||'')+': укажите расстояние и точки',0);});
   }
 
   function issues(){
     var out=[],p=state.data.inspection,packet=state.packet||{};function add(key,title,view,detail){out.push({key:key,title:title,detail:detail||'',step:view});}
     if(!p.org||!p.address||!p.service)add('packet','Менеджеру нужно дополнить заявку',0);
     if(!state.data.building_type)add('building','Выберите: жилое или нежилое здание',0);
-    if(!state.data.map.evidence_id||!state.data.map.annotations.length)add('map','Сохраните схему территории',0);
-    if(!state.data.entrances.length)add('entrances','Отметьте входы на схеме',0);
-    state.data.entrances.forEach(function(e){if(!evidenceFor('entrance',e.id).length)add('photo-'+e.id,(e.label||'Вход')+': добавьте фото',0);if(['Нет доступа','Не осмотрен'].includes(e.access))add('entrance-'+e.id,(e.label||'Вход')+': осмотр не завершён',0);});
-    state.data.zones.forEach(function(z){if(!z.name.trim())add('name-'+z.id,'Укажите название проверенной организации',0);if(!evidenceFor('zone',z.id).length)add('photo-'+z.id,(z.name||'Организация')+': добавьте фото',0);if(!z.status||['pending','disputed','confirmed'].includes(z.status))add('zone-'+z.id,(z.name||'Организация')+': '+(z.status==='confirmed'?'есть ограничение':'нужно уточнить'),0);if(z.status==='licensed'&&!z.source)add('source-'+z.id,(z.name||'Организация')+': укажите источник лицензии',0);});
-    (state.data.map.annotations||[]).filter(function(m){return ['route','straight'].includes(m.tool);}).forEach(function(m){if(!(Number(String(m.distance||'').replace(',','.'))>0)||!m.fromEntranceId||!m.toObjectId)add('measure-'+m.id,'Замер '+(m.code||'')+': укажите расстояние и точки',0);});
+    territoryIssues(add,false);
     [['floor_plan','Этаж на плане'],['floor_actual','Фактический этаж'],['cadastral_count','Количество кадастров'],['rooms_complete','Входит ли вся площадь по плану в объект'],['within_cadastral','Границы помещения'],['kkt_count','Количество касс'],['kkt_ip','Наличие кассы ИП']].forEach(function(pair){if(!p[pair[0]])add(pair[0],'Укажите: '+pair[1].toLowerCase(),1);});
     if(p.floor_plan&&p.floor_actual&&String(p.floor_plan).trim().toLowerCase().replace(/этаж/g,'').replace(/\s+/g,' ').trim()!==String(p.floor_actual).trim().toLowerCase().replace(/этаж/g,'').replace(/\s+/g,' ').trim())add('floor-mismatch','Этаж на плане и фактический этаж отличаются',1);
     if(isRenewal()&&state.data.workflow.archive_skipped!=='Да'){
@@ -262,7 +383,13 @@
     if(typeof area.focus==='function')area.focus({preventScroll:true});
   }
   function reportStep(){var tasks=issues(),p=state.data.inspection;return heading(2)+'<div class="fields">'+select('Результат','workflow.conclusion_status',[{value:'ready',label:'Соответствует по проверенным пунктам'},{value:'actions',label:'Нужны действия'},{value:'insufficient',label:'Нужно уточнить'},{value:'obstacle',label:'Есть препятствие'}],'',true)+input('Комментарий аудитора · необязательно','conclusion',{type:'textarea',wide:true,maxlength:6000})+input('Клиент сообщил / договорённости','workflow.followup_notes',{type:'textarea',wide:true,maxlength:2000})+input((state.packet&&(state.packet.video_required||state.packet.has_video))?'Видео в Яндекс Диске':'Видео · необязательно','workflow.video_url',{type:'url',maxlength:2000,placeholder:'https://disk.yandex.ru/d/…'})+(state.data.workflow.video_url?select('Доступность видео','inspection.video_status',['Сделано','Снято — загрузить позже','Не сделано','Не проверено']):'')+input('Дата осмотра','inspection.visit_date',{type:'date'})+'</div>'+reportPreview()+reportFeedback(tasks)+'<button type="button" class="button primary full" id="submit-audit">Отправить отчёт</button><p class="field-note" id="submit-status" role="status" aria-live="polite"></p>';}
-  function reportPreview(){var p=state.data.inspection,rows=[['Здание',state.data.building_type],['Этаж','план: '+(p.floor_plan||'—')+' · факт: '+(p.floor_actual||'—')],['Кадастры',(p.cadastral_count||'—')+(Number(p.cadastral_count)>1?' · '+(p.inter_cadastral_boundary||'—'):'')],['Границы',p.within_cadastral],['Вся площадь по плану',p.rooms_complete],['ТО',state.data.to],['Кассы',(p.kkt_count||'—')+' · касса ИП: '+(p.kkt_ip||'—')]];if(state.data.object_category!=='tobacco')rows.push(['Алкоголь',p.alcohol_present]);else rows.push(['Табак',[p.tobacco_display,p.tobacco_price_list,p.tobacco_advertising].filter(Boolean).join(' · ')]);return '<section class="report-preview"><h3>Сообщение юристу</h3><p><strong>'+esc(p.address)+'</strong><br>'+esc(p.service)+' · '+esc(({catering:'Алкоголь · общепит',retail:'Алкоголь · магазин',tobacco:'Табак'})[state.data.object_category]||'')+'</p><dl class="report-facts">'+rows.map(function(r){return '<div><dt>'+esc(r[0])+'</dt><dd>'+esc(r[1]||'—')+'</dd></div>';}).join('')+'</dl>'+(state.data.workflow.conclusion_status?'<p><strong>Результат:</strong> '+esc(({ready:'Соответствует по проверенным пунктам',actions:'Нужны действия',insufficient:'Нужно уточнить',obstacle:'Есть препятствие'})[state.data.workflow.conclusion_status])+'</p>':'')+(state.data.conclusion?'<p>'+esc(state.data.conclusion)+'</p>':'')+(p.plan_note?'<p><strong>Изменения:</strong> '+esc(p.plan_note)+'</p>':'')+(state.data.workflow.archive_skipped==='Да'?'<p class="warning">Архив не предоставлен. Сверка с архивом не выполнена.</p>':'')+'<p class="field-note">Вместе с сообщением: схема, размеченные планы, фотографии, оригиналы выезда и ссылка на документы заявки.</p></section>';}
+  function reportPreview(){
+    var p=state.data.inspection,result=state.data.workflow.territory_result,rows=[['Здание',state.data.building_type],['Этаж','план: '+(p.floor_plan||'—')+' · факт: '+(p.floor_actual||'—')],['Кадастры',(p.cadastral_count||'—')+(Number(p.cadastral_count)>1?' · '+(p.inter_cadastral_boundary||'—'):'')],['Границы',p.within_cadastral],['Вся площадь по плану',p.rooms_complete],['ТО',state.data.to],['Кассы',(p.kkt_count||'—')+' · касса ИП: '+(p.kkt_ip||'—')]];
+    if(state.data.object_category!=='tobacco')rows.push(['Алкоголь',p.alcohol_present]);else rows.push(['Табак',[p.tobacco_display,p.tobacco_price_list,p.tobacco_advertising].filter(Boolean).join(' · ')]);
+    if(result)rows.push(['Территория',result==='clear'?'Зоны и спорные объекты не выявлены':'Проверено организаций и спорных мест — '+state.data.zones.length],['Входы',state.data.entrances.length]);
+    var scheme=result==='findings'||state.frozen&&!result?'схема, ':'';
+    return '<section class="report-preview"><h3>Сообщение юристу</h3><p><strong>'+esc(p.address)+'</strong><br>'+esc(p.service)+' · '+esc(({catering:'Алкоголь · общепит',retail:'Алкоголь · магазин',tobacco:'Табак'})[state.data.object_category]||'')+'</p><dl class="report-facts">'+rows.map(function(r){return '<div><dt>'+esc(r[0])+'</dt><dd>'+esc(r[1]||'—')+'</dd></div>';}).join('')+'</dl>'+(state.data.workflow.conclusion_status?'<p><strong>Результат:</strong> '+esc(({ready:'Соответствует по проверенным пунктам',actions:'Нужны действия',insufficient:'Нужно уточнить',obstacle:'Есть препятствие'})[state.data.workflow.conclusion_status])+'</p>':'')+(state.data.conclusion?'<p>'+esc(state.data.conclusion)+'</p>':'')+(p.plan_note?'<p><strong>Изменения:</strong> '+esc(p.plan_note)+'</p>':'')+(state.data.workflow.archive_skipped==='Да'?'<p class="warning">Архив не предоставлен. Сверка с архивом не выполнена.</p>':'')+'<p class="field-note">К сообщению прилагаются '+scheme+'размеченные планы, фотографии, оригиналы выезда и ссылка на документы заявки.</p></section>';
+  }
 
   function normalizeLayout(){if(!state.frozen){state.data.ui_version=5;state.data.inspection.region='МСК';state.data.map=state.data.map||{evidence_id:'',page:1,annotations:[]};state.data.additional_plans=state.data.additional_plans||[];}}
 
@@ -277,6 +404,7 @@
     var kind=step()===0?'map':'plan',mountedPlanId=activePlanId,container=$(kind==='map'?'#map-editor':'#plan-editor');if(!container)return;
     function mountedPlan(){return kind==='map'?state.data.map:mountedPlanId==='main'?state.data.plan:state.data.additional_plans.find(function(p){return p.id===mountedPlanId;});}
     if(window.AuditPlanEditor&&typeof window.AuditPlanEditor.mount==='function'){try{editor=window.AuditPlanEditor.mount(container,{kind:kind,service:state.data.object_category==='tobacco'?'tobacco':'alcohol',getState:mountedPlan,onChange:function(plan){
+      if(kind==='map')plan=Object.assign({},plan,{mode:'draw'});
       if(state.frozen||!mountedPlan())return false;var before=JSON.stringify(mountedPlan());if(before===JSON.stringify(plan))return (state.dirty||state.serverError)?saveNow():undefined;
       if(kind==='map'){state.data.map=plan;syncMapCards();}else if(mountedPlanId==='main')state.data.plan=plan;else{var i=state.data.additional_plans.findIndex(function(p){return p.id===mountedPlanId;});if(i<0)return false;state.data.additional_plans[i]=Object.assign({},plan,{id:mountedPlanId});}
       if(!state.data.inspection.visit_date)state.data.inspection.visit_date=localDate();changed();return saveNow();
@@ -293,8 +421,13 @@
   function bind(scope) {
     var bindRoot=scope||root;
     bindRoot.querySelectorAll('[data-bind]').forEach(function(control){
-      var path=control.dataset.bind,rebuild=['inspection.alcohol_present','inspection.cadastral_count','bti','workflow.video_url'].includes(path);
-      function capture(){if(state.submitting||state.frozen)return;set(path,control.type==='checkbox'?control.checked:control.value);changed();var preview=root.querySelector('.report-preview');if(step()===2&&preview)preview.outerHTML=reportPreview();if(step()===2&&root.querySelector('#report-feedback'))refreshReportFeedback();}
+      var path=control.dataset.bind,rebuild=['inspection.alcohol_present','bti','workflow.video_url'].includes(path);
+      function capture(){if(state.submitting||state.frozen)return;set(path,control.type==='checkbox'?control.checked:control.value);
+        if(path==='inspection.cadastral_count'){
+          var boundary=root.querySelector('[data-cadastral-boundary]');
+          if(boundary)boundary.hidden=!(Number(control.value)>1);
+        }
+        changed();var preview=root.querySelector('.report-preview');if(step()===2&&preview)preview.outerHTML=reportPreview();if(step()===2&&root.querySelector('#report-feedback'))refreshReportFeedback();}
       async function rebuildAfterChange(){if(!rebuild||state.submitting||state.frozen)return;try{if(editor&&editor.flush)await editor.flush();sanitizeService();render();}catch(error){notify(error.message);}}
       control.addEventListener(control.tagName==='SELECT'||control.type==='checkbox'?'change':'input',capture);
       if(rebuild)control.addEventListener('change',rebuildAfterChange);
@@ -302,11 +435,23 @@
     bindRoot.querySelectorAll('[data-go-step]').forEach(function (b) { b.onclick = function () { go(Number(b.dataset.goStep)); }; });
     bindRoot.querySelectorAll('[data-conclusion-choice]').forEach(function (button) { button.onclick=function(){chooseConclusion(button.dataset.conclusionChoice);}; });
     bindRoot.querySelectorAll('[data-upload-role]').forEach(function (control) { control.onchange = function () { var files = Array.from(control.files || []); uploadFiles(files, control.dataset.uploadRole, control.dataset.uploadSubject).catch(function (error) { notify(error.message); }).finally(function () { control.value = ''; }); }; });
+    bindRoot.querySelectorAll('[data-territory-upload]').forEach(function(control){control.onchange=function(){var file=(control.files||[])[0];if(file)uploadTerritoryImage(file,control.dataset.territoryUpload).catch(function(error){notify(error.message);}).finally(function(){control.value='';});};});
     bindRoot.querySelectorAll('[data-open-evidence]').forEach(function (b) { b.onclick = function () { openEvidence(b.dataset.openEvidence); }; });
     bindRoot.querySelectorAll('[data-delete-evidence]').forEach(function (b) { b.onclick = function () { deleteEvidence(b.dataset.deleteEvidence); }; });
     bindRoot.querySelectorAll('[data-download-material]').forEach(function (b) { b.onclick = function () { var file = packetFiles().find(function (f) { return String(f.id) === b.dataset.downloadMaterial; }); if (file) downloadResource(file.url, file.name); }; });
     bindRoot.querySelectorAll('[data-use-plan]').forEach(function (b) { b.onclick = function () { useManagerPlan(b.dataset.usePlan); }; });
-    bindRoot.querySelectorAll('[data-choice]').forEach(function(button){button.onclick=async function(){if(state.submitting||state.frozen)return;try{if(editor&&editor.flush)await editor.flush();set(button.dataset.choice,button.dataset.value);changed();render();}catch(error){notify(error.message);}};});
+    bindRoot.querySelectorAll('[data-choice]').forEach(function(button){button.onclick=async function(){
+      if(state.submitting||state.frozen)return;
+      var path=button.dataset.choice,value=button.dataset.value;
+      if(['workflow.territory_result','map.mode'].includes(path)&&state.pendingUploads){notify('Дождитесь загрузки выбранных файлов.');return;}
+      try{
+        if(editor&&editor.flush)await editor.flush();
+        if(path==='workflow.territory_result')chooseTerritory(value);
+        else if(path==='map.mode')switchTerritoryMode(value);
+        else set(path,value);
+        changed();render();
+      }catch(error){notify(error.message);}
+    };});
     bindRoot.querySelectorAll('[data-plan-context]').forEach(function(button){button.onclick=async function(){try{if(editor&&editor.flush)await editor.flush();activePlanId=button.dataset.planContext;render();}catch(error){notify(error.message);}};});
     var extraButton=bindRoot.querySelector('[data-add-plan]');if(extraButton)extraButton.onclick=async function(){try{if(editor&&editor.flush)await editor.flush();var extra={id:id('extra'),evidence_id:'',page:1,annotations:[]};state.data.additional_plans.push(extra);activePlanId=extra.id;changed();render();}catch(error){notify(error.message);}};
     var removePlan=bindRoot.querySelector('[data-remove-plan]');if(removePlan)removePlan.onclick=async function(){try{if(editor&&editor.flush)await editor.flush();}catch(error){notify(error.message);return;}state.data.retired_plans=state.data.retired_plans||[];state.data.retired_plans.push(clone(currentPlan()));state.data.additional_plans=state.data.additional_plans.filter(function(p){return p.id!==activePlanId;});activePlanId='main';changed();render();};
@@ -318,10 +463,31 @@
     b = $('[data-download-archive]'); if (b) b.onclick = function () { var attached=packetFiles().some(function(file){return file.role==='archive';});var url=state.packet.archive_download_url||(attached?'/api/audit/orders/'+encodeURIComponent(orderId)+'/materials/download-all?role=archive':'/api/audit/orders/'+encodeURIComponent(orderId)+'/archive/download');downloadResource(url,'Архив-заявки-'+orderId+'.zip'); };
     b = $('[data-copy-address]'); if (b) b.onclick = function () { copyText(state.data.inspection.address, 'Адрес скопирован'); };
     b = $('[data-copy-archive]'); if (b) b.onclick = function () { copyText(state.packet.archive_url, 'Ссылка на архив скопирована'); };
-    b = $('[data-add-entrance]'); if (b) b.onclick = function () { var n = state.data.entrances.length + 1; state.data.entrances.push({ id: id('entrance'), label: 'Вход ' + n, kind: '', location: '', facing: '', access: '', notes: '' }); if (!state.data.inspection.visit_date) state.data.inspection.visit_date = localDate(); changed(); render(); };
-    b = $('[data-add-zone]'); if (b) b.onclick = function () { state.data.zones.push({ id: id('zone'), name: 'Организация ' + (state.data.zones.length + 1), type: '', status: 'pending', entrance_id: state.data.entrances.length === 1 ? state.data.entrances[0].id : '', dist: '', method: '', points: '', license: '', source: '', info: '', resolution: '' }); changed(); render(); };
-    bindRoot.querySelectorAll('[data-remove-entrance]').forEach(function (button) { button.onclick = function () { var eid = button.dataset.removeEntrance; if (evidenceFor('entrance', eid).length || state.data.zones.some(function (z) { return z.entrance_id === eid; })) { notify('У входа есть фото или замеры. Сначала уберите их привязку.'); return; } state.data.entrances = state.data.entrances.filter(function (e) { return e.id !== eid; }); changed(); render(); }; });
-    bindRoot.querySelectorAll('[data-remove-zone]').forEach(function (button) { button.onclick = function () { var zid = button.dataset.removeZone; if (evidenceFor('zone', zid).length) { notify('Сначала уберите файлы этой организации.'); return; } state.data.zones = state.data.zones.filter(function (z) { return z.id !== zid; }); changed(); render(); }; });
+    b = bindRoot.querySelector('[data-add-entrance]'); if (b) b.onclick = function () {
+      var n=state.data.entrances.length;
+      if(n>=30){notify('Можно добавить до 30 входов.');return;}
+      var number=n+1;while(state.data.entrances.some(function(e){return e.label==='Вход '+number;}))number++;
+      state.data.entrances.push({id:id('entrance'),label:'Вход '+number,kind:'',location:'',facing:'',access:'',notes:''});
+      if(!state.data.inspection.visit_date)state.data.inspection.visit_date=localDate();
+      changed();render();$('[data-entrance-title="'+n+'"]').focus();
+    };
+    b = bindRoot.querySelector('[data-add-zone]'); if (b) b.onclick = function () {
+      var n=state.data.zones.length;
+      if(n>=20){notify('Можно добавить до 20 организаций.');return;}
+      state.data.zones.push({id:id('zone'),name:'',type:'',status:'',entrance_id:state.data.entrances.length===1?state.data.entrances[0].id:'',dist:'',method:'',points:'',license:'',source:'',info:'',resolution:''});
+      changed();render();$('[data-bind="zones.'+n+'.name"]').focus();
+    };
+    bindRoot.querySelectorAll('[data-remove-entrance]').forEach(function(button){button.onclick=function(){
+      var eid=button.dataset.removeEntrance,linked=state.data.zones.filter(function(z){return z.entrance_id===eid;});
+      if((linked.length||evidenceFor('entrance',eid).length)&&!window.confirm(linked.length?'Убрать вход с фото? Для связанных замеров нужно выбрать другой вход.':'Убрать вход и его фото из отчёта?'))return;
+      state.data.entrances=state.data.entrances.filter(function(e){return e.id!==eid;});
+      linked.forEach(function(z){z.entrance_id='';z.dist='';});changed();render();
+    };});
+    bindRoot.querySelectorAll('[data-remove-zone]').forEach(function(button){button.onclick=function(){
+      var zid=button.dataset.removeZone;
+      if(evidenceFor('zone',zid).length&&!window.confirm('Убрать карточку организации и её фото из отчёта?'))return;
+      state.data.zones=state.data.zones.filter(function(z){return z.id!==zid;});changed();render();
+    };});
     b = $('#submit-audit'); if (b) b.onclick = submit;
   }
   function openExternal(url){return actions.openExternal(url,tg,function(href,target){return window.open(href,target);},window);}
@@ -394,14 +560,25 @@
       } catch (error) { reject(unreadable()); }
     });
   }
+  function fileMime(file, data) {
+    var declared = String(file.type || file.mime || '').toLowerCase();
+    if (declared === 'image/jpg') return 'image/jpeg';
+    if (declared && declared !== 'application/octet-stream') return declared;
+    // Some Android providers omit the MIME type even for a valid image or PDF.
+    var header = atob(data.slice(0, 12));
+    if (header.startsWith('\xff\xd8\xff')) return 'image/jpeg';
+    if (header.startsWith('\x89PNG\r\n\x1a\n')) return 'image/png';
+    if (header.startsWith('%PDF-')) return 'application/pdf';
+    return '';
+  }
   async function evidenceId(file,role,subject,data){var key=[file.name,file.type||file.mime,role,subject||'',data].join('\n');if(window.crypto&&crypto.subtle&&window.TextEncoder){var digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(key));var hex=Array.from(new Uint8Array(digest)).map(function(n){return n.toString(16).padStart(2,'0');}).join('').slice(0,32);hex=hex.slice(0,12)+'4'+hex.slice(13,16)+'8'+hex.slice(17);return hex.slice(0,8)+'-'+hex.slice(8,12)+'-'+hex.slice(12,16)+'-'+hex.slice(16,20)+'-'+hex.slice(20,32);}var hash=0;for(var i=0;i<key.length;i++)hash=(Math.imul(31,hash)+key.charCodeAt(i))|0;var short=file.name+':'+role+':'+subject+':'+data.length+':'+hash;if(!uploadIds.has(short))uploadIds.set(short,uuid());return uploadIds.get(short);}
   async function postEvidence(file,role,subject,data,eid){var result=await request('/api/audit/drafts/'+encodeURIComponent(state.draft.id)+'/evidence',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:eid||await evidenceId(file,role,subject,data),revision:state.draft.revision,name:file.name,mime:file.type||file.mime,role:role,subject_id:subject||'',data:data})});adoptRevision(result);var evidence=result.evidence;if(evidence&&!Array.isArray(evidence)){state.evidence=state.evidence.filter(function(e){return String(e.id)!==String(evidence.id);});state.evidence.push(evidence);}return evidence;}
   async function uploadFiles(files, role, subject, options) {
     options = options || {}; if (!files.length) return;
     if (state.submitting || state.frozen || state.conflict) { notify('Сначала завершите текущую операцию с черновиком.'); return; }
-    var allowed = ['image/jpeg','image/png','image/webp','image/gif','image/heic','image/heif','image/avif','image/tiff','image/bmp','application/pdf'];
-    var invalid = files.find(function (f) { return !allowed.includes(f.type) || f.size > 12 * 1024 * 1024; });
-    if (invalid) throw new Error(invalid.size > 12 * 1024 * 1024 ? 'Файл ' + invalid.name + ' больше 12 МБ.' : 'Поддерживаются изображения и PDF. Выберите другой формат для ' + invalid.name + '.');
+    var allowed = options.allowedTypes || ['image/jpeg','image/png','image/webp','image/gif','image/heic','image/heif','image/avif','image/tiff','image/bmp','application/pdf'];
+    var tooLarge = files.find(function (f) { return f.size > 12 * 1024 * 1024; });
+    if (tooLarge) throw new Error('Файл ' + tooLarge.name + ' больше 12 МБ.');
     if (state.evidence.length + state.pendingUploads + files.length > 60) throw new Error('В одной проверке можно сохранить до 60 файлов.');
     var total = state.evidence.reduce(function (n, e) { return n + Number(e.size || e.bytes || 0); }, 0) + files.reduce(function (n, f) { return n + f.size; }, 0);
     if (total > 100 * 1024 * 1024) throw new Error('Общий объём файлов проверки больше 100 МБ.');
@@ -413,10 +590,15 @@
       var saved = [], remaining = files.length;
       try {
         var captured = await prepared; if (captured.error) throw captured.error;
+        var originals = files.map(function (file, index) {
+          var type = fileMime(file, captured.data[index]);
+          if (!allowed.includes(type)) throw new Error('Формат файла «' + file.name + '» не поддерживается. ' + (options.allowedTypes ? 'Выберите JPG или PNG.' : 'Выберите изображение или PDF.'));
+          return type === file.type ? file : { name: file.name, size: file.size, type: type };
+        });
         await flush();
         for (var i = 0; i < files.length; i++) {
           status('Загружаю оригинал ' + (i + 1) + ' из ' + files.length + '…');
-          saved.push(await postEvidence(files[i], role, subject, captured.data[i]));
+          saved.push(await postEvidence(originals[i], role, subject, captured.data[i]));
           state.pendingUploads--; remaining--; localSave();
         }
         status('Оригиналы сохранены на сервере · ' + timeLabel(), 'success'); if (!options.noRender) render(); return saved;
@@ -435,7 +617,8 @@
     var data;
     try {
       data = await readBase64(file);
-      if (!file.type && /\.pdf$/i.test(file.name) && atob(data.slice(0, 12)).startsWith('%PDF-')) file = { name: file.name, size: file.size, type: 'application/pdf' };
+      var type = fileMime(file, data);
+      if (type !== file.type) file = { name: file.name, size: file.size, type: type };
       if (file.type === 'application/pdf') {
         var pdfjs = await import('/vendor/pdfjs/pdf.mjs'); pdfjs.GlobalWorkerOptions.workerSrc = '/vendor/pdfjs/pdf.worker.mjs';
         var raw = atob(data), bytes = new Uint8Array(raw.length); for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
@@ -448,7 +631,35 @@
     finally { state.pendingUploads--; }
     var saved = await uploadFiles([file], role, 'source', { noRender: true, preparedData: [data] }); return saved && saved[0];
   }
-  async function deleteEvidence(eid){if(state.submitting||state.frozen||state.conflict)return;var evidence=state.evidence.find(function(e){return String(e.id)===String(eid);});if(!evidence)return;if(!window.confirm('Убрать файл «'+(evidence.name||'документ')+'» из этой проверки?'))return;queue(async function(){try{await flush();var result=await request('/api/audit/drafts/'+encodeURIComponent(state.draft.id)+'/evidence/'+encodeURIComponent(eid),{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({revision:state.draft.revision})});adoptRevision(result);state.evidence=state.evidence.filter(function(e){return String(e.id)!==String(eid);});if(String(state.data.plan.evidence_id)===String(eid)){state.data.plan.evidence_id='';state.data.plan.annotations=[];state.dirty=true;state.version++;await flush();}if(blobUrls.has(String(eid))){URL.revokeObjectURL(blobUrls.get(String(eid)));blobUrls.delete(String(eid));}localSave();render();notify('Файл убран из проверки.');}catch(error){notify(error.message);}});}
+  async function uploadTerritoryImage(file,mode){
+    if(state.pendingUploads){notify('Дождитесь загрузки выбранных файлов.');return;}
+    var map=state.data.map,draw=mode==='draw';
+    if(state.data.workflow.territory_result!=='findings'||mapMode()!==mode)return;
+    var saved=await uploadFiles([file],draw?'map-source':'map',draw?'source':'attached',{noRender:true,allowedTypes:MAP_IMAGE_TYPES});
+    if(!saved||!saved[0]||state.data.map!==map||state.frozen)return;
+    if(draw){
+      state.data.map=Object.assign({},map,{evidence_id:saved[0].id,page:1,mode:'draw'});
+    }else state.data.map=Object.assign({},clone(defaults.map),{mode:'attached',evidence_id:saved[0].id});
+    changed();render();
+  }
+  async function deleteEvidence(eid){
+    if(state.submitting||state.frozen||state.conflict)return;
+    var evidence=state.evidence.find(function(e){return String(e.id)===String(eid);});
+    if(!evidence||!window.confirm('Убрать файл «'+(evidence.name||'документ')+'» из этой проверки?'))return;
+    queue(async function(){try{
+      await flush();
+      var result=await request('/api/audit/drafts/'+encodeURIComponent(state.draft.id)+'/evidence/'+encodeURIComponent(eid),{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({revision:state.draft.revision})});
+      adoptRevision(result);state.evidence=state.evidence.filter(function(e){return String(e.id)!==String(eid);});
+      var plan=state.data.plan,map=state.data.map;
+      if(String(plan.evidence_id)===String(eid)||String(map.evidence_id)===String(eid)){
+        if(String(plan.evidence_id)===String(eid)){plan.evidence_id='';plan.annotations=[];}
+        if(String(map.evidence_id)===String(eid))map.evidence_id='';
+        state.dirty=true;state.version++;await flush();
+      }
+      if(blobUrls.has(String(eid))){URL.revokeObjectURL(blobUrls.get(String(eid)));blobUrls.delete(String(eid));}
+      localSave();render();notify('Файл убран из проверки.');
+    }catch(error){notify(error.message);}});
+  }
   async function removeGeneratedEvidence(eid){var result=await request('/api/audit/drafts/'+encodeURIComponent(state.draft.id)+'/evidence/'+encodeURIComponent(eid),{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({revision:state.draft.revision})});adoptRevision(result);state.evidence=state.evidence.filter(function(e){return e.id!==eid;});}
   async function exportGraphic(plan,kind,subject){if(!window.AuditPlanEditor||!plan.evidence_id||!plan.annotations.length)return null;var host=document.createElement('div');host.className='export-shell';document.body.appendChild(host);var api;try{api=window.AuditPlanEditor.mount(host,{kind:kind,service:state.data.object_category==='tobacco'?'tobacco':'alcohol',getState:function(){return plan;},onChange:function(){},evidenceUrl:evidenceUrl,evidence:state.evidence});await api.refresh();var result=await api.exportPreview();if(result)result.subject_id=subject;return result;}finally{if(api)api.destroy();host.remove();}}
   async function exportPlan(){return exportGraphic(state.data.plan,'plan','annotation');}
@@ -489,13 +700,16 @@
     if(!state.frozen){
       if(!p.org.trim()||!p.address.trim()||!p.service){notify('В заявке не хватает данных. Менеджеру нужно дополнить объект, адрес или услугу. Наблюдения сохранены в черновике.');go(0);return;}
       if(!state.data.workflow.conclusion_status){notify('Выберите результат проверки.');return;}
+      var missingTerritory=[];territoryIssues(function(key,title){missingTerritory.push(title);},true);
+      if(missingTerritory.length){notify(missingTerritory[0]);showReportIssues();return;}
       if(state.data.workflow.conclusion_status==='ready'&&issues().length){showReportIssues();return;}
       if(!state.data.conclusion.trim())state.data.conclusion=({ready:'Соответствует по проверенным пунктам',actions:'Нужны действия',insufficient:'Недостаточно данных',obstacle:'Выявлено препятствие'})[state.data.workflow.conclusion_status];
       state.data.ui_version=5;state.data.inspection.region='МСК';
-      p.all_entrances_checked=state.data.entrances.length&&state.data.entrances.every(function(e){return evidenceFor('entrance',e.id).length;})?'Да':'Не проверено';p.zones_checked=state.data.zones.every(function(z){return z.status&&z.status!=='pending'&&z.name&&evidenceFor('zone',z.id).length;})?'Да':'Не проверено';state.data.additional_plans=state.data.additional_plans.filter(function(p){return p.evidence_id||p.annotations.length;});['alcohol_present','within_cadastral','all_entrances_checked','zones_checked'].forEach(function(key){if(!p[key])p[key]='Не проверено';});
+      p.all_entrances_checked=state.data.entrances.length&&state.data.entrances.every(function(e){return !['Нет доступа','Не осмотрен'].includes(e.access)&&hasEvidenceImage('entrance',e.id);})?'Да':'Не проверено';
+      p.zones_checked=state.data.workflow.territory_result==='clear'||state.data.zones.every(function(z){return z.status!=='pending'&&z.dist!=='Не проверено'&&z.name&&hasEvidenceImage('zone',z.id);})?'Да':'Не проверено';
+      state.data.additional_plans=state.data.additional_plans.filter(function(p){return p.evidence_id||p.annotations.length;});['alcohol_present','within_cadastral','all_entrances_checked','zones_checked'].forEach(function(key){if(!p[key])p[key]='Не проверено';});
       if(isRenewal()){if(!p.archive_available)p.archive_available=state.packet&&(state.packet.archive_url||packetFiles().some(function(f){return f.role==='archive';}))?'Да':'Не проверено';if(p.alcohol_present==='Да'&&!p.alcohol_within_licensed)p.alcohol_within_licensed='Не проверено';}
 
-      state.data.zones.forEach(function(zone,i){if(!zone.name.trim())zone.name='Организация '+(i+1)+' — название уточнить';});
       state.dirty=true;state.version++;localSave();
     }
     var enteredSubmission=state.frozen;
@@ -504,7 +718,9 @@
     try{
       await queue(async function(){
         if(!state.frozen){
-          await flush();var figures=[{plan:state.data.map,kind:'map',subject:'annotation'},{plan:state.data.plan,kind:'plan',subject:'annotation'}].concat(state.data.additional_plans.map(function(p){return{plan:p,kind:'plan',subject:'annotation-'+p.id};}));for(var figure of figures){var preview=await exportGraphic(figure.plan,figure.kind,figure.subject);if(preview){if(submitStatus)submitStatus.textContent='Сохраняю схему и планы…';var newPreview=await postEvidence({name:preview.name,type:preview.mime},preview.role||figure.kind,figure.subject,preview.data);figure.plan.preview_evidence_id=newPreview.id;state.dirty=true;state.version++;var stale=state.evidence.filter(function(e){return e.role===figure.kind&&e.subject_id===figure.subject&&e.id!==newPreview.id;});for(var oldPreview of stale){await removeGeneratedEvidence(oldPreview.id);}}}
+          await flush();var figures=[{plan:state.data.plan,kind:'plan',subject:'annotation'}].concat(state.data.additional_plans.map(function(p){return{plan:p,kind:'plan',subject:'annotation-'+p.id};}));
+          if(state.data.workflow.territory_result==='findings'&&mapMode()==='draw')figures.unshift({plan:state.data.map,kind:'map',subject:'annotation'});
+          for(var figure of figures){var preview=await exportGraphic(figure.plan,figure.kind,figure.subject);if(preview){if(submitStatus)submitStatus.textContent='Сохраняю схему и планы…';var newPreview=await postEvidence({name:preview.name,type:preview.mime},preview.role||figure.kind,figure.subject,preview.data);figure.plan.preview_evidence_id=newPreview.id;state.dirty=true;state.version++;var stale=state.evidence.filter(function(e){return e.role===figure.kind&&e.subject_id===figure.subject&&e.id!==newPreview.id;});for(var oldPreview of stale){await removeGeneratedEvidence(oldPreview.id);}}}
         }
         if(!state.frozen){var activeSubjects=['annotation'].concat(state.data.additional_plans.map(function(p){return 'annotation-'+p.id;}));var retiredExports=state.evidence.filter(function(e){return e.role==='plan'&&String(e.subject_id||'').startsWith('annotation-')&&!activeSubjects.includes(e.subject_id);});for(var retiredExport of retiredExports)await removeGeneratedEvidence(retiredExport.id);await flush();}
         if(submitStatus)submitStatus.textContent='Передаю отчёт. Дождитесь подтверждения…';

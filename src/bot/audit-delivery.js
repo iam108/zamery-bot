@@ -78,7 +78,7 @@ function describeFile(file, data) {
   let title = ROLE_TITLES[file.role] || 'Материал объекта';
   if (file.role === 'entrance') {
     let label = oneLine(entry?.label || mark?.label || 'Вход');
-    if (/^Вход\s*(?:№\s*)?\d+$/i.test(label)) label = 'Вход';
+    if ((code || !data.workflow?.territory_result) && /^Вход\s*(?:№\s*)?\d+$/i.test(label)) label = 'Вход';
     title = [code, label].filter(Boolean).join(' · ');
     if (['Нет доступа', 'Не осмотрен'].includes(entry?.access)) details.push(entry.access);
   } else if (file.role === 'zone') {

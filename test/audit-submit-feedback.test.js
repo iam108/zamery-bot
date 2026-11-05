@@ -15,6 +15,11 @@ function actualFunction(name) {
   return next < 0 ? rest : rest.slice(0, next + 1);
 }
 function harness(data = compactVisit()) {
+  if (!data.workflow.territory_result) {
+    data.workflow.territory_result = data.zones.length ? 'findings' : 'clear';
+    if (data.zones.length) data.map.mode = 'draw';
+    else data.map = { evidence_id: '', page: 1, annotations: [] };
+  }
   const evidence = data.evidence; delete data.evidence;
   const calls = [], nodes = new Map();
   const node = selector => {
@@ -27,6 +32,8 @@ function harness(data = compactVisit()) {
       pendingUploads: 0, submitting: false, frozen: false, completed: false },
     root: { querySelector: node, querySelectorAll: () => [], innerHTML: '' },
     $: node, tail: Promise.resolve(), timer: null, clearTimeout, editor: null, tg: null, orderId: '58', localKey: 'synthetic-audit-submit-feedback', clone: copy,
+    defaults: { map: { evidence_id: '', page: 1, annotations: [] } },
+    MAP_IMAGE_TYPES: ['image/jpeg','image/png'], ZONE_STATUS: { clear:'Без замечаний', licensed:'Есть сведения о лицензии', disputed:'Спорное место', confirmed:'Есть ограничение', pending:'Нужно уточнить', other:'Наблюдение' },
     esc: value => String(value == null ? '' : value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;'),
     document: { body: { classList: { add() {}, remove() {} } } },
     localStorage: { removeItem() {}, setItem() {} },
@@ -50,7 +57,7 @@ function harness(data = compactVisit()) {
     },
   };
   vm.createContext(c);
-  vm.runInContext(['queue','isRenewal','packetFiles','evidenceFor','adoptRevision','removeGeneratedEvidence','issues','tasksHtml',
+  vm.runInContext(['queue','isRenewal','packetFiles','evidenceFor','adoptRevision','removeGeneratedEvidence','mapMode','rememberTerritory','switchTerritoryMode','chooseTerritory','hasEvidenceImage','validDistance','territoryIssues','issues','tasksHtml',
     'reportFeedback','bindReportFeedback','refreshReportFeedback','chooseConclusion','showReportIssues','reportPreview','submit'].map(actualFunction).join('\n'), c);
   return { c, calls, node };
 }
@@ -111,6 +118,38 @@ test('decimal-comma measurements accepted by the server are not falsely blocked 
     fromEntranceId: data.entrances[0].id, toObjectId: data.zones[0].id, points: [{ x: .2, y: .3 }, { x: .8, y: .4 }] });
   data.zones[0].dist = '12,5'; const { c } = harness(data);
   assert.equal(c.issues().length, 0); await c.submit(); assert.equal(c.state.completed, true);
+});
+
+test('clear territory keeps entrance evidence, omits map export, and requires the explicit outcome', async () => {
+  const { c, calls } = harness();
+  delete c.state.data.workflow.territory_result;
+  await c.submit();
+  assert.equal(c.state.completed, false);
+  assert.match(calls.find(([action]) => action === 'notify')[1], /Выберите результат проверки территории/);
+  c.chooseTerritory('clear');
+  c.exportGraphic = async (_drawing, kind) => {
+    assert.equal(kind, 'plan');
+    return { name: 'plan.png', mime: 'image/png', role: 'plan', data: 'synthetic-preview' };
+  };
+  await c.submit();
+  assert.equal(c.state.completed, true);
+});
+
+test('switching modes preserves the drawn draft and manual entrance photos', () => {
+  const data = addOrganization(compactVisit());
+  const { c } = harness(data);
+  const drawn = copy(c.state.data.map), drawZones = copy(c.state.data.zones);
+  c.chooseTerritory('clear');
+  assert.deepEqual(copy(c.state.data.zones), []);
+  assert.equal(c.state.data.map.evidence_id, '');
+  c.state.data.entrances[0].label = 'Боковой вход';
+  c.chooseTerritory('findings');
+  assert.deepEqual(copy(c.state.data.map), drawn);
+  assert.deepEqual(copy(c.state.data.zones), drawZones);
+  c.switchTerritoryMode('attached');
+  assert.equal(c.state.data.entrances[0].label, 'Боковой вход');
+  assert.equal(c.hasEvidenceImage('entrance', c.state.data.entrances[0].id), true);
+  assert.deepEqual(copy(c.state.data.map.annotations), []);
 });
 
 test('archive originals uploaded with auditor evidence count just like archive documents in the request', async () => {

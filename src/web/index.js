@@ -13,9 +13,17 @@ function esc(s) {
 }
 
 function setupWeb(app) {
-  
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+  require('./auth').setupAuth(app);
+  app.use(express.json({ limit: '50mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+  app.use('/api/audit', (error, req, res, next) => {
+    if (res.headersSent) return next(error);
+    const tooLarge = error.type === 'entity.too.large';
+    return res.status(tooLarge ? 413 : (error.status || 400)).json({
+      ok: false,
+      error: tooLarge ? 'Запрос слишком большой. Добавляйте файлы до 12 МБ по одному.' : 'Не удалось прочитать запрос проверки. Попробуйте ещё раз.',
+    });
+  });
   app.get('/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
   app.use(express.static(path.join(__dirname, '../../public')));
   require('./egrn-downloads').setupEgrnDownloads(app);
@@ -28,7 +36,6 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
     cookie: { maxAge: 86400000 },
   }));
 
-  require('./auth').setupAuth(app);
   require('./workspace').setupWorkspace(app);
   require('../db/pool').query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS submitted_name TEXT').catch((e) => console.error('orders.submitted_name:', e.message));
 
@@ -157,7 +164,7 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
   const { auditForm } = require('./audit-form');
   const auditWizard = require('./audit-wizard');
-  app.get('/audit', (req, res) => res.send(auditWizard()));
+  app.get('/audit', (req, res) => res.set('Cache-Control', 'no-store').send(auditWizard()));
   app.get('/audit/legacy', (req, res) => res.send(auditForm()));
   app.get('/audit-wizard.css', (req, res) => res.type('text/css').send(auditWizard.css()));
   app.get('/audit-wizard-client.js', (req, res) => res.type('application/javascript').send(auditWizard.client()));

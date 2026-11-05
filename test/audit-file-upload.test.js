@@ -49,7 +49,7 @@ function harness() {
       readAsDataURL() { throw new Error('Unexpected FileReader fallback'); }
     }
   };
-  vm.createContext(c); load(c, 'queue', 'readBase64', 'uploadFiles');
+  vm.createContext(c); load(c, 'queue', 'readBase64', 'fileMime', 'uploadFiles');
   return { c, events, notices, status, uploads };
 }
 
@@ -66,6 +66,32 @@ for (const image of images) test('a complete ' + image.type + ' screenshot reach
   assert.equal(uploads.length, 1); assert.equal(uploads[0].file.type, image.type);
   assert.deepEqual(Buffer.from(uploads[0].data, 'base64'), original);
   assert.equal(c.state.pendingUploads, 0);
+});
+
+for (const [index, image] of images.entries()) test('Android generic MIME is resolved for ' + image.type, async () => {
+  const { c, uploads } = harness(), original = Buffer.from(image.data, 'base64');
+  const chosen = file(image.name, original);
+  chosen.type = index ? '' : 'application/octet-stream';
+  await c.uploadFiles([chosen], 'map', 'attached', { allowedTypes: ['image/jpeg','image/png'] });
+  assert.equal(uploads[0].file.type, image.type);
+  assert.deepEqual(Buffer.from(uploads[0].data, 'base64'), original);
+});
+
+test('a non-image renamed to PNG is rejected in the finished-scheme flow', async () => {
+  const { c, uploads } = harness(), chosen = file('renamed.png', Buffer.from('%PDF-1.7'));
+  chosen.type = 'application/octet-stream';
+  await assert.rejects(c.uploadFiles([chosen], 'map', 'attached', { allowedTypes: ['image/jpeg','image/png'] }), /Выберите JPG или PNG/);
+  assert.equal(uploads.length, 0);
+  assert.equal(c.state.pendingUploads, 0);
+});
+
+test('an HTML edge challenge is distinguished from the draft API JSON errors', async () => {
+  const { c } = harness();
+  load(c, 'request');
+  c.fetch = async () => ({ status: 200, ok: true, text: async () => '<title>Checking your browser…</title>' });
+  await assert.rejects(c.request('/api/audit/drafts/current'), /ограничил доступ/);
+  c.fetch = async () => ({ status: 409, ok: false, text: async () => '{"ok":false,"error":"Конфликт","code":"REVISION_CONFLICT"}' });
+  await assert.rejects(c.request('/api/audit/drafts/current'), error => error.status === 409 && error.payload.code === 'REVISION_CONFLICT');
 });
 
 test('a failed native Blob read falls back to FileReader and preserves every byte', async () => {

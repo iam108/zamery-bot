@@ -4,6 +4,8 @@ const { randomUUID } = require('node:crypto');
 const { normalizeWorkflow, validateWorkflow, buildWorkflowReport, followupTasks, hydrateDraftReport } = require('../src/bot/audit-workflow');
 const { validateInspection, buildInspectionReport } = require('../src/bot/audit-inspection');
 const { compactVisit, addOrganization } = require('./helpers/audit-v5');
+const { buildAuditSummary } = require('../src/bot/audit-summary');
+const { presentationMedia } = require('../src/bot/audit-delivery');
 
 for (const category of ['catering', 'retail', 'tobacco']) for (const service of ['Получение', 'Продление']) {
   test('V5 ' + category + ' / ' + service + ' accepts actual facts and linked evidence without generic checkboxes', () => {
@@ -152,6 +154,117 @@ test('V5 measured route links existing endpoints, supports freehand paths and re
   assert.throws(() => validateWorkflow(data), /измеренное расстояние/);
   path.distance = '23.5'; data.zones = [];
   assert.throws(() => validateWorkflow(data), /каждой отмеченной организации|существующим входом/);
+});
+
+test('explicit clear territory can finish without a map in ready and follow-up reports but still requires entrance photos and a marked plan', () => {
+  const data = compactVisit('tobacco');
+  data.workflow.territory_result = 'clear';
+  delete data.map;
+  for (const conclusion of ['ready', 'actions', 'insufficient', 'obstacle']) {
+    data.workflow.conclusion_status = conclusion;
+    assert.doesNotThrow(() => validateWorkflow(data));
+  }
+  assert.match(buildWorkflowReport(data).plain.join('\n'), /Зоны запрета и спорные объекты не выявлены/);
+  assert.match(buildAuditSummary(data, 'Аудитор').plain, /Зоны запрета и спорные объекты не выявлены/);
+  assert.doesNotMatch(buildAuditSummary(data, 'Аудитор').plain, /Организации не перечислены|схема территории приложена/i);
+  data.evidence = data.evidence.filter(file => file.role !== 'entrance');
+  assert.throws(() => validateWorkflow(data), /Добавьте фото входа/);
+  data.plan.annotations = [];
+  assert.throws(() => validateWorkflow(data), /границы помещения на плане/);
+});
+
+test('explicit clear territory rejects contradictory active map and zone entries and omits inactive historical map files from delivery', () => {
+  const data = addOrganization(compactVisit());
+  data.workflow.territory_result = 'clear';
+  assert.throws(() => validateWorkflow(data), /Для результата «Зон нет»/);
+  data.map = { annotations: [] };
+  assert.throws(() => validateWorkflow(data), /Для результата «Зон нет»/);
+  data.zones = [];
+  data.map.annotations = {};
+  assert.throws(() => validateWorkflow(data), /Проверьте сведения о схеме территории/);
+  data.map.annotations = [];
+  data.entrances[0].label = 'Вход 1';
+  data.territory_versions = { draw: { entrances: [{ id: 'parked-entrance' }], zones: [{ id: 'org-4' }] } };
+  data.evidence.push({ id: randomUUID(), role: 'entrance', subject_id: 'parked-entrance', mime: 'image/jpeg', name: 'Лишний вход.jpg' });
+  data.workflow.territory_notes = 'Вход со двора.';
+  const evidence = data.evidence.map(file => ({ ...file, buffer: Buffer.from(file.name) }));
+  const hydrated = hydrateDraftReport({ id: randomUUID(), revision: 2, order_id: 58, data, evidence });
+  assert.deepEqual(hydrated.documents.map(file => file.role), ['plan-source', 'entrance', 'plan']);
+  assert.equal(hydrated.territory_versions, undefined);
+  assert.deepEqual(data.territory_versions.draw.entrances, [{ id: 'parked-entrance' }]);
+  assert.match(buildAuditSummary(hydrated, 'Аудитор').plain, /Аудитор сообщил: Вход со двора\./);
+  assert.match(buildWorkflowReport(hydrated).plain.join('\n'), /Дополнение по территории: Вход со двора\./);
+  assert.equal(evidence.filter(file => ['zone', 'map', 'map-source'].includes(file.role)).length, 3);
+  const media = presentationMedia(hydrated, 'Отчёт');
+  const entrances = media.photos.filter(file => file.role === 'entrance');
+  assert.equal(entrances.length, 1);
+  assert.match(entrances[0].caption, /Вход 1/);
+});
+
+test('older V5 territory has mandatory original map semantics and only explicit results unlock the new paths', () => {
+  const data = compactVisit();
+  assert.doesNotThrow(() => validateWorkflow(data));
+  delete data.map;
+  assert.throws(() => validateWorkflow(data), /Добавьте схему территории/);
+  data.workflow.territory_result = 'unknown';
+  assert.throws(() => validateWorkflow(data), /Укажите результат проверки территории/);
+  data.workflow.territory_result = 'findings';
+  assert.throws(() => validateWorkflow(data), /хотя бы одну проверенную организацию/);
+  const findings = addOrganization(compactVisit());
+  findings.workflow.territory_result = 'findings';
+  findings.workflow.conclusion_status = 'insufficient';
+  findings.map = {};
+  assert.throws(() => validateWorkflow(findings), /Выберите способ оформления схемы территории/);
+  findings.map.mode = 'draw';
+  assert.throws(() => validateWorkflow(findings), /Добавьте скриншот карты/);
+  findings.map.mode = 'attached';
+  assert.throws(() => validateWorkflow(findings), /Приложите готовую схему территории в JPG или PNG/);
+});
+
+test('explicit findings accepts finished JPG or PNG with entrance and organization cards and delivers the selected map as an album photo', () => {
+  for (const mime of ['image/jpeg', 'image/png']) {
+    const data = addOrganization(compactVisit());
+    const attached = { id: randomUUID(), role: 'map', subject_id: 'attached', mime, name: 'Готовая схема' };
+    data.workflow.territory_result = 'findings';
+    data.map = { mode: 'attached', evidence_id: attached.id, annotations: [] };
+    data.zones[0].dist = '12,5';
+    data.zones[0].entrance_id = data.entrances[0].id;
+    data.evidence.push(attached, { id: randomUUID(), role: 'zone', subject_id: 'parked-org', mime, name: 'Старая организация' });
+    const evidence = data.evidence.map(file => ({ ...file, buffer: Buffer.from(file.name) }));
+    const hydrated = hydrateDraftReport({ id: randomUUID(), revision: 2, order_id: 58, data, evidence });
+    assert.match(buildAuditSummary(hydrated, 'Аудитор').plain, /12,5 м от входа «Главный вход»/);
+    assert.match(buildAuditSummary(hydrated, 'Аудитор').plain, /Готовая схема территории приложена/);
+    const album = presentationMedia(hydrated, 'Отчёт').photos;
+    assert.equal(album.filter(file => file.role === 'zone').length, 1);
+    assert.equal(hydrated.documents.some(file => file.subject_id === 'parked-org'), false);
+    const photos = album.filter(file => file.role === 'map');
+    assert.equal(photos.length, 1);
+    assert.equal(photos[0].id, attached.id);
+    assert.equal(photos[0].source.toString(), attached.name);
+    data.zones[0].entrance_id = 'different-entrance';
+    assert.throws(() => validateWorkflow(data), /несуществующий вход/);
+    data.zones[0].entrance_id = data.entrances[0].id;
+    attached.mime = 'application/pdf';
+    assert.throws(() => validateWorkflow(data), /готовую схему территории в JPG или PNG/);
+  }
+});
+
+test('drawn findings require actual measurements or an honest follow-up', () => {
+  const data = addOrganization(compactVisit());
+  data.workflow.territory_result = 'findings';
+  assert.throws(() => validateWorkflow(data), /Выберите вход для замера/);
+  data.zones[0].entrance_id = data.entrances[0].id;
+  assert.throws(() => validateWorkflow(data), /Укажите расстояние/);
+  data.zones[0].dist = '0';
+  assert.throws(() => validateWorkflow(data), /Укажите расстояние/);
+  data.zones[0].dist = 'Не проверено';
+  assert.throws(() => validateWorkflow(data), /замечания или непроверенные сведения/);
+  data.workflow.conclusion_status = 'insufficient';
+  assert.doesNotThrow(() => validateWorkflow(data));
+  assert.ok(followupTasks(data).some(task => task.id === 'zone-distance:org-4'));
+  data.map.annotations.push({ id: 'route-new', tool: 'straight', distance: '20', fromEntranceId: 'entrance-1', toObjectId: 'org-4', points: [{ x: .1, y: .1 }, { x: .2, y: .2 }] });
+  data.workflow.conclusion_status = 'ready';
+  assert.doesNotThrow(() => validateWorkflow(data));
 });
 
 test('V5 clearing optional video removes stale links; required video cannot be silently omitted', () => {

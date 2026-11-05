@@ -8,6 +8,8 @@ const COMPACT_PLAN_TOOLS = new Set([...PLAN_TOOLS, 'licensed', 'license', 'cadas
 const MAP_TOOLS = new Set(['entrance', 'hazard', 'route', 'straight', 'text']);
 const COMPACT_ZONE_STATUS = { pending: 'Требует уточнения', clear: 'Без замечаний', licensed: 'Есть сведения о лицензии', disputed: 'Спорное место', confirmed: 'Ограничение отмечено аудитором', other: 'Наблюдение' };
 const nonempty = value => typeof value === 'string' && value.trim().length > 0;
+const MEASUREMENT_TOOLS = new Set(['route', 'straight']);
+const TERRITORY_CLEAR_LABEL = 'Зоны запрета и спорные объекты не выявлены.';
 
 function normalizeWorkflow(input) {
   if (input.schema_version !== 3) return input;
@@ -240,11 +242,33 @@ function buildSimpleReport(data) {
 }
 
 function hydrateDraftReport(draft) {
-  const activeEvidence = (draft.evidence || []).map(({ buffer, data: ignored, ...meta }) => meta);
-  const data = normalizeWorkflow({ ...draft.data, evidence: activeEvidence, schema_version: 3, order_id: draft.order_id || null, submit_id: 'draft:' + draft.id + ':' + draft.revision });
+  const input = draft.data;
+  const territoryResult = input?.ui_version === 5 && input.workflow?.territory_result;
+  const explicitTerritory = territoryResult === 'clear' || territoryResult === 'findings';
+  let files = draft.evidence || [];
+  if (explicitTerritory) {
+    const entrances = Array.isArray(input.entrances) ? input.entrances : [];
+    const zones = Array.isArray(input.zones) ? input.zones : [];
+    const map = input.map;
+    files = files.filter(file => {
+      if (file.role === 'entrance') return entrances.some(item => item?.id === file.subject_id);
+      if (file.role === 'zone') return territoryResult === 'findings' && zones.some(item => item?.id === file.subject_id);
+      if (file.role !== 'map' && file.role !== 'map-source') return true;
+      if (territoryResult === 'clear') return false;
+      if (map?.mode === 'attached') return file.id === map.evidence_id;
+      if (file.role === 'map-source') return file.id === map?.evidence_id;
+      return file.subject_id !== 'attached' && (!map?.preview_evidence_id || file.id === map.preview_evidence_id);
+    });
+  }
+  const activeEvidence = files.map(({ buffer, data: ignored, ...meta }) => meta);
+  const data = normalizeWorkflow({ ...input, evidence: activeEvidence, schema_version: 3, order_id: draft.order_id || null, submit_id: 'draft:' + draft.id + ':' + draft.revision });
+  if (explicitTerritory) {
+    delete data.territory_versions;
+    delete data.legacy_territory;
+  }
   data.draft_id = draft.id;
   data.evidence = activeEvidence;
-  data.documents = (draft.evidence || []).map(file => ({ id: file.id, name: file.name, mime: file.mime, role: file.role, subject_id: file.subject_id, sha256: file.sha256, source: file.buffer }));
+  data.documents = files.map(file => ({ id: file.id, name: file.name, mime: file.mime, role: file.role, subject_id: file.subject_id, sha256: file.sha256, source: file.buffer }));
   data.photos = [];
   validateWorkflow(data);
   return data;
@@ -256,6 +280,9 @@ function compactFollowupTasks(data) {
   for (const entrance of data.entrances || []) if (['Нет доступа', 'Не осмотрен'].includes(entrance.access)) tasks.push({ id: 'entrance:' + entrance.id, label: (entrance.label || 'Вход') + ': нужно досмотреть.' });
   for (const zone of data.zones || []) {
     if (['pending', 'disputed', 'confirmed'].includes(zone.status)) tasks.push({ id: 'zone:' + zone.id, label: (zone.name || 'Организация') + ': ' + COMPACT_ZONE_STATUS[zone.status].toLowerCase() + (zone.resolution || zone.note ? ' — ' + (zone.resolution || zone.note) : '') });
+    if (data.workflow?.territory_result === 'findings' && zone.dist === 'Не проверено' && !hasDrawnMeasurement(data.map?.annotations || [], zone)) {
+      tasks.push({ id: 'zone-distance:' + zone.id, label: (zone.name || 'Организация') + ': расстояние не проверено.' });
+    }
   }
   return tasks;
 }
@@ -289,12 +316,44 @@ function validateCompactDrawing(drawing, type, evidence, subject, requireMarks) 
   }
 }
 
+function hasDrawnMeasurement(marks, zone) {
+  return marks.some(mark => mark && MEASUREMENT_TOOLS.has(mark.tool) && mark.toObjectId === zone.id);
+}
+
+function validateCompactTerritory(data, evidence) {
+  const result = data.workflow?.territory_result;
+  const drawing = data.map;
+  if (result !== undefined && !['clear', 'findings'].includes(result)) throw new Error('Укажите результат проверки территории: «Зон нет» или «Есть организации / спорные места».');
+  if (result !== undefined && drawing != null && (typeof drawing !== 'object' || Array.isArray(drawing) || drawing.annotations != null && !Array.isArray(drawing.annotations))) {
+    throw new Error('Проверьте сведения о схеме территории.');
+  }
+  if (result === 'clear') {
+    if (data.zones.length || drawing?.evidence_id || drawing?.preview_evidence_id || drawing?.annotations?.length || drawing?.pending?.points?.length) {
+      throw new Error('Для результата «Зон нет» уберите организации, замеры и приложенную схему территории.');
+    }
+    return { marks: [], checkMarks: false };
+  }
+  if (result === 'findings' && !data.zones.length) throw new Error('Добавьте хотя бы одну проверенную организацию или спорное место.');
+  if (result === 'findings' && drawing?.mode === 'attached') {
+    const attached = evidence.find(file => file.id === drawing.evidence_id);
+    if (attached?.role !== 'map' || attached.subject_id !== 'attached' || !/^image\/(jpeg|png)$/.test(attached.mime)) throw new Error('Приложите готовую схему территории в JPG или PNG.');
+    if (drawing.annotations?.length || drawing.pending?.points?.length || drawing.preview_evidence_id) throw new Error('Для готовой схемы заполните карточки входов и организаций без новой разметки.');
+    return { marks: [], checkMarks: false };
+  }
+  if (result === 'findings') {
+    if ((!drawing?.mode && !drawing?.evidence_id) || (drawing?.mode && drawing.mode !== 'draw')) throw new Error('Выберите способ оформления схемы территории.');
+    if (!drawing?.evidence_id) throw new Error('Добавьте скриншот карты для разметки территории.');
+  }
+  validateCompactDrawing(drawing, 'map', evidence, 'annotation', true);
+  return { marks: drawing.annotations, checkMarks: true };
+}
+
 function validateCompactWorkflow(data) {
   validateInspection(data);
   const p = data.inspection, w = data.workflow || {}, evidence = data.evidence || [];
   if (!CONCLUSIONS[w.conclusion_status]) throw new Error('Выберите результат выезда.');
   if (!Array.isArray(evidence) || evidence.length > 60) throw new Error('Проверьте комплект файлов отчёта.');
-  if (!Array.isArray(data.entrances) || !data.entrances.length || data.entrances.length > 30) throw new Error('Отметьте хотя бы один вход на схеме и добавьте его фото.');
+  if (!Array.isArray(data.entrances) || !data.entrances.length || data.entrances.length > 30) throw new Error('Добавьте хотя бы один вход и его фото.');
   if (!Array.isArray(data.zones) || data.zones.length > 20) throw new Error('Можно описать до 20 проверенных организаций.');
   const ids = new Set();
   for (const item of [...data.entrances, ...data.zones]) {
@@ -312,7 +371,7 @@ function validateCompactWorkflow(data) {
   if (video) { try { const url = new URL(video); if (url.protocol !== 'https:') throw new Error(); } catch (_) { throw new Error('Укажите полную HTTPS-ссылку на видео.'); } }
   if (data.request_packet?.video_required && !video) throw new Error('Менеджер запросил видео: приложите ссылку на Яндекс Диск.');
   if (p.service === 'Продление' && w.archive_skipped !== 'Да' && ![...evidence, ...(data.request_packet?.materials || [])].some(file => file.role === 'archive')) throw new Error('Архивная графика не приложена. Добавьте архив или явно выберите «Архив не предоставлен».');
-  validateCompactDrawing(data.map, 'map', evidence, 'annotation', true);
+  const { marks, checkMarks } = validateCompactTerritory(data, evidence);
   validateCompactDrawing(data.plan, 'plan', evidence, 'annotation', true);
   if (data.additional_plans != null && (!Array.isArray(data.additional_plans) || data.additional_plans.length > 20)) throw new Error('Проверьте дополнительные планы.');
   const additionalIds = new Set();
@@ -320,24 +379,28 @@ function validateCompactWorkflow(data) {
     if (!plan || !nonempty(plan.id) || plan.id.length > 80 || additionalIds.has(plan.id)) throw new Error('У дополнительного плана должен быть отдельный идентификатор.');
     additionalIds.add(plan.id); validateCompactDrawing(plan, 'plan', evidence, 'annotation-' + plan.id, false);
   }
-  const marks = data.map.annotations;
   for (const entrance of data.entrances) {
-    if (!marks.some(mark => mark.id === (entrance.mark_id || entrance.id) && mark.tool === 'entrance')) throw new Error('Вход «' + (entrance.label || entrance.id) + '» не привязан к отметке на схеме.');
+    if (checkMarks && !marks.some(mark => mark.id === (entrance.mark_id || entrance.id) && mark.tool === 'entrance')) throw new Error('Вход «' + (entrance.label || entrance.id) + '» не привязан к отметке на схеме.');
+    if (!checkMarks && !nonempty(entrance.label)) throw new Error('Укажите название входа.');
     if (!evidence.some(file => file.subject_id === entrance.id && file.role === 'entrance' && /^image\//.test(file.mime || ''))) throw new Error('Добавьте фото входа «' + (entrance.label || entrance.id) + '».');
   }
   for (const zone of data.zones) {
     if (!nonempty(zone.name) || !COMPACT_ZONE_STATUS[zone.status]) throw new Error('Укажите название и результат проверки организации.');
     if (zone.status === 'licensed' && !nonempty(zone.source)) throw new Error('Для сведений о лицензии организации «' + zone.name + '» укажите источник.');
     if (zone.status === 'confirmed' && !nonempty(zone.source) && !nonempty(zone.resolution) && !nonempty(zone.note)) throw new Error('Укажите основание отмеченного ограничения по организации «' + zone.name + '».');
-    if (!marks.some(mark => mark.id === (zone.mark_id || zone.id) && mark.tool === 'hazard')) throw new Error('Организация «' + zone.name + '» не привязана к отметке на схеме.');
+    if (checkMarks && !marks.some(mark => mark.id === (zone.mark_id || zone.id) && mark.tool === 'hazard')) throw new Error('Организация «' + zone.name + '» не привязана к отметке на схеме.');
     if (!evidence.some(file => file.subject_id === zone.id && file.role === 'zone' && /^image\//.test(file.mime || ''))) throw new Error('Добавьте фото организации «' + zone.name + '».');
     if (zone.entrance_id && !data.entrances.some(item => item.id === zone.entrance_id)) throw new Error('У замера выбран несуществующий вход.');
     if (zone.dist && zone.dist !== 'Не проверено' && !/^\d{1,6}(?:[.,]\d{1,2})?$/.test(zone.dist)) throw new Error('Расстояние: число в метрах или «Не проверено».');
+    if (w.territory_result === 'findings' && !hasDrawnMeasurement(marks, zone)) {
+      if (!zone.entrance_id) throw new Error('Выберите вход для замера до организации «' + zone.name + '».');
+      if (zone.dist !== 'Не проверено' && !(Number(String(zone.dist || '').replace(',', '.')) > 0)) throw new Error('Укажите расстояние до организации «' + zone.name + '» или отметьте «Не проверено».');
+    }
   }
   for (const mark of marks) {
     if (mark.tool === 'entrance' && !data.entrances.some(item => (item.mark_id || item.id) === mark.id)) throw new Error('Добавьте сведения и фото для каждого отмеченного входа.');
     if (mark.tool === 'hazard' && !data.zones.some(item => (item.mark_id || item.id) === mark.id)) throw new Error('Добавьте сведения и фото для каждой отмеченной организации.');
-    if (['route', 'straight'].includes(mark.tool)) {
+    if (MEASUREMENT_TOOLS.has(mark.tool)) {
       if (!(Number(String(mark.distance || '').replace(',', '.')) > 0)) throw new Error('Укажите измеренное расстояние для каждой линии замера.');
       if (!data.entrances.some(item => item.id === mark.fromEntranceId) || !data.zones.some(item => item.id === mark.toObjectId)) throw new Error('Свяжите линию замера с существующим входом и организацией.');
     }
@@ -359,16 +422,18 @@ function buildCompactWorkflowReport(data) {
   const name = drawing => evidence.find(file => file.id === drawing.evidence_id)?.name || 'Выбранный файл';
   field('План', name(data.plan) + ' · лист ' + data.plan.page + ' · разметка приложена');
   for (const plan of data.additional_plans || []) field('Дополнительный план', name(plan) + ' · лист ' + plan.page + (plan.annotations.length ? ' · разметка приложена' : ' · исходник'));
-  field('Схема территории', 'Размеченное изображение приложено');
-  const markCode = item => data.map.annotations.find(mark => mark.id === (item.mark_id || item.id))?.code || '';
+  if (w.territory_result === 'clear') plain.push(TERRITORY_CLEAR_LABEL);
+  else field('Схема территории', w.territory_result === 'findings' && data.map.mode === 'attached' ? 'Готовая схема приложена' : 'Размеченное изображение приложено');
+  const markCode = item => data.map?.annotations?.find(mark => mark.id === (item.mark_id || item.id))?.code || '';
   plain.push('Входы: ' + data.entrances.map(item => [markCode(item), item.label !== markCode(item) ? item.label : ''].filter(Boolean).join(' · ') || 'Вход').join('; '));
   if (data.zones.length) {
     plain.push('Проверенные организации:');
     for (const zone of data.zones) {
-      plain.push('• ' + [markCode(zone), zone.name].filter(Boolean).join(' · ') + ' — ' + COMPACT_ZONE_STATUS[zone.status] + (zone.dist ? '; ' + zone.dist + ' м' : ''));
+      const distance = w.territory_result === 'findings' && zone.dist === 'Не проверено' ? 'расстояние не проверено' : zone.dist && zone.dist + ' м';
+      plain.push('• ' + [markCode(zone), zone.name].filter(Boolean).join(' · ') + ' — ' + COMPACT_ZONE_STATUS[zone.status] + (distance ? '; ' + distance : ''));
       field('Источник', zone.source); field('Наблюдение', zone.resolution || zone.note || zone.info);
     }
-  } else plain.push('Проверенные организации не перечислены.');
+  } else if (w.territory_result !== 'clear') plain.push('Проверенные организации не перечислены.');
   const video = Object.hasOwn(w, 'video_url') ? w.video_url : data.video_url;
   field('Видео', video);
   if (video && data.inspection.video_status && data.inspection.video_status !== 'Сделано') field('Состояние видео', data.inspection.video_status);
@@ -384,4 +449,4 @@ function buildCompactWorkflowReport(data) {
   return { plain, html: plain.map(esc) };
 }
 
-module.exports = { normalizeWorkflow, validateWorkflow, buildWorkflowReport, followupTasks, hydrateDraftReport, CONCLUSIONS };
+module.exports = { normalizeWorkflow, validateWorkflow, buildWorkflowReport, followupTasks, hydrateDraftReport, CONCLUSIONS, TERRITORY_CLEAR_LABEL };

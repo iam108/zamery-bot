@@ -11,7 +11,7 @@ function auditWizard() {
   <title>Выезд аудитора</title>
   <script src="https://telegram.org/js/telegram-web-app.js"><\/script>
   <script src="/auth.js"><\/script>
-  <link rel="stylesheet" href="/audit-wizard.css?v=20261102-submit-feedback">
+  <link rel="stylesheet" href="/audit-wizard.css?v=20261105-territory">
   <link rel="stylesheet" href="/audit-plan-editor.css?v=20261030-actions5">
 </head>
 <body>
@@ -38,7 +38,7 @@ function auditWizard() {
   <script src="/audit-plan-editor.js?v=20261030-actions5"><\/script>
   <script src="/audit-actions.js?v=20261030-actions5"><\/script>
   <script src="/audit-route.js?v=20261030-actions5"><\/script>
-  <script src="/audit-wizard-client.js?v=20261102-submit-feedback"><\/script>
+  <script src="/audit-wizard-client.js?v=20261105-territory"><\/script>
 </body>
 </html>`;
 }
