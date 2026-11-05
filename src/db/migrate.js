@@ -46,6 +46,7 @@ async function migrate() {
     `);
 
     await client.query(require('../web/order-materials').DDL);
+    await client.query(require('../web/workspace').SESSION_DDL);
 
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_orders_status    ON orders(status);

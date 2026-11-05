@@ -20,6 +20,7 @@ test('migration and session persistence, expiry, touch and logout in PostgreSQL'
       if (name === 'dotenv') return { config() {} };
       if (name === './pool') return pool;
       if (name === '../web/order-materials') return { DDL: require('../src/web/order-materials').DDL };
+      if (name === '../web/workspace') return { SESSION_DDL: require('../src/web/workspace').SESSION_DDL };
       throw new Error('Unexpected require: ' + name);
     } };
     vm.createContext(context);

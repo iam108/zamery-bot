@@ -1273,14 +1273,44 @@ function setupHandoff(app) {
       var c = (await pool.query('SELECT * FROM cases WHERE id=$1', [id])).rows[0];
       if (!c) return res.json({ ok: false, error: 'not found' });
       var data = req.body.data || {};
+      var expectedNote = req.body.expectedNote == null ? null : req.body.expectedNote;
+      if ((expectedNote !== null && typeof expectedNote !== 'string') ||
+          (data._comment != null && typeof data._comment !== 'string')) {
+        return res.status(400).json({ ok: false, error: 'Заметка должна быть текстом.' });
+      }
+      var requestedNote = data._comment || '';
+      var preserveNote = expectedNote !== null && expectedNote === requestedNote;
       var old = c.data || {};
       var done = parseInt(req.body.done) || 0;
       var total = parseInt(req.body.total) || 0;
       var nowDone = total > 0 && done >= total;
-      await pool.query(
-        'UPDATE cases SET data=($1::jsonb - \'_handoff\') || CASE WHEN data ? \'_handoff\' THEN jsonb_build_object(\'_handoff\',data->\'_handoff\') ELSE \'{}\'::jsonb END, done=$2, total=$3, completed_at=' + (nowDone ? 'COALESCE(completed_at, NOW())' : 'NULL') + ' WHERE id=$4',
-        [data, done, total, id]
-      );
+      var saved = (await pool.query(
+        `UPDATE cases SET data=($1::jsonb - '_handoff' - '_workspaceNote' - '_comment')
+          || CASE WHEN data ? '_handoff' THEN jsonb_build_object('_handoff', data -> '_handoff') ELSE '{}'::jsonb END
+          || CASE WHEN data ? '_workspaceNote' THEN jsonb_build_object('_workspaceNote', data -> '_workspaceNote') ELSE '{}'::jsonb END
+          || CASE
+            WHEN $5 OR ((data ? '_workspaceNote') AND NOT ($1::jsonb ? '_comment'))
+              THEN CASE WHEN data ? '_comment' THEN jsonb_build_object('_comment', data -> '_comment') ELSE '{}'::jsonb END
+            WHEN $1::jsonb ? '_comment' THEN jsonb_build_object('_comment', $7::text)
+            ELSE '{}'::jsonb
+          END,
+          done=$2, total=$3, completed_at=` + (nowDone ? 'COALESCE(completed_at, NOW())' : 'NULL') + `
+          WHERE id=$4 AND (
+            $5 OR COALESCE(data ->> '_comment', '') = $7
+            OR ($6::text IS NOT NULL AND COALESCE(data ->> '_comment', '') = $6)
+            OR ($6::text IS NULL AND (NOT COALESCE(data ? '_workspaceNote', false) OR NOT ($1::jsonb ? '_comment')))
+          )
+          RETURNING COALESCE(data ->> '_comment', '') AS note`,
+        [data, done, total, id, preserveNote, expectedNote, requestedNote]
+      )).rows[0];
+      if (!saved) {
+        var latest = (await pool.query("SELECT COALESCE(data ->> '_comment', '') AS note FROM cases WHERE id=$1", [id])).rows[0];
+        if (!latest) return res.status(404).json({ ok: false, error: 'Клиент не найден' });
+        return res.status(409).json({
+          ok: false, code: 'note_conflict', note: latest.note,
+          error: 'Заметку изменили в другом окне. Откройте чек-лист заново или выберите, какую версию сохранить.',
+        });
+      }
 
       var CLIENTS = process.env.CLIENTS_CHAT_ID;
       // Новые красные флаги ЕГРН → сразу уведомление
@@ -1304,12 +1334,12 @@ function setupHandoff(app) {
         var subOn = /^\d{4}-\d{2}-\d{2}$/.test(data._submittedOn || '') ? data._submittedOn : mskToday();
         due = addWorkdays(subOn, decisionDays(c.region));
         data._submittedOn = subOn; data._decisionDue = due;
-        await pool.query('UPDATE cases SET data=($1::jsonb - \'_handoff\') || CASE WHEN data ? \'_handoff\' THEN jsonb_build_object(\'_handoff\',data->\'_handoff\') ELSE \'{}\'::jsonb END, submitted_on=$2, decision_due=$3, reminded_on=NULL WHERE id=$4', [data, subOn, due, id]);
+        await pool.query("UPDATE cases SET data=COALESCE(data,'{}'::jsonb) || jsonb_build_object('_submittedOn',$1::text,'_decisionDue',$2::text), submitted_on=$1::date, decision_due=$2::date, reminded_on=NULL WHERE id=$3", [subOn, due, id]);
       } else if (data._stage === 'Подано' && data._submittedOn && data._submittedOn !== old._submittedOn) {
         // юрист поправил дату подачи — пересчитываем срок
         due = addWorkdays(data._submittedOn, decisionDays(c.region));
         data._decisionDue = due;
-        await pool.query('UPDATE cases SET data=($1::jsonb - \'_handoff\') || CASE WHEN data ? \'_handoff\' THEN jsonb_build_object(\'_handoff\',data->\'_handoff\') ELSE \'{}\'::jsonb END, submitted_on=$2, decision_due=$3, reminded_on=NULL WHERE id=$4', [data, data._submittedOn, due, id]);
+        await pool.query("UPDATE cases SET data=COALESCE(data,'{}'::jsonb) || jsonb_build_object('_submittedOn',$1::text,'_decisionDue',$2::text), submitted_on=$1::date, decision_due=$2::date, reminded_on=NULL WHERE id=$3", [data._submittedOn, due, id]);
       }
       if (data._stage && data._stage !== old._stage && CLIENTS) {
         var stageMsg = data._stage === 'Подано'
@@ -1321,7 +1351,7 @@ function setupHandoff(app) {
       if (nowDone && !c.completed_at && CLIENTS) {
         await bot.telegram.sendMessage(CLIENTS, '✅ <b>Чек-лист выполнен</b>\n🏢 ' + esc(c.org) + '\n⚖️ ' + esc(c.lawyer_name) + '\n#заявка' + c.id, { parse_mode: 'HTML' });
       }
-      res.json({ ok: true, submittedOn: data._submittedOn || null, decisionDue: data._decisionDue || null });
+      res.json({ ok: true, note: saved.note, submittedOn: data._submittedOn || null, decisionDue: data._decisionDue || null });
     } catch (e) { console.error(e); res.json({ ok: false, error: e.message }); }
   });
 
@@ -1782,6 +1812,7 @@ function checklistClient() {
 
   var CFG = window.__CFG;
   var L = CFG.list, D = CFG.data || {}, CASE = CFG.caseInfo;
+  var noteBase = D._comment || '', noteConflict = null;
   var OPEN = {};
   var ME = (tg && tg.initDataUnsafe && tg.initDataUnsafe.user)
     ? [tg.initDataUnsafe.user.first_name, tg.initDataUnsafe.user.last_name].filter(Boolean).join(' ')
@@ -2047,6 +2078,7 @@ function checklistClient() {
     var ch = el('div', 'gh'); ch.appendChild(el('span', 'gt', 'Комментарий')); cm.appendChild(ch);
     var cb = el('div', 'gb'); var cr = el('div', 'row col');
     var ta = el('textarea', 'note plain'); ta.rows = 3; ta.placeholder = 'Заметки юриста по клиенту';
+    ta.id = 'lawyer-note';
     ta.value = D._comment || '';
     ta.oninput = function () { D._comment = ta.value; changed(); };
     cr.appendChild(ta); cb.appendChild(cr); cm.appendChild(cb);
@@ -2290,7 +2322,7 @@ function checklistClient() {
   // ── Сохранение ────────────────────────────────────────
   var timer = null, refresh = null;
   var LKEY = 'zamery_cl_' + CASE.id;
-  function backup() { try { localStorage.setItem(LKEY, JSON.stringify({ t: Date.now(), d: D })); } catch (e) {} }
+  function backup() { try { localStorage.setItem(LKEY, JSON.stringify({ t: Date.now(), d: D, noteBase: noteBase })); } catch (e) {} }
   function dropBackup() { try { localStorage.removeItem(LKEY); } catch (e) {} }
   function changed() {
     try { updateEcp(); } catch (e) {}
@@ -2326,12 +2358,17 @@ function checklistClient() {
     clearTimeout(timer);
     if (inFlight) { dirty = true; return; }
     clearTimeout(retryTimer); clearInterval(countdown);
+    if (noteConflict !== null) {
+      setSt('err', 'Заметка изменилась в другом окне. Нажмите здесь, чтобы сохранить свой черновик.');
+      return;
+    }
     var s = stats();
-    var body = JSON.stringify({ case_id: CASE.id, data: D, done: s.done, total: s.total });
+    var sentNote = D._comment || '';
+    var body = JSON.stringify({ case_id: CASE.id, data: D, done: s.done, total: s.total, expectedNote: noteBase });
     var snapshot = JSON.stringify(D);
     if (snapshot === lastSaved) { dropBackup(); setSt('ok', 'Сохранено'); return; } // ничего не изменилось — не нагружаем сервер
     inFlight = true; dirty = false;
-    var ok = false, why = '';
+    var ok = false, why = '', savedNote = sentNote;
     try {
       var r = await fetch('/api/checklist/save', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -2341,18 +2378,44 @@ function checklistClient() {
       var txt = await r.text(), j = null;
       try { j = JSON.parse(txt); } catch (pe) {}
       ok = !!(j && j.ok);
+      if (ok && typeof j.note === 'string') savedNote = j.note;
+      if (r.status === 409 && j && j.code === 'note_conflict' && typeof j.note === 'string') {
+        noteConflict = j.note;
+      }
       if (!ok) {
         // Показываем настоящую причину: код ответа и начало текста
         var snippet = String(txt || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80);
         why = j ? (j.error || 'ошибка сервера') + ' [' + r.status + ']'
           : (r.status === 429 || /^rate limited/i.test(snippet) ? 'сервер занят' : 'ошибка') + ' [' + r.status + (snippet ? ': ' + snippet : '') + ']';
-        console.log('save failed', r.status, txt.slice(0, 500));
+        console.log('save failed', r.status, j && j.code || '');
       }
     } catch (e) { why = 'нет связи'; }
     inFlight = false;
+    if (noteConflict !== null) {
+      setSt('err', 'Заметка изменилась в другом окне. Нажмите здесь, чтобы сохранить свой черновик.');
+      return;
+    }
     if (ok) {
+      var draftNote = D._comment || '';
+      if (savedNote !== sentNote && draftNote !== sentNote && draftNote !== savedNote) {
+        noteConflict = savedNote;
+        backup();
+        setSt('err', 'Заметка изменилась в другом окне. Нажмите здесь, чтобы сохранить свой черновик.');
+        return;
+      }
+      noteBase = savedNote;
+      if (sentNote !== savedNote) {
+        if (draftNote === sentNote) {
+          D._comment = savedNote;
+          var editor = document.getElementById('lawyer-note');
+          if (editor) editor.value = savedNote;
+        }
+        var savedData = JSON.parse(snapshot);
+        savedData._comment = savedNote;
+        snapshot = JSON.stringify(savedData);
+      }
       failCount = 0; lastSaved = snapshot;
-      if (dirty) { setSt('saving', 'Сохраняю…'); timer = setTimeout(flush, 400); }
+      if (dirty) { backup(); setSt('saving', 'Сохраняю…'); timer = setTimeout(flush, 400); }
       else { dropBackup(); setSt('ok', 'Сохранено'); }
       return;
     }
@@ -2370,7 +2433,18 @@ function checklistClient() {
   document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') flush(); });
   window.addEventListener('pagehide', function () { flush(); });
   // Тап по статусу — сохранить прямо сейчас
-  document.getElementById('st').onclick = function () { failCount = 0; flush(); };
+  document.getElementById('st').onclick = function () {
+    if (noteConflict !== null) {
+      var message = 'Заметка изменилась в другом окне. Заменить её вашим черновиком?';
+      var resolve = function (confirmed) {
+        if (!confirmed) return;
+        noteBase = noteConflict; noteConflict = null; backup(); flush();
+      };
+      if (tg && tg.showConfirm) tg.showConfirm(message, resolve); else resolve(window.confirm(message));
+      return;
+    }
+    failCount = 0; flush();
+  };
   document.getElementById('printBtn').onclick = function () {
     // Внутри Telegram печать не работает — открываем версию для печати в браузере (там «Сохранить как PDF»)
     failCount = 0; flush();
@@ -2391,7 +2465,12 @@ function checklistClient() {
   var restored = false;
   try {
     var bk = JSON.parse(localStorage.getItem(LKEY) || 'null');
-    if (bk && bk.d && Date.now() - bk.t < 7 * 24 * 3600 * 1000) { D = bk.d; restored = true; }
+    if (bk && bk.d && Date.now() - bk.t < 7 * 24 * 3600 * 1000) {
+      var noteProtected = D._workspaceNote === true;
+      D = bk.d; restored = true;
+      if (typeof bk.noteBase === 'string') noteBase = bk.noteBase;
+      else if (noteProtected && (D._comment || '') !== noteBase) noteConflict = noteBase;
+    }
   } catch (e) {}
   render();
   loadReminders();

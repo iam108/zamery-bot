@@ -29,6 +29,7 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
   }));
 
   require('./auth').setupAuth(app);
+  require('./workspace').setupWorkspace(app);
   require('../db/pool').query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS submitted_name TEXT').catch((e) => console.error('orders.submitted_name:', e.message));
 
   const requireAuth = (req, res, next) => {

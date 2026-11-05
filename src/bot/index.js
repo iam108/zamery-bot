@@ -11,6 +11,7 @@ function setupBot() {
   require('./egrn').setupEgrn(bot);
   const pool = require('../db/pool');
   const { ensureStaff } = require('../web/auth');
+  const { parsePairing, approvePairing, canPair } = require('../web/workspace');
   const { esc } = require('./formatter');
   const ROLES = { manager: 'Менеджер', lawyer: 'Юрист', auditor: 'Аудитор' };
   const roleKb = () => Markup.inlineKeyboard([
@@ -35,6 +36,12 @@ function setupBot() {
   bot.start(async (ctx) => {
     if (ctx.chat.type !== 'private') return;
     const me = await getMe(ctx.from.id);
+    if (String(ctx.startPayload || '').startsWith('mac_')) {
+      if (!canPair(me)) return ctx.reply('Подключение Мака доступно одобренным юристам и менеджерам.');
+      if (!parsePairing(ctx.startPayload)) return ctx.reply('Ссылка истекла. Откройте новую ссылку из приложения на Маке.');
+      return ctx.reply('Подключить «Рабочий стол ЛРС» к вашему аккаунту? Подтвердите, если вы сами открыли ссылку из приложения на Маке.',
+        Markup.inlineKeyboard([[Markup.button.callback('Подключить Мак', ctx.startPayload)]]));
+    }
     if (!me) return ctx.reply('👋 Привет! Кто вы в команде?', roleKb());
     if (!me.approved) return ctx.reply('⏳ Заявка на доступ (' + (ROLES[me.requested_role || me.role] || '') + ') ждёт одобрения. Как только её одобрят, я напишу.');
     // Кнопки клавиатуры не получают подпись Telegram — добавляем личный ключ сотрудника
@@ -49,6 +56,15 @@ function setupBot() {
     else kb = [[Markup.button.webApp('🔍 Отчёт аудитора', WEBAPP_URL + '/audit' + kq)], ['📄 Выписка ЕГРН']];
     const pending = me.requested_role && me.requested_role !== me.role ? '\n⏳ Запрос на роль «' + ROLES[me.requested_role] + '» ждёт одобрения.' : '';
     await ctx.reply('👋 ' + me.name + ' (' + ROLES[me.role] + ')' + pending + '\n\nВыбери действие:', Markup.keyboard(kb).resize());
+  });
+
+  bot.action(/^mac_[A-Za-z0-9_-]{43}_[0-9a-z]{1,8}$/, async ctx => {
+    if (ctx.chat.type !== 'private') return ctx.answerCbQuery('Откройте личный чат с ботом.');
+    if (!await approvePairing(pool, ctx.from.id, ctx.callbackQuery.data)) {
+      return ctx.answerCbQuery('Ссылка уже использована, истекла или подключение недоступно.', { show_alert: true });
+    }
+    await ctx.answerCbQuery('Мак подключён.');
+    await ctx.editMessageText('Мак подключён. Вернитесь в «Рабочий стол ЛРС».');
   });
 
   bot.action(/^role:(manager|lawyer|auditor)$/, async (ctx) => {

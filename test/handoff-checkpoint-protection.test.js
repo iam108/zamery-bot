@@ -131,3 +131,88 @@ test('null retains the legacy empty-answer save while preserving the internal ha
   const row = await h.row();
   assert.deepEqual(row.data, { _handoff: checkpoint(2) }); assert.equal(row.done, 1); assert.equal(row.total, 4);
 }));
+
+test('unrelated Telegram checklist updates preserve a Mac note written during the save', pg, async () => fixture(async h => {
+  await h.seed({ _stage: 'Сбор документов', _comment: 'Исходная заметка', _handoff: checkpoint(2) });
+  h.interleave(async ({ number, db }) => {
+    if (number === 1) {
+      await db.query("UPDATE cases SET data=data || jsonb_build_object('_comment','Заметка с Мака','_workspaceNote',true) WHERE id=17");
+    }
+  });
+  const result = await h.save({
+    _stage: 'Подано', _submittedOn: '2026-11-02', _comment: 'Исходная заметка', document: { s: 'yes' },
+  }, { expectedNote: 'Исходная заметка' });
+  const row = await h.row();
+  assert.equal(row.data._comment, 'Заметка с Мака');
+  assert.equal(result.note, 'Заметка с Мака');
+  assert.equal(row.data._decisionDue, '2026-11-24');
+  assert.deepEqual(row.data._handoff, checkpoint(2));
+  assert.deepEqual(row.data.document, { s: 'yes' });
+}));
+
+test('competing Telegram note edits return the saved note and leave the draft unresolved', pg, async () => fixture(async h => {
+  await h.seed({ _stage: 'Сбор документов', _comment: 'Уже изменено на Маке', _workspaceNote: true });
+  const pending = { _stage: 'Сбор документов', _comment: 'Правка в Telegram' };
+  for (const version of [{}, { expectedNote: 'Устаревший текст' }]) {
+    const result = await h.rawSave(pending, version);
+    assert.equal(result.status, 409);
+    assert.equal(result.result.code, 'note_conflict');
+    assert.equal(result.result.note, 'Уже изменено на Маке');
+    assert.equal((await h.row()).data._comment, 'Уже изменено на Маке');
+  }
+  const saved = await h.save({ ...pending, _workspaceNote: false }, { expectedNote: 'Уже изменено на Маке' });
+  assert.equal(saved.note, 'Правка в Telegram');
+  assert.deepEqual((await h.row()).data, { ...pending, _workspaceNote: true });
+}));
+
+test('typing a note while an unrelated Telegram save is in flight keeps the draft and reports a Mac edit', async () => {
+  const start = source.indexOf('function checklistClient()');
+  const end = source.indexOf('\n  render();\n  loadReminders();', start);
+  assert.ok(start >= 0 && end > start);
+  // Run the actual inline save code. Stop before rendering the full checklist.
+  const elements = new Map(), storage = new Map();
+  const requests = [];
+  let respond;
+  const client = vm.runInNewContext('(' + source.slice(start, end) + `
+    return {
+      flush,
+      changeAnswer() { D.answer = { s: 'yes' }; changed(); },
+      typeNote(value) { D._comment = value; changed(); },
+      state() { return { draft: D._comment, base: noteBase, conflict: noteConflict }; },
+    };
+  })()`, {
+    window: {
+      addEventListener() {},
+      __CFG: { data: { _comment: 'А' }, list: { sections: [], passport: [] }, caseInfo: { id: 17 } },
+    },
+    document: {
+      documentElement: { dataset: {} }, addEventListener() {},
+      getElementById(id) {
+        if (!elements.has(id)) elements.set(id, { style: {} });
+        return elements.get(id);
+      },
+    },
+    location: { search: '' },
+    localStorage: {
+      getItem: key => storage.get(key),
+      setItem: (key, value) => storage.set(key, value),
+      removeItem: key => storage.delete(key),
+    },
+    setTimeout() {}, clearTimeout() {}, clearInterval() {},
+    fetch(url, options) {
+      requests.push(JSON.parse(options.body));
+      return new Promise(resolve => { respond = resolve; });
+    },
+  });
+  client.changeAnswer();
+  const saving = client.flush();
+  assert.equal(requests[0].expectedNote, 'А');
+  client.typeNote('В');
+  respond({ status: 200, headers: { get() {} }, text: async () => JSON.stringify({ ok: true, note: 'Б' }) });
+  await saving;
+  assert.deepEqual({ ...client.state() }, { draft: 'В', base: 'А', conflict: 'Б' });
+  assert.equal(JSON.parse(storage.get('zamery_cl_17')).d._comment, 'В');
+  assert.match(elements.get('st').textContent, /Заметка изменилась/);
+  await client.flush();
+  assert.equal(requests.length, 1);
+});

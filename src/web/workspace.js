@@ -1,0 +1,246 @@
+const { createHash } = require('node:crypto');
+const { LISTS, STAGES } = require('../checklists');
+
+const PAIRING_LIFETIME = 10 * 60;
+const MAX_NOTE_LENGTH = 16_000;
+const WORKSPACE_ROLES = ['lawyer', 'manager'];
+const SESSION_DDL = `
+  CREATE TABLE IF NOT EXISTS workspace_sessions (
+    token_digest TEXT PRIMARY KEY,
+    staff_id BIGINT NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ
+  );
+`;
+
+function canonicalToken(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{43}$/.test(value) &&
+    Buffer.from(value, 'base64url').toString('base64url') === value;
+}
+
+function parsePairing(payload, now = Math.floor(Date.now() / 1000)) {
+  const match = typeof payload === 'string' && /^mac_([A-Za-z0-9_-]{43})_([0-9a-z]{1,8})$/.exec(payload);
+  if (!match || !canonicalToken(match[1])) return null;
+  const expiresAt = parseInt(match[2], 36);
+  if (expiresAt.toString(36) !== match[2] || expiresAt <= now || expiresAt > now + PAIRING_LIFETIME) return null;
+  return { digest: match[1], expiresAt };
+}
+
+function bearerDigest(header) {
+  const match = typeof header === 'string' && /^Bearer ([A-Za-z0-9_-]{43})$/i.exec(header);
+  if (!match || !canonicalToken(match[1])) return null;
+  return createHash('sha256').update(match[1]).digest('base64url');
+}
+
+async function approvePairing(pool, staffId, payload) {
+  const pairing = parsePairing(payload);
+  if (!pairing) return false;
+  const result = await pool.query(`
+    INSERT INTO workspace_sessions (token_digest, staff_id, expires_at)
+    SELECT $1, tg_id, NOW() + INTERVAL '30 days'
+    FROM staff
+    WHERE tg_id = $2 AND approved IS TRUE AND role IN ('lawyer', 'manager')
+      AND to_timestamp($3) > NOW()
+    ON CONFLICT (token_digest) DO NOTHING
+    RETURNING staff_id
+  `, [pairing.digest, staffId, pairing.expiresAt]);
+  return result.rowCount === 1;
+}
+
+function canPair(staff) {
+  return staff && staff.approved === true && WORKSPACE_ROLES.includes(staff.role);
+}
+
+function checklistTitles(caseRow) {
+  const list = LISTS[caseRow.checklist_key];
+  if (!list) return [];
+  const data = caseRow.checklist_choices || {};
+  const visible = item => !item.when || Object.entries(item.when).every(([key, value]) => {
+    if (key === 'svc') return caseRow.service === value;
+    return (data[key] === undefined && !item.strict) || data[key] === value;
+  });
+  return list.passport.concat(list.sections.flatMap(section => section.i)).filter(visible).map(item => item.l);
+}
+
+function makeSnapshot(account, cases, now) {
+  const clients = [];
+  const tasks = [];
+  for (const row of cases) {
+    const id = String(row.id);
+    const stage = row.stage || STAGES[0];
+    clients.push({
+      id,
+      name: row.org || 'Клиент #' + id,
+      address: row.address || '',
+      kind: [row.service, row.kind].filter(Boolean).join(' · '),
+      stage,
+      report: row.audit_text || '',
+      checklist: checklistTitles(row),
+      note: row.note || '',
+      done: row.done || 0,
+      total: row.total || 0,
+    });
+    for (const reminder of row.reminders || []) {
+      tasks.push({
+        id: String(reminder.id), clientID: id, title: reminder.title, dueDate: reminder.dueDate,
+        completed: reminder.completed === true, editable: account.role === 'lawyer',
+      });
+    }
+    if (row.decision_due && ['Подано', 'Выездная проверка'].includes(stage)) {
+      tasks.push({
+        id: 'decision-' + id, clientID: id, title: 'Проверить решение', dueDate: row.decision_due,
+        completed: false, editable: false,
+      });
+    }
+  }
+  tasks.sort((first, second) => first.dueDate.localeCompare(second.dueDate) || first.id.localeCompare(second.id));
+  return {
+    version: 1,
+    account: { id: String(account.id), name: account.name, role: account.role },
+    today: new Date(now + 3 * 60 * 60 * 1000).toISOString().slice(0, 10),
+    clients,
+    tasks,
+  };
+}
+
+const SELECT_ACCOUNT = `
+  SELECT s.tg_id::text AS id, s.name, s.role
+  FROM workspace_sessions session
+  JOIN staff s ON s.tg_id = session.staff_id
+  WHERE session.token_digest = $1 AND session.expires_at > NOW() AND session.revoked_at IS NULL
+    AND s.approved IS TRUE AND s.role IN ('lawyer', 'manager')
+`;
+
+const SELECT_CASES = `
+  SELECT c.id, c.org, c.address, c.kind, c.service, c.checklist_key, c.audit_text, c.done, c.total,
+    c.data ->> '_stage' AS stage, c.data ->> '_comment' AS note,
+    c.data - '_handoff' AS checklist_choices,
+    to_char(c.decision_due, 'YYYY-MM-DD') AS decision_due, reminders.items AS reminders
+  FROM cases c
+  LEFT JOIN LATERAL (
+    SELECT json_agg(json_build_object(
+      'id', r.id, 'title', r.text, 'dueDate', to_char(r.remind_on, 'YYYY-MM-DD'),
+      'completed', COALESCE(r.done, false)
+    ) ORDER BY r.remind_on, r.id) AS items
+    FROM case_reminders r WHERE r.case_id = c.id
+  ) reminders ON true
+  WHERE (($2 = 'lawyer' AND c.lawyer_tg_id = $1) OR ($2 = 'manager' AND c.created_by = $1))
+    AND COALESCE(c.data ->> '_stage', '') <> 'Архив'
+  ORDER BY c.created_at DESC NULLS LAST, c.id DESC
+`;
+
+const UPDATE_NOTE = `
+  WITH target AS MATERIALIZED (
+    SELECT id, COALESCE(data ->> '_comment', '') AS note
+    FROM cases
+    WHERE id = $1 AND lawyer_tg_id = $2 AND COALESCE(data ->> '_stage', '') <> 'Архив'
+    FOR UPDATE
+  ), saved AS (
+    UPDATE cases c
+    SET data = (CASE WHEN jsonb_typeof(c.data) = 'object' THEN c.data ELSE '{}'::jsonb END)
+      || jsonb_build_object('_comment', $3::text, '_workspaceNote', true)
+    FROM target
+    WHERE c.id = target.id AND target.note = $4 AND target.note <> $3
+    RETURNING c.id
+  )
+  SELECT target.note = $3 OR EXISTS (SELECT 1 FROM saved) AS ok
+  FROM target
+`;
+
+function positiveId(value) {
+  return /^[1-9]\d{0,9}$/.test(value) && Number(value) <= 2147483647;
+}
+
+function setupWorkspace(app, options = {}) {
+  const pool = options.pool || require('../db/pool');
+  const getBot = options.getBot || (() => require('../bot/instance').telegram.getMe());
+  const now = options.now || Date.now;
+  let botUsername;
+  const namespace = '/api/workspace';
+
+  function sendError(res, status, code, error) {
+    return res.status(status).json({ ok: false, code, error });
+  }
+  function handle(handler) {
+    return async (req, res) => {
+      try {
+        return await handler(req, res);
+      } catch (error) {
+        console.error('workspace request:', error.code || error.name || 'error');
+        return sendError(res, 503, 'unavailable', 'Связь с ботом временно недоступна.');
+      }
+    };
+  }
+  function authenticated(handler) {
+    return handle(async (req, res) => {
+      const digest = bearerDigest(req.get('Authorization'));
+      if (!digest) return sendError(res, 401, 'unauthorized', 'Подтвердите подключение в боте.');
+      const { rows: [account] } = await pool.query(SELECT_ACCOUNT, [digest]);
+      if (!account) return sendError(res, 401, 'unauthorized', 'Подтвердите подключение в боте.');
+      return handler(req, res, account, digest);
+    });
+  }
+  function readOnly(res) {
+    return sendError(res, 403, 'read_only', 'Изменить клиента может его юрист.');
+  }
+  function notFound(res) {
+    return sendError(res, 404, 'not_found', 'Запись недоступна.');
+  }
+
+  app.use(namespace, (req, res, next) => {
+    res.set('Cache-Control', 'no-store');
+    next();
+  });
+  app.get(namespace + '/config', handle(async (req, res) => {
+    if (!botUsername) {
+      botUsername = Promise.resolve().then(getBot).then(me => {
+        if (!me || !/^[A-Za-z0-9_]{5,32}$/.test(me.username || '')) throw new Error('Missing bot username');
+        return me.username;
+      }).catch(error => {
+        botUsername = undefined;
+        throw error;
+      });
+    }
+    return res.json({ version: 1, botUsername: await botUsername });
+  }));
+  app.get(namespace + '/snapshot', authenticated(async (req, res, account) => {
+    const { rows } = await pool.query(SELECT_CASES, [account.id, account.role]);
+    return res.json(makeSnapshot(account, rows, now()));
+  }));
+  app.patch(namespace + '/reminders/:id', authenticated(async (req, res, account) => {
+    if (account.role !== 'lawyer') return readOnly(res);
+    const { id } = req.params;
+    if (!positiveId(id) || typeof req.body?.completed !== 'boolean') {
+      return sendError(res, 400, 'invalid_reminder', 'Некорректная отметка напоминания.');
+    }
+    const result = await pool.query(`
+      UPDATE case_reminders r SET done = $3
+      FROM cases c
+      WHERE r.id = $1 AND r.case_id = c.id AND c.lawyer_tg_id = $2
+        AND COALESCE(c.data ->> '_stage', '') <> 'Архив'
+      RETURNING r.id
+    `, [id, account.id, req.body.completed]);
+    return result.rowCount ? res.json({ ok: true }) : notFound(res);
+  }));
+  app.patch(namespace + '/cases/:id/note', authenticated(async (req, res, account) => {
+    if (account.role !== 'lawyer') return readOnly(res);
+    const { id } = req.params;
+    const { note, expectedNote } = req.body || {};
+    if (!positiveId(id) || typeof note !== 'string' || typeof expectedNote !== 'string' ||
+        note.length > MAX_NOTE_LENGTH || note.includes('\u0000') || expectedNote.includes('\u0000')) {
+      return sendError(res, 400, 'invalid_note', 'Некорректная заметка. Допустимо до 16 000 символов.');
+    }
+    const { rows: [result] } = await pool.query(UPDATE_NOTE, [id, account.id, note, expectedNote]);
+    if (!result) return notFound(res);
+    return result.ok ? res.json({ ok: true }) :
+      sendError(res, 409, 'note_conflict', 'Заметка изменилась в боте. Обновите данные перед сохранением.');
+  }));
+  app.post(namespace + '/logout', handle(async (req, res) => {
+    const digest = bearerDigest(req.get('Authorization'));
+    if (!digest) return sendError(res, 401, 'unauthorized', 'Подключение отсутствует.');
+    await pool.query('UPDATE workspace_sessions SET revoked_at = NOW() WHERE token_digest = $1 AND revoked_at IS NULL', [digest]);
+    return res.json({ ok: true });
+  }));
+}
+
+module.exports = { SESSION_DDL, setupWorkspace, parsePairing, approvePairing, canPair };
