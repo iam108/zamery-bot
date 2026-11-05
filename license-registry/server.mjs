@@ -217,8 +217,12 @@ async function run({store,telegram,worker,contacts,contactReplies,registryComple
     while(!stopping){
       try{
         const result=await registryCompletion.tick();health.success('registryCompletion');
+        const progress=['discovered','processed','saved','fetched','sent'].some((name)=>(result?.[name]??0)>0);
+        if(progress){
+          log({type:'registry_completion_summary',...Object.fromEntries(['discovered','processed','saved','fetched','sent'].map((name)=>[name,result?.[name]??0]))});
+          log({type:'state_proof',trigger:'registry_completion_progress',...privateStateProof(await store.read())});
+        }
         if((result?.saved??result?.updated??result?.written??0)>0){
-          log({type:'state_proof',trigger:'registry_gap_write_verified',...privateStateProof(await store.read())});
           if(contacts){
             const journal=(await store.read()).journal;
             const last=[...journal].reverse().find((item)=>item.type==='registry_completion_write_verified');

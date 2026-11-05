@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import { sign } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { hash } from './state.mjs';
 import { normalizeDate, normalizeAddress, normalizeLicense, normalizeLicenseNumber,
   licenseIdentity, parseSheetRows, planSheetUpsert, SHEET_ACTIVITY_VALUES } from './core.mjs';
@@ -47,9 +48,13 @@ function occupied(cell) {
 /** A direct, server-side adapter. No browser session, MCP token or local Google cookies are used. */
 export class GoogleSheetsClient {
   constructor({ spreadsheetId, sheetName = 'Реестр лицензий', sheetId = 0, credentials,
-    fetchImpl = fetch, now = () => new Date() } = {}) {
+    fetchImpl = fetch, now = () => new Date(), readLimit = 40, writeLimit = 40,
+    requestWindowMs = 60_000, requestClock = () => performance.now(), requestWait = sleep } = {}) {
     if (!/^[\w-]+$/u.test(String(spreadsheetId ?? ''))) fail('invalid_spreadsheet_id');
     if (!sheetName || !Number.isInteger(sheetId) || sheetId < 0) fail('invalid_sheet_identity');
+    if (![readLimit, writeLimit].every((limit) => Number.isSafeInteger(limit) && limit > 0)
+      || !Number.isFinite(requestWindowMs) || requestWindowMs <= 0
+      || typeof requestClock !== 'function' || typeof requestWait !== 'function') fail('google_request_limit_invalid');
     this.spreadsheetId = spreadsheetId;
     this.sheetName = sheetName;
     this.sheetId = sheetId;
@@ -57,6 +62,28 @@ export class GoogleSheetsClient {
     this.fetchImpl = fetchImpl;
     this.now = now;
     this.token = null;
+    this.requestWindowMs = requestWindowMs;
+    this.requestClock = requestClock;
+    this.requestWait = requestWait;
+    this.requestBudget = {
+      GET: { limit: readLimit, started: [] },
+      POST: { limit: writeLimit, started: [] },
+    };
+  }
+
+  async #sendWithinBudget(method, send) {
+    const { limit, started } = this.requestBudget[method];
+    while (true) {
+      const now = this.requestClock();
+      while (started.length && started[0] <= now - this.requestWindowMs) started.shift();
+      if (started.length < limit) {
+        // Reserve and dispatch synchronously so concurrent callers share one budget.
+        started.push(now);
+        return send();
+      }
+      const delay = started[0] + this.requestWindowMs - now;
+      await this.requestWait(Math.max(1, Math.ceil(delay)));
+    }
   }
 
   async credentials() {
@@ -109,17 +136,19 @@ export class GoogleSheetsClient {
       for (const item of Array.isArray(value) ? value : [value]) url.searchParams.append(key, item);
     }
     const token = await this.accessToken();
+    const method = body ? 'POST' : 'GET';
     let response; let data;
     try {
-      response = await this.fetchImpl(url.toString(), { method: body ? 'POST' : 'GET',
+      response = await this.#sendWithinBudget(method, () => this.fetchImpl(url.toString(), { method,
         headers: { Authorization: `Bearer ${token}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
-        ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(25_000) });
-      data = await response.json();
+        ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(25_000) }));
+      if (response.ok) data = await response.json();
     } catch { fail('google_network_error', 'Google Sheets request failed before a valid response was received'); }
     if (response.status === 401 && retry) {
       await this.accessToken(true);
       return this.request(suffix, { query, body, retry: false });
     }
+    if (response.status === 429) fail('google_rate_limited', 'Google Sheets request quota reached (HTTP 429)');
     if (!response.ok) fail(response.status === 403 || response.status === 404 ? 'google_access_denied' : 'google_request_failed',
       `Google Sheets request rejected (HTTP ${response.status})`);
     return data;

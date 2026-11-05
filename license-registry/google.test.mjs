@@ -254,3 +254,87 @@ test('a historical Expert license in row 632 is preserved while the proven curre
   assert.equal(freshMock.batches.length, 0);
   assert.deepEqual(freshMock.values[631], historical);
 });
+
+function virtualRequestClock() {
+  let now = 0;
+  let pending = [];
+  return {
+    clock: () => now,
+    wait: (delay) => new Promise((resolve) => pending.push({ until: now + delay, resolve })),
+    advance(ms) {
+      now += ms;
+      const due = pending.filter(({ until }) => until <= now);
+      pending = pending.filter(({ until }) => until > now);
+      for (const { resolve } of due) resolve();
+    },
+  };
+}
+const nextTurn = () => new Promise((resolve) => setImmediate(resolve));
+
+test('concurrent reads share the default forty requests per rolling minute', async () => {
+  const time = virtualRequestClock();
+  const dispatched = [];
+  const google = client({ fetchImpl: async () => {
+    dispatched.push(time.clock());
+    return response({});
+  } }, { requestClock: time.clock, requestWait: time.wait });
+  google.token = { value: 'fixture-token', expiresAt: Infinity };
+  const pending = Promise.all(Array.from({ length: 85 }, () => google.request()));
+  await nextTurn();
+  assert.deepEqual(dispatched, Array(40).fill(0));
+  time.advance(59_999);
+  await nextTurn();
+  assert.equal(dispatched.length, 40);
+  time.advance(1);
+  await nextTurn();
+  assert.deepEqual(dispatched.slice(40), Array(40).fill(60_000));
+  time.advance(60_000);
+  await pending;
+  assert.deepEqual(dispatched.slice(80), Array(5).fill(120_000));
+});
+
+test('metadata, values and row reads share a read budget while batch writes have a separate budget', async () => {
+  const time = virtualRequestClock();
+  const mock = mockGoogle([[...REGISTRY_HEADERS], existingRow()]);
+  const google = client(mock, {
+    readLimit: 2, writeLimit: 1, requestWindowMs: 1000, requestClock: time.clock, requestWait: time.wait,
+  });
+  await google.context();
+  const read = google.readRow(2);
+  await google.request(':batchUpdate', { body: { requests: [] } });
+  const write = google.request(':batchUpdate', { body: { requests: [] } });
+  await nextTurn();
+  assert.equal(mock.calls.filter(({ options }) => options.method === 'GET').length, 2);
+  assert.equal(mock.calls.filter(({ url }) => new URL(url).searchParams.has('ranges')).length, 0);
+  assert.equal(mock.batches.length, 1);
+  time.advance(1000);
+  const [cells] = await Promise.all([read, write]);
+  assert.equal(cells[6].formattedValue, license.inn);
+  assert.equal(mock.batches.length, 2);
+  assert.equal(mock.calls.filter(({ options }) => options.method === 'GET').length, 3);
+});
+
+test('quota and transport failures have safe codes and never retry uncertain batch writes', async () => {
+  const providerText = 'private provider body';
+  const failures = [
+    [async () => { throw new Error(providerText); }, 'google_network_error'],
+    [async () => ({ ok: true, status: 200, json: async () => { throw new Error(providerText); } }), 'google_network_error'],
+    [async () => ({ ok: false, status: 429, json: async () => { throw new Error(providerText); } }), 'google_rate_limited'],
+    [async () => ({ ok: false, status: 503, json: async () => { throw new Error(providerText); } }), 'google_request_failed'],
+  ];
+  for (const [failFetch, code] of failures) {
+    let dispatches = 0;
+    const google = client({ fetchImpl: async (_url, options) => {
+      assert.equal(options.method, 'POST');
+      dispatches++;
+      return failFetch();
+    } });
+    google.token = { value: 'fixture-token', expiresAt: Infinity };
+    await assert.rejects(google.request(':batchUpdate', { body: { requests: [] } }), (error) => {
+      assert.equal(error.code, code);
+      assert.ok(!error.message.includes(providerText));
+      return true;
+    });
+    assert.equal(dispatches, 1);
+  }
+});

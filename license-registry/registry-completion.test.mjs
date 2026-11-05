@@ -8,7 +8,7 @@ import {REGISTRY_HEADERS} from './google.mjs';
 import {normalizeAddress} from './core.mjs';
 import {renderNotification} from './notifier.mjs';
 import {convertOwnerUpdate} from './contact-reply-input.mjs';
-import {verifyRegistryGapPlan} from './registry-gap-google.mjs';
+import {prepareRegistryGapPlan,verifyRegistryGapPlan} from './registry-gap-google.mjs';
 import {RegistryCompletionWorker} from './registry-completion.mjs';
 
 const OWNER='123456',BOT='987654',INN='9705148570',ORG='ООО «ХОРОШОТ»',NUMBER='77РПО0021680';
@@ -103,7 +103,7 @@ test('full numbered objects use their exact delivered candidate version; stale n
   assert.equal(old.reply_markup.inline_keyboard[1][0].callback_data,`rg:${request.id}:object:2`);
   await h.store.update((state)=>{const current=state.registry.requests[request.id];current.candidates.reverse();current.candidateVersion=hash(current.candidates);});
   await h.reply('2',old);await h.tick();assert.equal(h.batches.length,0);assert.equal((await h.requests())[0].selectedCandidateHash,undefined);
-  await h.store.update((state)=>{const current=state.registry.requests[request.id];current.candidates.reverse();current.candidateVersion=hash(current.candidates);});
+  await h.store.update((state)=>{const current=state.registry.requests[request.id];current.candidates.reverse();current.candidateVersion=request.candidateVersion;});
   await h.callback(`rg:${request.id}:object:2`,old);assert.equal((await h.tick()).saved,1);
   assert.equal(h.cells[1][7].formattedValue,second);assert.equal(h.cells[1][11].formattedValue,ADDRESS2);assert.equal(h.calls.length,1);
 });
@@ -195,4 +195,70 @@ test('a receipt for a different spreadsheet cannot acknowledge or clear the guar
     spreadsheetId:'different-spreadsheet',sheetName:plan.sheetName,sheetId:plan.sheetId,verifiedAt:TODAY,cells:plan.expectedCells,appliedCells:[]})});
   assert.equal(result.saved,0);assert.equal(h.batches.length,0);assert.ok((await h.requests())[0].plan.hash);
   assert.equal((await h.store.read()).journal.filter((entry)=>entry.type==='registry_completion_write_verified').length,0);
+});
+
+test('old object lists are invalidated, and an incomplete address plus an existing one-day-shifted license cannot fill the new row',async(t)=>{
+  const sheetAddress='Россия, , Москва Город, , , , , , , , вн. тер. г. муниципальный округ Коммунарка, пр-кт Куприна, д.18, корп.2, этаж 1, часть помещ. 2Н';
+  const apiAddress='Россия,,Москва Город,,,,,,,,вн.тер.г. муниципальный округ Коммунарка, пр-кт Куприна, д. 18, к2, этаж 1, часть помещ. 2Н';
+  const h=await fixture(t,{rows:[row({6:INN,8:'25.02.2025',9:'25.02.2030',11:sheetAddress,12:'Имя',13:'+79991112233'}),row({6:INN})],
+    items:[record(),record({licenseNumber:'77РПО0021681',address:ADDRESS2})]});
+  await h.tick();const original=h.sent[0],request=(await h.requests()).find((item)=>item.rowNumber===3);
+  assert.equal(request.reason,'multiple_objects');
+  await h.store.update((state)=>{
+    const current=state.registry.requests[request.id];delete current.selectionPolicyVersion;
+    state.registry.apiCache[INN].items=[record({licenseNumber:'77РПО0021681',address:'Москва Город, этаж 1, часть помещ. 2Н'}),
+      record({issueDate:'2025-02-26',expiryDate:'2030-02-25',address:apiAddress})];
+  });
+  await h.callback(`rg:${request.id}:object:2`,original);
+  const result=await h.tick();assert.equal(result.saved,0);assert.equal(h.batches.length,0);assert.equal(h.calls.length,1);
+  const held=(await h.requests()).find((item)=>item.id===request.id);
+  assert.equal(held.reason,'incomplete_api_address');assert.equal(held.status,'api_waiting');assert.equal(held.candidateVersion,undefined);
+  assert.ok(Date.parse(held.nextCheckAt)>Date.parse(TODAY));assert.match(h.sent.at(-1).text,/неполный адрес/u);
+  await h.reply(`Адрес: ${apiAddress}`);await h.tick();
+  assert.equal((await h.requests()).find((item)=>item.id===request.id).reason,'represented_license');assert.equal(h.batches.length,0);
+});
+
+test('same-period legacy licenses with new numbers and address-label variants are held while a different room remains eligible',async(t)=>{
+  const cases=[
+    ['Москва Город, , , , Петровка Улица, 30/7, , , цокольный этаж, часть помещ. V',
+      'Россия,,Москва Город,,,,,,,,вн.тер.г. муниципальный округ Тверской, ул. Петровка, д.30/7, помещ. 1/Ц, цокольный этаж 0, часть помещ. V'],
+    ['Москва Город, , , , , , , , вн.тер.г. муниципальный округ Алексеевский, улица Маломосковская, д.14, этаж 1, часть помещ. 1Н',
+      'Россия,,Москва Город,,,,,,,,вн.тер.г. муниципальный округ Алексеевский, ул. Маломосковская, д. 14, этаж 1, часть помещ. 1Н'],
+    ['Москва, ул. Пушкина, д.1, пом. 1Н','Москва, улица Пушкина, дом 1, помещение 2Н',true],
+    ['Москва, ул. Пушкина, д.1','Москва Город, ул. Пушкина, дом 1, помещение 2Н',false,'uncertain_existing_object'],
+  ];
+  for(const [existing,address,different,reason='represented_license'] of cases){
+    const h=await fixture(t,{rows:[row({6:INN,7:'77РПО0019390',8:ISSUE,9:EXPIRY,11:existing,12:'Имя',13:'+79991112233'}),row({6:INN})],
+      items:[record({address})]});
+    const result=await h.tick();assert.equal(result.saved,different?1:0);assert.equal(h.batches.length,different?1:0);
+    if(different)assert.equal(h.cells[2][11].formattedValue,address);
+    else assert.equal((await h.requests())[0].reason,reason);
+  }
+});
+
+test('uncommitted saved FSRAR plans recheck concrete address and newly represented rows before a write',async(t)=>{
+  for(const duplicate of [false,true]){
+    const h=await fixture(t,{rows:[row({6:INN})],items:[]});
+    await h.worker().discover(await h.google.context());const request=(await h.requests())[0];
+    const address=duplicate?ADDRESS:'Москва Город, этаж 1, помещение 2Н';
+    const plan=await prepareRegistryGapPlan(h.google,{rowNumber:2,expectedRowValues:request.expectedRowValues,
+      updates:[{column:'H',after:NUMBER},{column:'I',after:ISSUE},{column:'J',after:EXPIRY},{column:'L',after:address}],
+      authorization:{requestId:request.id,ownerChatId:OWNER,source:'fsrar'}});
+    await h.store.update((state)=>{Object.assign(state.registry.requests[request.id],{plan,status:'planned',writeAttempted:true});});
+    if(duplicate)h.cells.push(row({6:INN,7:'77РПО0019390',8:ISSUE,9:EXPIRY,11:address,12:'Имя',13:'+79991112233'}).map(cell));
+    assert.equal((await h.tick()).saved,0);assert.equal(h.batches.length,0);assert.equal(h.calls.length,0);
+    const held=(await h.requests()).find((item)=>item.id===request.id);
+    assert.equal(held.reason,duplicate?'represented_license':'incomplete_api_address');assert.equal(held.plan,undefined);
+  }
+});
+
+test('restoring the original blank row creates a fresh request and reuses the cached duplicate guard',async(t)=>{
+  const h=await fixture(t,{rows:[row({6:INN})]});const before=clone(h.cells[1]);
+  assert.equal((await h.tick()).saved,1);const previous=(await h.requests())[0];
+  h.cells[1]=before;
+  h.cells.push(row({6:INN,7:'77РПО0019390',8:ISSUE,9:EXPIRY,11:ADDRESS,12:'Имя',13:'+79991112233'}).map(cell));
+  const result=await h.tick();assert.equal(result.discovered,1);assert.equal(result.saved,0);assert.equal(h.calls.length,1);assert.equal(h.batches.length,1);
+  const requests=await h.requests(),restored=requests.find((item)=>item.id!==previous.id);
+  assert.equal(requests.find((item)=>item.id===previous.id).status,'superseded');
+  assert.equal(restored.originalRowFingerprint,previous.originalRowFingerprint);assert.equal(restored.reason,'represented_license');
 });

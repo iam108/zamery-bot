@@ -17,10 +17,92 @@ const active=(item,today)=>['действующая','действует','activ
 const COL={inn:'G',licenseNumber:'H',issueDate:'I',expiryDate:'J',activity:'K',address:'L',name:'M',phone:'N',telegram:'O',email:'P'};
 const INDEX={G:6,H:7,I:8,J:9,K:10,L:11,M:12,N:13,O:14,P:15};
 const API_TTL=24*60*60*1000,NEGATIVE_TTL=3*60*60*1000,FETCH_LEASE=120000;
+const OBJECT_SELECTION_POLICY=2,DAY_MS=86400000;
 const same=(column,a,b)=>column==='I'||column==='J'?normalizeDate(a)===normalizeDate(b):column==='H'?normalizeLicenseNumber(a)===normalizeLicenseNumber(b):column==='L'?normalizeAddress(a)===normalizeAddress(b):column==='K'?mapActivityForSheet(a)===mapActivityForSheet(b):String(a??'')===String(b??'');
 const licenseNumber=(value)=>/^\d{2}[А-ЯA-Z]{2,4}\d{4,10}$/u.test(value??'');
 const validEmail=(value)=>/^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(value)&&value.length<=254;
 const safeText=(value,limit)=>String(value??'').slice(0,limit);
+function canonicalObjectAddress(value){
+  return normalizeAddress(clean(value).toLowerCase()
+    .replace(/(?<![\p{L}\p{N}])(?:д(?:ом)?|d)\.?\s*(?=\d)/gu,'дом ')
+    .replace(/(дом\s+\d+[а-яa-z]?(?:\/\d+[а-яa-z]?)?)\s*(?:корпус|корп|к)\.?\s*(?=\d)/gu,'$1 корпус ')
+    .replace(/(?<![\p{L}\p{N}])(?:корпус|корп|к)\.?\s*(?=\d)/gu,'корпус ')
+    .replace(/(?<![\p{L}\p{N}])ул\.?\s+(?=\p{L})/gu,'улица ')
+    .replace(/(?<![\p{L}\p{N}])(?:пр-кт|пр-т|просп)\.?(?=$|[\s,;])/gu,'проспект')
+    .replace(/(?<![\p{L}\p{N}])(?:пом|помещ)\.?(?=\s|\d)/gu,'помещение ')
+    .replace(/(?<![\p{L}\p{N}])(?:г\.?|город)\s+(?=\p{L})/gu,''));
+}
+const STREET_TYPE='улица|переулок|проспект|шоссе|набережная|бульвар|проезд|площадь|тупик|аллея|тракт';
+const STREET_PREFIX=new RegExp(`^(${STREET_TYPE}) (.+)$`,'u');
+const STREET_SUFFIX=new RegExp(`^(.+) (${STREET_TYPE})$`,'u');
+const HOUSE_NUMBER='\\d+[а-яa-z]?(?:/\\d+[а-яa-z]?)?';
+const EXPLICIT_HOUSE=new RegExp(`(?:^| )(?:дом|владение) (${HOUSE_NUMBER})(?: |$)`,'u');
+const BARE_HOUSE=new RegExp(`^(${HOUSE_NUMBER})(?: |$)`,'u');
+const INLINE_HOUSE=new RegExp(` (?:дом|владение) (${HOUSE_NUMBER})(?: |$)| (${HOUSE_NUMBER})$`,'u');
+
+function physicalAddress(value){
+  const parts=clean(value).split(/[,;]/u).map(canonicalObjectAddress).filter(Boolean);
+  for(const [index,part] of parts.entries()){
+    let streetPart=part,house,buildingParts=parts.slice(index+1);
+    const separateHouse=buildingParts[0]?.match(EXPLICIT_HOUSE)??buildingParts[0]?.match(BARE_HOUSE);
+    if(separateHouse)house=separateHouse[1];
+    else{
+      const inline=part.match(INLINE_HOUSE);
+      if(!inline)continue;
+      streetPart=part.slice(0,inline.index);house=inline[1]??inline[2];
+      buildingParts=parts.slice(index);
+    }
+    const prefix=streetPart.match(STREET_PREFIX),suffix=streetPart.match(STREET_SUFFIX);
+    if(!prefix&&!suffix)continue;
+    const street=prefix?`${prefix[1]} ${prefix[2]}`:`${suffix[2]} ${suffix[1]}`;
+    const corpus=buildingParts.slice(0,2).join(' ').match(/(?:^| )корпус (\d+[а-яa-z]?)(?: |$)/u)?.[1]??'';
+    return {street,house,corpus};
+  }
+  return null;
+}
+function concreteObjectAddress(value){
+  const text=clean(value);
+  if(!text||text.length>1000||/[\u0000-\u001f\u007f]/u.test(text))return false;
+  return physicalAddress(text)!==null;
+}
+function addressUnits(address,label){
+  const unit='(?:\\d+[а-яa-z]?(?:/[\\dа-яa-z]+)?|[ivxlcdm]+)';
+  return [...address.matchAll(new RegExp(`(?:^| )${label} (?:№\\s*)?(${unit})(?= |$)`,'gu'))].map((match)=>match[1]);
+}
+function compareObjects(left,right){
+  const a=canonicalObjectAddress(left),b=canonicalObjectAddress(right);
+  if(a&&a===b)return 'same';
+  const aBuilding=physicalAddress(left),bBuilding=physicalAddress(right);
+  if(!aBuilding||!bBuilding)return 'uncertain';
+  if(aBuilding.street!==bBuilding.street||aBuilding.house!==bBuilding.house)return 'different';
+  if(aBuilding.corpus&&bBuilding.corpus&&aBuilding.corpus!==bBuilding.corpus)return 'different';
+  for(const label of ['комната','часть помещение','помещение']){
+    const aUnits=addressUnits(a,label),bUnits=addressUnits(b,label);
+    if(aUnits.length&&bUnits.length)return aUnits.some((unit)=>bUnits.includes(unit))?'same':'different';
+  }
+  return 'uncertain';
+}
+function existingObjectReason(rows,rowNumber,license){
+  let uncertain=false;
+  for(const other of rows){
+    if(other.rowNumber===rowNumber||other.inn!==license.inn||other.expiryDate!==license.expiryDate||!other.issueDate)continue;
+    if(Math.abs(Date.parse(other.issueDate)-Date.parse(license.issueDate))>DAY_MS)continue;
+    const comparison=compareObjects(other.address,license.address);
+    if(comparison==='same')return 'represented_license';
+    if(comparison==='uncertain')uncertain=true;
+  }
+  return uncertain?'uncertain_existing_object':null;
+}
+function eligibleObjects(items,inn,today,row,hints){
+  const number=normalizeLicenseNumber(hints.licenseNumber||row.licenseNumber);
+  return (items??[]).filter((item)=>item.inn===inn&&active(item,today)&&licenseNumber(item.licenseNumber)
+    &&item.expiryDate>=item.issueDate&&(!number||item.licenseNumber===number)
+    &&(!hints.issueDate||item.issueDate===hints.issueDate)&&(!hints.expiryDate||item.expiryDate===hints.expiryDate));
+}
+function unresolvedObject(candidates,ownerAddress){
+  if(!candidates.some((item)=>!concreteObjectAddress(item.address)))return false;
+  return !concreteObjectAddress(ownerAddress)||!candidates.some((item)=>concreteObjectAddress(item.address)&&compareObjects(item.address,ownerAddress)==='same');
+}
 function init(state){
   state.registry??={};for(const key of ['requests','apiCache','outbox','processed'])state.registry[key]??={};state.registry.inbox??=[];
   state.telegram??={offset:0,inbox:[]};state.telegram.ownerInbox??=[];return state.registry;
@@ -43,6 +125,8 @@ function help(request,reason){
     missing_contacts:'Ответь именем и телефоном: «+79991234567 Иван Иванов». Если контактов несколько, пришли каждый на отдельной строке.',missing_license_number:'Номер лицензии пуст. Если он известен, ответь «Номер лицензии: …».',
     no_matching_active_license:'В полученных данных ФСРАР не найдена подходящая действующая лицензия. Уточни ИНН, адрес или номер лицензии.',
     represented_license:'Найденная лицензия уже относится к другой строке. Уточни адрес, номер или даты именно этой подачи; старую лицензию в новую строку я не переношу.',
+    uncertain_existing_object:'В реестре уже есть объект этой компании с теми же сроками. По адресам пока нельзя подтвердить, что это разные точки. Уточни полный адрес и помещение.',
+    incomplete_api_address:'В ФСРАР по одному из объектов неполный адрес. Ответь «Адрес: …», указав улицу, дом и помещение. Я повторю проверку, когда данные обновятся.',
     api_older_than_existing:'Данные API старше указанных в этой строке. Ничего не заменяю. Уточни номер/адрес или повтори проверку позже.',
     existing_values_conflict:'Новые данные расходятся с заполненными ячейками. Заполненные значения сохранены. Проверь строку и пришли уточнение.',
     row_changed:'Строка изменилась после запроса. Запись остановлена; новые данные требуют повторной проверки.',
@@ -80,14 +164,14 @@ export class RegistryCompletionWorker{
     await this.store.update((state)=>{const request=init(state).requests[id];if(!this.scoped(request))return;
       request.status=nextCheckAt?'api_waiting':'awaiting_owner';request.reason=reason;request.updatedAt=at(this.now);
       if(nextCheckAt)request.nextCheckAt=nextCheckAt;else delete request.nextCheckAt;
-      const actions=keyboard??(['api_failed','no_matching_active_license','api_older_than_existing','represented_license'].includes(reason)?[[{text:'Повторить проверку',callback_data:`rg:${id}:retry`}]]:[]);
+      const actions=keyboard??(['api_failed','no_matching_active_license','api_older_than_existing','represented_license','incomplete_api_address'].includes(reason)?[[{text:'Повторить проверку',callback_data:`rg:${id}:retry`}]]:[]);
       const controls=[...actions,[{text:'Пропустить',callback_data:`rg:${id}:skip`}]];
       enqueue(state,request,reason,text??help(request,reason),at(this.now),controls,
         reason==='multiple_objects'?request.candidateVersion:undefined,reason==='multiple_objects'?keyboard?.length:undefined);});
   }
   async retryPrompt(id,reason,cache){
     const state=await this.store.read(),max=Math.min(7,state.config.maxAttempts??7);
-    if((cache?.attempts??0)>=max)return this.prompt(id,'api_attempts_exhausted');
+    if((cache?.attempts??0)>=max)return this.prompt(id,reason==='incomplete_api_address'?reason:'api_attempts_exhausted');
     const morning=nextMorning(this.now(),{timeZone:state.config.timeZone,hour:this.config.dailyHour??9});
     const when=cache?.expiresAt&&Date.parse(cache.expiresAt)>Date.parse(morning)?cache.expiresAt:morning;
     return this.prompt(id,reason,undefined,undefined,when);
@@ -96,6 +180,17 @@ export class RegistryCompletionWorker{
     const rows=parseSheetRows(context.values,{startRow:context.startRow??1}).filter((row)=>row.rowNumber>=2&&clean(row.organization));
     return this.store.update((state)=>{
       const registry=init(state),today=localDate(this.now(),state.config.timeZone);let discovered=0;
+      for(const request of Object.values(registry.requests)){
+        if(!this.scoped(request)||request.selectionPolicyVersion===OBJECT_SELECTION_POLICY)continue;
+        request.selectionPolicyVersion=OBJECT_SELECTION_POLICY;
+        delete request.candidates;delete request.candidateVersion;delete request.selectedCandidateHash;
+        if(request.status==='awaiting_owner'&&request.reason==='multiple_objects'&&!request.plan){
+          request.status='ready';delete request.nextCheckAt;
+        }
+        for(const item of Object.values(registry.outbox)){
+          if(item.requestId===request.id&&item.reason==='multiple_objects'&&['pending','sending'].includes(item.status))item.status='superseded';
+        }
+      }
       for(const row of [...rows].sort((a,b)=>priority(a)-priority(b))){
         const missing=gaps(row),values=rowValues(row),fingerprint=rowFingerprint(values);
         const existing=Object.values(registry.requests).filter((request)=>this.scoped(request)&&request.rowNumber===row.rowNumber);
@@ -110,14 +205,16 @@ export class RegistryCompletionWorker{
           }
           continue;
         }
-        const old=existing.find((request)=>request.fingerprints?.includes(fingerprint));
+        const old=existing.find((request)=>request.status!=='superseded'&&rowFingerprint(request.expectedRowValues)===fingerprint);
         if(old)continue;
-        const id=hash([this.botId,this.ownerChatId,normalizeName(row.organization),clean(row.inn),fingerprint,row.rowNumber]).slice(0,32);
-        if(registry.requests[id])continue;
         // A live pending write retains its original snapshot until readback settles.
         if(existing.some((request)=>request.plan))continue;
-        for(const request of existing)if(!['done','skipped','superseded'].includes(request.status)){
-          request.status='superseded';for(const item of Object.values(registry.outbox))if(item.requestId===request.id&&item.status==='pending')item.status='superseded';
+        const baseId=hash([this.botId,this.ownerChatId,normalizeName(row.organization),clean(row.inn),fingerprint,row.rowNumber]).slice(0,32);
+        let id=baseId;
+        for(let revision=1;registry.requests[id];revision++)id=hash([baseId,revision]).slice(0,32);
+        for(const request of existing)if(request.status!=='superseded'){
+          request.status='superseded';
+          for(const item of Object.values(registry.outbox))if(item.requestId===request.id&&['pending','sending'].includes(item.status))item.status='superseded';
         }
         const notificationJobIds=Object.values(state.jobs??{}).filter((job)=>job.receipt?.rowNumber===row.rowNumber||job.plan?.rowNumber===row.rowNumber)
           .filter((job)=>job.inn===row.inn&&(!job.address||normalizeAddress(job.address)===normalizeAddress(row.address))
@@ -130,7 +227,7 @@ export class RegistryCompletionWorker{
         registry.requests[id]={id,ownerChatId:this.ownerChatId,botId:this.botId,rowNumber:row.rowNumber,organization:row.organization,
           originalInn:row.inn,originalRowFingerprint:fingerprint,expectedRowValues:values,fingerprints:[fingerprint],notificationJobIds:[...new Set(notificationJobIds)],
           replyMessageIds:[],status:existingPrompt?'awaiting_owner':'ready',...(existingPrompt?{reason:'missing_contacts'}:{}),
-          priority:priority(row),createdAt:at(this.now),updatedAt:at(this.now),provided:{}};discovered++;
+          selectionPolicyVersion:OBJECT_SELECTION_POLICY,priority:priority(row),createdAt:at(this.now),updatedAt:at(this.now),provided:{}};discovered++;
       }
       return discovered;
     });
@@ -171,7 +268,7 @@ export class RegistryCompletionWorker{
       if(parsed.rowNumber&&parsed.rowNumber!==request.rowNumber){enqueue(state,request,'row_changed',help(request,'row_changed'),at(this.now));return {invalid:true};}
       if(parsed.rowNumber===request.rowNumber)request.explicitRow=parsed.rowNumber;
       if(parsed.objectChoice){
-        const delivery=Object.values(registry.outbox).find((item)=>item.requestId===request.id&&item.status==='sent'&&item.telegramMessageId===Number(entry.event.replyTo?.messageId)
+        const delivery=request.selectionPolicyVersion===OBJECT_SELECTION_POLICY&&Object.values(registry.outbox).find((item)=>item.requestId===request.id&&item.status==='sent'&&item.telegramMessageId===Number(entry.event.replyTo?.messageId)
           &&item.reason==='multiple_objects'&&item.candidateVersion===request.candidateVersion);
         const chosen=delivery&&parsed.objectChoice<=delivery.candidateCount&&request.candidates?.[parsed.objectChoice-1];if(!chosen){enqueue(state,request,'invalid_input',help(request,'invalid_input'),at(this.now));return {invalid:true};}
         request.selectedCandidateHash=hash(chosen);
@@ -280,11 +377,34 @@ export class RegistryCompletionWorker{
     return saved;
   }
   async apply(id){
-    const request=(await this.store.read()).registry?.requests?.[id];if(!this.scoped(request)||!request.plan)return false;
+    const state=await this.store.read(),request=state.registry?.requests?.[id];if(!this.scoped(request)||!request.plan)return false;
     try{return await this.acknowledge(id,await this.verifyPlan(this.google,request.plan));}
     catch(error){
       if(error.code!=='registry_gap_readback_pending'){this.logCode('registry_readback_unavailable');return false;}
       if(error.reason){await this.store.update((state)=>{const current=init(state).requests[id];if(this.scoped(current)){delete current.plan;delete current.writeAttempted;}});await this.prompt(id,error.reason==='registry_gap_cell_protected'?error.reason:'row_changed');return false;}
+    }
+    if(request.plan.authorization?.source==='fsrar'){
+      const proposed=parseSheetRows([request.plan.afterValues],{startRow:request.rowNumber})[0];
+      const cache=state.registry.apiCache[proposed?.inn];
+      let reason='incomplete_api_address';
+      if(proposed&&concreteObjectAddress(proposed.address)){
+        const context=await this.google.context();
+        const rows=parseSheetRows(context.values,{startRow:context.startRow??1});
+        reason=existingObjectReason(rows,request.rowNumber,proposed);
+        const original=parseSheetRows([request.expectedRowValues],{startRow:request.rowNumber})[0];
+        const candidates=eligibleObjects(cache?.items,proposed.inn,localDate(this.now(),state.config.timeZone),original,request.provided);
+        if(!reason&&unresolvedObject(candidates,request.provided.address))reason='incomplete_api_address';
+      }
+      if(reason){
+        const cleared=await this.store.update((currentState)=>{
+          const current=init(currentState).requests[id];
+          if(!this.scoped(current)||current.plan?.hash!==request.plan.hash)return false;
+          delete current.plan;delete current.writeAttempted;delete current.selectedCandidateHash;delete current.candidateVersion;
+          return true;
+        });
+        if(cleared)await this.retryPrompt(id,reason,cache);
+        return false;
+      }
     }
     const allowed=await this.store.update((state)=>{const registry=init(state),current=registry.requests[id];if(!this.scoped(current)||current.plan?.hash!==request.plan.hash)return false;
       if(registry.inbox.some((entry)=>entry.requestId===id)||(state.telegram?.ownerInbox??[]).some((entry)=>entry.event?.updateId===entry.updateId&&this.routeFor(state,entry.event)===id)){
@@ -309,7 +429,7 @@ export class RegistryCompletionWorker{
     const missing=gaps(row),licenseQuery=!row.inn||missing.some((column)=>['I','J','L'].includes(column));
     const conflicts=[];
     if(row.inn&&row.inn!==inn)conflicts.push({column:'G',before:row.inn,after:inn});
-    if(p.address&&row.address&&!same('L',p.address,row.address))conflicts.push({column:'L',before:row.address,after:p.address});
+    if(p.address&&row.address&&compareObjects(p.address,row.address)!=='same')conflicts.push({column:'L',before:row.address,after:p.address});
     if(p.licenseNumber&&row.licenseNumber&&!same('H',p.licenseNumber,row.licenseNumber))conflicts.push({column:'H',before:row.licenseNumber,after:p.licenseNumber});
     if(conflicts.length){await this.prompt(id,'existing_values_conflict',conflictText(request,conflicts));return {saved:0,fetched:0};}
     const ownerFields={...(row.inn?p.contact??{}:{})};
@@ -335,26 +455,29 @@ export class RegistryCompletionWorker{
     }
     if(!activePrimary&&cache&&Date.parse(cache.expiresAt)>+new Date(this.now())&&cache.status==='ready'&&(licenseQuery||missing.includes('H'))){
       const today=localDate(this.now(),this.config.timeZone??'Europe/Moscow');
-      let candidates=cache.items.filter((item)=>item.inn===inn&&active(item,today)&&licenseNumber(item.licenseNumber)
-        &&normalizeAddress(item.address)&&item.address.length<=1000&&!/[\u0000-\u001f\u007f]/u.test(item.address)&&item.expiryDate>=item.issueDate);
+      let candidates=eligibleObjects(cache.items,inn,today,row,p);
       if(p.inn&&request.ownerVerifiedInn!==inn&&candidates.some((item)=>normalizeName(item.organization)!==normalizeName(request.organization))){
         const names=[...new Set(candidates.map((item)=>item.organization).filter(Boolean))].join('; ');
         await this.prompt(id,'company_name_mismatch',`${safeText(request.organization,200)}\nСтрока ${request.rowNumber}. В ФСРАР по ИНН ${inn} указано: ${safeText(names,1000)||'другое наименование'}. Если это нужная организация, ответь повторно этим ИНН. Пока ничего из API не переношу.`);return {saved:0,fetched};
       }
-      if(p.licenseNumber||row.licenseNumber)candidates=candidates.filter((item)=>item.licenseNumber===normalizeLicenseNumber(p.licenseNumber||row.licenseNumber));
-      if(p.address||row.address)candidates=candidates.filter((item)=>normalizeAddress(item.address)===normalizeAddress(p.address||row.address));
-      if(p.issueDate)candidates=candidates.filter((item)=>item.issueDate===p.issueDate);if(p.expiryDate)candidates=candidates.filter((item)=>item.expiryDate===p.expiryDate);
-      const unique=new Map();for(const item of candidates)unique.set(hash([item.inn,item.licenseNumber,item.issueDate,item.expiryDate,normalizeAddress(item.address)]),item);candidates=[...unique.values()];
-      let represented=0;
-      candidates=candidates.filter((item)=>{const elsewhere=rows.some((other)=>other.rowNumber!==row.rowNumber&&other.inn===inn
-        &&(normalizeAddress(other.address)===normalizeAddress(item.address)||!other.address&&other.licenseNumber===item.licenseNumber)
-        &&((other.licenseNumber===item.licenseNumber&&(!other.issueDate||!other.expiryDate||other.issueDate>=item.issueDate&&other.expiryDate>=item.expiryDate))
-          ||(!other.licenseNumber&&other.issueDate===item.issueDate&&other.expiryDate===item.expiryDate)));
-        if(elsewhere)represented++;return !elsewhere;});
+      if(unresolvedObject(candidates,p.address)){
+        if(licenseQuery){await this.retryPrompt(id,'incomplete_api_address',cache);return {saved:0,fetched};}
+        candidates=[];
+      }
+      candidates=candidates.filter((item)=>concreteObjectAddress(item.address));
+      if(p.address||row.address)candidates=candidates.filter((item)=>compareObjects(item.address,p.address||row.address)==='same');
+      const unique=new Map();for(const item of candidates)unique.set(hash([item.inn,item.licenseNumber,item.issueDate,item.expiryDate,canonicalObjectAddress(item.address)]),item);candidates=[...unique.values()];
+      const held=new Set();
+      candidates=candidates.filter((item)=>{
+        const reason=existingObjectReason(rows,row.rowNumber,item);
+        if(reason)held.add(reason);
+        return !reason;
+      });
+      if(held.has('uncertain_existing_object')&&licenseQuery){await this.retryPrompt(id,'uncertain_existing_object',cache);return {saved:0,fetched};}
       if(request.selectedCandidateHash)candidates=candidates.filter((item)=>hash(item)===request.selectedCandidateHash);
       if(!licenseQuery&&candidates.length!==1)candidates=[];
       if(candidates.length>1){
-        await this.store.update((state)=>{const current=init(state).requests[id];if(this.scoped(current)){current.candidates=clone(candidates);current.candidateVersion=hash(candidates);}});
+        await this.store.update((state)=>{const current=init(state).requests[id];if(this.scoped(current)){current.candidates=clone(candidates);current.candidateVersion=hash([OBJECT_SELECTION_POLICY,candidates]);}});
         const descriptions=[];let length=0;for(const [index,item] of candidates.slice(0,20).entries()){
           const line=`${index+1}. ${item.licenseNumber}; ${item.issueDate} — ${item.expiryDate}; ${item.address}`;if(length+line.length>3400)break;
           descriptions.push(line);length+=line.length+1;
@@ -362,14 +485,15 @@ export class RegistryCompletionWorker{
         await this.prompt(id,'multiple_objects',`${safeText(request.organization,200)}\nСтрока ${row.rowNumber}. Выбери объект лицензии:\n${descriptions.join('\n')}\nОтветь номером из списка или пришли адрес.${candidates.length>descriptions.length?' Другие объекты в этот список не вошли.':''}`,
           descriptions.map((_,index)=>[{text:`Объект ${index+1}`,callback_data:`rg:${id}:object:${index+1}`} ]));return {saved:0,fetched};
       }
-      if(!candidates.length&&licenseQuery){await this.retryPrompt(id,represented?'represented_license':'no_matching_active_license',cache);return {saved:0,fetched};}
+      if(!candidates.length&&licenseQuery){await this.retryPrompt(id,held.has('represented_license')?'represented_license':'no_matching_active_license',cache);return {saved:0,fetched};}
       const license=candidates[0];
       if(license){
         if(row.issueDate&&license.issueDate<row.issueDate||row.expiryDate&&license.expiryDate<row.expiryDate){await this.retryPrompt(id,'api_older_than_existing',cache);return {saved:0,fetched};}
         const fields={inn:license.inn,licenseNumber:license.licenseNumber,issueDate:license.issueDate,expiryDate:license.expiryDate,address:license.address,
           ...(mapActivityForSheet(license.activity)?{activity:mapActivityForSheet(license.activity)}:{}),...(validEmail(license.email)?{email:license.email}:{})};
         const updates=[];for(const [key,value] of Object.entries(fields)){const column=COL[key],before=values[INDEX[column]];
-          if(before==='')updates.push({column,after:value});else if(!['K','P'].includes(column)&&!same(column,before,value))conflicts.push({column,before,after:value});}
+          if(before==='')updates.push({column,after:value});else if(!['K','P'].includes(column)
+            &&(column==='L'?compareObjects(before,value)!=='same':!same(column,before,value)))conflicts.push({column,before,after:value});}
         if(conflicts.length){await this.prompt(id,'existing_values_conflict',conflictText(request,conflicts));return {saved:0,fetched};}
         if(updates.length)return {saved:Number(await this.planAndApply(id,updates,'fsrar')),fetched};
       }

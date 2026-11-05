@@ -42,6 +42,7 @@ const REASONS = Object.freeze({
   google_credentials_missing_or_invalid: 'Не настроен серверный доступ к Google.',
   google_network_error: 'Не удалось связаться с Google.',
   google_request_failed: 'Google отклонил запрос к реестру.',
+  google_rate_limited: 'Google временно ограничил частоту запросов. Очередь сохранена; проверка повторится автоматически.',
   google_token_unavailable: 'Не удалось подтвердить серверный вход в Google.',
   google_write_failed: 'Запись в Google-реестре пока не подтверждена.',
   sheet_plan_stale: 'Строка реестра изменилась во время обработки.',
