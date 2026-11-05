@@ -348,7 +348,8 @@
     if(!state.data.to)add('to','Укажите, нужно ли техническое описание (ТО)',1);
     if(!state.data.bti)add('compare','Укажите результат сверки планировки',1);
     if(state.data.bti==='Нет'&&!p.plan_note.trim())add('note','Кратко опишите изменения планировки',1);
-    if(state.data.bti==='Нет'||state.data.to==='Нужно')add('changes','Есть изменения планировки или требуется ТО',1);
+    if(state.data.bti==='Нет')add('changes','Планировка отличается от представленного плана',1);
+    if(state.data.to==='Нужно')add('technical-description','Требуется техническое описание (ТО)',1);
     if(state.data.object_category==='tobacco'){[['tobacco_display','Выкладка'],['tobacco_price_list','Перечень с ценами'],['tobacco_advertising','Реклама']].forEach(function(pair){if(!p[pair[0]]||p[pair[0]]==='Не проверено')add(pair[0],'Табак: '+pair[1].toLowerCase()+' не проверены',1);});if(p.tobacco_display==='Открытая'||p.tobacco_price_list==='Нет'||p.tobacco_advertising==='Есть')add('tobacco','Есть замечания по торговле табаком',1);}
     else {if(!p.alcohol_present||p.alcohol_present==='Не проверено')add('alcohol','Зафиксируйте наличие алкоголя',1);if(p.service==='Получение'&&p.alcohol_present==='Да')add('alcohol-new','Для получения нужно убрать алкоголь',1);if(isRenewal()&&p.alcohol_present==='Да'&&p.alcohol_within_licensed!=='Да')add('alcohol-zone','Размещение алкоголя требует проверки',1);}
     if(isRenewal()&&state.data.workflow.archive_skipped==='Да')add('archive-skip','Архивная сверка не выполнена',0);else if(isRenewal()&&!packetFiles().concat(state.evidence).some(function(f){return f.role==='archive';}))add('archive','Добавьте графику архива или пропустите архив',0);
@@ -357,6 +358,10 @@
   }
 
   function tasksHtml(tasks) { return '<div class="task-list">' + tasks.map(function (t) { return '<div class="task"><div class="task-main"><p>' + esc(t.title) + '</p>' + (t.detail ? '<small>' + esc(t.detail) + '</small>' : '') + '</div><button type="button" data-go-step="' + t.step + '">'+(['Территория →','Помещение →','Отчёт →'][t.step]||'Открыть')+'</button></div>'; }).join('') + '</div>'; }
+  function offersActions(tasks) {
+    var outcome=state.data.workflow.conclusion_status;
+    return !state.frozen && tasks.length>0 && (!outcome || outcome==='ready');
+  }
   function reportFeedback(tasks) {
     if(!tasks.length)return '<section id="report-feedback" hidden></section>';
     var ready=state.data.workflow.conclusion_status==='ready';
@@ -368,7 +373,12 @@
   }
   function refreshReportFeedback() {
     var area=$('#report-feedback');if(!area)return;
-    area.outerHTML=reportFeedback(issues());var next=$('#report-feedback');if(next)bindReportFeedback(next);
+    var tasks=issues();
+    area.outerHTML=reportFeedback(tasks);var next=$('#report-feedback');if(next)bindReportFeedback(next);
+    if(state.frozen)return;
+    var button=$('#submit-audit'),hint=$('#submit-outcome'),actions=offersActions(tasks);
+    if(button)button.textContent=actions?'Отправить с замечаниями':'Отправить отчёт';
+    if(hint)hint.hidden=!actions;
   }
   function chooseConclusion(value) {
     if(state.submitting||state.frozen||!['actions','insufficient'].includes(value))return;
@@ -382,7 +392,12 @@
     if(typeof area.scrollIntoView==='function')area.scrollIntoView({block:'center',behavior:'auto'});
     if(typeof area.focus==='function')area.focus({preventScroll:true});
   }
-  function reportStep(){var tasks=issues(),p=state.data.inspection;return heading(2)+'<div class="fields">'+select('Результат','workflow.conclusion_status',[{value:'ready',label:'Соответствует по проверенным пунктам'},{value:'actions',label:'Нужны действия'},{value:'insufficient',label:'Нужно уточнить'},{value:'obstacle',label:'Есть препятствие'}],'',true)+input('Комментарий аудитора · необязательно','conclusion',{type:'textarea',wide:true,maxlength:6000})+input('Клиент сообщил / договорённости','workflow.followup_notes',{type:'textarea',wide:true,maxlength:2000})+input((state.packet&&(state.packet.video_required||state.packet.has_video))?'Видео в Яндекс Диске':'Видео · необязательно','workflow.video_url',{type:'url',maxlength:2000,placeholder:'https://disk.yandex.ru/d/…'})+(state.data.workflow.video_url?select('Доступность видео','inspection.video_status',['Сделано','Снято — загрузить позже','Не сделано','Не проверено']):'')+input('Дата осмотра','inspection.visit_date',{type:'date'})+'</div>'+reportPreview()+reportFeedback(tasks)+'<button type="button" class="button primary full" id="submit-audit">Отправить отчёт</button><p class="field-note" id="submit-status" role="status" aria-live="polite"></p>';}
+  function reportStep(){
+    var tasks=issues(),actions=offersActions(tasks);
+    return heading(2)+'<div class="fields">'+select('Результат','workflow.conclusion_status',[{value:'ready',label:'Соответствует по проверенным пунктам'},{value:'actions',label:'Нужны действия'},{value:'insufficient',label:'Нужно уточнить'},{value:'obstacle',label:'Есть препятствие'}],'',true)+input('Комментарий аудитора · необязательно','conclusion',{type:'textarea',wide:true,maxlength:6000})+input('Клиент сообщил / договорённости','workflow.followup_notes',{type:'textarea',wide:true,maxlength:2000})+input((state.packet&&(state.packet.video_required||state.packet.has_video))?'Видео в Яндекс Диске':'Видео · необязательно','workflow.video_url',{type:'url',maxlength:2000,placeholder:'https://disk.yandex.ru/d/…'})+(state.data.workflow.video_url?select('Доступность видео','inspection.video_status',['Сделано','Снято — загрузить позже','Не сделано','Не проверено']):'')+input('Дата осмотра','inspection.visit_date',{type:'date'})+'</div>'+reportPreview()+reportFeedback(tasks)+
+      '<p class="field-note" id="submit-outcome"'+(actions?'':' hidden')+'>Итог будет «Нужны действия». Ответы и комментарий сохранятся.</p>'+
+      '<button type="button" class="button primary full" id="submit-audit" aria-describedby="submit-outcome">'+(actions?'Отправить с замечаниями':'Отправить отчёт')+'</button><p class="field-note" id="submit-status" role="status" aria-live="polite"></p>';
+  }
   function reportPreview(){
     var p=state.data.inspection,result=state.data.workflow.territory_result,rows=[['Здание',state.data.building_type],['Этаж','план: '+(p.floor_plan||'—')+' · факт: '+(p.floor_actual||'—')],['Кадастры',(p.cadastral_count||'—')+(Number(p.cadastral_count)>1?' · '+(p.inter_cadastral_boundary||'—'):'')],['Границы',p.within_cadastral],['Вся площадь по плану',p.rooms_complete],['ТО',state.data.to],['Кассы',(p.kkt_count||'—')+' · касса ИП: '+(p.kkt_ip||'—')]];
     if(state.data.object_category!=='tobacco')rows.push(['Алкоголь',p.alcohol_present]);else rows.push(['Табак',[p.tobacco_display,p.tobacco_price_list,p.tobacco_advertising].filter(Boolean).join(' · ')]);
@@ -488,7 +503,7 @@
       if(evidenceFor('zone',zid).length&&!window.confirm('Убрать карточку организации и её фото из отчёта?'))return;
       state.data.zones=state.data.zones.filter(function(z){return z.id!==zid;});changed();render();
     };});
-    b = $('#submit-audit'); if (b) b.onclick = submit;
+    b = $('#submit-audit'); if (b) b.onclick = function(){return submit(!state.frozen&&offersActions(issues())?'actions':'');};
   }
   function openExternal(url){return actions.openExternal(url,tg,function(href,target){return window.open(href,target);},window);}
   function showRoute(){
@@ -692,16 +707,17 @@
       frozenSnapshot(null);
     }
   }
-  async function submit(){
+  async function submit(outcome){
     if(state.submitting)return;
     if(state.pendingUploads){notify('Дождитесь загрузки выбранных файлов.');return;}
     try{if(editor&&editor.flush)await editor.flush();}catch(error){notify(error.message);return;}
     var p=state.data.inspection;
     if(!state.frozen){
       if(!p.org.trim()||!p.address.trim()||!p.service){notify('В заявке не хватает данных. Менеджеру нужно дополнить объект, адрес или услугу. Наблюдения сохранены в черновике.');go(0);return;}
-      if(!state.data.workflow.conclusion_status){notify('Выберите результат проверки.');return;}
       var missingTerritory=[];territoryIssues(function(key,title){missingTerritory.push(title);},true);
       if(missingTerritory.length){notify(missingTerritory[0]);showReportIssues();return;}
+      if(outcome==='actions'&&offersActions(issues()))chooseConclusion('actions');
+      if(!state.data.workflow.conclusion_status){notify('Выберите результат проверки.');return;}
       if(state.data.workflow.conclusion_status==='ready'&&issues().length){showReportIssues();return;}
       if(!state.data.conclusion.trim())state.data.conclusion=({ready:'Соответствует по проверенным пунктам',actions:'Нужны действия',insufficient:'Недостаточно данных',obstacle:'Выявлено препятствие'})[state.data.workflow.conclusion_status];
       state.data.ui_version=5;state.data.inspection.region='МСК';

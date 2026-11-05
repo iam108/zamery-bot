@@ -58,7 +58,7 @@ function harness(data = compactVisit()) {
   };
   vm.createContext(c);
   vm.runInContext(['queue','isRenewal','packetFiles','evidenceFor','adoptRevision','removeGeneratedEvidence','mapMode','rememberTerritory','switchTerritoryMode','chooseTerritory','hasEvidenceImage','validDistance','territoryIssues','issues','tasksHtml',
-    'reportFeedback','bindReportFeedback','refreshReportFeedback','chooseConclusion','showReportIssues','reportPreview','submit'].map(actualFunction).join('\n'), c);
+    'offersActions','reportFeedback','bindReportFeedback','refreshReportFeedback','chooseConclusion','showReportIssues','reportPreview','submit'].map(actualFunction).join('\n'), c);
   return { c, calls, node };
 }
 
@@ -85,6 +85,26 @@ test('a blocked positive result does not create a stale positive comment before 
   const data = compactVisit(); data.inspection.rooms_complete = 'Нет'; data.conclusion = '';
   const { c } = harness(data); await c.submit();
   assert.equal(c.state.data.conclusion, '');
+});
+
+for (const previous of ['', 'ready']) test('sending with findings keeps the truthful acquisition answers and comment from ' + (previous || 'an unset outcome'), async () => {
+  const data = compactVisit();
+  data.inspection.alcohol_present = 'Да';
+  data.to = 'Нужно';
+  data.conclusion = 'Зон нет. Алкоголь есть, ТО нужно.';
+  data.workflow.conclusion_status = previous;
+  const { c, calls, node } = harness(data);
+  c.refreshReportFeedback();
+  assert.equal(node('#submit-audit').textContent, 'Отправить с замечаниями');
+  assert.equal(node('#submit-outcome').hidden, false);
+  await c.submit('actions');
+  assert.equal(c.state.completed, true);
+  assert.equal(calls.filter(([name, url]) => name === 'request' && url === '/api/audit').length, 1);
+  assert.equal(c.state.data.workflow.conclusion_status, 'actions');
+  assert.equal(c.state.data.inspection.alcohol_present, 'Да');
+  assert.equal(c.state.data.to, 'Нужно');
+  assert.equal(c.state.data.building_type, 'Жилое');
+  assert.equal(c.state.data.conclusion, 'Зон нет. Алкоголь есть, ТО нужно.');
 });
 
 for (const outcome of ['actions', 'insufficient']) test('explicitly choosing ' + outcome + ' preserves observations and requires a separate Send click', async () => {
