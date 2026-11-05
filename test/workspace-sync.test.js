@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
 const { createHash, randomBytes } = require('node:crypto');
 const { test } = require('node:test');
+const { LISTS } = require('../src/checklists');
 const { SESSION_DDL, setupWorkspace, parsePairing, approvePairing, canPair } = require('../src/web/workspace');
 
 const token = () => randomBytes(32).toString('base64url');
@@ -142,6 +143,50 @@ test('lawyers see assigned active cases, managers see cases they handed off, and
   const handedOff = await request('GET', 'snapshot', manager);
   assert.deepEqual(handedOff.body.clients.map(c => c.id).sort(), ['1', '2']);
   assert.ok(handedOff.body.tasks.every(t => !t.editable));
+}));
+
+test('workspace checklist keeps actual answers and missing documents grouped and hides inapplicable data', pg, async () => database(async ({ db, request, connect }) => {
+  const checklist = LISTS.MSK_OBSH;
+  const find = label => checklist.sections.flatMap(section => section.i).find(item => item.l === label);
+  const rent = find('Акт приёма-передачи');
+  const owner = find('Право собственности подтверждено');
+  const address = find('Адрес соответствует ФИАС');
+  const egrn = find('На здание / помещение №');
+  const choices = {
+    basis: 'Собственность',
+    building: 'Нежилое',
+    graph_dog: 'Есть',
+    [rent.id]: { s: 'bad', c: 'hidden rent answer' },
+    [owner.id]: { s: 'na', by: 'private author name' },
+    [address.id]: { s: 'bad', c: 'Уточнить\nкорпус\u202e' },
+    [egrn.id]: '77:01:0000001:20',
+    fl_arrest: { s: 'yes', c: 'Сверить запись' },
+    docs: { m: { 'Выписка из ЕГРН': 'ok', 'Технический план': 'bad', unrelated: 'private document' }, other: 'Акт осмотра' },
+    _handoff: { secret: 'private handoff' },
+  };
+  await db.query('UPDATE cases SET checklist_key=$1, service=$2, data=$3 WHERE id=1', ['MSK_OBSH', 'Получение', choices]);
+  const credential = await connect(101);
+  const { body } = await request('GET', 'snapshot', credential);
+  const client = body.clients[0];
+  const items = client.checklistSections.flatMap(section => section.items);
+  const result = id => items.find(item => item.id === id);
+  assert.equal(client.checklistSections[0].title, 'Паспорт объекта');
+  assert.deepEqual(client.checklist, items.map(item => item.title));
+  assert.deepEqual(result('basis'), { id: 'basis', title: 'Основание', state: 'complete', value: 'Собственность' });
+  assert.equal(result('graph_egrn').state, 'pending');
+  assert.equal(result('graph_egrn').value, '');
+  assert.equal(result(rent.id), undefined);
+  assert.equal(result('graph_dog'), undefined);
+  assert.equal(result(find('Юр. адрес совпадает с РАР').id), undefined);
+  assert.equal(result(owner.id).value, 'Н/П');
+  assert.equal(result(egrn.id).value, '77:01:0000001:20');
+  assert.equal(result(address.id).state, 'attention');
+  assert.equal(result(address.id).value, 'Проблема · Уточнить корпус');
+  assert.equal(result('fl_arrest').state, 'attention');
+  assert.equal(result('fl_arrest').value, 'Есть · Сверить запись');
+  assert.equal(result('docs').state, 'attention');
+  assert.match(result('docs').value, /Нет: Технический план\nДополнительно не хватает: Акт осмотра\nЕсть: Выписка из ЕГРН\nНе проверено:/);
+  assert.doesNotMatch(JSON.stringify(client), /hidden rent answer|private author name|private document|private handoff/);
 }));
 
 test('reminder writes are owner scoped and note writes are compare-and-swap', pg, async () => database(async ({ db, request, connect }) => {

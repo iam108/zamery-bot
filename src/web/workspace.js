@@ -51,15 +51,62 @@ function canPair(staff) {
   return staff && staff.approved === true && WORKSPACE_ROLES.includes(staff.role);
 }
 
-function checklistTitles(caseRow) {
+function checklistText(value) {
+  if (typeof value !== 'string') return '';
+  return value.replace(/[\s\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]+/g, ' ').trim().slice(0, 500);
+}
+
+function checklistDocuments(item, answer) {
+  const marks = answer?.m || {};
+  const missing = item.o.filter(name => marks[name] === 'bad');
+  const present = item.o.filter(name => marks[name] === 'ok');
+  const pending = item.o.filter(name => !['ok', 'bad'].includes(marks[name]));
+  const other = checklistText(answer?.other);
+  if (!missing.length && !present.length && !other) return { state: 'pending', value: '' };
+  const lines = [];
+  if (missing.length) lines.push('Нет: ' + missing.join(', '));
+  if (other) lines.push('Дополнительно не хватает: ' + other);
+  if (present.length) lines.push('Есть: ' + present.join(', '));
+  if (pending.length) lines.push('Не проверено: ' + pending.join(', '));
+  const state = missing.length || other ? 'attention' : pending.length ? 'pending' : 'complete';
+  return { state, value: lines.join('\n') };
+}
+
+function checklistAnswer(item, answer) {
+  const pending = { state: 'pending', value: '' };
+  if (item.t === 'docs') return checklistDocuments(item, answer);
+  if (item.t === 'k' || item.t === 'flag') {
+    const problem = item.t === 'k' ? 'bad' : 'yes';
+    const options = item.t === 'k' ? { ok: 'Ок', bad: 'Проблема', na: 'Н/П' } : { no: 'Нет', yes: 'Есть' };
+    if (typeof answer?.s !== 'string' || !Object.hasOwn(options, answer.s)) return pending;
+    const attention = answer.s === problem;
+    const detail = attention && checklistText(answer.c);
+    const value = detail ? options[answer.s] + ' · ' + detail : options[answer.s];
+    return { state: attention ? 'attention' : 'complete', value };
+  }
+  if ((item.t === 'p' || item.t === 'r') && item.o.includes(answer)) return { state: 'complete', value: answer };
+  if (item.t === 'f' || item.t === 'd') {
+    const value = checklistText(answer);
+    if (value) return { state: 'complete', value };
+  }
+  return pending;
+}
+
+function checklistSections(caseRow) {
+  if (!Object.hasOwn(LISTS, caseRow.checklist_key)) return [];
   const list = LISTS[caseRow.checklist_key];
-  if (!list) return [];
   const data = caseRow.checklist_choices || {};
   const visible = item => !item.when || Object.entries(item.when).every(([key, value]) => {
     if (key === 'svc') return caseRow.service === value;
     return (data[key] === undefined && !item.strict) || data[key] === value;
   });
-  return list.passport.concat(list.sections.flatMap(section => section.i)).filter(visible).map(item => item.l);
+  const groups = [{ id: 'passport', title: 'Паспорт объекта', items: list.passport }];
+  for (const section of list.sections) groups.push({ id: section.t, title: section.t, items: section.i });
+  return groups.map(group => ({
+    id: group.id,
+    title: group.title,
+    items: group.items.filter(visible).map(item => ({ id: item.id, title: item.l, ...checklistAnswer(item, data[item.id]) })),
+  })).filter(group => group.items.length);
 }
 
 function makeSnapshot(account, cases, now) {
@@ -68,6 +115,7 @@ function makeSnapshot(account, cases, now) {
   for (const row of cases) {
     const id = String(row.id);
     const stage = row.stage || STAGES[0];
+    const sections = checklistSections(row);
     clients.push({
       id,
       name: row.org || 'Клиент #' + id,
@@ -75,7 +123,8 @@ function makeSnapshot(account, cases, now) {
       kind: [row.service, row.kind].filter(Boolean).join(' · '),
       stage,
       report: row.audit_text || '',
-      checklist: checklistTitles(row),
+      checklist: sections.flatMap(section => section.items.map(item => item.title)),
+      checklistSections: sections,
       note: row.note || '',
       done: row.done || 0,
       total: row.total || 0,
