@@ -116,6 +116,7 @@ function makeSnapshot(account, cases, now) {
     const id = String(row.id);
     const stage = row.stage || STAGES[0];
     const sections = checklistSections(row);
+    const checklistItems = sections.flatMap(section => section.items);
     clients.push({
       id,
       name: row.org || 'Клиент #' + id,
@@ -123,11 +124,11 @@ function makeSnapshot(account, cases, now) {
       kind: [row.service, row.kind].filter(Boolean).join(' · '),
       stage,
       report: row.audit_text || '',
-      checklist: sections.flatMap(section => section.items.map(item => item.title)),
+      checklist: checklistItems.map(item => item.title),
       checklistSections: sections,
       note: row.note || '',
-      done: row.done || 0,
-      total: row.total || 0,
+      done: checklistItems.filter(item => item.state !== 'pending').length,
+      total: checklistItems.length,
     });
     for (const reminder of row.reminders || []) {
       tasks.push({

@@ -164,13 +164,15 @@ test('workspace checklist keeps actual answers and missing documents grouped and
     docs: { m: { 'Выписка из ЕГРН': 'ok', 'Технический план': 'bad', unrelated: 'private document' }, other: 'Акт осмотра' },
     _handoff: { secret: 'private handoff' },
   };
-  await db.query('UPDATE cases SET checklist_key=$1, service=$2, data=$3 WHERE id=1', ['MSK_OBSH', 'Получение', choices]);
+  await db.query('UPDATE cases SET checklist_key=$1, service=$2, data=$3,done=99,total=999 WHERE id=1', ['MSK_OBSH', 'Получение', choices]);
   const credential = await connect(101);
   const { body } = await request('GET', 'snapshot', credential);
   const client = body.clients[0];
   const items = client.checklistSections.flatMap(section => section.items);
   const result = id => items.find(item => item.id === id);
   assert.equal(client.checklistSections[0].title, 'Паспорт объекта');
+  assert.equal(client.total, items.length, 'Progress counts the same currently applicable items as the sheet');
+  assert.equal(client.done, items.filter(item => item.state !== 'pending').length, 'Stale stored progress cannot contradict saved answers');
   assert.deepEqual(client.checklist, items.map(item => item.title));
   assert.deepEqual(result('basis'), { id: 'basis', title: 'Основание', state: 'complete', value: 'Собственность' });
   assert.equal(result('graph_egrn').state, 'pending');
