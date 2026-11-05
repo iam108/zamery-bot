@@ -215,7 +215,7 @@ async function handleAuditReportInner(ctx, data, progress) {
   var textParts = splitTelegramHtml(text);
   for (let i = progress.textIds.length; i < textParts.length; i++) {
     const m = await tgRetry(function () { return tg.sendMessage(GROUP_ID, textParts[i], {
-      parse_mode: 'HTML', reply_to_message_id: replyToMsgId || undefined,
+      parse_mode: 'HTML', reply_to_message_id: replyToMsgId || undefined, allow_sending_without_reply: true,
       ...(presentation ? { link_preview_options: { is_disabled: true } } : {}),
     }); });
     progress.textIds.push(m.message_id);
@@ -225,28 +225,54 @@ async function handleAuditReportInner(ctx, data, progress) {
   const mediaPacket = presentation ? presentationMedia(data, { summaryText: plain.join('\n') }) : deliveryMedia(data);
   const photos = mediaPacket.photos;
   const documents = mediaPacket.documents;
+  function invalidPhoto(error) {
+    return error.response?.error_code === 400 &&
+      /PHOTO_INVALID|PHOTO_EXT_INVALID|IMAGE_PROCESS_FAILED|IMAGE_PROCESSING_FAILED/i.test(error.response.description || error.message || '');
+  }
+  function previewSource(photo) {
+    return presentation && photo.source ? photo.source : Buffer.from(photo.data, 'base64');
+  }
+  async function sendPreview(photo) {
+    const options = { caption: photoCaption(photo, data.order_id, presentation ? data : undefined),
+      reply_to_message_id: progress.textIds[0], allow_sending_without_reply: true };
+    try { return await tgRetry(() => tg.sendPhoto(GROUP_ID, { source: previewSource(photo) }, options)); }
+    catch (error) {
+      if (!invalidPhoto(error)) throw error;
+      return tgRetry(() => tg.sendDocument(GROUP_ID,
+        { source: previewSource(photo), filename: photo.name || 'Фото-выезда.jpg' }, options));
+    }
+  }
   if (photos.length) {
     try {
       for (let offset = progress.photoIds.length; offset < photos.length;) {
         const batch = photos.slice(offset, offset + 10);
-      if (batch.length === 1) {
-        const photo = batch[0];
-        const m = await tgRetry(function () { return tg.sendPhoto(GROUP_ID,
-          { source: presentation && photo.source ? photo.source : Buffer.from(photo.data, 'base64') },
-          { caption: photoCaption(photo, data.order_id, presentation ? data : undefined), reply_to_message_id: progress.textIds[0] }); });
-        progress.photoIds.push(m.message_id);
-      } else {
-        const media = batch.map(function (p) {
-          return { type: 'photo', media: { source: presentation && p.source ? p.source : Buffer.from(p.data, 'base64') }, caption: photoCaption(p, data.order_id, presentation ? data : undefined) };
-        });
-        const msgs = await tgRetry(function () { return tg.sendMediaGroup(GROUP_ID, media, { reply_to_message_id: progress.textIds[0] }); });
-        msgs.forEach(function (m) { progress.photoIds.push(m.message_id); });
-      }
+        if (batch.length === 1) {
+          const message = await sendPreview(batch[0]);
+          progress.photoIds.push(message.message_id);
+          await checkpoint();
+        } else {
+          try {
+            const media = batch.map(photo => ({ type: 'photo', media: { source: previewSource(photo) },
+              caption: photoCaption(photo, data.order_id, presentation ? data : undefined) }));
+            const messages = await tgRetry(() => tg.sendMediaGroup(GROUP_ID, media,
+              { reply_to_message_id: progress.textIds[0], allow_sending_without_reply: true }));
+            messages.forEach(message => progress.photoIds.push(message.message_id));
+            await checkpoint();
+          } catch (error) {
+            if (!invalidPhoto(error)) throw error;
+            // A rejected photo album has no receipts. Deliver each original
+            // separately so a panorama cannot strand the whole report.
+            for (const photo of batch) {
+              const message = await sendPreview(photo);
+              progress.photoIds.push(message.message_id);
+              await checkpoint();
+            }
+          }
+        }
         offset = progress.photoIds.length;
-        await checkpoint();
       }
-    } catch (e) {
-      console.error('audit photos:', e.message);
+    } catch (error) {
+      console.error('audit photos:', error.code || error.response?.error_code || error.name || 'error');
       throw new Error('Текст отчёта отправлен, но фотографии не доставлены. Повторите отправку — уже отправленный текст не продублируется.');
     }
   }
@@ -262,11 +288,11 @@ async function handleAuditReportInner(ctx, data, progress) {
         };
         if (batch.length === 1) {
           const file = batch[0];
-          const m = await tgRetry(() => tg.sendDocument(GROUP_ID, { source: file.source || Buffer.from(file.data, 'base64'), filename: file.name }, { caption: caption(file), reply_to_message_id: progress.textIds[0] }));
+          const m = await tgRetry(() => tg.sendDocument(GROUP_ID, { source: file.source || Buffer.from(file.data, 'base64'), filename: file.name }, { caption: caption(file), reply_to_message_id: progress.textIds[0], allow_sending_without_reply: true }));
           progress.documentIds.push(m.message_id);
         } else {
           const media = batch.map(file => ({ type: 'document', media: { source: file.source || Buffer.from(file.data, 'base64'), filename: file.name }, caption: caption(file) }));
-          const msgs = await tgRetry(() => tg.sendMediaGroup(GROUP_ID, media, { reply_to_message_id: progress.textIds[0] }));
+          const msgs = await tgRetry(() => tg.sendMediaGroup(GROUP_ID, media, { reply_to_message_id: progress.textIds[0], allow_sending_without_reply: true }));
           msgs.forEach(m => progress.documentIds.push(m.message_id));
         }
         offset = progress.documentIds.length;

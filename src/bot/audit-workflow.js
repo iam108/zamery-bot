@@ -241,7 +241,7 @@ function buildSimpleReport(data) {
   return { plain, html: plain.map(esc) };
 }
 
-function hydrateDraftReport(draft) {
+function activeDraftEvidence(draft) {
   const input = draft.data;
   const territoryResult = input?.ui_version === 5 && input.workflow?.territory_result;
   const explicitTerritory = territoryResult === 'clear' || territoryResult === 'findings';
@@ -260,6 +260,14 @@ function hydrateDraftReport(draft) {
       return file.subject_id !== 'attached' && (!map?.preview_evidence_id || file.id === map.preview_evidence_id);
     });
   }
+  return files;
+}
+
+function hydrateDraftReport(draft) {
+  const input = draft.data;
+  const territoryResult = input?.ui_version === 5 && input.workflow?.territory_result;
+  const explicitTerritory = territoryResult === 'clear' || territoryResult === 'findings';
+  const files = activeDraftEvidence(draft);
   const activeEvidence = files.map(({ buffer, data: ignored, ...meta }) => meta);
   const data = normalizeWorkflow({ ...input, evidence: activeEvidence, schema_version: 3, order_id: draft.order_id || null, submit_id: 'draft:' + draft.id + ':' + draft.revision });
   if (explicitTerritory) {
@@ -449,4 +457,4 @@ function buildCompactWorkflowReport(data) {
   return { plain, html: plain.map(esc) };
 }
 
-module.exports = { normalizeWorkflow, validateWorkflow, buildWorkflowReport, followupTasks, hydrateDraftReport, CONCLUSIONS, TERRITORY_CLEAR_LABEL };
+module.exports = { activeDraftEvidence, normalizeWorkflow, validateWorkflow, buildWorkflowReport, followupTasks, hydrateDraftReport, CONCLUSIONS, TERRITORY_CLEAR_LABEL };

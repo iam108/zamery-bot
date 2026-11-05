@@ -236,6 +236,7 @@
     const controller = new AbortController(), signal = controller.signal;
     let state = normalise(options.getState?.()), image = null, alive = true, loadToken = 0, sourceLoading = false;
     let activeTool = kind === 'map' ? 'edit' : 'boundary', selected = null, selectedVertex = -1, zoom = 1, fitScale = 1;
+    let choosing = false;
     let past = [], future = [], saveTail = Promise.resolve(), saveError = null, revision = 0, pointer = null;
     let chooserToken = 0, candidate = null, renderTask = null;
     const el = (tag, text, cls) => { const n = document.createElement(tag); if (text !== undefined && text !== null) n.textContent = text; if (cls) n.className = cls; return n; };
@@ -399,6 +400,7 @@
       chooser.showModal(); if (state.evidence_id) await loadCandidate(state.evidence_id, state.page);
     }
     async function loadCandidate(id, page) {
+      if (choosing) return;
       const token = ++chooserToken; renderTask?.cancel(); renderTask = null; candidate?.pdf?.destroy(); candidate = null; selectPage.disabled = true; prev.disabled = next.disabled = true; previewCanvas.width = previewCanvas.height = 1;
       if (!id) { chooserStatus.textContent = 'Выберите исходный файл.'; return; }
       const evidence = (options.evidence || []).find(e => String(e.id) === String(id)); if (!evidence) return;
@@ -410,7 +412,7 @@
       }
     }
     async function candidatePage(page) {
-      if (!candidate || page < 1 || page > candidate.pages) return;
+      if (choosing || !candidate || page < 1 || page > candidate.pages) return;
       const token = ++chooserToken, resource = candidate; resource.page = page; resource.rendered = null; renderTask?.cancel(); selectPage.disabled = true;
       prev.disabled = page <= 1; next.disabled = page >= resource.pages; pageLabel.textContent = 'Страница ' + page + ' из ' + resource.pages; chooserStatus.textContent = 'Загружаю страницу…';
       try { const output = await pageImage(resource, page, task => { renderTask = task; }); if (!alive || token !== chooserToken || !chooser.open || resource !== candidate) return;
@@ -418,11 +420,30 @@
       } catch (e) { if (token === chooserToken && e.name !== 'RenderingCancelledException') chooserStatus.textContent = 'Не удалось отобразить страницу. Выберите другую.'; }
     }
     async function useCandidate() {
-      if (!candidate?.rendered || candidate.renderedPage !== candidate.page) return;
-      const chosen = candidate, nextState = selectSource(state, chosen.evidence.id, chosen.page), changed = String(state.evidence_id) !== String(nextState.evidence_id) || state.page !== nextState.page;
-      state = nextState; selectPage.disabled = true;
-      try { await persist(); image = chosen.rendered; sourceLoading = false; if (changed) { past = []; future = []; selected = null; selectedVertex = -1; } chooser.close(); draw(); requestAnimationFrame(fitImage); notice('Лист выбран; исходный документ сохранён отдельно.'); }
-      catch (e) { chooserStatus.textContent = 'Не удалось сохранить выбранный лист. Повторите.'; selectPage.disabled = false; }
+      if (choosing || !candidate?.rendered || candidate.renderedPage !== candidate.page) return;
+      const chosenImage = candidate.rendered;
+      const nextState = selectSource(state, candidate.evidence.id, candidate.page);
+      const changed = String(state.evidence_id) !== String(nextState.evidence_id) || state.page !== nextState.page;
+      state = nextState;
+      choosing = true;
+      selectPage.disabled = prev.disabled = next.disabled = sourceSelect.disabled = upload.disabled = true;
+      try {
+        await persist();
+        image = chosenImage;
+        sourceLoading = false;
+        if (changed) { past = []; future = []; selected = null; selectedVertex = -1; }
+        chooser.close();
+        draw();
+        requestAnimationFrame(fitImage);
+        notice('Лист выбран; исходный документ сохранён отдельно.');
+      } catch (e) {
+        chooserStatus.textContent = 'Не удалось сохранить выбранный лист. Повторите.';
+        selectPage.disabled = false;
+      } finally {
+        choosing = false;
+        sourceSelect.disabled = upload.disabled = false;
+        if (candidate) { prev.disabled = candidate.page <= 1; next.disabled = candidate.page >= candidate.pages; }
+      }
     }
     on(sourceSelect, 'change', () => loadCandidate(sourceSelect.value, 1));
     on(uploadInput, 'change', async () => { const file = uploadInput.files?.[0]; if (!file) return; chooserStatus.textContent = 'Загружаю оригинал…'; upload.disabled = true; try {

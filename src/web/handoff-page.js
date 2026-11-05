@@ -32,7 +32,7 @@ function handoffModel() {
   function gallery(media) { return (media || []).filter(function (file) { return isImage(file) && !isSource(file); }).sort(function (a, b) { var rank = { map: 0, plan: 1, entrance: 2, zone: 3, interior: 4 }; return (rank[a.role] == null ? 5 : rank[a.role]) - (rank[b.role] == null ? 5 : rank[b.role]); }); }
   function packageInfo(packet) {
     var report = packet && packet.report, media = report && Array.isArray(report.media) ? report.media : [], images = gallery(media);
-    return { report: !!(report && text(report.text)), maps: images.filter(function (f) { return f.role === 'map'; }).length, plans: images.filter(function (f) { return f.role === 'plan'; }).length, photos: images.filter(function (f) { return ['map', 'plan'].indexOf(f.role) < 0; }).length, originals: media.length, materials: packet && Array.isArray(packet.materials) ? packet.materials.length : 0, video: !!(report && text(report.video_url)), egrn: packet && packet.egrn ? packet.egrn.status : 'unknown', known: !!packet && packet.files_known !== false && (!report || report.src !== 'r' || media.length > 0), materialsKnown: !!packet && packet.files_known !== false && Array.isArray(packet.materials) };
+    return { report: !!(report && text(report.text)), maps: images.filter(function (f) { return f.role === 'map'; }).length, plans: images.filter(function (f) { return f.role === 'plan'; }).length, photos: images.filter(function (f) { return ['map', 'plan'].indexOf(f.role) < 0; }).length, originals: media.length, egrnLinks: packet && Array.isArray(packet.egrn_links) ? packet.egrn_links.length : 0, materials: packet && Array.isArray(packet.materials) ? packet.materials.length : 0, video: !!(report && text(report.video_url)), egrn: packet && packet.egrn ? packet.egrn.status : 'unknown', known: !!packet && packet.files_known !== false && (!report || report.src !== 'r' || media.length > 0), materialsKnown: !!packet && packet.files_known !== false && Array.isArray(packet.materials) };
   }
   function safeHttp(value) { try { var u = new URL(value); return /^https?:$/.test(u.protocol) ? u.href : ''; } catch (_) { return ''; } }
   function protectedUrl(value, origin) {
@@ -79,6 +79,7 @@ function handoffClient() {
     if (info.known) { lines.push('Схемы: ' + info.maps, 'Планы: ' + info.plans, 'Фото: ' + info.photos, 'Оригиналы аудита: ' + info.originals); }
     else lines.push('Вложения старого отчёта: состав не подтверждён');
     lines.push(info.materialsKnown ? 'Документы заявки: ' + info.materials : 'Документы заявки: состав не подтверждён');
+    if (info.egrnLinks) lines.push('Крупные выписки ЕГРН по ссылке: ' + info.egrnLinks);
     lines.push(info.video ? 'Видео по ссылке' : 'Видео не приложено', egrnText(info));
     if (S.egrnOrder) lines.push('Заказать новую ЕГРН по указанному кадастровому номеру');
     return lines;
@@ -141,7 +142,9 @@ function handoffClient() {
       var assignment = S.existingAssignment;
       $('delivery-title').textContent = 'Уже передано: ' + (assignment.lawyer_name || 'юристу');
       $('delivery-text').textContent = 'Клиент №' + assignment.case_id + '.' + (assignment.delivery_complete === false ? ' Доставка этого комплекта ещё не завершена. Повторное создание клиента недоступно.' : ' Материалы отчёта можно открыть выше.');
-      $('retry-send').hidden = true;
+      $('retry-send').hidden = assignment.can_resume !== true;
+      $('retry-send').disabled = S.sending;
+      $('retry-send').textContent = S.sending ? 'Продолжаю доставку…' : 'Продолжить доставку';
     } else if (S.pending) {
       $('delivery-title').textContent = S.pending.manualReview ? 'Нужна проверка доставки' : 'Доставка не завершена';
       $('delivery-text').textContent = (S.pending.caseId ? 'Передача №' + S.pending.caseId + '. ' : '') + (S.pending.message || (orderId ? 'Подтверждение не получено. Повторите эту же передачу: новая заявка создана не будет.' : 'Подтверждение не получено. Проверьте личные сообщения юриста перед повторной отправкой.'));
@@ -189,7 +192,23 @@ function handoffClient() {
     updateFooter(); $('review').scrollIntoView({ block: 'start', behavior: 'auto' }); $('confirm-send').focus();
   }
   async function send(savedPayload) {
-    if (S.sending || readonly || S.completed || S.existingAssignment) return;
+    if (S.sending || readonly || S.completed) return;
+    if (S.existingAssignment) {
+      if (S.existingAssignment.can_resume !== true) return;
+      S.sending = true; updateFooter();
+      try {
+        var resumed = await api('/api/handoff', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ resume_case_id: S.existingAssignment.case_id }) });
+        if (resumed.delivery_complete) {
+          S.completed = { id: resumed.id, name: S.existingAssignment.lawyer_name, warn: resumed.warn || '' };
+          S.existingAssignment = null;
+        } else {
+          S.error = resumed.warn || 'Доставка ещё не завершена. Повторите попытку.';
+          S.existingAssignment.can_resume = resumed.retry !== false && resumed.manual_review !== true;
+        }
+      } catch (error) { S.error = error.message; }
+      finally { S.sending = false; save(); updateFooter(); }
+      return;
+    }
     if (!savedPayload && !S.review) return;
     var payload = savedPayload || buildPayload();
     S.sending = true;
@@ -215,7 +234,7 @@ function handoffClient() {
       } else {
         S.pending.message = error.message + (error.data && error.data.manual_review ? '' : orderId ? ' Отправка не подтверждена. Повтор продолжит эту же передачу.' : ' Отправка не подтверждена. Перед повтором проверьте сообщения юриста: заявка могла быть создана.');
         if (error.data) { S.pending.caseId = error.data.id || error.data.case_id; S.pending.manualReview = error.data.manual_review === true; S.pending.retry = error.data.retry; }
-        if (error.code === 'HANDOFF_ALREADY_ASSIGNED' && error.data && error.data.case_id) S.existingAssignment = { case_id: error.data.case_id, lawyer_name: error.data.lawyer_name || '', delivery_complete: error.data.delivery_complete };
+        if (error.code === 'HANDOFF_ALREADY_ASSIGNED' && error.data && error.data.case_id) S.existingAssignment = { case_id: error.data.case_id, lawyer_name: error.data.lawyer_name || '', delivery_complete: error.data.delivery_complete, can_resume: error.data.can_resume === true };
       }
     } finally {
       S.sending = false; save(); renderPacket(); updateFooter(); $('confirm-send').disabled = false; $('confirm-send').textContent = 'Подтвердить передачу'; (S.pending || S.completed ? $('delivery') : $('packet-error').hidden ? $('form-error') : $('packet-error')).scrollIntoView({ block: 'center', behavior: 'auto' });
@@ -248,7 +267,7 @@ function handoffClient() {
   }
   async function loadPacket(rep, options) {
     if (rep && rep.id) S.selectedReport = { id: rep.id, src: rep.src };
-    var qs = new URLSearchParams(); if (orderId) qs.set('order_id', orderId); if (rep && rep.id) { qs.set('report_src', rep.src); qs.set('report_id', rep.id); }
+    var qs = new URLSearchParams(); if (orderId) qs.set('order_id', orderId); if (requestId) qs.set('request_id', requestId); if (rep && rep.id) { qs.set('report_src', rep.src); qs.set('report_id', rep.id); }
     S.loading = true; S.packetError = ''; renderPacket(); updateFooter();
     try { applyPacket(await api('/api/handoff/packet?' + qs.toString()), options); }
     catch (error) { S.packetError = error.message; }
@@ -367,6 +386,13 @@ function handoffClient() {
     if (!url) { announce('Ссылка на оригинал недоступна.'); return; }
     var old = button.innerHTML; button.disabled = true; button.textContent = 'Скачиваю…';
     try {
+      if (/\/egrn\/[0-9a-f-]+\/link(?:\?|$)/i.test(url)) {
+        var link = await api(url), downloadUrl = M.safeHttp(link.url);
+        if (!downloadUrl) throw new Error('Не удалось открыть оригинал выписки.');
+        if (tg && tg.openLink) tg.openLink(downloadUrl);
+        else { var original = document.createElement('a'); original.href = downloadUrl; original.target = '_blank'; original.rel = 'noopener'; original.click(); }
+        return;
+      }
       var u = new URL(url, location.origin); u.searchParams.set('download', '1');
       var response = await fetch(u.pathname + u.search); if (!response.ok) throw new Error('Не удалось скачать файл. Попробуйте ещё раз.');
       var blob = await response.blob(), blobUrl = URL.createObjectURL(blob), a = document.createElement('a'); a.href = blobUrl; a.download = file.name || 'Документ'; document.body.appendChild(a); a.click(); a.remove();
@@ -385,7 +411,7 @@ function handoffClient() {
     $('report-video').hidden = !video; if (video) $('report-video').href = video;
     $('report-archive').hidden = !archive; if (archive) $('report-archive').href = archive;
     $('report-telegram').hidden = !telegram; if (telegram) $('report-telegram').href = telegram;
-    var media = Array.isArray(report.media) ? report.media : [], images = M.gallery(media), list = media.concat(S.packet.materials || []), epoch = imageEpoch;
+    var media = Array.isArray(report.media) ? report.media : [], images = M.gallery(media), list = media.concat(S.packet.materials || [], S.packet.egrn_links || []), epoch = imageEpoch;
     $('gallery').innerHTML = ''; $('gallery-empty').hidden = images.length > 0;
     $('gallery-empty').textContent = !M.packageInfo(S.packet).known ? 'Вложения старого отчёта здесь не восстановлены. Откройте оригинальные сообщения в Telegram, если ссылка доступна.' : 'Фотографии и графика к этому отчёту не приложены.';
     images.forEach(function (file) {

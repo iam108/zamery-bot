@@ -210,7 +210,7 @@ test('an otherwise ready report cannot be submitted or frozen while a territory 
   c.request = async url => { requests.push(url); return {}; }; c.adoptRevision = () => {};
   c.localStorage = { setItem() {}, removeItem() {} }; c.tg = null; c.timer = null;
   c.checkSubmissionState = async () => {};
-  load(c, 'uploadEditorSource', 'submit');
+  load(c, 'requiredIssues', 'uploadEditorSource', 'submit');
   const sourceUpload = c.uploadEditorSource(file(), 'map-source');
   assert.equal(c.state.pendingUploads, 1);
   await c.submit();

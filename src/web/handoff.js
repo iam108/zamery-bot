@@ -1,9 +1,13 @@
 // Передача клиента юристу + чек-листы юриста
 const pool = require('../db/pool');
 const { LISTS, STAGES, pickChecklist, flagLabels } = require('../checklists');
+const { canManageCases, canAccessCase } = require('./auth');
+const { asyncHandler } = require('./http-errors');
 
-async function ensureTables() {
-  await pool.query(`
+let handoffTablesReady;
+function ensureTables() {
+  if (handoffTablesReady) return handoffTablesReady;
+  handoffTablesReady = pool.query(`
     CREATE TABLE IF NOT EXISTS audits (
       id         SERIAL PRIMARY KEY,
       order_id   INT,
@@ -39,7 +43,9 @@ async function ensureTables() {
       completed_at  TIMESTAMPTZ
     );
     ALTER TABLE cases ADD COLUMN IF NOT EXISTS contacts JSONB DEFAULT '[]';
-  `);
+    ALTER TABLE cases ADD COLUMN IF NOT EXISTS checklist_revision INT NOT NULL DEFAULT 0;
+  `).catch(function (error) { handoffTablesReady = null; throw error; });
+  return handoffTablesReady;
 }
 
 async function saveAudit(orderId, text, chatId, msgIds, data) {
@@ -68,6 +74,41 @@ function guessKind(t) {
 }
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>]/g, function (ch) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;' }[ch]; }); }
 function json(o) { return JSON.stringify(o).replace(/</g, '\\u003c'); }
+
+function requireManager(req, res) {
+  if (canManageCases(req.staff, req.tgUser && req.tgUser.id)) return true;
+  res.status(403).json({ ok: false, code: 'CASE_FORBIDDEN', error: 'Передавать и распределять клиента может менеджер.' });
+  return false;
+}
+function requireCase(req, res, row) {
+  if (!row) { res.status(404).json({ ok: false, error: 'Клиент не найден.' }); return false; }
+  if (canAccessCase(req.staff, req.tgUser && req.tgUser.id, row)) return true;
+  res.status(403).json({ ok: false, code: 'CASE_FORBIDDEN', error: 'Этот клиент недоступен вашему аккаунту.' });
+  return false;
+}
+function validCalendarDate(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const date = new Date(value + 'T12:00:00Z');
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}
+function checklistCounts(client, data) {
+  const list = LISTS[client.checklist_key];
+  if (!list) return null;
+  const items = list.passport.concat(list.sections.flatMap(section => section.i)).filter(item =>
+    !item.when || Object.entries(item.when).every(([key, expected]) => key === 'svc'
+      ? client.service === expected : data[key] === expected || data[key] === undefined && !item.strict));
+  const resolved = item => {
+    const value = data[item.id];
+    if (item.t === 'k') return value && ['ok', 'bad', 'na'].includes(value.s);
+    if (item.t === 'flag') return value && ['yes', 'no'].includes(value.s);
+    if (item.t === 'term') return value && validCalendarDate(value.from) && validCalendarDate(value.to);
+    if (item.t === 'sig') return value && typeof value.at === 'string' && value.at.trim();
+    if (item.t === 'docs') return value && value.m && item.o.every(name => ['ok', 'bad'].includes(value.m[name]));
+    if (item.t === 'p' || item.t === 'r') return item.o.includes(value);
+    return typeof value === 'string' && value.trim().length > 0;
+  };
+  return { done: items.filter(resolved).length, total: items.length };
+}
 
 function caseText(c) {
   var icon = { 'Общепит': '🍺', 'Магазин': '🛒', 'Табак': '🚬' }[c.kind] || '📦';
@@ -141,8 +182,8 @@ async function addToReports(chatId, msgId, text, author, authorId, mgid, date, r
   var r = null;
   if (mgid) r = (await pool.query('SELECT id FROM reports WHERE chat_id=$1 AND mgid=$2 ORDER BY id DESC LIMIT 1', [chatId, mgid])).rows[0];
   if (!r) r = (await pool.query(
-    "SELECT id FROM reports WHERE chat_id=$1 AND author=$2 AND created_at > $3::timestamptz - INTERVAL '" + MERGE_SEC + " seconds' AND created_at <= $3::timestamptz + INTERVAL '5 seconds' AND ($4::bigint IS NULL OR reply_to = $4) ORDER BY id DESC LIMIT 1",
-    [chatId, author, when, replyTo || null])).rows[0];
+    "SELECT id FROM reports WHERE chat_id=$1 AND author=$2 AND author_id IS NOT DISTINCT FROM $5::bigint AND created_at > $3::timestamptz - INTERVAL '" + MERGE_SEC + " seconds' AND created_at <= $3::timestamptz + INTERVAL '5 seconds' AND reply_to IS NOT DISTINCT FROM $4::bigint ORDER BY id DESC LIMIT 1",
+    [chatId, author, when, replyTo || null, authorId || null])).rows[0];
   if (r) {
     await pool.query(
       "UPDATE reports SET msg_ids = array_append(msg_ids, $1), text = CASE WHEN $2 = '' THEN text WHEN text = '' THEN $2 ELSE text || E'\\n' || $2 END, mgid = COALESCE(mgid, $3), reply_to = COALESCE(reply_to, $5) WHERE id=$4 AND NOT ($1 = ANY(msg_ids))",
@@ -159,6 +200,8 @@ function setupReportsBot(bot) {
   ensureReports().catch(function (e) { console.error('reports table:', e.message); });
   bot.action(/^rq:(\d+)$/, async function (ctx) {
     var id = ctx.match[1];
+    var actor = (await pool.query('SELECT * FROM staff WHERE tg_id=$1', [ctx.from.id])).rows[0];
+    if (!canManageCases(actor, ctx.from.id)) return ctx.answerCbQuery('Распределять клиентов может менеджер.', { show_alert: true });
     var done = (await pool.query('SELECT lawyer_name FROM cases WHERE request_id=$1 ORDER BY id DESC LIMIT 1', [id])).rows[0];
     if (done) return ctx.answerCbQuery('Уже передано: ' + done.lawyer_name, { show_alert: true });
     try {
@@ -173,6 +216,9 @@ function setupReportsBot(bot) {
   bot.action('noop', function (ctx) { return ctx.answerCbQuery(); });
   bot.action(/^rmd:(\d+)$/, async function (ctx) {
     try {
+      var actor = (await pool.query('SELECT * FROM staff WHERE tg_id=$1', [ctx.from.id])).rows[0];
+      var client = (await pool.query('SELECT c.* FROM case_reminders r JOIN cases c ON c.id=r.case_id WHERE r.id=$1', [ctx.match[1]])).rows[0];
+      if (!client || !canAccessCase(actor, ctx.from.id, client)) return ctx.answerCbQuery('Этот клиент недоступен вашему аккаунту.', { show_alert: true });
       await pool.query('UPDATE case_reminders SET done = true WHERE id=$1', [ctx.match[1]]);
       var who = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ');
       try { await ctx.editMessageReplyMarkup({ inline_keyboard: [[{ text: '✅ Сделано · ' + who, callback_data: 'noop' }]] }); } catch (e) {}
@@ -368,6 +414,7 @@ function setupReportsWeb(app, upload) {
   ensureReports().catch(function (e) { console.error('reports table:', e.message); });
 
   app.get('/api/reports/get', async function (req, res) {
+    if (!requireManager(req, res)) return;
     try {
       var r = await getReport(req.query.src, parseInt(req.query.id));
       if (!r) return res.json({ ok: false });
@@ -376,6 +423,7 @@ function setupReportsWeb(app, upload) {
   });
 
   app.get('/api/reports/search', async function (req, res) {
+    if (!requireManager(req, res)) return;
     try { res.json({ ok: true, items: await searchReports(req.query.q) }); }
     catch (e) { console.error(e); res.json({ ok: false, error: e.message }); }
   });
@@ -384,6 +432,7 @@ function setupReportsWeb(app, upload) {
   app.get('/admin/import', auth, function (req, res) { res.send(adminImportPage()); });
   app.post('/admin/import', auth, upload.array('files', 50), async function (req, res) {
     try {
+      await ensureReports(); await ensureTables(); await ensureRequests();
       var files = req.files || [];
       if (!files.length) return res.send(adminImportPage('Файлы не выбраны. Нажмите «Выберите файлы» и отметьте messages.html.', true));
       var msgs = [];
@@ -396,7 +445,7 @@ function setupReportsWeb(app, upload) {
       msgs.forEach(function (m) {
         if (!m.text && !m.media) return;
         var author = m.author || 'аудитор';
-        var sameThread = !m.reply || (cur && m.reply === cur.reply);
+        var sameThread = cur && (m.reply || null) === (cur.reply || null);
         if (cur && cur.author === author && (m.date - cur.last) <= MERGE_SEC * 1000 && sameThread) {
           cur.ids.push(m.id); if (m.text) cur.text.push(m.text); cur.last = m.date;
         } else {
@@ -407,7 +456,7 @@ function setupReportsWeb(app, upload) {
 
       // Пересобираем ранее импортированное (без дублей); живые записи бота не трогаем
       if (msgs.length) {
-        await pool.query('DELETE FROM reports WHERE chat_id=$1 AND author_id IS NULL AND first_id BETWEEN $2 AND $3',
+        await pool.query('DELETE FROM reports WHERE chat_id=$1 AND author_id IS NULL AND first_id BETWEEN $2 AND $3 AND NOT EXISTS (SELECT 1 FROM cases WHERE request_id=reports.id)',
           [chatId, msgs[0].id, msgs[msgs.length - 1].id]);
       }
       var live = new Set((await pool.query('SELECT unnest(msg_ids) AS id FROM reports WHERE chat_id=$1', [chatId])).rows.map(function (x) { return String(x.id); }));
@@ -499,6 +548,8 @@ async function ensureRequests() {
   await pool.query(`
     ALTER TABLE reports ADD COLUMN IF NOT EXISTS dismissed BOOLEAN DEFAULT false;
     ALTER TABLE cases ADD COLUMN IF NOT EXISTS request_id INT;
+    ALTER TABLE reports ADD COLUMN IF NOT EXISTS incoming_key TEXT;
+    CREATE INDEX IF NOT EXISTS reports_incoming_key ON reports(incoming_key);
   `);
 }
 
@@ -530,6 +581,7 @@ function setupRequestsWeb(app) {
   });
 
   app.post('/api/requests/dismiss', async function (req, res) {
+    if (!requireManager(req, res)) return;
     try {
       if (req.body.older_days) {
         var r = await pool.query("UPDATE reports SET dismissed = true WHERE chat_id=$1 AND created_at < NOW() - ($2 || ' days')::interval AND text ~* $3 AND NOT EXISTS (SELECT 1 FROM cases c WHERE c.request_id = reports.id)",
@@ -545,28 +597,55 @@ function setupRequestsWeb(app) {
 
   // Google-форма → сюда (Apps Script). Бот публикует заявку в «Заявки по клиенту» с кнопкой «Распределить»
   app.post('/api/requests/incoming', async function (req, res) {
+    var client, ownsLock = false, unlockError;
     try {
       var token = req.query.token || req.body.token;
       if (!process.env.REQUEST_TOKEN || token !== process.env.REQUEST_TOKEN) return res.status(403).json({ ok: false, error: 'bad token' });
       var CLIENTS = process.env.CLIENTS_CHAT_ID;
       var fields = Array.isArray(req.body.fields) ? req.body.fields : [];
+      if (fields.length > 100) return res.status(400).json({ ok: false, error: 'Слишком много полей заявки.' });
       var lines = fields
         .filter(function (x) { return x && String(x.a || '').trim(); })
         .map(function (x) { return String(x.q || '').replace(/[\s:]+$/, '') + ': ' + String(x.a).trim(); });
       if (!lines.length) return res.json({ ok: false, error: 'empty' });
       var text = '📩 Новая форма заполнена:\n\n' + lines.join('\n');
-      var row = (await pool.query(
-        "INSERT INTO reports (chat_id, first_id, msg_ids, text, author, created_at) VALUES ($1, -floor(random()*1e12)::bigint, '{}', $2, 'Google-форма', NOW()) RETURNING id",
-        [CLIENTS, text])).rows[0];
+      if (text.length > 64000) return res.status(413).json({ ok: false, error: 'Слишком длинная заявка.' });
+      await ensureReports(); await ensureRequests();
+      var explicitKey = String(req.get('Idempotency-Key') || req.body.submission_id || '').trim();
+      if (explicitKey.length > 200) return res.status(400).json({ ok: false, error: 'Некорректный номер отправки.' });
+      var key = require('node:crypto').createHash('sha256').update(JSON.stringify([CLIENTS, explicitKey || text])).digest('hex');
+      client = await pool.connect();
+      ownsLock = !!(await client.query('SELECT pg_try_advisory_lock(114,hashtext($1)) AS locked', [key])).rows[0].locked;
+      if (!ownsLock) return res.status(409).json({ ok: false, retry: true, error: 'Эта заявка уже принимается. Повторите проверку результата.' });
+      // Explicit submission IDs stay stable across retries. Legacy senders
+      // without IDs deduplicate identical forms for one day, and always resume
+      // an older row whose Telegram delivery has not yet succeeded.
+      var row = (await client.query(
+        "SELECT * FROM reports WHERE incoming_key=$1 AND ($2::boolean OR created_at>NOW()-INTERVAL '1 day' OR cardinality(msg_ids)=0) ORDER BY id DESC LIMIT 1",
+        [key, !!explicitKey])).rows[0];
+      if (row && explicitKey && row.text !== text) return res.status(409).json({ ok: false, error: 'Номер отправки уже использован для другой заявки.' });
+      if (!row) row = (await client.query(
+        "INSERT INTO reports (chat_id, first_id, msg_ids, text, author, created_at, incoming_key) VALUES ($1, -floor(random()*1e12)::bigint, '{}', $2, 'Google-форма', NOW(), $3) RETURNING *",
+        [CLIENTS, text, key])).rows[0];
+      if (Array.isArray(row.msg_ids) && row.msg_ids.length) return res.json({ ok: true, id: row.id });
       var bot = require('../bot/instance');
       var msg = await bot.telegram.sendMessage(CLIENTS, text.slice(0, 4000), {
         disable_web_page_preview: true,
         reply_markup: { inline_keyboard: [[{ text: '⚖️ Распределить', callback_data: 'rq:' + row.id }]] }
       });
-      await pool.query('UPDATE reports SET first_id=$1, msg_ids=$2 WHERE id=$3', [msg.message_id, [msg.message_id], row.id]);
+      await client.query('UPDATE reports SET first_id=$1, msg_ids=$2 WHERE id=$3', [msg.message_id, [msg.message_id], row.id]);
       res.json({ ok: true, id: row.id });
-    } catch (e) { console.error('incoming request:', e); res.status(500).json({ ok: false, error: e.message }); }
+    } catch (e) {
+      console.error('incoming request:', e.code || 'delivery_failed');
+      res.status(503).json({ ok: false, retry: true, error: 'Заявка сохранена, но доставка не подтверждена. Повторите ту же отправку.' });
+    } finally {
+      if (client) {
+        if (ownsLock) { try { await client.query('SELECT pg_advisory_unlock(114,hashtext($1))', [key]); } catch (e) { unlockError = e; } }
+        client.release(unlockError);
+      }
+    }
   });
+
 }
 
 function requestsClient() {
@@ -721,8 +800,10 @@ function mskHour() { return new Date(Date.now() + 3 * 3600 * 1000).getUTCHours()
 function ruDate(s) { return s ? s.slice(8, 10) + '.' + s.slice(5, 7) + '.' + s.slice(0, 4) : ''; }
 function ruShort(s) { return s ? s.slice(8, 10) + '.' + s.slice(5, 7) : ''; }
 
-async function ensureDeadlines() {
-  await pool.query(`
+let deadlinesReady;
+function ensureDeadlines() {
+  if (deadlinesReady) return deadlinesReady;
+  deadlinesReady = pool.query(`
     ALTER TABLE cases ADD COLUMN IF NOT EXISTS submitted_on DATE;
     ALTER TABLE cases ADD COLUMN IF NOT EXISTS decision_due DATE;
     ALTER TABLE cases ADD COLUMN IF NOT EXISTS reminded_on DATE;
@@ -737,32 +818,56 @@ async function ensureDeadlines() {
       done         BOOLEAN DEFAULT false,
       created_at   TIMESTAMPTZ DEFAULT NOW()
     );
-  `);
+    ALTER TABLE case_reminders ADD COLUMN IF NOT EXISTS delivery JSONB NOT NULL DEFAULT '{}';
+  `).catch(function (error) { deadlinesReady = null; throw error; });
+  return deadlinesReady;
 }
 
 // Напоминания юриста по клиенту: в 9:00 по Москве, только в личку (юристу клиента и тому, кто поставил)
 async function sendCaseReminders(bot) {
+  await ensureTables(); await ensureDeadlines();
   if (mskHour() < 9) return;
   var today = mskToday();
   var rows = (await pool.query(
     'SELECT r.*, c.org, c.inn, c.lawyer_tg_id, c.lawyer_name FROM case_reminders r JOIN cases c ON c.id = r.case_id ' +
     'WHERE r.done = false AND r.sent_at IS NULL AND r.remind_on <= $1::date ORDER BY r.remind_on, r.id', [today])).rows;
   for (var i = 0; i < rows.length; i++) {
-    var r = rows[i];
-    var due = r.remind_on instanceof Date ? r.remind_on.toISOString().slice(0, 10) : String(r.remind_on).slice(0, 10);
-    var text = '⏰ <b>Напоминание</b>\n🏢 ' + esc(r.org) + (r.inn ? ' · ИНН ' + esc(r.inn) : '') + '\n\n' + esc(r.text) +
-      '\n\n<i>' + (due < today ? 'на ' + ruDate(due) + ' · ' : '') + 'поставил(а) ' + esc(r.created_name || '') + '</i>';
-    var kb = { inline_keyboard: [[
-      { text: '📋 Открыть чек-лист', web_app: { url: process.env.WEBAPP_URL + '/checklist?case_id=' + r.case_id } },
-      { text: '✅ Сделано', callback_data: 'rmd:' + r.id }
-    ]] };
-    var to = [String(r.lawyer_tg_id)];
-    if (r.created_by && to.indexOf(String(r.created_by)) === -1) to.push(String(r.created_by));
-    for (var j = 0; j < to.length; j++) {
-      try { await bot.telegram.sendMessage(to[j], text, { parse_mode: 'HTML', reply_markup: kb }); }
-      catch (e) { console.error('case reminder DM', to[j], e.message); }
+    var client = await pool.connect(), ownsLock = false, unlockError;
+    try {
+      ownsLock = !!(await client.query('SELECT pg_try_advisory_lock(113,$1) AS locked', [rows[i].id])).rows[0].locked;
+      if (!ownsLock) continue;
+      var locked = (await client.query('SELECT * FROM case_reminders WHERE id=$1 AND done=false AND sent_at IS NULL', [rows[i].id])).rows[0];
+      if (!locked) continue;
+      var r = Object.assign({}, rows[i], locked);
+      var due = r.remind_on instanceof Date ? r.remind_on.toISOString().slice(0, 10) : String(r.remind_on).slice(0, 10);
+      var text = '⏰ <b>Напоминание</b>\n🏢 ' + esc(r.org) + (r.inn ? ' · ИНН ' + esc(r.inn) : '') + '\n\n' + esc(r.text) +
+        '\n\n<i>' + (due < today ? 'на ' + ruDate(due) + ' · ' : '') + 'поставил(а) ' + esc(r.created_name || '') + '</i>';
+      var kb = { inline_keyboard: [[
+        { text: '📋 Открыть чек-лист', web_app: { url: process.env.WEBAPP_URL + '/checklist?case_id=' + r.case_id } },
+        { text: '✅ Сделано', callback_data: 'rmd:' + r.id }
+      ]] };
+      var to = [...new Set([r.lawyer_tg_id, r.created_by].filter(value => /^[1-9]\d*$/.test(String(value))).map(String))];
+      var receipts = Object.assign({}, r.delivery || {});
+      for (var j = 0; j < to.length; j++) {
+        if (Number.isSafeInteger(Number(receipts[to[j]])) && Number(receipts[to[j]]) > 0) continue;
+        try {
+          var message = await bot.telegram.sendMessage(to[j], text, { parse_mode: 'HTML', reply_markup: kb });
+          if (!Number.isSafeInteger(Number(message && message.message_id)) || Number(message.message_id) < 1) throw new Error('Missing Telegram receipt');
+          receipts[to[j]] = Number(message.message_id);
+          await client.query('UPDATE case_reminders SET delivery=$1 WHERE id=$2', [JSON.stringify(receipts), r.id]);
+        } catch (e) { console.error('case reminder delivery failed', e.response && e.response.error_code || e.code || 'send_failed'); }
+      }
+      var complete = to.length > 0 && to.every(chat => Number(receipts[chat]) > 0);
+      await client.query('UPDATE case_reminders SET delivery=$1, sent_at=CASE WHEN $2 THEN NOW() ELSE NULL END WHERE id=$3', [JSON.stringify(receipts), complete, r.id]);
+    } catch (e) {
+      console.error('case reminder checkpoint failed', e.code || 'storage_failed');
+    } finally {
+      if (ownsLock) {
+        try { await client.query('SELECT pg_advisory_unlock(113,$1)', [rows[i].id]); }
+        catch (e) { unlockError = e; }
+      }
+      client.release(unlockError);
     }
-    await pool.query('UPDATE case_reminders SET sent_at = NOW() WHERE id = $1', [r.id]);
   }
 }
 
@@ -1146,6 +1251,10 @@ function setupHandoff(app) {
   app.get('/api/handoff/prefill', async function (req, res) {
     try {
       var orderId = parseInt(req.query.order_id) || 0;
+      if (!canManageCases(req.staff, req.tgUser.id)) {
+        var ownedCase = orderId && (await pool.query('SELECT * FROM cases WHERE order_id=$1 AND lawyer_tg_id=$2 ORDER BY id DESC LIMIT 1', [orderId, req.tgUser.id])).rows[0];
+        if (!requireCase(req, res, ownedCase || null)) return;
+      }
       var order = null, audit = null;
       if (orderId) {
         order = (await pool.query('SELECT * FROM orders WHERE id=$1', [orderId])).rows[0] || null;
@@ -1153,7 +1262,7 @@ function setupHandoff(app) {
       }
       var lawyers = (await pool.query("SELECT tg_id, name FROM staff WHERE role='lawyer' AND approved = true ORDER BY name")).rows;
       var request = null, reqId = parseInt(req.query.request_id) || 0;
-      if (reqId) {
+      if (reqId && canManageCases(req.staff, req.tgUser.id)) {
         var rq = (await pool.query('SELECT id, text, created_at FROM reports WHERE id=$1', [reqId])).rows[0];
         if (rq) request = { id: rq.id, text: rq.text, created_at: rq.created_at, f: parseRequest(rq.text) };
       }
@@ -1174,9 +1283,10 @@ function setupHandoff(app) {
 
   // Создание передачи юристу
   app.post('/api/handoff', async function (req, res) {
+    if (!requireManager(req, res)) return;
     try {
       var d = req.body;
-      if (d && d.handoff_version === 2) {
+      if (d && (d.handoff_version === 2 || d.resume_case_id != null)) {
         if (!submitV2) submitV2 = require('./handoff-submit').createHandoffSubmitter({
           pool, ready: ensureTables, packetService, telegram: bot.telegram, loadReport: getReport,
           pickChecklist, webappUrl: WEBAPP_URL,
@@ -1256,12 +1366,14 @@ function setupHandoff(app) {
     } catch (e) { console.error('api/handoff error:', e.message); res.status(e.status || 500).json({ ok: false, error: e.message, code: e.code,
       ...(typeof e.case_created === 'boolean' ? { case_created: e.case_created } : {}),
       ...(e.case_id ? { case_id: e.case_id } : {}),
+      ...(typeof e.delivery_complete === 'boolean' ? { delivery_complete: e.delivery_complete, can_resume: e.can_resume === true } : {}),
       ...(e.manual_review ? { manual_review: true, retry: false } : {}) }); }
   });
 
   // Сохранение чек-листа
   app.post('/api/checklist/save', async function (req, res) {
     try {
+      await ensureTables(); await ensureDeadlines();
       if (!req.body || typeof req.body !== 'object' || !req.body.case_id) {
         console.log('checklist save: пустое тело', req.get('Content-Type'), req.get('Content-Length'));
         return res.status(400).json({ ok: false, error: 'Пустой запрос (тип ' + (req.get('Content-Type') || '—') + ')' });
@@ -1271,18 +1383,36 @@ function setupHandoff(app) {
       }
       var id = parseInt(req.body.case_id);
       var c = (await pool.query('SELECT * FROM cases WHERE id=$1', [id])).rows[0];
-      if (!c) return res.json({ ok: false, error: 'not found' });
-      var data = req.body.data || {};
+      if (!requireCase(req, res, c)) return;
+      var data = Object.assign({}, req.body.data || {});
+      var expectedRevision = req.body.expectedRevision;
+      if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
+        return res.status(409).json({ ok: false, code: 'checklist_version_required', error: 'Откройте чек-лист заново, чтобы сохранить актуальную версию.' });
+      }
       var expectedNote = req.body.expectedNote == null ? null : req.body.expectedNote;
       if ((expectedNote !== null && typeof expectedNote !== 'string') ||
           (data._comment != null && typeof data._comment !== 'string')) {
         return res.status(400).json({ ok: false, error: 'Заметка должна быть текстом.' });
       }
+      if (data._stage && !STAGES.includes(data._stage)) {
+        return res.status(400).json({ ok: false, error: 'Неизвестный этап дела.' });
+      }
+      if (data._submittedOn && !validCalendarDate(data._submittedOn)) {
+        return res.status(400).json({ ok: false, error: 'Укажите существующую дату подачи заявления.' });
+      }
       var requestedNote = data._comment || '';
       var preserveNote = expectedNote !== null && expectedNote === requestedNote;
-      var old = c.data || {};
-      var done = parseInt(req.body.done) || 0;
-      var total = parseInt(req.body.total) || 0;
+      var old = c.data || {}, subOn = null, due = null;
+      if (data._stage === 'Подано' && !data._submittedOn) data._submittedOn = old._submittedOn || mskToday();
+      if (data._submittedOn) {
+        subOn = data._submittedOn;
+        due = addWorkdays(subOn, decisionDays(c.region));
+        data._decisionDue = due;
+      } else delete data._decisionDue;
+      var counts = checklistCounts(c, data);
+      var done = counts ? counts.done : Math.max(0, parseInt(req.body.done) || 0);
+      var total = counts ? counts.total : Math.max(0, parseInt(req.body.total) || 0);
+      if (done > total || total > 1000) return res.status(400).json({ ok: false, error: 'Проверьте количество пунктов чек-листа.' });
       var nowDone = total > 0 && done >= total;
       var saved = (await pool.query(
         `UPDATE cases SET data=($1::jsonb - '_handoff' - '_workspaceNote' - '_comment')
@@ -1294,21 +1424,31 @@ function setupHandoff(app) {
             WHEN $1::jsonb ? '_comment' THEN jsonb_build_object('_comment', $7::text)
             ELSE '{}'::jsonb
           END,
-          done=$2, total=$3, completed_at=` + (nowDone ? 'COALESCE(completed_at, NOW())' : 'NULL') + `
-          WHERE id=$4 AND (
+          checklist_revision=checklist_revision + CASE WHEN
+            (data - '_handoff' - '_workspaceNote' - '_comment') = ($1::jsonb - '_handoff' - '_workspaceNote' - '_comment') THEN 0 ELSE 1 END,
+          done=$2, total=$3, completed_at=` + (nowDone ? 'COALESCE(completed_at, NOW())' : 'NULL') + `,
+          submitted_on=$9::date, decision_due=$10::date,
+          reminded_on=CASE WHEN decision_due IS DISTINCT FROM $10::date THEN NULL ELSE reminded_on END
+          WHERE id=$4
+          AND (checklist_revision=$8 OR
+            (data - '_handoff' - '_workspaceNote' - '_comment') = ($1::jsonb - '_handoff' - '_workspaceNote' - '_comment'))
+          AND (
             $5 OR COALESCE(data ->> '_comment', '') = $7
             OR ($6::text IS NOT NULL AND COALESCE(data ->> '_comment', '') = $6)
             OR ($6::text IS NULL AND (NOT COALESCE(data ? '_workspaceNote', false) OR NOT ($1::jsonb ? '_comment')))
           )
-          RETURNING COALESCE(data ->> '_comment', '') AS note`,
-        [data, done, total, id, preserveNote, expectedNote, requestedNote]
+          RETURNING COALESCE(data ->> '_comment', '') AS note, checklist_revision`,
+        [data, done, total, id, preserveNote, expectedNote, requestedNote, expectedRevision, subOn, due]
       )).rows[0];
       if (!saved) {
-        var latest = (await pool.query("SELECT COALESCE(data ->> '_comment', '') AS note FROM cases WHERE id=$1", [id])).rows[0];
+        var latest = (await pool.query("SELECT COALESCE(data ->> '_comment', '') AS note, checklist_revision, (data - '_handoff' - '_workspaceNote' - '_comment') IS DISTINCT FROM ($2::jsonb - '_handoff' - '_workspaceNote' - '_comment') AS checklist_changed FROM cases WHERE id=$1", [id, data])).rows[0];
         if (!latest) return res.status(404).json({ ok: false, error: 'Клиент не найден' });
+        var checklistConflict = latest.checklist_changed && Number(latest.checklist_revision) !== expectedRevision;
         return res.status(409).json({
-          ok: false, code: 'note_conflict', note: latest.note,
-          error: 'Заметку изменили в другом окне. Откройте чек-лист заново или выберите, какую версию сохранить.',
+          ok: false, code: checklistConflict ? 'checklist_conflict' : 'note_conflict', note: latest.note,
+          revision: Number(latest.checklist_revision),
+          error: checklistConflict ? 'Пункты чек-листа изменились в другом окне. Ваши правки сохранены на устройстве. Откройте актуальную версию перед продолжением.' :
+            'Заметку изменили в другом окне. Откройте чек-лист заново или выберите, какую версию сохранить.',
         });
       }
 
@@ -1327,20 +1467,6 @@ function setupHandoff(app) {
           try { await bot.telegram.sendMessage(c.created_by, msg, { parse_mode: 'HTML' }); } catch (e) { console.error(e.message); }
         }
       }
-      // Смена этапа
-      var due = null;
-      if (data._stage === 'Подано' && old._stage !== 'Подано') {
-        // Подано: дата подачи — сегодня (или указанная юристом), срок решения по рабочим дням
-        var subOn = /^\d{4}-\d{2}-\d{2}$/.test(data._submittedOn || '') ? data._submittedOn : mskToday();
-        due = addWorkdays(subOn, decisionDays(c.region));
-        data._submittedOn = subOn; data._decisionDue = due;
-        await pool.query("UPDATE cases SET data=COALESCE(data,'{}'::jsonb) || jsonb_build_object('_submittedOn',$1::text,'_decisionDue',$2::text), submitted_on=$1::date, decision_due=$2::date, reminded_on=NULL WHERE id=$3", [subOn, due, id]);
-      } else if (data._stage === 'Подано' && data._submittedOn && data._submittedOn !== old._submittedOn) {
-        // юрист поправил дату подачи — пересчитываем срок
-        due = addWorkdays(data._submittedOn, decisionDays(c.region));
-        data._decisionDue = due;
-        await pool.query("UPDATE cases SET data=COALESCE(data,'{}'::jsonb) || jsonb_build_object('_submittedOn',$1::text,'_decisionDue',$2::text), submitted_on=$1::date, decision_due=$2::date, reminded_on=NULL WHERE id=$3", [data._submittedOn, due, id]);
-      }
       if (data._stage && data._stage !== old._stage && CLIENTS) {
         var stageMsg = data._stage === 'Подано'
           ? '📤 <b>Заявление подано</b>\n🏢 ' + esc(c.org) + (c.inn ? ' · ИНН ' + esc(c.inn) : '') +
@@ -1351,15 +1477,16 @@ function setupHandoff(app) {
       if (nowDone && !c.completed_at && CLIENTS) {
         await bot.telegram.sendMessage(CLIENTS, '✅ <b>Чек-лист выполнен</b>\n🏢 ' + esc(c.org) + '\n⚖️ ' + esc(c.lawyer_name) + '\n#заявка' + c.id, { parse_mode: 'HTML' });
       }
-      res.json({ ok: true, note: saved.note, submittedOn: data._submittedOn || null, decisionDue: data._decisionDue || null });
+      res.json({ ok: true, note: saved.note, revision: Number(saved.checklist_revision), submittedOn: data._submittedOn || null, decisionDue: data._decisionDue || null });
     } catch (e) { console.error(e); res.json({ ok: false, error: e.message }); }
   });
 
   // Запрос недостающих документов: в «Заявки по клиенту» и менеджеру
   app.post('/api/checklist/request', async function (req, res) {
     try {
+      await ensureTables(); await ensureDeadlines();
       var c = (await pool.query('SELECT * FROM cases WHERE id=$1', [parseInt(req.body.case_id)])).rows[0];
-      if (!c) return res.json({ ok: false, error: 'Клиент не найден' });
+      if (!requireCase(req, res, c)) return;
       var list = (req.body.missing || []).map(function (x) { return String(x).slice(0, 200); }).slice(0, 40);
       if (!list.length) return res.json({ ok: false, error: 'Список пуст' });
       var msg = '📨 <b>Запросить документы у клиента</b>\n🏢 ' + esc(c.org) + (c.inn ? ' · ИНН ' + esc(c.inn) : '') + '\n\n' +
@@ -1376,7 +1503,8 @@ function setupHandoff(app) {
 
   var auth = require('./auth');
 
-  app.get('/checklist', async function (req, res) {
+  app.get('/checklist', asyncHandler(async function (req, res) {
+    await ensureTables(); await ensureDeadlines();
     var caseId = parseInt(req.query.case_id) || 0;
     if (req.query.print) {
       // Версия для печати открывается в обычном браузере — по подписанной ссылке
@@ -1388,41 +1516,57 @@ function setupHandoff(app) {
       return res.send(printCompact(c, LISTS[c.checklist_key]));
     }
     res.send(checklistBoot(caseId));
-  });
+  }));
 
   // Сам чек-лист отдаётся только сотруднику (проверка подписи Telegram — в auth.js)
-  app.post('/checklist/view', async function (req, res) {
+  app.post('/checklist/view', asyncHandler(async function (req, res) {
+    await ensureTables(); await ensureDeadlines();
     var c = (await pool.query('SELECT * FROM cases WHERE id=$1', [parseInt(req.query.case_id) || 0])).rows[0];
-    if (!c || !c.checklist_key) return res.status(404).send('Чек-лист не найден');
+    if (!requireCase(req, res, c)) return;
+    if (!c.checklist_key) return res.status(404).send('Чек-лист не найден');
     res.send(checklistPage(c, LISTS[c.checklist_key]));
-  });
+  }));
 
   app.get('/api/checklist/reminders', async function (req, res) {
     try {
+      await ensureTables(); await ensureDeadlines();
+      var client = (await pool.query('SELECT * FROM cases WHERE id=$1', [parseInt(req.query.case_id) || 0])).rows[0];
+      if (!requireCase(req, res, client)) return;
       var rows = (await pool.query('SELECT id, remind_on, text, created_name, sent_at FROM case_reminders WHERE case_id=$1 AND done = false ORDER BY remind_on, id', [parseInt(req.query.case_id) || 0])).rows;
       res.json({ ok: true, items: rows.map(function (r) { return { id: r.id, date: (r.remind_on instanceof Date ? r.remind_on.toISOString() : String(r.remind_on)).slice(0, 10), text: r.text, by: r.created_name, sent: !!r.sent_at }; }) });
     } catch (e) { console.error(e); res.json({ ok: false, error: e.message }); }
   });
   app.post('/api/checklist/reminders', async function (req, res) {
     try {
+      await ensureTables(); await ensureDeadlines();
       var id = parseInt(req.body.case_id) || 0, date = String(req.body.date || ''), text = String(req.body.text || '').trim().slice(0, 300);
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.json({ ok: false, error: 'Укажите дату' });
+      if (!validCalendarDate(date)) return res.json({ ok: false, error: 'Укажите дату' });
       if (!text) return res.json({ ok: false, error: 'Напишите, о чём напомнить' });
-      if (!(await pool.query('SELECT 1 FROM cases WHERE id=$1', [id])).rows.length) return res.json({ ok: false, error: 'Клиент не найден' });
+      var client = (await pool.query('SELECT * FROM cases WHERE id=$1', [id])).rows[0];
+      if (!requireCase(req, res, client)) return;
       var r = (await pool.query('INSERT INTO case_reminders (case_id, remind_on, text, created_by, created_name) VALUES ($1,$2,$3,$4,$5) RETURNING id',
         [id, date, text, req.tgUser.id, req.staff.name])).rows[0];
       res.json({ ok: true, id: r.id });
     } catch (e) { console.error(e); res.json({ ok: false, error: e.message }); }
   });
   app.post('/api/checklist/reminders/done', async function (req, res) {
-    try { await pool.query('UPDATE case_reminders SET done = true WHERE id=$1', [parseInt(req.body.id) || 0]); res.json({ ok: true }); }
+    try {
+      await ensureTables(); await ensureDeadlines();
+      var reminder = (await pool.query('SELECT c.* FROM case_reminders r JOIN cases c ON c.id=r.case_id WHERE r.id=$1', [parseInt(req.body.id) || 0])).rows[0];
+      if (!requireCase(req, res, reminder)) return;
+      await pool.query('UPDATE case_reminders SET done = true WHERE id=$1', [parseInt(req.body.id) || 0]);
+      res.json({ ok: true });
+    }
     catch (e) { console.error(e); res.json({ ok: false, error: e.message }); }
   });
 
-  app.post('/api/checklist/printlink', function (req, res) {
+  app.post('/api/checklist/printlink', asyncHandler(async function (req, res) {
+    await ensureTables(); await ensureDeadlines();
     var id = parseInt(req.body.case_id) || 0;
+    var client = (await pool.query('SELECT * FROM cases WHERE id=$1', [id])).rows[0];
+    if (!requireCase(req, res, client)) return;
     res.json({ ok: true, url: (process.env.WEBAPP_URL || '') + '/checklist?case_id=' + id + '&print=1&' + auth.signCase(id, 24) });
-  });
+  }));
 }
 
 var BASE_CSS = [
@@ -1812,7 +1956,8 @@ function checklistClient() {
 
   var CFG = window.__CFG;
   var L = CFG.list, D = CFG.data || {}, CASE = CFG.caseInfo;
-  var noteBase = D._comment || '', noteConflict = null;
+  var noteBase = D._comment || '', noteConflict = null, checklistConflict = false;
+  var checklistRevision = Number(CASE.revision) || 0;
   var OPEN = {};
   var ME = (tg && tg.initDataUnsafe && tg.initDataUnsafe.user)
     ? [tg.initDataUnsafe.user.first_name, tg.initDataUnsafe.user.last_name].filter(Boolean).join(' ')
@@ -2322,7 +2467,7 @@ function checklistClient() {
   // ── Сохранение ────────────────────────────────────────
   var timer = null, refresh = null;
   var LKEY = 'zamery_cl_' + CASE.id;
-  function backup() { try { localStorage.setItem(LKEY, JSON.stringify({ t: Date.now(), d: D, noteBase: noteBase })); } catch (e) {} }
+  function backup() { try { localStorage.setItem(LKEY, JSON.stringify({ t: Date.now(), d: D, noteBase: noteBase, revision: checklistRevision })); } catch (e) {} }
   function dropBackup() { try { localStorage.removeItem(LKEY); } catch (e) {} }
   function changed() {
     try { updateEcp(); } catch (e) {}
@@ -2358,13 +2503,17 @@ function checklistClient() {
     clearTimeout(timer);
     if (inFlight) { dirty = true; return; }
     clearTimeout(retryTimer); clearInterval(countdown);
+    if (checklistConflict) {
+      setSt('err', 'Чек-лист изменился в другом окне. Нажмите, чтобы сохранить копию и открыть актуальные ответы.');
+      return;
+    }
     if (noteConflict !== null) {
       setSt('err', 'Заметка изменилась в другом окне. Нажмите здесь, чтобы сохранить свой черновик.');
       return;
     }
     var s = stats();
     var sentNote = D._comment || '';
-    var body = JSON.stringify({ case_id: CASE.id, data: D, done: s.done, total: s.total, expectedNote: noteBase });
+    var body = JSON.stringify({ case_id: CASE.id, data: D, done: s.done, total: s.total, expectedNote: noteBase, expectedRevision: checklistRevision });
     var snapshot = JSON.stringify(D);
     if (snapshot === lastSaved) { dropBackup(); setSt('ok', 'Сохранено'); return; } // ничего не изменилось — не нагружаем сервер
     inFlight = true; dirty = false;
@@ -2379,6 +2528,8 @@ function checklistClient() {
       try { j = JSON.parse(txt); } catch (pe) {}
       ok = !!(j && j.ok);
       if (ok && typeof j.note === 'string') savedNote = j.note;
+      if (ok && Number.isSafeInteger(j.revision)) checklistRevision = j.revision;
+      if (r.status === 409 && j && ['checklist_conflict', 'checklist_version_required'].indexOf(j.code) !== -1) checklistConflict = true;
       if (r.status === 409 && j && j.code === 'note_conflict' && typeof j.note === 'string') {
         noteConflict = j.note;
       }
@@ -2391,6 +2542,7 @@ function checklistClient() {
       }
     } catch (e) { why = 'нет связи'; }
     inFlight = false;
+    if (checklistConflict) { backup(); setSt('err', 'Чек-лист изменился в другом окне. Нажмите, чтобы сохранить копию и открыть актуальные ответы.'); return; }
     if (noteConflict !== null) {
       setSt('err', 'Заметка изменилась в другом окне. Нажмите здесь, чтобы сохранить свой черновик.');
       return;
@@ -2434,6 +2586,17 @@ function checklistClient() {
   window.addEventListener('pagehide', function () { flush(); });
   // Тап по статусу — сохранить прямо сейчас
   document.getElementById('st').onclick = function () {
+    if (checklistConflict) {
+      var recovery = JSON.stringify({ case_id: CASE.id, data: D, revision: checklistRevision }, null, 2);
+      try { localStorage.setItem(LKEY + ':recovery', recovery); }
+      catch (error) { alertMsg('Не удалось сохранить копию на устройстве. Не закрывайте чек-лист и повторите попытку.'); return; }
+      var copy = document.createElement('a'), copyUrl = URL.createObjectURL(new Blob([recovery], { type: 'application/json' }));
+      copy.href = copyUrl; copy.download = 'checklist-draft-' + CASE.id + '.json'; copy.click();
+      setTimeout(function () { URL.revokeObjectURL(copyUrl); }, 1000);
+      dropBackup();
+      window.location.reload();
+      return;
+    }
     if (noteConflict !== null) {
       var message = 'Заметка изменилась в другом окне. Заменить её вашим черновиком?';
       var resolve = function (confirmed) {
@@ -2468,6 +2631,8 @@ function checklistClient() {
     if (bk && bk.d && Date.now() - bk.t < 7 * 24 * 3600 * 1000) {
       var noteProtected = D._workspaceNote === true;
       D = bk.d; restored = true;
+      if (Number.isSafeInteger(bk.revision)) { checklistConflict = bk.revision !== checklistRevision; checklistRevision = bk.revision; }
+      else checklistConflict = true;
       if (typeof bk.noteBase === 'string') noteBase = bk.noteBase;
       else if (noteProtected && (D._comment || '') !== noteBase) noteConflict = noteBase;
     }
@@ -2607,7 +2772,7 @@ function checklistPage(c, L) {
 
   var cfg = {
     list: L, data: Object.fromEntries(Object.entries(c.data || {}).filter(function (entry) { return entry[0] !== '_handoff'; })), stages: STAGES,
-    caseInfo: { id: c.id, service: c.service, lawyer: c.lawyer_name, region: c.region }
+    caseInfo: { id: c.id, service: c.service, lawyer: c.lawyer_name, region: c.region, revision: Number(c.checklist_revision) || 0 }
   };
 
   var facts = [

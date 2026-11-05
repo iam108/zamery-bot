@@ -19,10 +19,11 @@ function createAuditSubmitter(drafts, deliver, options = {}) {
           // not silently omit original documents from the lawyer's handoff.
           const requested = snapshot.data.ui_version === 5 ? undefined : snapshot.data.request_packet?.materials?.map(f => f.id);
           trustedPacket = await options.loadPacket(snapshot.order_id, requested);
-          if (snapshot.data.request_packet?.service && snapshot.data.request_packet.service !== trustedPacket.service) throw Object.assign(new Error('Менеджер изменил услугу в заявке. Обновите проверку перед отправкой.'), { status: 409 });
+          const originalPacket = snapshot.data.request_packet || { ...snapshot.data.inspection, object_category: snapshot.data.object_category };
+          if (originalPacket.service && originalPacket.service !== trustedPacket.service) throw Object.assign(new Error('Менеджер изменил услугу в заявке. Обновите проверку перед отправкой.'), { status: 409 });
           if (snapshot.data.ui_version === 5) {
-            for (const [field, label] of [['address', 'адрес'], ['object_category', 'тип объекта'], ['org', 'организацию']]) {
-              const original = snapshot.data.request_packet?.[field];
+            for (const [field, label] of [['address', 'адрес'], ['object_category', 'тип объекта'], ['org', 'организацию'], ['cad_num', 'кадастровый номер'], ['service', 'услугу']]) {
+              const original = originalPacket[field];
               if (original != null && String(original).trim() !== String(trustedPacket[field] || '').trim()) throw Object.assign(new Error('Менеджер изменил ' + label + ' в заявке. Обновите проверку и сверьте материалы объекта перед отправкой.'), { status: 409 });
             }
           }
@@ -30,7 +31,7 @@ function createAuditSubmitter(drafts, deliver, options = {}) {
         if (snapshot.data.ui_version === 5 && !trustedPacket) throw new Error('Не удалось проверить заявку менеджера. Обновите форму и повторите отправку.');
         if (trustedPacket) snapshot.data = { ...snapshot.data, request_packet: trustedPacket };
         const packet = snapshot.data.request_packet;
-        if (!packet || !packet.org || !packet.address || !packet.service) throw new Error('В заявке не хватает данных объекта или услуги. Менеджеру нужно дополнить заявку.');
+        if (!packet || !packet.org || !packet.address || (packet.object_category !== 'tobacco' && !packet.service)) throw new Error('В заявке не хватает данных объекта или услуги. Менеджеру нужно дополнить заявку.');
       }
       data = hydrateDraftReport(snapshot);
       validateInspection(data);

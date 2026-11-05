@@ -1,4 +1,4 @@
-function packetFromOrder(order, materials) {
+function packetFromOrder(order, materials, egrnLinks = []) {
   const id = Number(order.id);
   const type = String(order.object_type || '').toLowerCase();
   const files = materials.map(file => ({ id: file.id, name: file.name, mime: file.mime, role: file.role, bytes: file.bytes, sha256: file.sha256, url: '/api/audit/orders/' + id + '/materials/' + file.id }));
@@ -9,13 +9,13 @@ function packetFromOrder(order, materials) {
     object_category: /табак/.test(type) ? 'tobacco' : /общепит/.test(type) ? 'catering' : /магазин|рознич|торговл/.test(type) ? 'retail' : 'other',
     service: order.service || '', cad_num: order.cad_num || '', region: 'МСК', contacts: order.contacts || '',
     deadline: order.deadline ? new Date(order.deadline).toISOString().slice(0, 10) : '', zones_info: order.zones_info || '',
-    video_required: !!order.has_video, has_video: !!order.has_video, archive_url: archiveUrl, materials: files,
+    video_required: !!order.has_video, has_video: !!order.has_video, archive_url: archiveUrl, materials: files, egrn_links: egrnLinks,
     materials_download_url: '/api/audit/orders/' + id + '/materials/download-all',
     archive_download_url: order.service === 'Продление' ? (archiveFiles ? '/api/audit/orders/' + id + '/materials/download-all?role=archive' : archiveUrl ? '/api/audit/orders/' + id + '/archive/download' : '') : '',
   };
 }
 
-function createPacketLoader({ getOrder, getMaterials }) {
+function createPacketLoader({ getOrder, getMaterials, getEgrnLinks = async () => [] }) {
   return async (orderId, ids) => {
     const order = await getOrder(orderId);
     if (!order) throw Object.assign(new Error('Заявка менеджера не найдена.'), { status: 404 });
@@ -26,12 +26,12 @@ function createPacketLoader({ getOrder, getMaterials }) {
       files = files.filter(file => wanted.has(file.id));
       if (files.length !== wanted.size) throw Object.assign(new Error('Документ не относится к этой заявке или больше недоступен. Обновите заявку.'), { status: 409 });
     }
-    return packetFromOrder(order, files);
+    return packetFromOrder(order, files, await getEgrnLinks(orderId));
   };
 }
 
 async function loadAuditPacket(orderId, ids) {
-  return createPacketLoader({ getOrder: require('../db/queries').getOrderById, getMaterials: require('./order-materials').listOrderMaterials })(orderId, ids);
+  return createPacketLoader({ getOrder: require('../db/queries').getOrderById, getMaterials: require('./order-materials').listOrderMaterials, getEgrnLinks: require('./order-egrn-links').listOrderLinks })(orderId, ids);
 }
 
 module.exports = { packetFromOrder, createPacketLoader, loadAuditPacket };

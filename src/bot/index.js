@@ -2,6 +2,7 @@ const { Telegraf, Markup } = require('telegraf');
 const { createOrder, updateOrderStatus, getOrderById, addLog, getStats, setTelegramMsgId } = require('../db/queries');
 const { formatOrderMessage, STATUS_EMOJI } = require('./formatter');
 const { handleAuditReport } = require('./audit-handler');
+const { cardOptions } = require('../web/manager-orders');
 
 function setupBot() {
   const bot = new Telegraf(process.env.BOT_TOKEN);
@@ -10,7 +11,7 @@ function setupBot() {
   require('../web/handoff').setupReportsBot(bot);
   require('./egrn').setupEgrn(bot);
   const pool = require('../db/pool');
-  const { ensureStaff } = require('../web/auth');
+  const { ensureStaff, canManageCases } = require('../web/auth');
   const { parsePairing, approvePairing, canPair } = require('../web/workspace');
   const { esc } = require('./formatter');
   const ROLES = { manager: 'Менеджер', lawyer: 'Юрист', auditor: 'Аудитор' };
@@ -31,6 +32,25 @@ function setupBot() {
   async function getMe(id) {
     await ensureStaff();
     return (await pool.query('SELECT * FROM staff WHERE tg_id=$1', [id])).rows[0];
+  }
+
+  async function approvedActor(ctx, manageOnly = false) {
+    let staff;
+    try { staff = await getMe(ctx.from.id); }
+    catch (error) {
+      console.error('Telegram staff lookup failed:', error.code || error.name || 'error');
+      const text = 'Не удалось проверить доступ. Повторите действие.';
+      if (ctx.callbackQuery) await ctx.answerCbQuery(text, { show_alert: true });
+      else await ctx.reply(text);
+      return null;
+    }
+    if (!staff || staff.approved !== true || manageOnly && !canManageCases(staff, ctx.from.id)) {
+      const text = manageOnly ? 'Действие доступно менеджеру.' : 'Нет доступа. Нажмите /start и дождитесь одобрения.';
+      if (ctx.callbackQuery) await ctx.answerCbQuery(text, { show_alert: true });
+      else await ctx.reply(text);
+      return null;
+    }
+    return staff;
   }
 
   bot.start(async (ctx) => {
@@ -74,10 +94,8 @@ function setupBot() {
     const me = await getMe(ctx.from.id);
     const list = await approvers();
     const isAdmin = adminIds().indexOf(uid) !== -1;
-    const anyApproved = (await pool.query('SELECT 1 FROM staff WHERE approved = true LIMIT 1')).rows.length > 0;
-
-    // Админ — сразу. Самый первый сотрудник в пустой базе — тоже сразу (иначе некому одобрять)
-    if (isAdmin || (!anyApproved && !list.length)) {
+    // Only a configured administrator may bootstrap staff approval.
+    if (isAdmin) {
       await pool.query(
         'INSERT INTO staff (tg_id, name, username, role, approved, requested_role) VALUES ($1,$2,$3,$4,true,NULL) ON CONFLICT (tg_id) DO UPDATE SET name=$2, username=$3, role=$4, approved=true, requested_role=NULL',
         [ctx.from.id, name, ctx.from.username || null, role]);
@@ -136,6 +154,7 @@ function setupBot() {
 
   bot.command('stats', async (ctx) => {
     try {
+      if (!await approvedActor(ctx)) return;
       const s = await getStats();
       await ctx.reply(
         '<b>📊 Статистика заявок</b>\n\n' +
@@ -154,6 +173,7 @@ function setupBot() {
   });
 
   bot.command('panel', async (ctx) => {
+    if (!await approvedActor(ctx, true)) return;
     await ctx.reply(
       '🖥 Веб-панель для просмотра всех заявок:',
       Markup.inlineKeyboard([
@@ -164,6 +184,7 @@ function setupBot() {
 
   bot.on('web_app_data', async (ctx) => {
     try {
+      if (ctx.chat.type !== 'private' || !await approvedActor(ctx)) return;
       const raw = ctx.webAppData && ctx.webAppData.data && ctx.webAppData.data.text();
       if (!raw) return;
       const data = JSON.parse(raw);
@@ -202,6 +223,7 @@ function setupBot() {
 
   // Кнопка "Написать отчёт" — отправляем ссылку в личку аудитору
   bot.action(/^report:(\d+)$/, async (ctx) => {
+    if (!await approvedActor(ctx)) return;
     const orderId = ctx.match[1];
     const userId = ctx.from.id;
     const auditUrl = WEBAPP_URL + '/audit?order_id=' + orderId + '&' + require('../web/auth').keyQuery(userId);
@@ -219,39 +241,36 @@ function setupBot() {
     }
   });
 
+  async function refreshOrderCard(ctx, order) {
+    try { await ctx.editMessageText(formatOrderMessage(order), cardOptions(order)); }
+    catch (error) {
+      if (!/message is not modified/i.test(error.response?.description || error.message || '')) throw error;
+    }
+  }
+
   bot.action(/^status:(new|in_progress|done|cancelled):(\d+)$/, async (ctx) => {
+    if (!await approvedActor(ctx)) return;
+    if (String(ctx.chat.id) !== String(GROUP_ID)) return ctx.answerCbQuery('Откройте исходную заявку в рабочем чате.', { show_alert: true });
     const newStatus = ctx.match[1];
     const orderId = ctx.match[2];
     const actor = ctx.from.username ? '@' + ctx.from.username : [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ') || String(ctx.from.id);
 
     try {
-      const order = await updateOrderStatus(parseInt(orderId), newStatus, actor);
-      if (!order) return ctx.answerCbQuery('Заявка не найдена');
-
-      const text = formatOrderMessage(order);
-      let buttons = [];
-
-      if (newStatus === 'in_progress') {
-        buttons = [[
-          { text: '✅ Готово', callback_data: 'status:done:' + orderId },
-          { text: '❌ Отменить', callback_data: 'status:cancelled:' + orderId },
-        ], [
-          { text: '🔍 Продолжить проверку', callback_data: 'report:' + orderId },
-        ]];
-      } else if (newStatus === 'new') {
-        buttons = [[
-          { text: '🔧 Взять в работу', callback_data: 'status:in_progress:' + orderId },
-        ]];
-      } else if (newStatus === 'done') {
-        buttons = [[
-          { text: '🔍 Открыть проверку', callback_data: 'report:' + orderId },
-        ]];
+      const current = await getOrderById(Number(orderId));
+      if (!current) return ctx.answerCbQuery('Заявка не найдена');
+      if (current.status === newStatus) {
+        await refreshOrderCard(ctx, current);
+        return ctx.answerCbQuery('Этот статус уже установлен.');
       }
+      const allowed = newStatus === 'in_progress' ? ['new'] : newStatus === 'new' ? [] : ['new', 'in_progress'];
+      if (!allowed.includes(current.status)) {
+        await refreshOrderCard(ctx, current);
+        return ctx.answerCbQuery('Карточка обновлена. Статус уже изменился.', { show_alert: true });
+      }
+      const order = await updateOrderStatus(Number(orderId), newStatus, actor, allowed);
+      if (!order) return ctx.answerCbQuery('Статус заявки уже изменился. Обновите карточку.');
 
-      await ctx.editMessageText(text, {
-        parse_mode: 'HTML',
-        reply_markup: buttons.length ? { inline_keyboard: buttons } : undefined,
-      });
+      await refreshOrderCard(ctx, order);
 
       if (newStatus === 'in_progress') {
         const auditUrl = WEBAPP_URL + '/audit?order_id=' + orderId + '&' + require('../web/auth').keyQuery(ctx.from.id);
@@ -269,46 +288,14 @@ function setupBot() {
       await ctx.answerCbQuery('Ошибка, попробуйте ещё раз');
     }
   });
-// Получаем файлы от пользователя в личке — прикрепляем к последней заявке
-bot.on(['photo', 'document'], async (ctx) => {
-  if (ctx.chat.type !== 'private') return;
-  
-  try {
-    const me = await getMe(ctx.from.id);
-    if (!me || !me.approved) return ctx.reply('Нет доступа. Нажмите /start.');
-    // Последняя открытая заявка этого пользователя
-    const order = (await pool.query(
-      "SELECT * FROM orders WHERE submitted_by=$1 AND status NOT IN ('done','cancelled') ORDER BY created_at DESC LIMIT 1", [ctx.from.id])).rows[0];
-    if (!order) return ctx.reply('Нет открытых заявок, к которым можно прикрепить файл.');
-    const replyTo = order.telegram_msg_id;
-    
-    const caption = '📎 Файл к заявке #' + order.id;
-    
-    if (ctx.message.photo) {
-      const photo = ctx.message.photo[ctx.message.photo.length - 1];
-      await ctx.telegram.sendPhoto(GROUP_ID, photo.file_id, {
-        caption: caption,
-        reply_to_message_id: replyTo,
-      });
-    } else if (ctx.message.document) {
-      await ctx.telegram.sendDocument(GROUP_ID, ctx.message.document.file_id, {
-        caption: caption,
-        reply_to_message_id: replyTo,
-      });
-    }
-    
-    await ctx.reply('✅ Файл прикреплён к заявке #' + order.id);
-  } catch(e) {
-    console.error('file attach error:', e.message);
-    await ctx.reply('Ошибка при прикреплении файла.');
-  }
-});
+  require('./manual-order-attachments').setupManualOrderAttachments(bot, { pool, getMe, groupId: GROUP_ID });
     // Кнопка «Передать юристу» в группе замеров → ссылка на форму в личку
   bot.action(/^handoff:(\d+)$/, async (ctx) => {
+    if (!await approvedActor(ctx, true)) return;
     const orderId = ctx.match[1];
     try {
       await ctx.telegram.sendMessage(ctx.from.id, '⚖️ Передать заявку #' + orderId + ' юристу:', {
-        reply_markup: { inline_keyboard: [[{ text: '📝 Открыть форму', web_app: { url: WEBAPP_URL + '/handoff?order_id=' + orderId } }]] },
+        reply_markup: { inline_keyboard: [[{ text: '📝 Открыть форму', web_app: { url: WEBAPP_URL + '/handoff?order_id=' + orderId + '&' + require('../web/auth').keyQuery(ctx.from.id) } }]] },
       });
       await ctx.answerCbQuery('Форма отправлена вам в личку 👆');
     } catch (e) {
@@ -329,11 +316,14 @@ bot.on(['photo', 'document'], async (ctx) => {
     if (!rows.length) return ctx.reply('У вас нет открытых клиентов 🎉');
     await ctx.reply('📂 Ваши клиенты в работе:', {
       reply_markup: { inline_keyboard: rows.map(function(c) {
-                return [{ text: c.org + ' · ' + (c.stage || 'Сбор документов') + ' · ' + c.done + '/' + c.total, web_app: { url: WEBAPP_URL + '/checklist?case_id=' + c.id } }];
+                return [{ text: c.org + ' · ' + (c.stage || 'Сбор документов') + ' · ' + c.done + '/' + c.total, web_app: { url: WEBAPP_URL + '/checklist?case_id=' + c.id + '&' + require('../web/auth').keyQuery(ctx.from.id) } }];
       }) },
     });
   }
 
+  bot.catch(error => {
+    console.error('Telegram update failed:', error.code || error.response?.error_code || error.name || 'error');
+  });
   return bot;
 }
 

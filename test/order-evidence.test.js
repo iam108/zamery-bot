@@ -78,6 +78,11 @@ function egrnHarness({ registerError = false, cached = false } = {}) {
     require: name => {
       if (name === './formatter') return { esc: String };
       if (name === '../db/pool') return { query: async (sql, params) => {
+        if(sql.startsWith('UPDATE egrn_orders SET processing_token=gen_random_uuid()')) {order.processing_token='11111111-1111-4111-8111-111111111111';return {rows:[order]};}
+        if(sql.startsWith('UPDATE egrn_orders SET delivery_manifest=$1')) {order.delivery_manifest=JSON.parse(params[0]);return {rows:[]};}
+        if(sql.startsWith('UPDATE egrn_orders SET processing_token=NULL')) {order.processing_token=null;return {rows:[]};}
+        if(sql.startsWith('UPDATE egrn_orders SET file_msgs=$1')) {order.file_msgs=JSON.parse(params[0]);return {rows:[]};}
+        if(sql.startsWith('UPDATE egrn_orders SET deliver=(')) {order.deliver=(order.deliver||[]).concat(JSON.parse(params[0]));order.delivery_revision=(order.delivery_revision||0)+1;if(order.files_sent>0)order.files_sent=0;return {rows:[order]};}
         if (sql.startsWith('UPDATE egrn_orders SET files_sent=$1')) Object.assign(order, { files_sent: params[0], file_msgs: JSON.parse(params[1]) });
         return { rows: sql.startsWith('SELECT * FROM egrn_orders') ? [order] : [] };
       } };
@@ -93,7 +98,7 @@ function egrnHarness({ registerError = false, cached = false } = {}) {
   context.module.exports.testConfigure([{ name: 'ЕГРН.pdf', buf: pdf, kind: 'pdf' }]);
   context.module.exports.setupEgrn({ on() {}, hears() {}, action() {}, command() {}, telegram: {
     sendDocument: async (chat, file) => { sent.push(file); return { message_id: 3, document: { file_id: 'new-file-id', mime_type: 'application/pdf' } }; },
-    callApi: async () => {}, sendMessage: async () => {}, editMessageText: async () => {},
+    callApi: async () => ({ message_id: 900 }), sendMessage: async () => {}, editMessageText: async () => {},
   } });
   return { order, registrations, sent, logs, poll: () => poll(), attach: context.module.exports.attachOrOrder };
 }

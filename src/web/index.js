@@ -1,4 +1,6 @@
 const express = require('express');
+const crypto = require('node:crypto');
+const { asyncHandler, errorHandler } = require('./http-errors');
 const session = require('express-session');
 const PgSession = require('connect-pg-simple')(session);
 const pool = require('../db/pool');
@@ -12,8 +14,17 @@ function esc(s) {
   });
 }
 
+function adminPasswordMatches(supplied) {
+  const configured = process.env.ADMIN_PASSWORD;
+  if (typeof configured !== 'string' || !configured || typeof supplied !== 'string' || !supplied) return false;
+  return crypto.timingSafeEqual(crypto.createHash('sha256').update(configured).digest(),
+    crypto.createHash('sha256').update(supplied).digest());
+}
+
 function setupWeb(app) {
   require('./auth').setupAuth(app);
+  app.use('/admin/login', express.json({ limit: '4kb' }), express.urlencoded({ extended: false, limit: '4kb' }));
+  app.use('/api/requests/incoming', express.json({ limit: '256kb' }), express.urlencoded({ extended: false, limit: '256kb' }));
   app.use(express.json({ limit: '50mb' }));
   app.use(express.urlencoded({ extended: true, limit: '50mb' }));
   app.use('/api/audit', (error, req, res, next) => {
@@ -30,10 +41,10 @@ function setupWeb(app) {
 
   app.use(session({
     store: new PgSession({ pool: pool, tableName: 'web_sessions' }),
-    secret: process.env.SESSION_SECRET || 'zamery-secret-key',
+    secret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
     resave: false,
     saveUninitialized: false,
-    cookie: { maxAge: 86400000 },
+    cookie: { maxAge: 86400000, httpOnly: true, sameSite: 'lax' },
   }));
 
   require('./workspace').setupWorkspace(app);
@@ -46,16 +57,22 @@ function setupWeb(app) {
 
   app.get('/admin/login', (req, res) => res.send(loginPage()));
   app.post('/admin/login', (req, res) => {
-    if (req.body.password === process.env.ADMIN_PASSWORD) {
-      req.session.auth = true;
-      res.redirect('/admin');
+    if (adminPasswordMatches(req.body && req.body.password)) {
+      req.session.regenerate(error => {
+        if (error) return res.status(503).send(loginPage('Не удалось открыть сессию. Повторите попытку.'));
+        req.session.auth = true;
+        req.session.save(error => {
+          if (error) return res.status(503).send(loginPage('Не удалось сохранить сессию. Повторите попытку.'));
+          res.redirect('/admin');
+        });
+      });
     } else {
       res.send(loginPage('Неверный пароль'));
     }
   });
   app.get('/admin/logout', (req, res) => { req.session.destroy(); res.redirect('/admin/login'); });
 
-  app.get('/admin', requireAuth, async (req, res) => {
+  app.get('/admin', requireAuth, asyncHandler(async (req, res) => {
     const stats = await getStats();
     const { status = 'all', search = '', page = 1 } = req.query;
     const limit = 20;
@@ -63,27 +80,28 @@ function setupWeb(app) {
     const { orders, total } = await getOrders({ status, search, limit, offset });
     const totalPages = Math.ceil(total / limit);
     res.send(adminPage({ orders, stats, status, search, page: parseInt(page), totalPages, total }));
-  });
+  }));
 
-  app.get('/admin/order/:id', requireAuth, async (req, res) => {
+  app.get('/admin/order/:id', requireAuth, asyncHandler(async (req, res) => {
     const order = await getOrderById(parseInt(req.params.id) || 0);
     if (!order) return res.status(404).send('Заявка не найдена');
     const logs = await getOrderLogs(order.id);
     res.send(orderDetailPage(order, logs));
-  });
+  }));
 
-  app.post('/admin/api/status', requireAuth, async (req, res) => {
+  app.post('/admin/api/status', requireAuth, asyncHandler(async (req, res) => {
     const { id, status } = req.body;
     if (['new', 'in_progress', 'done', 'cancelled'].indexOf(status) === -1) return res.status(400).json({ ok: false });
     const order = await updateOrderStatus(parseInt(id), status, 'admin-web');
     res.json({ ok: true, order });
-  });
+  }));
 
   // Общий пакет менеджера: новая заявка или дополнение существующей.
   require('./manager-orders').setupManagerOrders(app);
 
   require('./order-materials').setupOrderMaterials(app);
   require('./order-archive').setupOrderArchive(app);
+  require('./order-egrn-links').setupOrderEgrnLinks(app);
 
   require('./audit-drafts').setupAuditDrafts(app);
 
@@ -102,7 +120,7 @@ function setupWeb(app) {
       res.json({ ok: true, order_id: order.id, org: order.owner_name || order.object_name || '', object_name: order.object_name || '', address: order.address || '', object_category: category,
         service: order.service || '', region: 'МСК', cad_num: order.cad_num || '', archive_url: order.service === 'Продление' ? order.archive_url || '' : '',
         zones_info: order.zones_info || '', has_video: !!order.has_video, video_required: !!order.has_video, contacts: order.contacts || '', deadline: order.deadline || null,
-        status: order.status || 'new', materials, materials_download_url: '/api/audit/orders/' + order.id + '/materials/download-all',
+        status: order.status || 'new', materials, egrn_links: await require('./order-egrn-links').listOrderLinks(order.id), materials_download_url: '/api/audit/orders/' + order.id + '/materials/download-all',
         archive_download_url: order.service === 'Продление' ? (materials.some(file => file.role === 'archive') ? '/api/audit/orders/' + order.id + '/materials/download-all?role=archive' : order.archive_url ? '/api/audit/orders/' + order.id + '/archive/download' : '') : '',
         can_edit_packet: req.staff.role === 'manager' || String(order.submitted_by) === String(req.tgUser.id),
         manager_edit_url: '/form?order_id=' + order.id, telegram_msg_id: order.telegram_msg_id || null });
@@ -135,31 +153,27 @@ function setupWeb(app) {
   }
 });
   // ── Stats page ───────────────────────────────────────────
-  app.get('/admin/stats', requireAuth, async (req, res) => {
+  app.get('/admin/stats', requireAuth, asyncHandler(async (req, res) => {
     const { getStatsByMonth, getStatsByType } = require('../db/queries');
     const byMonth = await getStatsByMonth();
     const byType = await getStatsByType();
     res.send(statsPage({ byMonth, byType }));
-  });
+  }));
 
   // ── Objects page ─────────────────────────────────────────
-  app.get('/admin/objects', requireAuth, async (req, res) => {
+  app.get('/admin/objects', requireAuth, asyncHandler(async (req, res) => {
     const { searchObjects } = require('../db/queries');
     const { search = '' } = req.query;
     const objects = await searchObjects({ search });
     res.send(objectsPage({ objects, search }));
-  });
+  }));
 
-  app.get('/admin/objects/detail', requireAuth, async (req, res) => {
+  app.get('/admin/objects/detail', requireAuth, asyncHandler(async (req, res) => {
     const { getOrdersByObject } = require('../db/queries');
     const { address, name } = req.query;
     const orders = await getOrdersByObject(address, name);
     res.send(objectDetailPage({ orders, address, name }));
-  });
-    app.use(function(err, req, res, next) {
-    console.error('server error:', err.message);
-    res.status(200).json({ ok: false, error: err.code === 'LIMIT_FILE_SIZE' ? 'Файл слишком большой (макс 50 МБ)' : err.message });
-  });
+  }));
   app.get('/form', (req, res) => res.send(miniAppForm()));
 
   const { auditForm } = require('./audit-form');
@@ -171,6 +185,7 @@ function setupWeb(app) {
   app.get('/audit-plan-editor.js', (req, res) => res.sendFile(require('path').join(__dirname, 'audit-plan-editor.js')));
     require('./handoff').setupHandoff(app);
     require('./handoff').setupReportsWeb(app, upload);
+  app.use(errorHandler);
 }
 
 function loginPage(error = '') {
@@ -855,4 +870,4 @@ function objectDetailPage({ orders, address, name }) {
   </div>
 </div></body></html>`;
 }
-module.exports = { setupWeb, miniAppForm };
+module.exports = { setupWeb, miniAppForm, adminPasswordMatches };

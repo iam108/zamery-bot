@@ -105,12 +105,17 @@ test('auditor prefill inherits manager service, archive, task, cadastral id and 
   let handler;
   const order = { id: 58, owner_name: 'Клиент', address: 'Москва, адрес', object_type: 'Розничная торговля', service: 'Продление', cad_num: '77:01:1:12', archive_url: 'https://disk.yandex.ru/d/object', zones_info: 'Проверить соседа', contacts: 'Контакт', has_video: true };
   const materials = [{ id: 'file', name: 'план.pdf', role: 'plan' }];
-  const context = { app: { get(url, fn) { handler = fn; } }, Number, String, console, getOrderById: async () => order, require(name) { assert.equal(name, './order-materials'); return { ensureOrderMaterials: async () => {}, listOrderMaterials: async () => materials }; } };
+  const links = [{ id: 'large-file', name: 'Большая выписка.pdf', role: 'egrn', bytes: 350 * 1024 * 1024 }];
+  const context = { app: { get(url, fn) { handler = fn; } }, Number, String, console, getOrderById: async () => order, require(name) {
+    if (name === './order-egrn-links') return { listOrderLinks: async id => { assert.equal(id, order.id); return links; } };
+    assert.equal(name, './order-materials'); return { ensureOrderMaterials: async () => {}, listOrderMaterials: async () => materials };
+  } };
   vm.createContext(context); vm.runInContext(route, context);
   let result; await handler({ query: { order_id: 58 }, staff: { role: 'manager' }, tgUser: { id: 108 } }, { json(data) { result = data; }, status() { return this; } });
   assert.equal(result.object_category, 'retail'); assert.equal(result.service, 'Продление');
   assert.equal(result.cad_num, order.cad_num); assert.equal(result.zones_info, order.zones_info); assert.equal(result.archive_url, order.archive_url);
   assert.equal(result.video_required, true); assert.equal(result.materials, materials);
+  assert.equal(result.egrn_links, links);
   assert.equal(result.materials_download_url, '/api/audit/orders/58/materials/download-all');
   assert.equal(result.can_edit_packet, true);
 });

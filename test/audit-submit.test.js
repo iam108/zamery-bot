@@ -229,7 +229,7 @@ test('V5 deleted source evidence fails before trusted-packet checkpoint or deliv
 });
 
 test('V5 changed object identity cannot silently relabel an already captured inspection', async () => {
-  for (const [field, value] of [['address', 'Москва, другой адрес'], ['org', 'Другое ООО'], ['object_category', 'tobacco']]) {
+  for (const [field, value] of [['address', 'Москва, другой адрес'], ['org', 'Другое ООО'], ['object_category', 'tobacco'], ['cad_num', '77:01:0004016:9999']]) {
     const data = compactVisit(), h = harness(data);
     h.snapshot.evidence = data.evidence.map(file => ({ ...file, buffer: Buffer.from('ORIGINAL') }));
     let delivered = false;
@@ -242,4 +242,25 @@ test('V5 changed object identity cannot silently relabel an already captured ins
     assert.deepEqual(h.state.delivery, {});
     assert.notEqual(h.snapshot.data.request_packet[field], value);
   }
+});
+
+test('old V5 draft without packet metadata still checks its captured inspection address', async () => {
+  const data=compactVisit(),packet=data.request_packet;delete data.request_packet;
+  const h=harness(data);h.snapshot.evidence=data.evidence.map(file=>({...file,buffer:Buffer.from('ORIGINAL')}));
+  const submit=createAuditSubmitter(h.drafts,async()=>assert.fail('An older draft cannot silently change its actual object'),{
+    loadPacket:async()=>({...packet,address:'Другой адрес'}),
+  });
+  await assert.rejects(submit(108,h.id,4,h.context),error=>error.status===409);
+  assert.equal(h.state.frozen,false);
+});
+
+
+test('a blank tobacco task cannot silently adopt a new manager task at submission', async () => {
+  const data=compactVisit('tobacco',''),h=harness(data);
+  h.snapshot.evidence=data.evidence.map(file=>({...file,buffer:Buffer.from('ORIGINAL')}));
+  const submit=createAuditSubmitter(h.drafts,async()=>assert.fail('Changed task needs an explicit material recheck'),{
+    loadPacket:async()=>({...data.request_packet,service:'Получение'}),
+  });
+  await assert.rejects(submit(108,h.id,4,h.context),error=>error.status===409);
+  assert.equal(h.state.frozen,false);
 });

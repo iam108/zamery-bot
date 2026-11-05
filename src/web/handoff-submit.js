@@ -1,4 +1,6 @@
 const { createHash } = require('node:crypto');
+const { getSessionLockPool } = require('../db/session-lock-pool');
+const { canManageCases } = require('./auth');
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DDL = `ALTER TABLE cases ADD COLUMN IF NOT EXISTS handoff_submit_id TEXT;
   ALTER TABLE cases ADD COLUMN IF NOT EXISTS handoff_signature TEXT;
@@ -95,8 +97,21 @@ function createHandoffSubmitter(options={}) {
     return state;
   }
   return async function submit({body,user,staff}={}) {
-    if(!body||typeof body!=='object'||Array.isArray(body)||body.handoff_version!==2||!UUID.test(body.submit_id||''))fail(400,'HANDOFF_INVALID','Для передачи нужен постоянный номер отправки и версия формы 2.');
-    const owner=String(user?.id||'');if(!/^[1-9]\d{0,19}$/.test(owner))fail(401,'HANDOFF_AUTH','Не удалось определить сотрудника.');
+    if (!canManageCases(staff, user && user.id)) fail(403, 'HANDOFF_FORBIDDEN', 'Передавать клиента может менеджер.');
+    let owner = String(user?.id || '');
+    if (!/^[1-9]\d{0,19}$/.test(owner)) fail(401, 'HANDOFF_AUTH', 'Не удалось определить сотрудника.');
+    if (body?.resume_case_id != null) {
+      const caseId = positive(body.resume_case_id, 'Некорректный номер передачи.');
+      await ensure();
+      const row = (await pool.query('SELECT * FROM cases WHERE id=$1', [caseId])).rows[0];
+      const checkpoint = row && json(json(row.data)._handoff);
+      if (!row || checkpoint.version !== 2 || !checkpoint.body) fail(409, 'HANDOFF_CHECKPOINT_MISSING', 'Не найдена сохранённая передача. Проверьте карточку клиента.');
+      // Resume the frozen manager-confirmed body and its original idempotency
+      // owner, never a newly reconstructed client payload or changed recipient.
+      owner = String(row.created_by);
+      body = checkpoint.body;
+    }
+    if (!body || typeof body !== 'object' || Array.isArray(body) || body.handoff_version !== 2 || !UUID.test(body.submit_id || '')) fail(400, 'HANDOFF_INVALID', 'Для передачи нужен постоянный номер отправки и версия формы 2.');
     const orderId=positive(body.order_id,'Выберите заявку на выезд.'),reportId=positive(body.report_id,'Выберите сохранённый отчёт аудитора.');
     if(orderId>2147483647||reportId>2147483647)fail(400,'HANDOFF_INVALID','Некорректный номер заявки или отчёта.');
     if(!['a','r'].includes(body.report_src))fail(400,'HANDOFF_INVALID','Выберите сохранённый отчёт аудитора.');
@@ -108,21 +123,26 @@ function createHandoffSubmitter(options={}) {
       await ensure();
       c=await getExisting(pool,owner,submitId);
       if(c){state=compatible(c,signature);if(state.completed)return completed(c,state);if(state.manual_review)return partial(c,state,state.manual_review,false);}
-      client=await pool.connect();
+      client=await getSessionLockPool(pool,options.lockPool).connect();
       locked=!!(await client.query('SELECT pg_try_advisory_lock(111,hashtext($1)) AS locked',[owner+':'+submitId])).rows[0]?.locked;
       if(!locked){if(c)return partial(c,state,'Передача уже выполняется. Повторите проверку результата.',true);const busy=new HandoffError(409,'HANDOFF_BUSY','Передача уже выполняется. Повторите проверку результата.');delete busy.case_created;throw busy;}
       c=await getExisting(client,owner,submitId);
       if(c){state=compatible(c,signature);if(state.completed)return completed(c,state);if(state.inflight||state.materials?.inflight)state.manual_review='Не удалось сохранить подтверждение предыдущей отправки. Проверьте уже доставленные сообщения вручную; автоматический повтор остановлен, чтобы не создавать дубли.';if(state.manual_review)return partial(c,state,state.manual_review,false);}
       else {
         orderLocked=!!(await client.query('SELECT pg_try_advisory_lock(112,$1) AS locked',[orderId])).rows[0]?.locked;
-        const assigned=(await client.query('SELECT id,lawyer_name FROM cases WHERE order_id=$1 ORDER BY id DESC LIMIT 1',[orderId])).rows[0];
+        const assigned=(await client.query('SELECT * FROM cases WHERE order_id=$1 ORDER BY id DESC LIMIT 1',[orderId])).rows[0];
         if(assigned){
           const error=new HandoffError(409,'HANDOFF_ALREADY_ASSIGNED','Заявка уже передана юристу «'+(value(assigned.lawyer_name)||'не указан')+'», клиент №'+assigned.id+'.');
-          error.case_created=true;error.case_id=Number(assigned.id);error.manual_review=true;error.retry=false;throw error;
+          const assignedState = json(json(assigned.data)._handoff);
+          if (assignedState.version === 2) {
+            error.delivery_complete = assignedState.completed === true;
+            error.can_resume = assignedState.completed !== true && !assignedState.manual_review;
+          }
+          error.case_created=true;error.case_id=Number(assigned.id);error.retry=false;throw error;
         }
         if(!orderLocked){const busy=new HandoffError(409,'HANDOFF_BUSY','Передача этой заявки уже выполняется. Проверьте результат перед повтором.');delete busy.case_created;busy.retry=true;throw busy;}
         const d=fields(body),lawyerId=positive(body.lawyer_tg_id,'Выберите юриста.');
-        const packet=await packetService().packet({order_id:orderId,report_src:body.report_src,report_id:reportId});
+        const packet=await packetService().packet({order_id:orderId,report_src:body.report_src,report_id:reportId,request_id:body.request_id||null});
         if(!packet?.order||!packet.report||packet.report.id!==reportId||packet.report.src!==body.report_src||Number(packet.order.id)!==orderId)fail(409,'HANDOFF_REPORT_UNAVAILABLE','Не удалось подтвердить выбранный отчёт и заявку.');
         if(!/^[a-f\d]{64}$/i.test(body.packet_signature||'')||body.packet_signature!==packet.signature)fail(409,'HANDOFF_PACKET_CHANGED','Заявка или её документы изменились. Обновите комплект перед передачей.');
         const lawyer=(await client.query("SELECT tg_id,name FROM staff WHERE tg_id=$1 AND role='lawyer' AND approved=true",[lawyerId])).rows[0];
@@ -131,6 +151,7 @@ function createHandoffSubmitter(options={}) {
         if(!checklist)fail(400,'HANDOFF_CHECKLIST','Для выбранной услуги не найден чек-лист.');
         const picked=await loadReport(body.report_src,reportId),source=sourceReport(picked);
         const requestId=body.request_id?positive(body.request_id,'Некорректный номер исходной заявки.'):null;
+        if (requestId !== (packet.request ? Number(packet.request.id) : null)) fail(409, 'HANDOFF_REQUEST_MISMATCH', 'Исходная заявка не совпадает с просмотренным комплектом. Обновите форму.');
         let request=null;
         if(requestId){
           const row=(await client.query('SELECT chat_id,msg_ids,first_id FROM reports WHERE id=$1',[requestId])).rows[0];

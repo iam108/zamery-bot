@@ -9,6 +9,8 @@ test('audit keeps structured answers and attachment roles without image base64',
   const context = { module: { exports: {} }, require(name) {
     if (name === '../db/pool') return { query: async (sql, params) => { queries.push({ sql, params }); return { rows: [] }; } };
     if (name === '../checklists') return {};
+    if (name === './auth') return require('../src/web/auth');
+    if (name === './http-errors') return require('../src/web/http-errors');
     throw new Error('Unexpected require: ' + name);
   } };
   vm.createContext(context);

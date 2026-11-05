@@ -4,7 +4,7 @@ const { randomUUID } = require('node:crypto');
 const { createDraftStore, prepareEvidence, setupAuditDrafts, validateData } = require('../src/web/audit-drafts');
 
 function file(text = 'original', changes = {}) {
-  return { id: randomUUID(), name: 'план.png', mime: 'image/png', role: 'plan', subject_id: 'plan-main', data: Buffer.from(text).toString('base64'), ...changes };
+  return { revision: 1, id: randomUUID(), name: 'план.png', mime: 'image/png', role: 'plan', subject_id: 'plan-main', data: Buffer.from(text).toString('base64'), ...changes };
 }
 function error(status, code) { return e => e.status === status && e.code === code; }
 
@@ -163,13 +163,13 @@ test('evidence retries are idempotent, downloads are scoped, and removals retain
   await assert.rejects(store.downloadEvidence(109, draft.id, source.id), error(404, 'NOT_FOUND'));
   await assert.rejects(store.addEvidence(108, draft.id, { ...source, name: 'other.png' }), error(409, 'FILE_CONFLICT'));
   await assert.rejects(store.addEvidence(108, draft.id, { ...source, data: Buffer.from('changed').toString('base64') }), error(409, 'FILE_CONFLICT'));
-  assert.equal((await store.removeEvidence(108, draft.id, source.id)).revision, 3);
+  assert.equal((await store.removeEvidence(108, draft.id, source.id, 2)).revision, 3);
   assert.equal((await store.current(108, 58)).evidence.length, 0);
   await assert.rejects(store.downloadEvidence(108, draft.id, source.id), error(404, 'NOT_FOUND'));
   const stored = await db.query('SELECT content,deleted_at FROM audit_evidence WHERE draft_id=$1 AND id=$2', [draft.id, source.id]);
   assert.equal(Buffer.from(stored.rows[0].content).toString(), 'original bytes');
   assert.ok(stored.rows[0].deleted_at);
-  assert.equal((await store.addEvidence(108, draft.id, source)).revision, 4);
+  assert.equal((await store.addEvidence(108, draft.id, { ...source, revision: 3 })).revision, 4);
   assert.equal((await store.current(108, 58)).evidence.length, 1);
 }));
 
@@ -177,10 +177,10 @@ test('evidence aggregate limits cannot be bypassed by recoverable removals', { s
   const draft = await store.create(108, 58);
   const first = file('123456789');
   await store.addEvidence(108, draft.id, first);
-  await assert.rejects(store.addEvidence(108, draft.id, file('1234567890')), error(413, 'EVIDENCE_LIMIT'));
-  await store.addEvidence(108, draft.id, file('123456789'));
-  await store.removeEvidence(108, draft.id, first.id);
-  await assert.rejects(store.addEvidence(108, draft.id, file('a')), error(413, 'EVIDENCE_LIMIT'));
+  await assert.rejects(store.addEvidence(108, draft.id, file('1234567890', { revision: 2 })), error(413, 'EVIDENCE_LIMIT'));
+  await store.addEvidence(108, draft.id, file('123456789', { revision: 2 }));
+  await store.removeEvidence(108, draft.id, first.id, 3);
+  await assert.rejects(store.addEvidence(108, draft.id, file('a', { revision: 4 })), error(413, 'EVIDENCE_LIMIT'));
 }, { fileBytes: 12, totalBytes: 18, files: 2 }));
 
 test('submission freezes a revision, resumes durable delivery after restart, and closes idempotently', { skip: !process.env.PGLITE_TEST_MODULE }, async () => database(async (store, db, pool) => {
@@ -194,7 +194,7 @@ test('submission freezes a revision, resumes durable delivery after restart, and
   assert.equal((await store.addEvidence(108, draft.id, source)).revision, 2); // A lost file-upload response can be retried after final freeze.
   await assert.rejects(store.addEvidence(108, draft.id, file('new file')), error(409, 'SUBMITTING'));
   await assert.rejects(store.update(108, draft.id, 2, {}), error(409, 'SUBMITTING'));
-  await assert.rejects(store.removeEvidence(108, draft.id, source.id), error(409, 'SUBMITTING'));
+  await assert.rejects(store.removeEvidence(108, draft.id, source.id, 2), error(409, 'SUBMITTING'));
   await store.releaseDraftSubmission(108, draft.id, 2); // Safe before Telegram side effects.
   await store.loadDraftForSubmit(108, draft.id, 2);
   await store.saveDraftDelivery(108, draft.id, 2, { textIds: [110, 111], documentIds: [112], saved: false });
@@ -210,3 +210,77 @@ test('submission freezes a revision, resumes durable delivery after restart, and
   assert.notEqual(next.id, draft.id);
   assert.equal((await db.query('SELECT COUNT(*)::int AS count FROM audit_evidence')).rows[0].count, 1);
 }));
+
+test('stale evidence mutations cannot bypass draft metadata concurrency and exact retries remain idempotent', { skip: !process.env.PGLITE_TEST_MODULE }, async () => database(async (store) => {
+  const draft = await store.create(108, 58, { conclusion: 'First' });
+  const original = file('first image');
+  const added = await store.addEvidence(108, draft.id, original);
+  assert.equal((await store.addEvidence(108, draft.id, original)).revision, 2);
+  const changed = await store.update(108, draft.id, added.revision, { conclusion: 'New answers from another tab' });
+  await assert.rejects(store.addEvidence(108, draft.id, file('stale attachment', { revision: 2 })), error(409, 'REVISION_CONFLICT'));
+  await assert.rejects(store.addEvidence(108, draft.id, original), error(409, 'REVISION_CONFLICT'));
+  await assert.rejects(store.removeEvidence(108, draft.id, original.id, 2), error(409, 'REVISION_CONFLICT'));
+  assert.equal((await store.current(108, 58)).data.conclusion, 'New answers from another tab');
+  const removed = await store.removeEvidence(108, draft.id, original.id, changed.revision);
+  assert.equal((await store.removeEvidence(108, draft.id, original.id, changed.revision)).revision, removed.revision);
+  await store.update(108, draft.id, removed.revision, { conclusion: 'Even newer answers' });
+  await assert.rejects(store.removeEvidence(108, draft.id, original.id, changed.revision), error(409, 'REVISION_CONFLICT'));
+  assert.equal((await store.current(108, 58)).data.conclusion, 'Even newer answers');
+}));
+
+test('delivery lock can use an independent pool while ordinary draft queries remain available', { timeout: 1000 }, async () => {
+  const id = randomUUID(), events = [];
+  const query = async (sql, params) => {
+    if (sql.startsWith('SELECT * FROM audit_drafts')) return { rows: [{ id, author_tg_id: params[1] }] };
+    if (sql.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
+    return { rows: [] };
+  };
+  let tail = Promise.resolve(), leases = 0;
+  const pool = { async connect() {
+    let unlock; const previous = tail; tail = new Promise(resolve => { unlock = resolve; });
+    await previous; leases++;
+    return { query, release: unlock };
+  } };
+  const lockPool = { async connect() { return { query: async (...args) => { events.push('lock-query'); return query(...args); }, release() { events.push('unlock'); } }; } };
+  const store = createDraftStore(pool, undefined, { lockPool });
+  await Promise.all(Array.from({ length: 10 }, () => store.withDraftDeliveryLock(108, id, async () => {
+    const client = await pool.connect();
+    await client.query('SELECT 1'); client.release();
+  })));
+  assert.equal(events.filter(event => event === 'unlock').length, 10);
+  assert.ok(leases >= 11);
+});
+
+test('ten simultaneous deliveries on a one-slot pg pool leave ordinary SQL available', { timeout: 2500 }, async () => {
+  const { EventEmitter } = require('node:events');
+  const { Pool } = require('pg');
+  const clients = [];
+  class SyntheticClient extends EventEmitter {
+    constructor(options) { super(); this.options=options; this._queryable=true; this._ending=false; clients.push(this); }
+    connect(callback) { queueMicrotask(()=>callback()); }
+    ref() {}
+    unref() {}
+    end(callback) { this._ending=true; queueMicrotask(()=>{ this.emit('end'); callback?.(); }); }
+    query(sql, params, callback) {
+      if(typeof params==='function'){callback=params;params=undefined;}
+      let rows=[];
+      if(sql.startsWith('SELECT * FROM audit_drafts'))rows=[{id:params[0],author_tg_id:params[1]}];
+      if(sql.includes('pg_try_advisory_lock'))rows=[{locked:true}];
+      const result={rows};
+      if(callback){setImmediate(()=>callback(null,result));return;}
+      return Promise.resolve(result);
+    }
+  }
+  const pool=new Pool({Client:SyntheticClient,max:1,connectionTimeoutMillis:500,idleTimeoutMillis:20,allowExitOnIdle:true});
+  try {
+    const store=createDraftStore(pool);let completed=0;
+    await Promise.all(Array.from({length:10},(_,index)=>store.withDraftDeliveryLock(108,randomUUID(),async()=>{
+      await pool.query('SELECT 1');completed++;
+    })));
+    assert.equal(completed,10);
+    assert.equal(pool.waitingCount,0);
+    assert.ok(clients.some(client=>client.options.max===2),'Session locks must have their own bounded pool');
+    assert.ok(clients.some(client=>client.options.max===1),'Normal queries stay on the original pool');
+  } finally { await require('../src/web/audit-drafts').closeDeliveryLockPool(pool); await pool.end(); }
+  assert.ok(clients.every(client=>client._ending),'All owned pools close during test cleanup');
+});

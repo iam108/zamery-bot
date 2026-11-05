@@ -23,12 +23,17 @@ function harness({ files = [native('small')], fail, receipt, sender = true } = {
     return transport('native', { chat: value.from_chat_id, id: value.message_id }, { chat: value.chat_id, reply: value.reply_parameters?.message_id });
   } };
   const context = {
-    module: { exports: {} }, Buffer,
+    module: { exports: {} }, Buffer, setInterval() {}, clearInterval() {},
     process: { env: {} }, console: { error(...args) { errors.push(args); } },
     fetch() { apiCalls++; throw new Error('Paid API and external requests are forbidden in this test.'); },
     require(name) {
       if (name === '../db/pool') return { async query(sql, params) {
         queries.push({ sql, params });
+        if(sql.startsWith('UPDATE egrn_orders SET processing_token=gen_random_uuid()')) {order.processing_token='11111111-1111-4111-8111-111111111111';return {rows:[order]};}
+        if(sql.startsWith('UPDATE egrn_orders SET delivery_manifest=$1')) {order.delivery_manifest=JSON.parse(params[0]);return {rows:[]};}
+        if(sql.startsWith('UPDATE egrn_orders SET processing_token=NULL')) {order.processing_token=null;return {rows:[]};}
+        if(sql.startsWith('UPDATE egrn_orders SET file_msgs=$1')) {order.file_msgs=JSON.parse(params[0]);return {rows:[]};}
+        if(sql.startsWith('UPDATE egrn_orders SET deliver=(')) {order.deliver=(order.deliver||[]).concat(JSON.parse(params[0]));order.delivery_revision=(order.delivery_revision||0)+1;if(order.files_sent>0)order.files_sent=0;return {rows:[order]};}
         if (sql.startsWith('SELECT * FROM egrn_orders WHERE cad_num=')) return { rows: [order] };
         return { rows: [] };
       } };
@@ -48,10 +53,9 @@ function harness({ files = [native('small')], fail, receipt, sender = true } = {
 
 const copyKey = (chat, file) => JSON.stringify([String(chat), file.key || String(file.chat) + ':' + String(file.id)]);
 
-test('legacy small-file failure remains best effort when strict mode is not requested', async () => {
+test('a native copy failure cannot claim a successful attachment when strict mode was omitted', async () => {
   const h = harness({ fail: () => new Error('Temporary Telegram failure') });
-  const result = await h.attach();
-  assert.equal(result.result, 'attached');
+  await assert.rejects(h.attach(), /Temporary Telegram failure/);
   assert.equal(h.calls.length, 1);
   h.noPaidOrder();
 });
@@ -62,7 +66,7 @@ test('opt-in strict copy failure cannot claim that an existing EGRN was attached
   await assert.rejects(h.attach({ copyOptions: { strict: true } }), error => error === failure);
   assert.equal(failure.uncertain, true);
   assert.equal(h.calls.length, 1);
-  assert.equal(h.order.files_sent, 1);
+  assert.equal(h.order.files_sent, 0, 'The failed recipient remains pending for background retry');
   h.noPaidOrder();
 });
 

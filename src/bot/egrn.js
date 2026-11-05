@@ -39,40 +39,110 @@ async function registerOriginal(targets, file) {
 function largeDelivery() {
   return require('./egrn-large-delivery').createLargeDelivery({ telegram: tgApi,
     persist: async function (order, records) {
-      await pool.query('UPDATE egrn_orders SET file_msgs=$1, updated_at=NOW() WHERE id=$2', [JSON.stringify(records), order.id]);
-      order.file_msgs = records;
+      await persistFileRecords(order, records);
     }
   });
 }
 
-function hasReusableLinks(order) {
+function hasReusableFiles(order) {
   const files = Array.isArray(order && order.file_msgs) ? order.file_msgs : [];
   const manifest = Array.isArray(order && order.delivery_manifest) ? order.delivery_manifest : [];
-  return !!(order && order.status === 'done' && files.some(file => file.kind === 'link') &&
-    (order.files_sent > 0 || manifest.length && manifest.every(key => files.some(file => file.key === key))));
+  return !!(order && order.status === 'done' && files.length &&
+    (order.files_sent > 0 || manifest.length && manifest.every(key => files.some(file => sourceKey(file) === key))));
 }
+
+function lostLease() { return Object.assign(new Error('Обработка выписки уже продолжена другим процессом.'), { code: 'EGRN_LEASE_LOST' }); }
+async function claimDelivery(id) {
+  const result = await pool.query("UPDATE egrn_orders SET processing_token=gen_random_uuid(),processing_until=NOW()+INTERVAL '2 minutes' WHERE id=$1 AND status IN ('ordered','done') AND (processing_until IS NULL OR processing_until<=NOW()) RETURNING *", [id]);
+  return result.rows[0] || null;
+}
+async function renewDelivery(order) {
+  const result = await pool.query("UPDATE egrn_orders SET processing_until=NOW()+INTERVAL '2 minutes' WHERE id=$1 AND processing_token=$2 AND processing_until>NOW()", [order.id, order.processing_token]);
+  if (result.rowCount === 0) throw lostLease();
+}
+function keepDeliveryAlive(order) {
+  let pending = null, failure = null;
+  const timer = setInterval(() => {
+    if (!pending) pending = renewDelivery(order).catch(error => { failure = error; }).finally(() => { pending = null; });
+  }, 30000);
+  if (timer?.unref) timer.unref();
+  return {
+    assert() { if (failure) throw failure; },
+    async close() {
+      if (timer && typeof clearInterval === 'function') clearInterval(timer);
+      if (pending) await pending;
+      await pool.query('UPDATE egrn_orders SET processing_token=NULL,processing_until=NULL WHERE id=$1 AND processing_token=$2', [order.id, order.processing_token]);
+    },
+  };
+}
+async function persistFileRecords(order, records) {
+  const result = await pool.query('UPDATE egrn_orders SET file_msgs=$1,updated_at=NOW() WHERE id=$2 AND processing_token=$3', [JSON.stringify(records), order.id, order.processing_token]);
+  if (result.rowCount === 0) throw lostLease();
+  order.file_msgs = records;
+  if ((order.deliver || []).some(target => target?.order_id) && records.some(file => file.kind==='link' || Number(file.bytes) > 12 * 1024 * 1024)) await require('../web/order-egrn-links').registerOrderLinks(order, records);
+}
+
+function nativeDeliveryTargets(order, record) {
+  const values = [{ chat: order.chat_id }, ...(Array.isArray(order.deliver) ? order.deliver : [])];
+  if (order.ordered_by) values.push({ chat: order.ordered_by });
+  const unique = new Map();
+  for (const value of values) {
+    if (!value || !/^-?[1-9]\d*$/.test(String(value.chat || ''))) continue;
+    if (record.document_kind === 'xml' && String(value.chat) !== String(record.chat)) continue;
+    if (!unique.has(String(value.chat))) unique.set(String(value.chat), value);
+  }
+  return [...unique.values()];
+}
+
+async function deliverNativeRecord(order, record, records) {
+  await renewDelivery(order);
+  if (!Number.isSafeInteger(Number(record.id)) || Number(record.id) < 1 || !record.chat) throw new Error('Не найден оригинал выписки в Telegram.');
+  const confirmed = {};
+  const deliveries = Array.isArray(record.deliveries) ? record.deliveries : [];
+  // Legacy native records already prove their delivery to the primary chat.
+  confirmed[JSON.stringify([String(record.chat), record.key || String(record.chat) + ':' + String(record.id)])] = true;
+  for (const receipt of deliveries) {
+    if (receipt && receipt.id) confirmed[JSON.stringify([String(receipt.chat), record.key || String(record.chat) + ':' + String(record.id)])] = true;
+  }
+  await copyFiles([record], nativeDeliveryTargets(order, record), { strict: true, confirmed,
+    async onCopied(key, message) {
+      const chat = JSON.parse(key)[0];
+      record.deliveries = deliveries;
+      deliveries.push({ chat, id: Number(message.message_id) });
+      await persistFileRecords(order, records);
+    }
+  });
+}
+
+async function markDelivered(order, records) {
+  if ((order.deliver || []).some(target => target?.order_id) && records.some(file => file.kind==='link' || Number(file.bytes)>12*1024*1024)) await require('../web/order-egrn-links').registerOrderLinks(order, records);
+  // A new recipient registered while delivery was running keeps the row
+  // pending, so the next round sends only their missing originals.
+  await pool.query('UPDATE egrn_orders SET files_sent=$1,file_msgs=$2,error=$3,failures=0,retry_at=NULL,updated_at=NOW() WHERE id=$4 AND delivery_revision=$5 AND processing_token=$6',
+    [records.length, JSON.stringify(records), null, order.id, Number(order.delivery_revision || 0), order.processing_token]);
+}
+
+function sourceKey(record) { return record.key || String(record.chat) + ':' + String(record.id); }
 
 async function resumeLargeDelivery(order) {
   const records = Array.isArray(order.file_msgs) ? order.file_msgs : [];
   const manifest = Array.isArray(order.delivery_manifest) ? order.delivery_manifest : [];
-  if (order.status !== 'done' || !records.some(file => file.kind === 'link') || !manifest.length ||
-      !manifest.every(key => records.some(file => file.key === key))) return false;
-  for (const record of records) if (record.kind === 'link') await largeDelivery().retry(order, record, records);
-  await pool.query('UPDATE egrn_orders SET files_sent=$1, file_msgs=$2, error=$3, failures=0, retry_at=NULL WHERE id=$4',
-    [records.length, JSON.stringify(records), null, order.id]);
+  if (order.status !== 'done' || !manifest.length || !manifest.every(key => records.some(file => sourceKey(file) === key))) return false;
+  for (const record of records) {
+    if (record.kind === 'link') await largeDelivery().retry(order, record, records);
+    else await deliverNativeRecord(order, record, records);
+  }
+  await markDelivered(order, records);
   return true;
 }
 
 function documentRecord(message, chat, key, file) {
-  const record = { chat: Number(chat), id: message.message_id, key: key };
-  if (message.document && message.document.file_id) {
-    record.file_id = message.document.file_id;
-    record.name = file.name;
-    record.mime = message.document.mime_type || (/\.pdf$/i.test(file.name) ? 'application/pdf' : /\.zip$/i.test(file.name) ? 'application/zip' : 'application/octet-stream');
-    record.bytes = file.buf.length;
-  }
+  const mime = message.document?.mime_type || (/\.pdf$/i.test(file.name) ? 'application/pdf' : /\.zip$/i.test(file.name) ? 'application/zip' : 'application/octet-stream');
+  const record = { chat: Number(chat), id: message.message_id, key, document_kind: file.kind || '', name: file.name, mime, bytes: file.buf.length };
+  if (message.document?.file_id) record.file_id = message.document.file_id;
   return record;
 }
+
 const TYPE_DOC = 'kvarmrusxmlpdf'; // выписка об объекте
 let tgApi = null; // bot.telegram — задаётся в setupEgrn, нужен и формам (заявка на замер, передача юристу)
 
@@ -104,6 +174,14 @@ function ensureTables() {
       ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS failures INT NOT NULL DEFAULT 0;
       ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS retry_at TIMESTAMPTZ;
       ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS delivery_manifest JSONB NOT NULL DEFAULT '[]';
+      ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS delivery_revision INT NOT NULL DEFAULT 0;
+      ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS request_key TEXT;
+      ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS processing_token UUID;
+      ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS processing_until TIMESTAMPTZ;
+      CREATE UNIQUE INDEX IF NOT EXISTS egrn_orders_request_key ON egrn_orders(request_key) WHERE request_key IS NOT NULL;
+      UPDATE egrn_orders SET status='order_unknown',status_text='Заказ требует проверки у поставщика',
+        error='Не подтверждён результат первоначального заказа',updated_at=NOW()
+        WHERE status='ordering' AND created_at < NOW() - INTERVAL '5 minutes';
       UPDATE egrn_orders SET files_sent=0, failures=0, retry_at=NULL, error='Повторная доставка крупной выписки', updated_at=NOW()
         WHERE files_sent=-1 AND status='done' AND created_at > NOW() - INTERVAL '30 days'
         AND (error LIKE '%Файл слишком большой для Telegram:%'
@@ -139,15 +217,84 @@ function parseCads(text) {
 }
 
 async function apiOrder(cad, typeDoc) {
-  const r = await fetch(API, {
-    method: 'POST',
-    headers: { 'Authorization-Token': process.env.EGRN_TOKEN, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ cad_num: cad, type_doc: typeDoc, id_declarant: parseInt(process.env.EGRN_DECLARANT_ID) || process.env.EGRN_DECLARANT_ID }),
-  });
-  const text = await r.text();
-  let j = null; try { j = JSON.parse(text); } catch (e) {}
-  if (!r.ok || !j || !j.id_statement) throw new Error('API ' + r.status + ': ' + String(text).slice(0, 200));
-  return j.id_statement;
+  let response;
+  try {
+    response = await fetch(API, {
+      method: 'POST',
+      headers: { 'Authorization-Token': process.env.EGRN_TOKEN, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cad_num: cad, type_doc: typeDoc, id_declarant: parseInt(process.env.EGRN_DECLARANT_ID) || process.env.EGRN_DECLARANT_ID }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const data = await response.json();
+    const statement = data?.id_statement;
+    if (!response.ok || typeof statement === 'number' && !Number.isSafeInteger(statement) || !/^[1-9]\d{0,18}$/.test(String(statement || '')) || BigInt(statement)>9223372036854775807n) throw new Error('Unconfirmed order');
+    return data.id_statement;
+  } catch (cause) {
+    const rejected = response && [400, 401, 403, 404, 405, 409, 422].includes(response.status);
+    throw Object.assign(new Error(rejected
+      ? 'Поставщик отклонил заказ выписки. Проверьте настройки и данные заказа.'
+      : 'Поставщик не подтвердил результат заказа. Проверьте личный кабинет перед повторным заказом.'),
+    { code: rejected ? 'EGRN_ORDER_REJECTED' : 'EGRN_ORDER_UNCONFIRMED', uncertain: !rejected });
+  }
+}
+
+async function reserveOrder(cad, opts) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // The lock protects only the short reservation transaction. Provider I/O
+    // happens after COMMIT, so a slow service never consumes a locked pool slot.
+    await client.query('SELECT pg_advisory_xact_lock(117,hashtext($1))', [cad + '\n' + TYPE_DOC]);
+    let previous;
+    if (opts.requestKey) previous = (await client.query('SELECT * FROM egrn_orders WHERE request_key=$1', [opts.requestKey])).rows[0];
+    if (!previous && opts.force) previous = (await client.query("SELECT * FROM egrn_orders WHERE cad_num=$1 AND type_doc=$2 AND status IN ('ordering','order_unknown') ORDER BY id DESC LIMIT 1", [cad, TYPE_DOC])).rows[0];
+    if (!previous && !opts.force) previous = (await client.query(
+      "SELECT * FROM egrn_orders WHERE cad_num=$1 AND type_doc=$2 AND status <> 'failed' AND created_at > NOW() - INTERVAL '30 days' ORDER BY id DESC LIMIT 1",
+      [cad, TYPE_DOC])).rows[0];
+    if (previous) {
+      await client.query('COMMIT');
+      return { order: previous, created: false };
+    }
+    const target = process.env.EGRN_CHAT_ID || opts.orderedBy;
+    const order = (await client.query(
+      "INSERT INTO egrn_orders(cad_num,label,type_doc,ordered_by,ordered_name,status,status_text,chat_id,deliver,request_key) VALUES($1,$2,$3,$4,$5,'ordering','Подтверждаю заказ у поставщика',$6,$7,$8) RETURNING *",
+      [cad, opts.label || '', TYPE_DOC, opts.orderedBy, opts.orderedName || '', target, JSON.stringify(opts.targets || []), opts.requestKey || null])).rows[0];
+    await client.query('COMMIT');
+    return { order, created: true };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally { client.release(); }
+}
+
+async function placeReservedOrder(order) {
+  let statement;
+  try {
+    statement = await apiOrder(order.cad_num, order.type_doc);
+    const result = await pool.query("UPDATE egrn_orders SET id_statement=$1,status='ordered',status_text='заказана',error=NULL,updated_at=NOW() WHERE id=$2 RETURNING *", [statement, order.id]);
+    return result.rows[0];
+  } catch (error) {
+    // A lost HTTP or database acknowledgement must not trigger another paid
+    // POST. Retain the reservation even after a process restart.
+    const status = error.uncertain === false ? 'failed' : 'order_unknown';
+    await pool.query('UPDATE egrn_orders SET status=$1,status_text=$2,error=$2,id_statement=COALESCE($3,id_statement),updated_at=NOW() WHERE id=$4',
+      [status, error.uncertain === false ? error.message : 'Заказ требует проверки у поставщика', statement || null, order.id]).catch(() => {});
+    if (statement) error = Object.assign(new Error('Заказ создан у поставщика, но подтверждение в боте не сохранено. Передайте администратору номер ' + statement + '.'), { uncertain: true, code: 'EGRN_ORDER_CHECKPOINT' });
+    throw error;
+  }
+}
+
+async function mergeTargets(order, targets) {
+  if (!Array.isArray(targets) || !targets.length) return order;
+  const result = await pool.query(`UPDATE egrn_orders SET deliver=(
+      SELECT COALESCE(jsonb_agg(target), '[]'::jsonb) FROM (
+        SELECT DISTINCT target FROM jsonb_array_elements(COALESCE(deliver,'[]'::jsonb) || $1::jsonb) AS entry(target)
+      ) unique_targets
+    ), delivery_revision=delivery_revision+1,
+    files_sent=CASE WHEN files_sent>0 THEN 0 ELSE files_sent END,
+    failures=0,retry_at=NULL,updated_at=NOW() WHERE id=$2 RETURNING *`, [JSON.stringify(targets), order.id]);
+  if (!result.rows[0]) throw new Error('Заказ выписки больше недоступен.');
+  return result.rows[0];
 }
 
 function authHeaders() {
@@ -441,39 +588,21 @@ function setupEgrn(bot) {
       if (!p) return ctx.answerCbQuery('Кнопка устарела, пришлите номер ещё раз', { show_alert: true });
       const typeDoc = TYPE_DOC;
 
-      // Уже заказывали за 30 дней?
-      if (!ctx.match[3]) {
-        const prev = (await pool.query(
-          "SELECT * FROM egrn_orders WHERE cad_num=$1 AND type_doc=$2 AND status <> 'failed' AND created_at > NOW() - INTERVAL '30 days' ORDER BY id DESC LIMIT 1",
-          [p.cad_num, typeDoc])).rows[0];
-        if (prev) {
-          await ctx.answerCbQuery();
-          if (hasReusableLinks(prev)) {
-            await copyFiles(prev.file_msgs, [{ chat: cbChat }]);
-            return ctx.reply('Готовая выписка отправлена выше. Новую выписку заказывать не потребовалось.', {
-              reply_markup: { inline_keyboard: [[{ text: 'Заказать новую выписку ещё раз', callback_data: 'eg:' + p.id + ':' + ctx.match[2] + ':force' }]] },
-            });
-          }
-          return ctx.reply('Выписку по ' + p.cad_num + ' уже заказывали ' + new Date(prev.created_at).toLocaleDateString('ru-RU') + ' (' + (prev.ordered_name || '') + '), статус: ' + (prev.status_text || prev.status) + '. Заказать ещё раз?', {
-            reply_markup: { inline_keyboard: [[{ text: 'Да, заказать ещё раз', callback_data: 'eg:' + p.id + ':' + ctx.match[2] + ':force' }]] },
-          });
-        }
+      await ctx.answerCbQuery('Проверяю заказ…');
+      const result = await attachOrOrder({ cad: p.cad_num, label: p.label, order: true,
+        orderedBy: ctx.from.id, orderedName: nameOf(ctx.from), force: !!ctx.match[3],
+        requestKey: ctx.match[3] ? 'telegram:' + p.id : null,
+        targets: [{ chat: cbChat }], note: 'Заказ из Telegram' });
+      if (result.result === 'attached') {
+        return ctx.reply('Готовая выписка отправлена выше. Новую выписку заказывать не потребовалось.', {
+          reply_markup: { inline_keyboard: [[{ text: 'Заказать новую выписку ещё раз', callback_data: 'eg:' + p.id + ':' + ctx.match[2] + ':force' }]] },
+        });
       }
-      await ctx.answerCbQuery('Заказываю…');
-      const idSt = await apiOrder(p.cad_num, typeDoc);
-      const target = CHAT() || ctx.from.id;
-      const o = (await pool.query(
-        "INSERT INTO egrn_orders (cad_num, label, type_doc, ordered_by, ordered_name, id_statement, status, status_text, chat_id) VALUES ($1,$2,$3,$4,$5,$6,'ordered','заказана',$7) RETURNING *",
-        [p.cad_num, p.label, typeDoc, ctx.from.id, nameOf(ctx.from), idSt, target])).rows[0];
-      const opts = { parse_mode: 'HTML' };
-      if (String(p.chat_id) === String(target) && p.src_msg_id) opts.reply_to_message_id = Number(p.src_msg_id);
-      let msg;
-      try { msg = await ctx.telegram.sendMessage(target, cardText(o), opts); }
-      catch (e) { delete opts.reply_to_message_id; msg = await ctx.telegram.sendMessage(target, cardText(o), opts); }
-      await pool.query('UPDATE egrn_orders SET status_msg_id=$1 WHERE id=$2', [msg.message_id, o.id]);
-      if (String(target) !== String(ctx.from.id)) {
-        try { await ctx.telegram.sendMessage(ctx.from.id, '⏳ Выписка по ' + p.cad_num + ' заказана (№' + idSt + '). Пришлю, когда будет готова.'); } catch (e) {}
-      }
+      if (result.result === 'uncertain') return ctx.reply(result.packet_warning);
+      if (result.result === 'waiting') return ctx.reply('Выписка по ' + p.cad_num + ' уже в работе. Пришлю её после готовности.');
+      if (result.result === 'unavailable') return ctx.reply('Выписка уже заказана, но её доставка остановлена. Передайте администратору номер ' + result.id + ' для повтора доставки.');
+      if (result.result !== 'ordered') return ctx.reply('Не удалось подтвердить заказ выписки. Повторный платный заказ не создавался.');
+      await ctx.reply('⏳ Выписка по ' + p.cad_num + ' заказана (№' + result.id + '). Пришлю, когда будет готова.');
       await closeRow(ctx, p.id, '✅ Заказано · ' + nameOf(ctx.from));
     } catch (e) {
       console.error('egrn order:', e.message);
@@ -510,6 +639,32 @@ function setupEgrn(bot) {
     }
   });
 
+  // Resolve an ambiguous paid request only after an administrator has checked
+  // the provider cabinet. This operation binds an existing order; it never POSTs.
+  bot.command('egrn_reconcile', async function (ctx) {
+    if (ctx.chat?.type !== 'private') return;
+    const admins = String(process.env.ADMIN_TG_IDS || '').split(/[\s,;]+/);
+    if (!admins.includes(String(ctx.from.id))) return ctx.reply('Сверить заказ может только администратор.');
+    const match = String(ctx.message?.text || '').match(/^\/egrn_reconcile(?:@[a-z\d_]+)?\s+([1-9]\d{0,9})\s+([1-9]\d{0,18}|no_order)\s*$/i);
+    if (!match || Number(match[1]) > 2147483647 || match[2].toLowerCase() !== 'no_order' && BigInt(match[2]) > 9223372036854775807n) {
+      return ctx.reply('После проверки кабинета поставщика укажите номер записи бота и существующего заказа: /egrn_reconcile запись номер_поставщика. Если подтверждено отсутствие заказа: /egrn_reconcile запись no_order. Команда ничего не заказывает.');
+    }
+    try {
+      await ensureTables();
+      const absent = match[2].toLowerCase() === 'no_order';
+      const result = await pool.query(`UPDATE egrn_orders SET id_statement=$1,status=$2,status_text=$3,
+        files_sent=0,failures=0,retry_at=NULL,error=NULL,updated_at=NOW()
+        WHERE id=$4 AND status IN ('ordering','order_unknown')
+          AND ($1::bigint IS NULL OR id_statement IS NULL OR id_statement=$1)
+          AND ($1::bigint IS NULL OR NOT EXISTS (SELECT 1 FROM egrn_orders other WHERE other.id<>$4 AND other.id_statement=$1))
+        RETURNING id`, [absent ? null : match[2], absent ? 'failed' : 'ordered',
+        absent ? 'Отсутствие заказа подтверждено администратором' : 'Заказ сверён с поставщиком', match[1]]);
+      return ctx.reply(result.rows.length
+        ? absent ? 'Отсутствие заказа зафиксировано. Следующий заказ можно создать обычной кнопкой.' : 'Существующий заказ привязан. Бот проверит его готовность и доставит выписку.'
+        : 'Не найдена подходящая неопределённая запись. Уже подтверждённые заказы не изменены.');
+    } catch (error) { console.error('egrn reconcile:', error.code || 'unavailable'); return ctx.reply('Не удалось сохранить сверку. Заказ не создавался.'); }
+  });
+
   // Админу: сырой ответ API по заказу — чтобы разобраться с форматом
   bot.command('egrn_debug', async function (ctx) {
     const admins = String(process.env.ADMIN_TG_IDS || '').split(/[\s,;]+/);
@@ -542,8 +697,8 @@ function setupEgrn(bot) {
     const failures = (o.failures || 0) + 1;
     const stopped = permanent || failures >= MAX_FAILURES;
     const retryAt = stopped ? null : new Date(Date.now() + 3 * 60 * 1000 * Math.pow(2, failures - 1));
-    await pool.query('UPDATE egrn_orders SET files_sent=$1, file_msgs=$2, error=$3, failures=$4, retry_at=$5, updated_at=NOW() WHERE id=$6',
-      [stopped ? -1 : 0, JSON.stringify(fileMsgs), errors.join('; ').slice(0, 300), failures, retryAt, o.id]);
+    await pool.query('UPDATE egrn_orders SET files_sent=$1, file_msgs=$2, error=$3, failures=$4, retry_at=$5, updated_at=NOW() WHERE id=$6 AND processing_token=$7',
+      [stopped ? -1 : 0, JSON.stringify(fileMsgs), errors.join('; ').slice(0, 300), failures, retryAt, o.id, o.processing_token]);
     if (stopped) await notifyStopped(o, permanent);
   }
 
@@ -562,33 +717,38 @@ function setupEgrn(bot) {
   async function pollOrders(onlyId) {
     let rows = [];
     try {
-      rows = (await pool.query("SELECT * FROM egrn_orders WHERE status IN ('ordered','done') AND files_sent = 0 AND (retry_at IS NULL OR retry_at <= NOW()) AND ((status='ordered' AND created_at > NOW() - INTERVAL '" + MAX_POLL_HOURS + " hours') OR (status='done' AND created_at > NOW() - INTERVAL '30 days'))" +
-        (onlyId ? ' AND id=$1' : '') + ' ORDER BY id LIMIT 20', onlyId ? [onlyId] : undefined)).rows;
+      rows = (await pool.query("SELECT * FROM egrn_orders WHERE status IN ('ordered','done') AND files_sent = 0 AND (processing_until IS NULL OR processing_until<=NOW()) AND (retry_at IS NULL OR retry_at <= NOW()) AND ((status='ordered' AND created_at > NOW() - INTERVAL '" + MAX_POLL_HOURS + " hours') OR (status='done' AND created_at > NOW() - INTERVAL '30 days'))" +
+        (onlyId ? ' AND id=$1' : '') + ' ORDER BY updated_at NULLS FIRST,id LIMIT 20', onlyId ? [onlyId] : undefined)).rows;
     } catch (e) { return console.error('egrn poll:', e.message); }
-    for (const o of rows) {
+    for (const candidate of rows) {
+      const o = await claimDelivery(candidate.id);
+      if (!o) continue;
+      const lease = keepDeliveryAlive(o);
       let source;
       try {
         if (await resumeLargeDelivery(o)) continue;
         const j = await apiStatus(o.id_statement);
         source = j && typeof j.cleanup === 'function' && typeof j.documents === 'function' ? j : null;
+        lease.assert();
         const item = source ? source.item : findReq(j, o.id_statement);
         const st = readStatus(item);
         if (source?.hasFiles) { st.done = true; st.failed = false; }
         const newStatus = st.failed ? 'failed' : st.done ? 'done' : 'ordered';
         const changed = newStatus !== o.status || st.text !== o.status_text;
-        await pool.query('UPDATE egrn_orders SET status=$1, status_text=$2, raw=$3, polls=polls+1, updated_at=NOW() WHERE id=$4', [newStatus, st.done && !/выполн/i.test(st.text) ? 'готова' : st.text, stripB64(item), o.id]);
+        const savedStatus = await pool.query('UPDATE egrn_orders SET status=$1,status_text=$2,raw=$3,polls=polls+1,updated_at=NOW() WHERE id=$4 AND processing_token=$5', [newStatus, st.done && !/выполн/i.test(st.text) ? 'готова' : st.text, stripB64(item), o.id, o.processing_token]);
+        if (savedStatus.rowCount === 0) throw lostLease();
         if (st.done && !/выполн/i.test(st.text)) st.text = 'готова';
         Object.assign(o, { status: newStatus, status_text: st.text, polls: o.polls + 1 });
         if (changed && o.status_msg_id) {
           try { await bot.telegram.editMessageText(o.chat_id, Number(o.status_msg_id), undefined, cardText(o), { parse_mode: 'HTML' }); } catch (e) {}
         }
         if (newStatus === 'failed') {
-          await pool.query('UPDATE egrn_orders SET files_sent = -1 WHERE id=$1', [o.id]);
+          await pool.query('UPDATE egrn_orders SET files_sent = -1 WHERE id=$1 AND processing_token=$2', [o.id, o.processing_token]);
           try { await bot.telegram.sendMessage(o.ordered_by, '❌ Выписка по ' + o.cad_num + ' не выполнена: ' + st.text); } catch (e) {}
           continue;
         }
         if (newStatus !== 'done') {
-          await pool.query('UPDATE egrn_orders SET failures=0, retry_at=NULL, error=NULL WHERE id=$1', [o.id]);
+          await pool.query('UPDATE egrn_orders SET failures=0,retry_at=NULL,error=NULL WHERE id=$1 AND processing_token=$2', [o.id, o.processing_token]);
           continue;
         }
 
@@ -599,13 +759,11 @@ function setupEgrn(bot) {
           continue;
         }
         const manifest = embedded.length ? embedded.map((file, index) => 'embedded:' + index + ':' + file.name) : urls.slice(0, 6).map((_, index) => 'url:' + index);
-        await pool.query('UPDATE egrn_orders SET delivery_manifest=$1 WHERE id=$2', [JSON.stringify(manifest), o.id]);
+        await pool.query('UPDATE egrn_orders SET delivery_manifest=$1 WHERE id=$2 AND processing_token=$3', [JSON.stringify(manifest), o.id, o.processing_token]);
         o.delivery_manifest = manifest;
-        let sent = 0;
         const deliveryErrors = [];
         let permanent = false;
         const fileMsgs = Array.isArray(o.file_msgs) ? o.file_msgs.slice() : [];
-        const newlySent = [];
         function fileError(e, name, size) {
           console.error('egrn file:', JSON.stringify({ order_id: o.id, id_statement: o.id_statement,
             filename: name, bytes: size, error: e.message,
@@ -622,20 +780,21 @@ function setupEgrn(bot) {
           try {
             const existing = fileMsgs.find(file => file.key === key);
             if (existing) { if (existing.kind === 'link') await largeDelivery().retry(o, existing, fileMsgs); continue; }
-            if (documentBytes(d) > MAX_DOCUMENT_BYTES) { await largeDelivery().deliver(o, d, key, fileMsgs); sent++; continue; }
+            if (documentBytes(d) > MAX_DOCUMENT_BYTES) { await largeDelivery().deliver(o, d, key, fileMsgs); continue; }
             d = await smallDocument(d);
             checkDocumentSize(d.buf);
             await registerOriginal(o.deliver, d);
             const extra = { caption: d.kind === 'pdf' ? caption.slice(0, 1000) : (d.kind === 'xml' ? 'XML ' + o.cad_num : 'Архив ' + o.cad_num), disable_notification: d.kind !== 'pdf' };
-            if (o.status_msg_id) extra.reply_to_message_id = Number(o.status_msg_id);
+            if (o.status_msg_id) extra.reply_parameters = { message_id: Number(o.status_msg_id), allow_sending_without_reply: true };
+            await renewDelivery(o);
             let m;
             try { m = await bot.telegram.sendDocument(o.chat_id, { source: d.buf, filename: d.name }, extra); }
-            catch (error) { if (!documentTooLarge(error)) throw error; await largeDelivery().deliver(o, d, key, fileMsgs); sent++; continue; }
-            if (m && m.message_id && d.kind !== 'xml') {
+            catch (error) { if (!documentTooLarge(error)) throw error; await largeDelivery().deliver(o, d, key, fileMsgs); continue; }
+            if (m && m.message_id) {
               const record = documentRecord(m, o.chat_id, key, d);
-              fileMsgs.push(record); newlySent.push(record);
+              fileMsgs.push(record);
+              await persistFileRecords(o, fileMsgs);
             }
-            if (d.kind === 'pdf' || d.kind === 'zip') sent++;
           } catch (e) {
             fileError(e, d.name, documentBytes(d));
           }
@@ -647,41 +806,41 @@ function setupEgrn(bot) {
             const existing = fileMsgs.find(file => file.key === key);
             if (existing) { if (existing.kind === 'link') await largeDelivery().retry(o, existing, fileMsgs); continue; }
             f = await download(u);
-            if (documentBytes(f) > MAX_DOCUMENT_BYTES) { await largeDelivery().deliver(o, f, key, fileMsgs); sent++; continue; }
+            if (documentBytes(f) > MAX_DOCUMENT_BYTES) { await largeDelivery().deliver(o, f, key, fileMsgs); continue; }
             f = await smallDocument(f);
             checkDocumentSize(f.buf);
             await registerOriginal(o.deliver, f);
             const extra = { caption: caption.slice(0, 1000) };
-            if (o.status_msg_id) extra.reply_to_message_id = Number(o.status_msg_id);
+            if (o.status_msg_id) extra.reply_parameters = { message_id: Number(o.status_msg_id), allow_sending_without_reply: true };
+            await renewDelivery(o);
             let m;
             try { m = await bot.telegram.sendDocument(o.chat_id, { source: f.buf, filename: f.name }, extra); }
-            catch (error) { if (!documentTooLarge(error)) throw error; await largeDelivery().deliver(o, f, key, fileMsgs); sent++; continue; }
+            catch (error) { if (!documentTooLarge(error)) throw error; await largeDelivery().deliver(o, f, key, fileMsgs); continue; }
             if (m && m.message_id) {
               const record = documentRecord(m, o.chat_id, key, f);
-              fileMsgs.push(record); newlySent.push(record);
+              fileMsgs.push(record);
+              await persistFileRecords(o, fileMsgs);
             }
-            sent++;
           } catch (e) {
             fileError(e, f ? f.name : 'download', f ? documentBytes(f) : null);
           } finally { if (f?.cleanup) await f.cleanup(); }
         }
-        if (deliveryErrors.length) {
-          await saveFailure(o, deliveryErrors, permanent, fileMsgs);
-        } else if (sent || fileMsgs.length) {
-          await pool.query('UPDATE egrn_orders SET files_sent=$1, file_msgs=$2, error=$3, failures=0, retry_at=NULL WHERE id=$4',
-            [fileMsgs.length || sent, JSON.stringify(fileMsgs), null, o.id]);
+        if (!deliveryErrors.length && fileMsgs.length) {
+          for (const record of fileMsgs) if (record.kind !== 'link') {
+            try { await deliverNativeRecord(o, record, fileMsgs); }
+            catch (error) { fileError(error, record.name || 'original', record.bytes); }
+          }
         }
-        if (sent) {
-          // копии: заказавшему и туда, куда выписку ждут (заявка на замер, юрист, «Заявки по клиенту»)
-          const targets = (Array.isArray(o.deliver) ? o.deliver : []).slice();
-          if (String(o.ordered_by) !== String(o.chat_id) && !targets.some(function (t) { return String(t.chat) === String(o.ordered_by); })) targets.push({ chat: Number(o.ordered_by) });
-          await copyFiles(newlySent, targets);
-        }
+        if (deliveryErrors.length) await saveFailure(o, deliveryErrors, permanent, fileMsgs);
+        else if (fileMsgs.length && manifest.every(key => fileMsgs.some(file => file.key === key))) await markDelivered(o, fileMsgs);
+        else await saveFailure(o, ['Не подтверждена доставка всех оригиналов выписки.'], false, fileMsgs);
       } catch (e) {
         console.error('egrn status', o.id_statement, e.message,
           JSON.stringify({ source_code: e.source_code, source_name: e.source_name, source_bytes: e.source_bytes }));
-        await saveFailure(o, [String(e.message || 'ошибка проверки статуса')], e.code === 'EGRN_FILE_TOO_LARGE', o.file_msgs || []);
-      } finally { if (source) await source.cleanup(); }
+        if (e.code !== 'EGRN_LEASE_LOST') await saveFailure(o, [String(e.message || 'ошибка проверки статуса')], e.code === 'EGRN_FILE_TOO_LARGE', o.file_msgs || []);
+      } finally {
+        try { if (source) await source.cleanup(); } finally { await lease.close(); }
+      }
     }
   }
   // Support operation only: redeliver a known ready order, never apiOrder().
@@ -711,6 +870,7 @@ function setupEgrn(bot) {
 }
 
 async function copyFiles(fileMsgs, targets, options = {}) {
+  options = { ...options, strict: options.strict !== false };
   if (!tgApi) {
     if (options.strict) throw Object.assign(new Error('Не удалось подключить доставку выписки.'), { code: 'EGRN_COPY_UNAVAILABLE', uncertain: false });
     return 0;
@@ -761,45 +921,96 @@ async function copyFiles(fileMsgs, targets, options = {}) {
 // Для форм «Заявка на замер» и «Передать юристу»:
 // есть свежая выписка — прикладываем сразу; нет и разрешён заказ — заказываем и доставим, когда будет готова.
 // targets: [{ chat, reply, order_id? }] — order_id links originals to a visit request.
+async function deliverCachedCopy(order, targets, copyOptions = {}) {
+  const records = Array.isArray(order.file_msgs) ? order.file_msgs : [];
+  const confirmed = { ...copyOptions.confirmed };
+  for (const record of records) {
+    const key = sourceKey(record);
+    if (record.kind !== 'link' && record.chat && record.id) confirmed[JSON.stringify([String(record.chat), key])] = true;
+    for (const receipt of Array.isArray(record.deliveries) ? record.deliveries : []) {
+      if (receipt?.id) confirmed[JSON.stringify([String(receipt.chat), key])] = true;
+    }
+  }
+  for (const target of targets) for (const record of records) {
+    await renewDelivery(order);
+    await copyFiles([record], [target], { ...copyOptions, strict: true, confirmed,
+      async onCopied(key, message) {
+        if (message?.message_id) {
+          const chat = JSON.parse(key)[0];
+          record.deliveries ||= [];
+          record.deliveries.push({ chat, id: Number(message.message_id) });
+          await persistFileRecords(order, records);
+        }
+        if (copyOptions.onCopied) await copyOptions.onCopied(key, message);
+      }
+    });
+  }
+  return records;
+}
+
+function uncertainOrder(order, cad) {
+  return { result: 'uncertain', cad, id: order.id_statement || null,
+    packet_warning: 'Результат заказа выписки по ' + cad + ' требует проверки у поставщика. ' +
+      'Проверьте личный кабинет https://armrus.org и передайте администратору номер заказа. ' +
+      'Номер записи бота: ' + order.id + '. Повторный платный заказ не создан.' };
+}
+
 async function attachOrOrder(opts) {
   const cad = (String(opts.cad || '').match(CAD_RE) || [])[0];
   if (!cad) return { result: 'none' };
   await ensureTables();
-  const prev = (await pool.query(
+  let prev;
+  if (!opts.force) prev = (await pool.query(
     "SELECT * FROM egrn_orders WHERE cad_num=$1 AND type_doc=$2 AND status <> 'failed' AND created_at > NOW() - INTERVAL '30 days' ORDER BY id DESC LIMIT 1",
     [cad, TYPE_DOC])).rows[0];
-  if (prev && (prev.files_sent > 0 || hasReusableLinks(prev)) && Array.isArray(prev.file_msgs) && prev.file_msgs.length) {
-    await copyFiles(prev.file_msgs, opts.targets || [], opts.copyOptions);
-    let packet = {};
-    if ((opts.targets || []).some(t => t && t.order_id) && prev.file_msgs.some(file => file.kind !== 'link')) {
-      try { packet = await require('./order-evidence').registerCached(opts.targets, prev.file_msgs.filter(file => file.kind !== 'link'), tgApi); }
-      catch (e) { console.error('egrn packet: original unavailable'); packet = { packet_warning: 'Оригинал выписки не добавлен к документам заявки. Прикрепите его к заявке.' }; }
+  if (!prev) {
+    if (!opts.order || !configured()) return { result: 'none', cad };
+    const reservation = await reserveOrder(cad, opts);
+    prev = reservation.order;
+    if (reservation.created) {
+      const order = await placeReservedOrder(prev);
+      if (tgApi && order.chat_id) {
+        try {
+          const message = await tgApi.sendMessage(order.chat_id, cardText(order, opts.note ? esc(opts.note) : ''), { parse_mode: 'HTML' });
+          await pool.query('UPDATE egrn_orders SET status_msg_id=$1 WHERE id=$2', [message.message_id, order.id]);
+        } catch (error) { console.error('egrn card:', error.message); }
+      }
+      return { result: 'ordered', cad, id: order.id_statement };
     }
-    return { result: 'attached', cad: cad, ...packet };
   }
-  if (prev && prev.files_sent < 0) {
-    // Остановка доставки не означает, что нужно повторно оплачивать выписку.
-    return { result: 'unavailable', cad: cad, id: prev.id_statement };
+  if (prev.status === 'ordering' && Date.now() - new Date(prev.created_at).getTime() > 2 * 60 * 1000) {
+    prev = (await pool.query("UPDATE egrn_orders SET status='order_unknown',status_text='Заказ требует проверки у поставщика',updated_at=NOW() WHERE id=$1 AND status='ordering' RETURNING *", [prev.id])).rows[0] || prev;
   }
-  if (prev && prev.status !== 'failed' && prev.files_sent >= 0) {
-    // уже заказана и ещё не готова — просто добавляем получателей
-    const merged = (Array.isArray(prev.deliver) ? prev.deliver : []).concat(opts.targets || []);
-    await pool.query('UPDATE egrn_orders SET deliver=$1 WHERE id=$2', [JSON.stringify(merged), prev.id]);
-    return { result: 'waiting', cad: cad };
-  }
-  if (!opts.order || !configured()) return { result: 'none', cad: cad };
-  const idSt = await apiOrder(cad, TYPE_DOC);
-  const target = process.env.EGRN_CHAT_ID || opts.orderedBy;
-  const o = (await pool.query(
-    "INSERT INTO egrn_orders (cad_num, label, type_doc, ordered_by, ordered_name, id_statement, status, status_text, chat_id, deliver) VALUES ($1,$2,$3,$4,$5,$6,'ordered','заказана',$7,$8) RETURNING *",
-    [cad, opts.label || '', TYPE_DOC, opts.orderedBy, opts.orderedName || '', idSt, target, JSON.stringify(opts.targets || [])])).rows[0];
-  if (tgApi && target) {
+  if (prev.status === 'order_unknown') return uncertainOrder(await mergeTargets(prev, opts.targets), cad);
+  if (prev.status === 'ordering') { await mergeTargets(prev, opts.targets); return { result: 'waiting', cad }; }
+  if (prev.status === 'failed') return { result: 'unavailable', cad, id: prev.id_statement };
+  if ((prev.files_sent > 0 || hasReusableFiles(prev)) && Array.isArray(prev.file_msgs) && prev.file_msgs.length) {
+    const wasComplete = prev.files_sent > 0;
+    prev = await mergeTargets(prev, opts.targets);
+    const leased = await claimDelivery(prev.id);
+    if (!leased) return { result: 'waiting', cad };
+    const lease = keepDeliveryAlive(leased);
     try {
-      const m = await tgApi.sendMessage(target, cardText(o, opts.note ? esc(opts.note) : ''), { parse_mode: 'HTML' });
-      await pool.query('UPDATE egrn_orders SET status_msg_id=$1 WHERE id=$2', [m.message_id, o.id]);
-    } catch (e) { console.error('egrn card:', e.message); }
+      if (!Array.isArray(leased.delivery_manifest) || !leased.delivery_manifest.length) {
+        leased.delivery_manifest = [...new Set(leased.file_msgs.map(sourceKey))];
+        await pool.query('UPDATE egrn_orders SET delivery_manifest=$1 WHERE id=$2 AND processing_token=$3', [JSON.stringify(leased.delivery_manifest), leased.id, leased.processing_token]);
+      }
+      const records = await deliverCachedCopy(leased, opts.targets || [], opts.copyOptions);
+      if ((leased.deliver || []).some(target => target && target.order_id) && records.some(file => file.kind === 'link' || Number(file.bytes)>12*1024*1024)) await require('../web/order-egrn-links').registerOrderLinks(leased, records);
+      let packet = {};
+      if ((opts.targets || []).some(target => target && target.order_id) && records.some(file => file.kind !== 'link')) {
+        try { packet = await require('./order-evidence').registerCached(opts.targets, records.filter(file => file.kind !== 'link'), tgApi); }
+        catch (error) { console.error('egrn packet: original unavailable'); packet = { packet_warning: 'Оригинал выписки не добавлен к документам заявки. Прикрепите его к заявке.' }; }
+      }
+      // The cached order was already complete before these targets joined.
+      // Only this generation may be acknowledged; another join leaves it open.
+      if (wasComplete) await markDelivered(leased, records);
+      return { result: 'attached', cad, ...packet };
+    } finally { await lease.close(); }
   }
-  return { result: 'ordered', cad: cad, id: idSt };
+  if (prev.files_sent < 0) return { result: 'unavailable', cad, id: prev.id_statement };
+  await mergeTargets(prev, opts.targets);
+  return { result: 'waiting', cad };
 }
 
 module.exports = { setupEgrn, parseCads, readStatus, findFileUrls, findReq, attachOrOrder, CAD_RE, extractDocs, unzip, stripB64 };

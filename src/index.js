@@ -25,8 +25,10 @@ async function main() {
 
   const bot = setupBot();
   await bot.telegram.deleteWebhook({ drop_pending_updates: false });
-  bot.launch();
-  console.log('Bot started polling');
+  bot.launch({}, () => console.log('Bot started polling')).catch(error => {
+    console.error('Bot polling stopped:', error.code || error.response?.error_code || error.name || 'error');
+    process.exit(1);
+  });
 
   process.once('SIGINT', function() {
     try { bot.stop('SIGINT'); } catch(e) {}

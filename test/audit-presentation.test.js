@@ -209,3 +209,23 @@ test('even a versionless signed checkpoint without receipts resumes the original
   assert.equal(h.events.some(e => e.method === 'editMessageReplyMarkup'), false);
   assert.notEqual(holder.value.deliveryVersion, 2);
 });
+
+test('a Telegram-rejected panorama falls back to its original document and finishes the report', async () => {
+  const data = report();
+  const rejected = data.documents.find(file => file.role === 'entrance');
+  const failure = Object.assign(new Error('PHOTO_INVALID_DIMENSIONS'), {
+    response: { error_code: 400, description: 'Bad Request: PHOTO_INVALID_DIMENSIONS' } });
+  const h = harness({ fail(method, args) {
+    if (method === 'sendMediaGroup' && args[1].some(file => file.type === 'photo' && file.media.source.equals(rejected.source))) throw failure;
+    if (method === 'sendPhoto' && args[1].source.equals(rejected.source)) throw failure;
+  } });
+  await h.send(data);
+  assert.equal(h.saves.length, 1);
+  assert.equal(h.delivered.filter(item => item.kind === 'text').length, 1);
+  const fallback = h.delivered.find(item => item.kind === 'document' && item.filename === rejected.name);
+  assert.deepEqual(fallback.buffer, rejected.source);
+  assert.ok(h.delivered.some(item => /\.zip$/i.test(item.filename || '')));
+  const before = h.delivered.length;
+  await h.send(data);
+  assert.equal(h.delivered.length, before, 'Retry must preserve all already acknowledged fallback receipts');
+});

@@ -144,3 +144,15 @@ test('no image-address conclusion is invented from document names, video folder 
   assert.match(result.html, /Москва, Никольская, 1/);
   assert.doesNotMatch(result.html, /Лесная|Lesnaya|адрес.*не совпад|друг.*адрес/);
 });
+
+test('a Unicode source URL that expands past a Telegram message remains fully readable without an oversized HTML tag', () => {
+  const data = addOrganization(compactVisit());
+  const source = 'https://example.invalid/?q=' + 'кириллица'.repeat(80);
+  assert.ok(source.length < 1000); assert.ok(new URL(source).href.length > 3500);
+  data.zones[0].status = 'licensed'; data.zones[0].source = source;
+  const result = buildAuditSummary(data);
+  const parts = splitTelegramHtml(result.html);
+  assert.ok(parts.length > 0); assert.ok(parts.every(part => part.length <= 3500));
+  assert.ok(result.plain.includes(source));
+  assert.ok(parts.join('').includes(source));
+});

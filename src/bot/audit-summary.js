@@ -15,7 +15,7 @@ function visitDate(date) {
 function sourceLink(source) {
   try {
     const url = new URL(source);
-    if (['https:', 'http:'].includes(url.protocol)) return '<a href="' + esc(url.href).replace(/"/g, '&quot;') + '">Источник сведений</a>';
+    if (['https:', 'http:'].includes(url.protocol) && url.href.length <= 1000) return '<a href="' + esc(url.href).replace(/"/g, '&quot;') + '">Источник сведений</a>';
   } catch (_) {}
   return esc(source);
 }
@@ -35,7 +35,7 @@ function buildAuditSummary(data, actor) {
   const entrances = data.entrances || [], zones = data.zones || [];
   const org = value(p.org || packet.org) || 'Организация не указана';
   const address = value(p.address || packet.address) || 'адрес не указан';
-  const service = value(p.service || packet.service) || 'услуга не указана';
+  const service = value(p.service || packet.service) || (data.object_category === 'tobacco' ? 'Проверка объекта' : 'услуга не указана');
   const category = { catering: 'алкоголь · общепит', retail: 'алкоголь · магазин', tobacco: 'табак' }[data.object_category] || 'тип объекта не указан';
   const number = data.order_id ? '№' + value(data.order_id) : 'аудитора';
   pair('<b>' + esc(org + ' · отчёт ' + number) + '</b>', 'Отчёт аудитора' + (data.order_id ? ' №' + value(data.order_id) : ''));

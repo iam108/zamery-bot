@@ -29,10 +29,11 @@ async function fixture(run) {
     console: { log() {}, error() {} }, process: { env: {} }, setTimeout() {}, setInterval() {},
     require(name) {
       if (name === '../db/pool') return pool;
-      if (name === '../checklists') return { LISTS: {}, STAGES: [], pickChecklist: () => 'QA', flagLabels: () => ({}) };
+      if (name === '../checklists') return { LISTS: {}, STAGES: ['Сбор документов', 'Подано', 'Выездная проверка', 'Архив'], pickChecklist: () => 'QA', flagLabels: () => ({}) };
       if (name === '../bot/instance') return { telegram: { async sendMessage(...args) { telegram.push(args); return { message_id: telegram.length }; } } };
       if (name === './handoff-packet') return { setupHandoffPacket: () => ({}) };
-      if (name === './auth') return {};
+      if (name === './auth') return require('../src/web/auth');
+      if (name === './http-errors') return require('../src/web/http-errors');
       throw new Error('Unexpected dependency: ' + name);
     },
   };
@@ -44,7 +45,8 @@ async function fixture(run) {
     const route = routes.get('POST /api/checklist/save'); assert.equal(typeof route, 'function');
     async function rawSave(data, extra = {}) {
       let result, status = 200;
-      await route({ body: { case_id: 17, data, done: 1, total: 4, ...extra }, tgUser: { id: 808 }, staff: { name: 'Тестовый юрист' }, get: () => 'application/json' }, {
+      const row = (await db.query('SELECT checklist_revision FROM cases WHERE id=17')).rows[0];
+      await route({ body: { case_id: 17, data, done: 1, total: 4, expectedRevision: Number(row?.checklist_revision || 0), ...extra }, tgUser: { id: 808 }, staff: { name: 'Тестовый юрист', role: 'lawyer', approved: true }, get: () => 'application/json' }, {
         status(value) { status = value; return this; }, json(value) { result = value; },
       });
       return { status, result };
@@ -95,8 +97,8 @@ test('first transition to submitted preserves the latest checkpoint across both 
   h.interleave(async ({ number, db }) => { await db.query("UPDATE cases SET data=jsonb_set(data,'{_handoff}',$1::jsonb) WHERE id=17", [checkpoint(number + 1)]); });
   const result = await h.save({ _stage: 'Подано', _submittedOn: '2026-11-02', document: { s: 'yes' }, _handoff: { malicious: true } });
   const row = await h.row();
-  assert.equal(h.queries.filter(sql => /^UPDATE cases SET data=/.test(sql)).length, 2);
-  assert.deepEqual(row.data._handoff, checkpoint(3)); assert.equal(row.data._stage, 'Подано');
+  assert.equal(h.queries.filter(sql => /^UPDATE cases SET data=/.test(sql)).length, 1);
+  assert.deepEqual(row.data._handoff, checkpoint(2)); assert.equal(row.data._stage, 'Подано');
   assert.equal(asDate(row.submitted_on), '2026-11-02'); assert.equal(asDate(row.decision_due), '2026-11-24');
   assert.equal(row.data._submittedOn, '2026-11-02'); assert.equal(row.data._decisionDue, '2026-11-24');
   assert.equal(result.submittedOn, '2026-11-02'); assert.equal(result.decisionDue, '2026-11-24');
@@ -108,8 +110,8 @@ test('editing an already submitted date preserves the latest checkpoint across t
   h.interleave(async ({ number, db }) => { await db.query("UPDATE cases SET data=jsonb_set(data,'{_handoff}',$1::jsonb) WHERE id=17", [checkpoint(number + 5)]); });
   const result = await h.save({ _stage: 'Подано', _submittedOn: '2026-11-03', _handoff: null });
   const row = await h.row();
-  assert.equal(h.queries.filter(sql => /^UPDATE cases SET data=/.test(sql)).length, 2);
-  assert.deepEqual(row.data._handoff, checkpoint(7));
+  assert.equal(h.queries.filter(sql => /^UPDATE cases SET data=/.test(sql)).length, 1);
+  assert.deepEqual(row.data._handoff, checkpoint(6));
   assert.equal(asDate(row.submitted_on), '2026-11-03'); assert.equal(asDate(row.decision_due), '2026-11-25');
   assert.equal(row.data._decisionDue, '2026-11-25'); assert.equal(row.reminded_on, null); assert.equal(result.decisionDue, '2026-11-25');
 }));
@@ -215,4 +217,38 @@ test('typing a note while an unrelated Telegram save is in flight keeps the draf
   assert.match(elements.get('st').textContent, /Заметка изменилась/);
   await client.flush();
   assert.equal(requests.length, 1);
+});
+
+
+test('a stale checklist response freezes autosave and explicit recovery keeps a local copy before refreshing', async () => {
+  const start = source.indexOf('function checklistClient()');
+  const end = source.indexOf('\n  render();\n  loadReminders();', start);
+  const elements = new Map(), storage = new Map(), requests = [];
+  let refreshed = 0, downloads = 0;
+  const location = { search: '', reload() { refreshed++; } };
+  const client = vm.runInNewContext('(' + source.slice(start, end) + `
+    return { flush, edit() { D.answer = {s:'ok'}; changed(); } };
+  })()`, {
+    window: { addEventListener() {}, location, __CFG: { data: {}, list: { sections: [], passport: [] }, caseInfo: { id: 17, revision: 3 } } },
+    document: {
+      documentElement: { dataset: {} }, addEventListener() {},
+      createElement() { return { click() { downloads++; } }; },
+      getElementById(id) { if (!elements.has(id)) elements.set(id, { style: {} }); return elements.get(id); },
+    },
+    location, Blob, URL: { createObjectURL() { return 'blob:qa'; }, revokeObjectURL() {} },
+    localStorage: { getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key) },
+    setTimeout() {}, clearTimeout() {}, clearInterval() {},
+    async fetch(url, options) {
+      requests.push(JSON.parse(options.body));
+      return { status: 409, headers: { get() {} }, text: async () => JSON.stringify({ ok:false, code:'checklist_conflict', revision:4, error:'Changed in another tab' }) };
+    },
+  });
+  client.edit(); await client.flush(); await client.flush();
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].expectedRevision, 3);
+  assert.match(elements.get('st').textContent, /актуальные ответы/);
+  elements.get('st').onclick();
+  assert.equal(downloads, 1); assert.equal(refreshed, 1);
+  assert.equal(storage.has('zamery_cl_17'), false);
+  assert.equal(JSON.parse(storage.get('zamery_cl_17:recovery')).data.answer.s, 'ok');
 });

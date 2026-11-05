@@ -46,6 +46,8 @@ async function migrate() {
     `);
 
     await client.query(require('../web/order-materials').DDL);
+    await client.query(require('../web/order-egrn-links').DDL);
+    await client.query(require('../bot/manual-order-attachments').DDL);
     await client.query(require('../web/workspace').SESSION_DDL);
 
     await client.query(`
@@ -108,8 +110,32 @@ async function migrate() {
         content BYTEA NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         deleted_at TIMESTAMPTZ,
+        mutation_revision INT,
         PRIMARY KEY (draft_id, id)
       );
+      ALTER TABLE audit_evidence ADD COLUMN IF NOT EXISTS mutation_revision INT;
+    `);
+
+    await client.query(`
+      DO $$ BEGIN
+        IF to_regclass('cases') IS NOT NULL THEN
+          ALTER TABLE cases ADD COLUMN IF NOT EXISTS checklist_revision INT NOT NULL DEFAULT 0;
+        END IF;
+        IF to_regclass('case_reminders') IS NOT NULL THEN
+          ALTER TABLE case_reminders ADD COLUMN IF NOT EXISTS delivery JSONB NOT NULL DEFAULT '{}';
+        END IF;
+        IF to_regclass('egrn_orders') IS NOT NULL THEN
+          ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS delivery_revision INT NOT NULL DEFAULT 0;
+          ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS request_key TEXT;
+          ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS processing_token UUID;
+          ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS processing_until TIMESTAMPTZ;
+          CREATE UNIQUE INDEX IF NOT EXISTS egrn_orders_request_key ON egrn_orders(request_key) WHERE request_key IS NOT NULL;
+        END IF;
+        IF to_regclass('reports') IS NOT NULL THEN
+          ALTER TABLE reports ADD COLUMN IF NOT EXISTS incoming_key TEXT;
+          CREATE INDEX IF NOT EXISTS reports_incoming_key ON reports(incoming_key);
+        END IF;
+      END $$;
     `);
 
     await client.query('COMMIT');

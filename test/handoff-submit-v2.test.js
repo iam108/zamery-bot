@@ -29,10 +29,10 @@ async function fixture(run,config={}){
   const telegram={async sendMessage(chat,text,opts){const event={type:'card',chat:String(chat),text,opts};await action(event);event.id=sequence++;return {message_id:event.id};},
     async callApi(method,payload){assert.equal(method,'copyMessages');const event={type:'copy',chat:String(payload.chat_id),payload};await action(event);const ids=payload.message_ids.map(()=>({message_id:sequence++}));return config.shortCopy&&event.chat===String(LAWYER)?ids.slice(1):ids;},
     async sendDocument(chat,file,opts){const event={type:'zip',chat:String(chat),name:file.filename,opts};await action(event);const chunks=[];for await(const chunk of file.source)chunks.push(Buffer.from(chunk));event.buffer=Buffer.concat(chunks);event.id=sequence++;return {message_id:event.id};}};
-  const options={pool,ready:async()=>{},packetService:{async packet(query){packetCalls++;assert.deepEqual(query,{order_id:60,report_src:'a',report_id:15});return JSON.parse(JSON.stringify(packet));}},telegram,
+  const options={pool,ready:async()=>{},packetService:{async packet(query){packetCalls++;assert.deepEqual(query,{order_id:60,report_src:'a',report_id:15,request_id:body.request_id||null});return JSON.parse(JSON.stringify({...packet,request:config.requestMismatch?{id:999}:body.request_id?{id:body.request_id}:null}));}},telegram,
     async loadReport(src,id){reportCalls++;assert.equal(src,'a');assert.equal(id,15);return structuredClone(pick);},materialDelivery:createHandoffMaterialsDelivery({telegram,loadMaterials:async()=>files}),
     async attachEgrn(opts){egCalls.push(opts);return config.egrn?config.egrn(opts,egCalls.length):{result:'none'};},pickChecklist:()=> 'MSK_OBSH',webappUrl:'https://bot.example',clientsChatId:CLIENTS};
-  const context={body,user:{id:101},staff:{name:'Менеджер'}};
+  const context={body,user:{id:101},staff:{name:'Менеджер',role:'manager',approved:true}};
   try{await run({db,pool,events,packet,body,files,pick,context,options,submit:createHandoffSubmitter(options),restart:()=>createHandoffSubmitter(options),packetCalls:()=>packetCalls,reportCalls:()=>reportCalls,egCalls,
     setFail(fn){fail=fn;},setMutation(fn){mutate=fn;},async cases(){return(await db.query('SELECT * FROM cases ORDER BY id')).rows;}});
     assert.ok(events.every(event=>event.chat===String(LAWYER)),'Handoff must never send to a shared chat, including after a failed delivery or retry');
@@ -204,7 +204,7 @@ test('request-origin original-file retry uses frozen row IDs and resumes without
 }));
 test('a reopened form with a new submit UUID cannot create a second ordinary case for the same audit order',pg,async()=>fixture(async h=>{
   const first=await h.submit(h.context),before=h.events.length;
-  await assert.rejects(h.restart()({...h.context,body:{...h.body,submit_id:randomUUID()}}),error=>error.code==='HANDOFF_ALREADY_ASSIGNED'&&error.case_created===true&&error.case_id===first.id&&error.manual_review===true&&error.retry===false);
+  await assert.rejects(h.restart()({...h.context,body:{...h.body,submit_id:randomUUID()}}),error=>error.code==='HANDOFF_ALREADY_ASSIGNED'&&error.case_created===true&&error.case_id===first.id&&error.retry===false);
   assert.equal((await h.cases()).length,1);assert.equal(h.events.length,before);assert.equal(h.packetCalls(),1);
   const same=await h.restart()(h.context);assert.equal(same.id,first.id);assert.equal(same.delivery_complete,true);
 }));
@@ -218,6 +218,28 @@ test('parallel forms from different staff for the same order respect the busines
 }));
 test('a legacy case without a handoff checkpoint still blocks a second ordinary handoff of the same order',pg,async()=>fixture(async h=>{
   await h.db.query("INSERT INTO cases(order_id,lawyer_tg_id,lawyer_name,data) VALUES(60,808,'Юрист старой заявки','{}')");
-  await assert.rejects(h.submit(h.context),error=>error.code==='HANDOFF_ALREADY_ASSIGNED'&&error.case_created===true&&error.manual_review===true&&/Юрист старой заявки/.test(error.message));
+  await assert.rejects(h.submit(h.context),error=>error.code==='HANDOFF_ALREADY_ASSIGNED'&&error.case_created===true&&/Юрист старой заявки/.test(error.message));
   assert.equal((await h.cases()).length,1);assert.equal(h.events.length,0);assert.equal(h.packetCalls(),0);
+}));
+
+
+test('an approved auditor cannot start or resume delivery even with a valid saved packet', pg, async () => fixture(async h => {
+  await assert.rejects(h.submit({ ...h.context, staff: { name: 'Auditor', role: 'auditor', approved: true } }), error => error.status === 403);
+  assert.equal((await h.cases()).length, 0); assert.equal(h.events.length, 0);
+}));
+test('a reviewed packet bound to a different request rejects source substitution before creating or delivering a case', pg, async () => fixture(async h => {
+  h.body.request_id = 9;
+  await assert.rejects(h.submit(h.context), error => error.code === 'HANDOFF_REQUEST_MISMATCH');
+  assert.equal((await h.cases()).length, 0); assert.equal(h.events.length, 0);
+}, { requestMismatch: true }));
+test('a fresh manager form resumes the frozen case body after a temporary Telegram rejection', pg, async () => fixture(async h => {
+  let rejected = false;
+  h.setFail(event => { if (event.type === 'card' && !rejected) { rejected = true; throw tgFailure('Temporary rejection'); } });
+  const first = await h.submit(h.context); assert.equal(first.delivery_complete, false);
+  const second = await h.restart()({ ...h.context, body: { resume_case_id: first.id } });
+  assert.equal(second.delivery_complete, true); assert.equal(second.id, first.id);
+  assert.equal((await h.cases()).length, 1);
+  assert.equal(h.events.filter(event => event.type === 'card' && event.id).length, 1);
+  const copies = h.events.filter(event => event.type === 'copy');
+  assert.ok(copies.every(event => event.chat === String(LAWYER)));
 }));

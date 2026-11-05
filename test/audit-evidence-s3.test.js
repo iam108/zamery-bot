@@ -7,7 +7,7 @@ const { createAuditEvidenceStore } = require('../src/web/audit-evidence-store');
 
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 function file(content = Buffer.from('original PNG bytes'), changes = {}) {
-  return { id: randomUUID(), name: 'territory.png', mime: 'image/png', role: 'map-source', subject_id: 'source', data: content.toString('base64'), ...changes };
+  return { revision: 1, id: randomUUID(), name: 'territory.png', mime: 'image/png', role: 'map-source', subject_id: 'source', data: content.toString('base64'), ...changes };
 }
 function fakeObjects(hooks = {}) {
   const files = new Map(), calls = { puts: [], gets: [], deletes: [] };
@@ -63,7 +63,7 @@ test('audit JPG, PNG and PDF originals are private S3 objects with metadata-only
     ['image/jpeg', 'phone.jpg', Buffer.alloc(6 * 1024 * 1024, 71)],
     ['application/pdf', 'plan.pdf', Buffer.from('%PDF-1.7\noriginal plan')]
   ]) {
-    const source = file(bytes, { mime, name });
+    const source = file(bytes, { mime, name, revision: (await store.current(108, 58)).revision });
     const added = await store.addEvidence(108, draft.id, source), puts = h.objects.calls.puts.length;
     assert.equal((await store.addEvidence(108, draft.id, source)).revision, added.revision);
     assert.equal(h.objects.calls.puts.length, puts, 'A lost upload response must not upload the original again');
@@ -88,7 +88,7 @@ test('existing PostgreSQL audit originals remain readable after the storage migr
   await legacy.addEvidence(108, draft.id, source); h.state.forbidBinary = true;
   const bytes = Buffer.from(source.data, 'base64'), store = h.makeStore();
   assert.deepEqual((await store.downloadEvidence(108, draft.id, source.id)).buffer, bytes);
-  const next = await store.addEvidence(108, draft.id, file(Buffer.from('new S3 file')));
+  const next = await store.addEvidence(108, draft.id, { ...file(Buffer.from('new S3 file')), revision: 2 });
   assert.equal(next.revision, 3);
   assert.equal((await h.db.query("SELECT COUNT(*)::int count FROM audit_evidence WHERE storage='postgres' AND content IS NOT NULL")).rows[0].count, 1);
   assert.equal((await h.db.query("SELECT COUNT(*)::int count FROM audit_evidence WHERE storage='s3' AND content IS NULL")).rows[0].count, 1);
@@ -150,10 +150,10 @@ test('a draft edited during original hydration cannot freeze or send a stale sna
 
 test('recoverable S3 removals still consume file and byte limits, and restoring never uploads again', pg, async () => database(async h => {
   const store = h.makeStore({ files: 1, totalBytes: 30, fileBytes: 30 }), draft = await store.create(108, 58), source = file(Buffer.from('recoverable original'));
-  await store.addEvidence(108, draft.id, source); await store.removeEvidence(108, draft.id, source.id);
-  await assert.rejects(store.addEvidence(108, draft.id, file(Buffer.from('second'))), e => e.code === 'EVIDENCE_LIMIT');
+  await store.addEvidence(108, draft.id, source); await store.removeEvidence(108, draft.id, source.id, 2);
+  await assert.rejects(store.addEvidence(108, draft.id, { ...file(Buffer.from('second')), revision: 3 }), e => e.code === 'EVIDENCE_LIMIT');
   assert.equal(h.objects.calls.puts.length, 1); assert.equal(h.objects.calls.deletes.length, 0);
-  assert.equal((await store.addEvidence(108, draft.id, source)).revision, 4); assert.equal(h.objects.calls.puts.length, 1);
+  assert.equal((await store.addEvidence(108, draft.id, { ...source, revision: 3 })).revision, 4); assert.equal(h.objects.calls.puts.length, 1);
 }));
 
 test('an audit original pointer cannot read another draft namespace even through a valid private client', async () => {
@@ -161,3 +161,14 @@ test('an audit original pointer cannot read another draft namespace even through
   await assert.rejects(store.read({ draft_id: randomUUID(), storage: 's3', object_key: 'audit-originals/' + randomUUID() + '/' + randomUUID(), bytes: 1, sha256: sha(Buffer.from('x')) }), e => e.code === 'AUDIT_EVIDENCE_INTEGRITY');
   assert.equal(objects.calls.gets.length, 0);
 });
+
+test('an edit during remote original upload rejects the stale metadata write and cleans only its unused object', pg, async () => database(async h => {
+  let store,draft;
+  const objects=fakeObjects({async put(){await store.update(108,draft.id,1,{conclusion:'Saved in another view during upload'});}});
+  store=createDraftStore(h.pool,undefined,{objectStore:objects});draft=await store.create(108,58,{conclusion:'Old view'});
+  await assert.rejects(store.addEvidence(108,draft.id,file()),error=>error.code==='REVISION_CONFLICT');
+  const current=await store.current(108,58);
+  assert.equal(current.data.conclusion,'Saved in another view during upload');
+  assert.equal(current.evidence.length,0);
+  assert.equal(objects.files.size,0);
+}));

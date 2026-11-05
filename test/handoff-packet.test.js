@@ -58,7 +58,7 @@ async function database(run) {
     await db.exec(`CREATE TABLE orders(id INT PRIMARY KEY,address TEXT,owner_name TEXT,object_name TEXT,object_type TEXT,contacts TEXT,zones_info TEXT,cad_num TEXT,service TEXT,archive_url TEXT,telegram_msg_id BIGINT);
       CREATE TABLE audits(id INT PRIMARY KEY,order_id INT,text TEXT,report_data JSONB,draft_id UUID,chat_id BIGINT,msg_ids BIGINT[],created_at TIMESTAMPTZ DEFAULT NOW());
       CREATE TABLE reports(id INT PRIMARY KEY,text TEXT,author TEXT,chat_id BIGINT,msg_ids BIGINT[],reply_to BIGINT,first_id BIGINT,created_at TIMESTAMPTZ DEFAULT NOW());
-      CREATE TABLE cases(id INT PRIMARY KEY,order_id INT,lawyer_name TEXT,data JSONB DEFAULT '{}',handoff_submit_id TEXT);
+      CREATE TABLE cases(id INT PRIMARY KEY,order_id INT,lawyer_tg_id BIGINT,lawyer_name TEXT,data JSONB DEFAULT '{}',handoff_submit_id TEXT);
       CREATE TABLE order_materials(order_id INT,id UUID,name TEXT,mime TEXT,role TEXT,bytes INT,sha256 TEXT,created_at TIMESTAMPTZ DEFAULT NOW());
       CREATE TABLE audit_evidence(draft_id UUID,id UUID,name TEXT,mime TEXT,role TEXT,subject_id TEXT,bytes INT,sha256 TEXT,content BYTEA,storage TEXT,object_key TEXT,deleted_at TIMESTAMPTZ);
       CREATE TABLE egrn_orders(id INT PRIMARY KEY,cad_num TEXT,status TEXT,files_sent INT,created_at TIMESTAMPTZ DEFAULT NOW(),type_doc TEXT DEFAULT 'kvarmrusxmlpdf',file_msgs JSONB DEFAULT '[]',delivery_manifest JSONB DEFAULT '[]');
@@ -189,7 +189,7 @@ test('packet exposes existing assignment and its resumable submit ID without cha
 
 test('HTTP files inherit the /api/handoff staff guard, preserve UTF-8 filenames and bytes, and hide unexpected storage errors', async () => {
   const express=require('express'),app=express(),calls=[],bytes=Buffer.from('exact original');
-  app.use('/api/handoff',(req,res,next)=>req.get('X-Test-Staff')==='approved'?next():res.status(403).json({ok:false}));
+  app.use('/api/handoff',(req,res,next)=>{if(req.get('X-Test-Staff')!=='approved')return res.status(403).json({ok:false});req.staff={role:'manager',approved:true};req.tgUser={id:101};next();});
   setupHandoffPacket(app,{service:{ async packet() {calls.push('packet');return {ok:true};}, async file(id) {calls.push('file');if(id==='99')throw new Error('secret storage key and credentials');return {name:'План «Лесная, 5».pdf',mime:'application/pdf',buffer:bytes};} }});
   const server=app.listen(0,'127.0.0.1'); await once(server,'listening');
   const origin='http://127.0.0.1:'+server.address().port;
@@ -205,3 +205,64 @@ test('HTTP files inherit the /api/handoff staff guard, preserve UTF-8 filenames 
     const failed=await fetch(origin+'/api/handoff/reports/99/files/'+randomUUID(),{headers}); assert.equal(failed.status,503); assert.doesNotMatch(await failed.text(),/secret|credentials|storage key/);
   } finally { server.close(); await once(server,'close'); }
 });
+
+test('large EGRN metadata is part of the reviewed handoff without downloading or duplicating the original', pg, async () => database(async h => {
+  const fileId = randomUUID();
+  const large = { id: fileId, name: 'Крупная выписка.pdf', mime: 'application/pdf', role: 'egrn', bytes: 350 * 1024 * 1024,
+    sha256: 'c'.repeat(64), url: '/api/audit/orders/60/egrn/' + fileId + '/link' };
+  const service = createPacketService({ pool: h.pool, evidenceStore: h.store, listEgrnLinks: async id => { assert.equal(id, 60); return [large]; } });
+  const packet = await service.packet({ order_id: 60, report_id: 15, report_src: 'a' });
+  assert.deepEqual(packet.egrn_links, [large]);
+  assert.equal(packet.materials.some(file => file.id === fileId), false);
+  assert.equal(h.gets.length, 0);
+  assert.notEqual(packet.signature, (await h.service.packet({ order_id: 60, report_id: 15, report_src: 'a' })).signature);
+}));
+
+test('an assigned lawyer cannot combine their order with an unrelated unlinked report', async () => {
+  const express = require('express'), app = express();
+  let manager = false;
+  const assigned = { id: 5, order_id: 60, lawyer_tg_id: 101, data: {} };
+  app.use((req, res, next) => { req.staff = { approved: true, role: manager ? 'manager' : 'lawyer' }; req.tgUser = { id: 101 }; next(); });
+  const pool = { async query() { return { rows: [assigned] }; } };
+  setupHandoffPacket(app, { pool, service: {
+    async packet(query) { return { order: { id: 60 }, report: { id: Number(query.report_id), src: query.report_src || 'a', order_id: query.report_id === '15' ? 60 : null } }; },
+  } });
+  const server = app.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const origin = 'http://127.0.0.1:' + server.address().port;
+  try {
+    assert.equal((await fetch(origin + '/api/handoff/packet?order_id=60&report_id=15')).status, 200);
+    for (const src of ['a', 'r']) {
+      const result = await fetch(origin + '/api/handoff/packet?order_id=60&report_id=900&report_src=' + src);
+      assert.equal(result.status, 403); assert.equal((await result.json()).code, 'CASE_FORBIDDEN');
+    }
+    assigned.data = { _handoff: { body: { report_id: 900, report_src: 'r' } } };
+    assert.equal((await fetch(origin + '/api/handoff/packet?order_id=60&report_id=900&report_src=r')).status, 200);
+    assert.equal((await fetch(origin + '/api/handoff/packet?order_id=60&report_id=901&report_src=r')).status, 403);
+    manager = true;
+    assert.equal((await fetch(origin + '/api/handoff/packet?order_id=60&report_id=901&report_src=r')).status, 200);
+  } finally { server.close(); await once(server, 'close'); }
+});
+
+test('the assigned lawyer can download media from the exact unlinked historical audit a manager handed off', pg, async () => database(async h => {
+  await h.db.query('UPDATE audits SET order_id=NULL WHERE id=15');
+  await h.db.query('INSERT INTO cases(id,order_id,lawyer_tg_id,data) VALUES(800,60,101,$1)', [JSON.stringify({ _handoff: { body: { report_id: 15, report_src: 'a' } } })]);
+  const express = require('express'), app = express();
+  app.use((req,res,next) => { req.staff = { approved: true, role: 'lawyer' }; req.tgUser = { id: 101 }; next(); });
+  setupHandoffPacket(app, { service: h.service, pool: h.pool });
+  const server = app.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const origin = 'http://127.0.0.1:' + server.address().port;
+  try {
+    const packetResponse = await fetch(origin + '/api/handoff/packet?order_id=60&report_id=15');
+    assert.equal(packetResponse.status, 200);
+    const packet = await packetResponse.json();
+    for (const media of packet.report.media) {
+      assert.match(media.url, /\?order_id=60$/);
+      const downloaded = await fetch(origin + media.url);
+      assert.equal(downloaded.status, 200);
+      assert.deepEqual(Buffer.from(await downloaded.arrayBuffer()), h.files.find(file => file.id === media.id).content);
+    }
+    const denied = await fetch(origin + packet.report.media[0].url.replace('order_id=60', 'order_id=61'));
+    assert.equal(denied.status, 403);
+    assert.equal((await fetch(origin + packet.report.media[0].url.split('?')[0])).status, 403);
+  } finally { server.close(); await once(server, 'close'); }
+}));

@@ -30,6 +30,7 @@ function harness(data = compactVisit()) {
   const c = {
     state: { data, evidence, packet: data.request_packet, draft: { id: randomUUID(), revision: 10 }, version: 0, dirty: false,
       pendingUploads: 0, submitting: false, frozen: false, completed: false },
+    URL,
     root: { querySelector: node, querySelectorAll: () => [], innerHTML: '' },
     $: node, tail: Promise.resolve(), queuedJobs: 0, timer: null, clearTimeout, editor: null, tg: null, orderId: '58', localKey: 'synthetic-audit-submit-feedback', clone: copy,
     defaults: { map: { evidence_id: '', page: 1, annotations: [] } },
@@ -58,7 +59,7 @@ function harness(data = compactVisit()) {
     },
   };
   vm.createContext(c);
-  vm.runInContext(['updateClosingConfirmation','setOutcome','queue','isRenewal','packetFiles','evidenceFor','adoptRevision','removeGeneratedEvidence','mapMode','rememberTerritory','switchTerritoryMode','chooseTerritory','hasEvidenceImage','validDistance','territoryIssues','issues','tasksHtml',
+  vm.runInContext(['updateClosingConfirmation','setOutcome','queue','isRenewal','packetFiles','evidenceFor','adoptRevision','removeGeneratedEvidence','mapMode','rememberTerritory','switchTerritoryMode','chooseTerritory','hasEvidenceImage','validDistance','territoryIssues','issues','requiredIssues','tasksHtml',
     'offersActions','reportFeedback','bindReportFeedback','refreshReportFeedback','chooseConclusion','showReportIssues','reportPreview','submit'].map(actualFunction).join('\n'), c);
   return { c, calls, node };
 }
@@ -211,4 +212,36 @@ test('the area question distinguishes a missing part of the premises from a remo
   assert.match(html, /часть площади отрезана или занята соседями/);
   assert.match(html, /убрана только внутренняя перегородка/);
   assert.doesNotMatch(html, /Все комнаты по плану на месте/);
+});
+
+for (const missing of ['building_type','plan','video']) test('missing required '+missing+' cannot silently change the outcome to findings', async () => {
+  const data=compactVisit();data.inspection.alcohol_present='Да';data.conclusion='Фактическое наблюдение';
+  if(missing==='building_type')data.building_type='';
+  if(missing==='plan')data.plan={evidence_id:'',page:1,annotations:[]};
+  if(missing==='video'){data.request_packet.video_required=true;data.workflow.video_url='';}
+  const {c,calls}=harness(data),before=copy(c.state.data);
+  assert.equal(c.offersActions(c.issues()),false);
+  await c.submit('actions');
+  assert.equal(c.state.completed,false);
+  assert.equal(c.state.data.workflow.conclusion_status,before.workflow.conclusion_status);
+  assert.equal(c.state.data.conclusion,before.conclusion);
+  assert.ok(!calls.some(([action])=>action==='request'));
+});
+
+test('renewal with unchecked archive answers is visible and cannot receive a positive conclusion', async () => {
+  const data=compactVisit('catering','Продление');
+  data.inspection.archive_match='';data.inspection.licensed_boundaries_match='';
+  const {c}=harness(data);
+  assert.ok(c.issues().some(item=>item.key==='archive-unchecked'));
+  assert.ok(c.issues().some(item=>item.key==='licensed-boundaries-unchecked'));
+  assert.throws(()=>validateWorkflow(normalizeWorkflow({...copy(c.state.data),evidence:copy(c.state.evidence)})),/замечания|непроверенные/);
+});
+
+test('tobacco report supports the task emitted by the manager form without an alcohol licence service', async () => {
+  const data=compactVisit('tobacco');data.inspection.service='';data.request_packet.service='';
+  const {c}=harness(data);
+  assert.equal(c.issues().length,0);
+  await c.submit();
+  assert.equal(c.state.completed,true);
+  assert.equal(c.state.data.inspection.service,'');
 });

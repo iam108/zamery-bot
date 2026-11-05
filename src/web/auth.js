@@ -2,6 +2,23 @@
 const crypto = require('crypto');
 const pool = require('../db/pool');
 
+function equalHex(expected, value) {
+  return typeof value === 'string' && value.length === expected.length &&
+    /^[a-f0-9]+$/.test(value) && crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(value, 'hex'));
+}
+
+function canManageCases(staff, userId) {
+  if (!staff || staff.approved !== true) return false;
+  const admins = String(process.env.ADMIN_TG_IDS || '').split(/[\s,;]+/).filter(Boolean);
+  return staff.role === 'manager' || admins.includes(String(userId));
+}
+
+function canAccessCase(staff, userId, caseRow) {
+  if (!caseRow || !staff || staff.approved !== true) return false;
+  return canManageCases(staff, userId) ||
+    staff.role === 'lawyer' && String(caseRow.lawyer_tg_id) === String(userId);
+}
+
 let ready = null;
 function ensureStaff() {
   if (!ready) {
@@ -35,10 +52,13 @@ function checkInitData(initData) {
       .map(function (kv) { return kv[0] + '=' + kv[1]; }).join('\n');
     const secret = crypto.createHmac('sha256', 'WebAppData').update(process.env.BOT_TOKEN).digest();
     const calc = crypto.createHmac('sha256', secret).update(dataCheck).digest('hex');
-    if (calc.length !== hash.length || !crypto.timingSafeEqual(Buffer.from(calc), Buffer.from(hash))) return null;
-    const authDate = parseInt(p.get('auth_date')) || 0;
-    if (Date.now() / 1000 - authDate > 7 * 24 * 3600) return null; // подпись старше недели — переоткрыть форму
-    return JSON.parse(p.get('user') || 'null');
+    if (!equalHex(calc, hash)) return null;
+    const date = p.get('auth_date');
+    if (!/^\d{1,12}$/.test(date || '')) return null;
+    const authDate = Number(date), now = Date.now() / 1000;
+    if (authDate > now + 60 || now - authDate > 7 * 24 * 3600) return null;
+    const user = JSON.parse(p.get('user') || 'null');
+    return user && Number.isSafeInteger(user.id) && user.id > 0 ? user : null;
   } catch (e) { return null; }
 }
 
@@ -50,10 +70,10 @@ function userKey(uid) {
 }
 function keyQuery(uid) { return 'u=' + encodeURIComponent(uid) + '&k=' + userKey(uid); }
 function checkUserKey(uid, key) {
-  if (!uid || !key || !/^\d+$/.test(String(uid))) return null;
+  if (typeof uid !== 'string' || !/^[1-9]\d{0,15}$/.test(uid) || !Number.isSafeInteger(Number(uid))) return null;
   const calc = userKey(uid);
-  if (calc.length !== String(key).length || !crypto.timingSafeEqual(Buffer.from(calc), Buffer.from(String(key)))) return null;
-  return { id: parseInt(uid) };
+  if (!equalHex(calc, key)) return null;
+  return { id: Number(uid) };
 }
 
 // Только одобренные сотрудники
@@ -88,9 +108,10 @@ function signCase(caseId, hours) {
   return 'exp=' + exp + '&sig=' + sig;
 }
 function checkCaseSig(caseId, exp, sig) {
-  if (!exp || !sig || Date.now() / 1000 > parseInt(exp)) return false;
+  if (!Number.isSafeInteger(caseId) || caseId < 1 || caseId > 2147483647 ||
+      typeof exp !== 'string' || !/^[1-9]\d{0,11}$/.test(exp) || Date.now() / 1000 > Number(exp)) return false;
   const calc = crypto.createHmac('sha256', sigKey()).update(caseId + ':' + exp).digest('hex').slice(0, 32);
-  return calc.length === String(sig).length && crypto.timingSafeEqual(Buffer.from(calc), Buffer.from(String(sig)));
+  return equalHex(calc, sig);
 }
 
 // Подключается на страницах мини-приложения: добавляет подпись Telegram к каждому запросу к нашему серверу
@@ -99,8 +120,8 @@ const CLIENT_JS = "(function(){var f=window.fetch;if(!f||f.__tg)return;" +
   "var q=new URLSearchParams(location.search),ku=q.get('u'),kk=q.get('k');" +
   "try{if(ku&&kk){sessionStorage.setItem('tg_u',ku);sessionStorage.setItem('tg_k',kk)}else{ku=sessionStorage.getItem('tg_u');kk=sessionStorage.getItem('tg_k')}}catch(e){}" +
   "var w=function(u,o){o=o||{};try{var tg=window.Telegram&&window.Telegram.WebApp;var d=tg&&tg.initData;" +
-  "var s=typeof u==='string'?u:(u&&u.url)||'';" +
-  "if(s.charAt(0)==='/'||s.indexOf(location.origin)===0){var h=new Headers(o.headers||{});" +
+  "var s=String(u);if(typeof Request==='function'){try{s=Object.getOwnPropertyDescriptor(Request.prototype,'url').get.call(u)}catch(e){}}" +
+  "if(new URL(s,location.href).origin===location.origin){var h=new Headers(o.headers||(u&&u.headers)||{});" +
   "if(d)h.set('X-Tg-Init',d);if(ku&&kk){h.set('X-Tg-U',ku);h.set('X-Tg-K',kk)}o.headers=h;}}catch(e){}" +
   "return f.call(this,u,o)};w.__tg=1;window.fetch=w;})();";
 
@@ -114,4 +135,4 @@ function setupAuth(app) {
   });
 }
 
-module.exports = { setupAuth, requireStaff, checkInitData, signCase, checkCaseSig, ensureStaff, keyQuery };
+module.exports = { setupAuth, requireStaff, checkInitData, signCase, checkCaseSig, ensureStaff, keyQuery, canManageCases, canAccessCase };

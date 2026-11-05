@@ -47,7 +47,8 @@ function harness(options = {}) {
       if (name === '../db/pool') return pool;
       if (name === '../checklists') return { LISTS: {}, STAGES: [], flagLabels: {}, pickChecklist: () => options.noChecklist ? null : 'qa-checklist' };
       if (name === '../bot/instance') return bot;
-      if (name === './auth') return {};
+      if (name === './auth') return require('../src/web/auth');
+      if (name === './http-errors') return require('../src/web/http-errors');
       if (name === './handoff-packet') return { setupHandoffPacket: () => ({}) };
       if (name === '../bot/egrn') return { async attachOrOrder(input) { calls.push({ method: 'attachOrOrder', input }); return { result: 'attached' }; } };
       throw new Error('Unexpected handoff dependency: ' + name);
@@ -61,7 +62,7 @@ function harness(options = {}) {
       const body = { lawyer_tg_id: LAWYER, order_id: 58, report_src: 'a', report_id: 7,
         org: 'ООО Пример', client: 'Контакт клиента', phone: '+79990000000', address: 'Москва, тестовый объект', region: 'МСК', kind: 'Общепит', service: 'Продление', priority: 'Обычный',
         video_url: 'https://untrusted.example/manager-body-must-not-win', ...changes };
-      await routes.get('POST /api/handoff')({ body, tgUser: { id: 101 }, staff: { name: 'Менеджер' } }, { json(value) { result = value; } });
+      await routes.get('POST /api/handoff')({ body, tgUser: { id: 101 }, staff: { name: 'Менеджер', role: 'manager', approved: true } }, { json(value) { result = value; } });
       assert.equal(result?.ok, true, result?.error); return result;
     }
   };

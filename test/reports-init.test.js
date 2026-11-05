@@ -9,6 +9,8 @@ function loadInitializer(client) {
   const context = { module: { exports: {} }, require(name) {
     if (name === '../db/pool') return { connect: async () => { connections++; return client; } };
     if (name === '../checklists') return {};
+    if (name === './auth') return require('../src/web/auth');
+    if (name === './http-errors') return require('../src/web/http-errors');
     throw new Error('Unexpected require: ' + name);
   } };
   vm.createContext(context);

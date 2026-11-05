@@ -18,7 +18,7 @@ function harness() {
   const c={
     state:{data:{schema_version:3,ui_version:5,object_category:'catering',inspection:{org:'Тест',address:'Москва',service:'Получение',visit_date:'2026-10-30'},workflow:{step:2,conclusion_status:'actions',territory_result:'findings'},conclusion:'Есть замечания',entrances:[],zones:[],plan:{evidence_id:'plan-original',page:6,annotations:[{id:'p1',tool:'boundary'}]},map:{evidence_id:'map-original',page:1,annotations:[{id:'e1',tool:'entrance'}]},additional_plans:[]},draft:{id:'draft-test',revision:10},evidence:[],dirty:false,serverError:'',version:0,frozen:false,submitting:false,completed:false,packet:{materials:[]}},
     $:node,root:node('#root'),calls,tail:Promise.resolve(),timer:null,pendingSave:null,queuedJobs:0,closingConfirmation:false,saveRetries:0,editor:null,activePlanId:'main',orderId:'123',localKey:'test-only',tg:null,
-    clone:copy,clearTimeout,setTimeout,console,TextEncoder,OUTCOME_LABELS:{ready:'Соответствует по проверенным пунктам',actions:'Нужны действия'},
+    clone:copy,clearTimeout,setTimeout,console,TextEncoder,URL,OUTCOME_LABELS:{ready:'Соответствует по проверенным пунктам',actions:'Нужны действия'},
     document:{body:{classList:{add(){},remove(){}},appendChild(){calls.push(['host-added']);}},createElement:()=>node('export-host')},
     window:{},localStorage:{setItem(){},removeItem(){}},
     render(){calls.push(['render']);},refreshChrome(){},notify(text){calls.push(['notify',text]);},notice(){},status(text){calls.push(['status',text]);},timeLabel:()=> '12:00',localDate:()=> '2026-10-30',localSave(){},issues:()=>[],packetFiles:()=>[],
@@ -31,7 +31,7 @@ function harness() {
     territoryIssues(){},
     defaults:{inspection:{region:'МСК'},workflow:{step:0},plan:{},map:{},additional_plans:[]}
   };
-  vm.createContext(c);load(c,'stable','sameData','draftWriteOptions','updateClosingConfirmation','recoverUnconfirmedWrite','setOutcome','queue','step','isRenewal','evidenceFor','mapMode','adoptRevision','removeGeneratedEvidence','submit','currentPlan','setCurrentPlan');return c;
+  vm.createContext(c);load(c,'requiredIssues','stable','sameData','draftWriteOptions','updateClosingConfirmation','recoverUnconfirmedWrite','setOutcome','queue','step','isRenewal','evidenceFor','mapMode','adoptRevision','removeGeneratedEvidence','submit','currentPlan','setCurrentPlan');return c;
 }
 
 test('the first Call click dispatches the one-shot dial URL without opening a contact dialog',()=>{
@@ -372,4 +372,87 @@ test('reopening a reported conflict does not treat the competing revision as the
   assert.equal(c.state.conflict,true);
   assert.equal(c.$('#conflict-panel').hidden,false);
   assert.equal(c.state.data.conclusion,'Есть замечания');
+});
+
+test('manager identity changes keep original observations until an explicit material recheck', async () => {
+  const c=harness();
+  c.state.data.request_packet={org:'Old company',address:'Old address',service:'Получение',object_category:'catering',cad_num:'77:01:1:1',materials:[]};
+  const original=copy(c.state.data), updated={...original.request_packet,address:'New address',cad_num:'77:01:1:2'};
+  c.request=async()=>updated;c.renderPacketUpdate=()=>c.calls.push(['review-panel']);
+  load(c,'packetIdentity','hasInspectionWork','applyPacket','fetchPacket');
+  await c.fetchPacket();
+  assert.deepEqual(copy(c.state.data),original);
+  assert.equal(c.state.pendingPacket.address,'New address');
+  assert.match(c.state.packetError,/изменились/);
+  await c.submit();
+  assert.equal(c.state.completed,false);
+  assert.ok(!c.calls.some(call=>['flush','export','upload'].includes(call[0])));
+  c.window.confirm=()=>true;c.prefillContact=()=>{};c.sanitizeService=()=>{};
+  c.saveNow=async()=>c.state.draft;
+  load(c,'acceptPacketUpdate');await c.acceptPacketUpdate();
+  assert.equal(c.state.data.request_packet.address,'New address');
+  assert.equal(c.state.data.inspection.address,'New address');
+  assert.equal(c.state.data.packet_rechecks[0].previous.address,'Old address');
+  assert.equal(c.state.data.packet_rechecks[0].current.cad_num,'77:01:1:2');
+  assert.equal(c.state.pendingPacket,null);
+});
+
+test('a local-only draft is discoverable from the same employee general menu', async () => {
+  const c=harness();c.uid='108';c.root.setAttribute=()=>{};c.document.querySelector=()=>null;
+  const values=new Map([
+    ['audit-wizard-v3:108:123',JSON.stringify({dirty:true,saved_at:Date.now(),data:{order_id:'123',inspection:{org:'Local inspection',address:'Москва'}}})],
+    ['audit-wizard-v3:109:124',JSON.stringify({dirty:true,data:{order_id:'124',inspection:{org:'Other employee'}}})],
+    ['audit-wizard-v3:108:123:recovery',JSON.stringify({dirty:true,data:{order_id:'123'}})]
+  ]);
+  c.localStorage={length:values.size,key:i=>[...values.keys()][i],getItem:key=>values.get(key)};
+  c.request=async()=>({ok:true,drafts:[]});
+  load(c,'esc','localDraftCards','setFormNavigation','openDrafts');await c.openDrafts();
+  assert.match(c.root.innerHTML,/Local inspection/);
+  assert.match(c.root.innerHTML,/order_id=123/);
+  assert.match(c.root.innerHTML,/Есть правки на этом устройстве/);
+  assert.doesNotMatch(c.root.innerHTML,/Other employee|order_id=124|recovery/);
+});
+
+test('a failed source read cannot reuse a previous marked-plan preview', async () => {
+  const c=harness();load(c,'exportGraphic');
+  let destroyed=false;
+  c.window.AuditPlanEditor={mount:()=>({refresh:async()=>{},exportPreview:async()=>null,destroy(){destroyed=true;}})};
+  await assert.rejects(c.exportGraphic({...c.state.data.plan,preview_evidence_id:'old-preview'},'plan','annotation'),/актуальное изображение плана/);
+  assert.equal(destroyed,true);
+});
+
+test('large EGRN opens a freshly requested URL without loading its binary in the form', async () => {
+  const c=harness(),id='d1b8c4da-4f14-4f51-a5b3-545b5e718dad',requests=[],opened=[];
+  c.state.packet.egrn_links=[{id,name:'Большая выписка.pdf',bytes:400*1024*1024,url:'/api/audit/orders/123/egrn/'+id+'/link'}];
+  c.window.location={origin:'https://bot.example'};c.request=async url=>{requests.push(url);return {ok:true,url:'https://bot.example/egrn-files/'+id+'/download?token=fresh'};};
+  c.openExternal=url=>{opened.push(url);return true;};c.fetchAuditFile=()=>assert.fail('A huge original must never enter browser Blob memory');
+  load(c,'packetEgrnLinks','openLargeEgrn');const button={disabled:false};
+  await c.openLargeEgrn(id,button);
+  assert.deepEqual(requests,[c.state.packet.egrn_links[0].url]);assert.equal(opened.length,1);
+  assert.match(opened[0],/token=fresh/);assert.equal(button.disabled,false);
+});
+
+test('removing an extra-plan source clears every live reference without changing another original', async () => {
+  const c=harness();
+  c.window.confirm=()=>true;c.blobUrls=new Map();
+  c.state.data.additional_plans=[{id:'extra',evidence_id:'extra-source',page:4,annotations:[{id:'mark'}],preview_evidence_id:'extra-preview',pending:{points:[{x:.1,y:.1}]}}];
+  c.state.evidence=[{id:'extra-source',role:'plan-source',name:'extra.pdf'}];
+  const main=copy(c.state.data.plan);
+  load(c,'deleteEvidence');await c.deleteEvidence('extra-source');await c.tail;
+  assert.equal(c.state.data.additional_plans[0].evidence_id,'');
+  assert.equal(c.state.data.additional_plans[0].annotations.length,0);
+  assert.equal(c.state.data.additional_plans[0].pending,null);
+  assert.equal(c.state.data.additional_plans[0].preview_evidence_id,undefined);
+  assert.deepEqual(copy(c.state.data.plan),main);
+});
+
+test('a Telegram-only EGRN original opens its message with Telegram native navigation', async () => {
+  const c=harness(),id='d1b8c4da-4f14-4f51-a5b3-545b5e718dad',opened=[];
+  c.state.packet.egrn_links=[{id,source:'telegram',name:'Выписка.pdf',bytes:20*1024*1024,url:'/api/audit/orders/123/egrn/'+id+'/link'}];
+  c.window.location={origin:'https://bot.example'};c.request=async()=>({ok:true,url:'https://t.me/c/123456/789'});
+  c.tg={openTelegramLink:url=>opened.push(url)};c.openExternal=()=>assert.fail('Use Telegram navigation for a Telegram original');
+  load(c,'esc','packetEgrnLinks','largeEgrnFilesHtml','openLargeEgrn');c.bytes=()=> '20 МБ';
+  assert.match(c.largeEgrnFilesHtml(),/Открыть в Telegram/);
+  await c.openLargeEgrn(id,{disabled:false});
+  assert.deepEqual(opened,['https://t.me/c/123456/789']);
 });

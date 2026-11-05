@@ -138,6 +138,12 @@ function createPacketService(options = {}) {
   const evidenceStore = options.evidenceStore || require('./audit-evidence-store').createAuditEvidenceStore();
   const listMaterials = options.listMaterials || (options.materials && (typeof options.materials === 'function' ? options.materials : options.materials.list?.bind(options.materials))) ||
     (async id => (await pool.query('SELECT id,name,mime,role,bytes,sha256 FROM order_materials WHERE order_id=$1 ORDER BY created_at,id', [id])).rows);
+  const orderLinks = require('./order-egrn-links').createOrderEgrnLinks({ pool, readOnly: true });
+  async function egrnLinks(orderId) {
+    if (options.listEgrnLinks) return options.listEgrnLinks(orderId);
+    try { return await orderLinks.list(orderId); }
+    catch (error) { if (error.code === '42P01') return []; throw error; }
+  }
   async function lookupEgrn({ order, materials }) {
     if (materials.some(file => file.role === 'egrn')) return { status: 'available', file_count: materials.filter(file => file.role === 'egrn').length, available_in: 'materials' };
     if (!text(order.cad_num)) return { status: 'missing' };
@@ -149,9 +155,9 @@ function createPacketService(options = {}) {
       const files = Array.isArray(row.file_msgs) ? row.file_msgs : [], manifest = Array.isArray(row.delivery_manifest) ? row.delivery_manifest : [];
       // Match attachOrOrder's reusable cache exactly: an orphaned S3 file,
       // an older ready order or an incomplete manifest is not a delivery receipt.
-      const reusableLinks = row.status === 'done' && files.some(file=>file.kind==='link') &&
-        (Number(row.files_sent)>0 || manifest.length>0 && manifest.every(key=>files.some(file=>file.key===key)));
-      if (files.length && (Number(row.files_sent)>0 || reusableLinks)) return { status:'available', file_count:files.length, available_in:'telegram' };
+      const reusableFiles = row.status === 'done' && files.length > 0 &&
+        (Number(row.files_sent)>0 || manifest.length>0 && manifest.every(key=>files.some(file=>(file.key || file.chat + ':' + file.id)===key)));
+      if (files.length && (Number(row.files_sent)>0 || reusableFiles)) return { status:'available', file_count:files.length, available_in:'telegram' };
       return { status:['new','ordered','done'].includes(row.status) && Number(row.files_sent)>=0 ? 'waiting' : 'unknown' };
     } catch (_) { return { status: 'unknown' }; }
   }
@@ -198,8 +204,9 @@ function createPacketService(options = {}) {
       if (orderId && !order) fail(404, 'ORDER_NOT_FOUND', 'Заявка не найдена.');
       if (order && !selected && !reportId) selected = (await pool.query('SELECT * FROM audits WHERE order_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1', [orderId])).rows[0] || null;
       const materials = order ? (await listMaterials(orderId)).map(file => materialView(file, orderId)) : [];
+      const egrn_links = order ? await egrnLinks(orderId) : [];
       const data = object(selected?.report_data), view = order ? orderView(order,data) : null;
-      const report = selected ? { id: Number(selected.id), src: reportId ? src : 'a', text: String(selected.text || ''), created_at: selected.created_at,
+      const report = selected ? { id: Number(selected.id), src: reportId ? src : 'a', order_id: integer(selected.order_id, true), text: String(selected.text || ''), created_at: selected.created_at,
         status: text(data.workflow?.conclusion_status), actor: text(data.actor) || text((String(selected.text || '').match(/(?:^|\n)Аудитор\s*:\s*([^\n]+)/i) || [])[1]) || text(selected.author),
         inspection: Object.fromEntries(Object.entries(object(data.inspection)).filter(([key,value]) => INSPECTION_KEYS.has(key) && (value == null || ['string','number','boolean'].includes(typeof value)))),
         address: reportAddress(data, selected.text), video_url: https(Object.hasOwn(object(data.workflow), 'video_url') ? data.workflow.video_url : data.video_url),
@@ -207,7 +214,8 @@ function createPacketService(options = {}) {
       if (report?.src === 'a') {
         const { photoCaption } = require('../bot/audit-delivery');
         report.media = (await media(selected)).map(({ expected, raw }) => ({ id: expected.id, name: expected.name, mime: expected.mime, role: expected.role, subject_id: expected.subject_id,
-          bytes: Number(raw.bytes), caption: photoCaption(expected, orderId, data), url: '/api/handoff/reports/' + report.id + '/files/' + expected.id }));
+          bytes: Number(raw.bytes), caption: photoCaption(expected, orderId, data), url: '/api/handoff/reports/' + report.id + '/files/' + expected.id +
+            (!selected.order_id && orderId ? '?order_id=' + orderId : '') }));
       }
       if (report) report.historical_address_difference = view && report.address && report.address !== view.address ? { report: report.address, order: view.address } : null;
       let readiness;
@@ -217,14 +225,21 @@ function createPacketService(options = {}) {
         try{
           // to_jsonb keeps this read compatible with a legacy cases table
           // before the first V2 submit adds its optional checkpoint columns.
-          const row=(await pool.query("SELECT id,lawyer_name,data->'_handoff'->>'completed' AS delivery_complete,to_jsonb(cases)->>'handoff_submit_id' AS submit_id FROM cases WHERE order_id=$1 ORDER BY id DESC LIMIT 1",[orderId])).rows[0];
-          if(row)assignment={case_id:Number(row.id),lawyer_name:text(row.lawyer_name),submit_id:text(row.submit_id)||null,
+          const row=(await pool.query("SELECT id,lawyer_name,data->'_handoff'->>'completed' AS delivery_complete,data->'_handoff'->>'manual_review' AS manual_review,to_jsonb(cases)->>'handoff_submit_id' AS submit_id FROM cases WHERE order_id=$1 ORDER BY id DESC LIMIT 1",[orderId])).rows[0];
+          if(row)assignment={case_id:Number(row.id),lawyer_name:text(row.lawyer_name),submit_id:text(row.submit_id)||null,...(row.manual_review?{manual_review:true}:{}),
             ...(['true','false'].includes(String(row.delivery_complete))?{delivery_complete:String(row.delivery_complete)==='true'}:{})};
         }catch(error){if(error.code!=='42P01')throw error;}
       }
-      const signature = createHash('sha256').update(canonical({ order: view, report: report ? { id: report.id, src: report.src } : null,
+      const requestId = integer(query.request_id, true);
+      let request = null;
+      if (requestId) {
+        const original = (await pool.query('SELECT id,text,created_at FROM reports WHERE id=$1', [requestId])).rows[0];
+        if (!original) fail(404, 'REQUEST_NOT_FOUND', 'Сохранённая исходная заявка не найдена.');
+        request = { id: Number(original.id), text: String(original.text || ''), created_at: original.created_at };
+      }
+      const signature = createHash('sha256').update(canonical({ order: view, request, egrn_links, report: report ? { id: report.id, src: report.src } : null,
         materials: materials.map(({ id,sha256,bytes,name,mime,role }) => ({ id,sha256,bytes,name,mime,role })) })).digest('hex');
-      return { ok: true, signature, order: view, report, materials, egrn: safeEgrn(readiness, view?.cad_num || ''), archive_url: view?.archive_url || '', assignment };
+      return { ok: true, signature, order: view, request, report, materials, egrn_links, egrn: safeEgrn(readiness, view?.cad_num || ''), archive_url: view?.archive_url || '', assignment };
     },
     async file(auditId, fileId) {
       if (!UUID.test(fileId || '')) fail(400, 'INVALID_FILE_ID', 'Некорректный номер материала.');
@@ -240,6 +255,22 @@ function disposition(name, download) {
 }
 function setupHandoffPacket(app, options = {}) {
   const service = options.service || createPacketService(options);
+  const pool = options.pool || require('../db/pool');
+  const { canManageCases, canAccessCase } = require('./auth');
+  async function authorize(req, orderId, report) {
+    if (canManageCases(req.staff, req.tgUser && req.tgUser.id)) return true;
+    const row = (await pool.query('SELECT * FROM cases WHERE order_id=$1 AND lawyer_tg_id=$2 ORDER BY id DESC LIMIT 1', [orderId, req.tgUser && req.tgUser.id])).rows[0];
+    if (!canAccessCase(req.staff, req.tgUser && req.tgUser.id, row)) fail(403, 'CASE_FORBIDDEN', 'Этот клиент недоступен вашему аккаунту.');
+    if (report && (!report.order_id || Number(report.order_id) !== Number(orderId))) {
+      // A manager may explicitly attach a historical unlinked report to a
+      // case. Its saved handoff selection is the authority, not a caller's
+      // arbitrary combination of their own order with somebody else's report.
+      const selection = object(object(object(row.data)._handoff).body);
+      if (Number(selection.report_id) !== Number(report.id) || selection.report_src !== report.src)
+        fail(403, 'CASE_FORBIDDEN', 'Этот отчёт не входит в переданный вам комплект.');
+    }
+    return false;
+  }
   const route = run => async (req,res) => {
     res.set('Cache-Control','private, no-store').set('X-Content-Type-Options','nosniff');
     try { await run(req,res); }
@@ -247,8 +278,16 @@ function setupHandoffPacket(app, options = {}) {
   };
   // These routes must be mounted after setupAuth: the shared /api/handoff
   // requireStaff middleware protects metadata and every original-file request.
-  app.get('/api/handoff/packet', route(async (req,res) => res.json(await service.packet(req.query))));
+  app.get('/api/handoff/packet', route(async (req,res) => {
+    const packet = await service.packet(req.query);
+    const manager = await authorize(req, packet.order && packet.order.id, packet.report);
+    if (packet.assignment) packet.assignment.can_resume = manager && packet.assignment.delivery_complete === false && !packet.assignment.manual_review;
+    if (!manager) delete packet.request;
+    res.json(packet);
+  }));
   app.get('/api/handoff/reports/:auditId/files/:fileId', route(async (req,res) => {
+    const packet = await service.packet({ report_id: req.params.auditId, report_src: 'a', order_id: req.query.order_id });
+    await authorize(req, packet.order && packet.order.id, packet.report);
     const file = await service.file(req.params.auditId,req.params.fileId);
     res.set('Content-Type',file.mime).set('Content-Length',String(file.buffer.length)).set('Content-Disposition',disposition(file.name,req.query.download === '1')).send(file.buffer);
   }));

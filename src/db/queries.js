@@ -77,15 +77,26 @@ async function updateOrderPacket(id, data) {
   return rows[0] || null;
 }
 
-async function updateOrderStatus(id, status, actor = 'admin') {
-  const { rows } = await pool.query(
-    'UPDATE orders SET status = $1 WHERE id = $2 RETURNING *',
-    [status, id]
-  );
-  if (rows[0]) {
-    await addLog(id, 'status_change', actor, `Статус изменён на: ${status}`);
+async function updateOrderStatus(id, status, actor = 'admin', expectedStatuses = null) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      'UPDATE orders SET status = $1 WHERE id = $2' + (expectedStatuses ? ' AND status = ANY($3::text[])' : '') + ' RETURNING *',
+      expectedStatuses ? [status, id, expectedStatuses] : [status, id]
+    );
+    if (rows[0]) {
+      await client.query('INSERT INTO logs (order_id,action,actor,details) VALUES($1,$2,$3,$4)',
+        [id, 'status_change', actor, 'Статус изменён на: ' + status]);
+    }
+    await client.query('COMMIT');
+    return rows[0];
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
   }
-  return rows[0];
 }
 
 async function setTelegramMsgId(orderId, msgId) {

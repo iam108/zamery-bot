@@ -134,7 +134,7 @@ function validateCompactInspection(data) {
   const p = data.inspection;
   if (!['catering', 'retail', 'tobacco'].includes(data.object_category)) throw new Error('Менеджеру нужно уточнить тип объекта в заявке.');
   if (!p || typeof p !== 'object' || Array.isArray(p)) throw new Error('Заполните сведения осмотра.');
-  if (!SERVICES.includes(p.service)) throw new Error('В заявке не указана услуга.');
+  if (!(data.object_category === 'tobacco' && !p.service) && !SERVICES.includes(p.service)) throw new Error('В заявке не указана услуга.');
   for (const [key, label] of [['org', 'организацию'], ['address', 'адрес объекта'], ['floor_plan', 'этаж на плане'], ['floor_actual', 'фактический этаж']]) {
     if (!nonempty(p[key])) throw new Error('Укажите ' + label + '.');
   }
@@ -175,8 +175,11 @@ function compactInspectionIssues(data) {
   if (p.service === 'Продление') {
     if (data.workflow?.archive_skipped === 'Да') add('archive-skipped', 'Архив не предоставлен; сверка с архивом не выполнена.');
     else if (p.archive_match === 'Нет') add('archive-mismatch', 'Аудитор отметил расхождения с архивом.');
-    else if (p.archive_match === 'Не проверено') add('archive-unchecked', 'Сверка с архивом не выполнена.');
-    if (data.workflow?.archive_skipped !== 'Да' && p.licensed_boundaries_match === 'Нет') add('licensed-boundaries', 'Аудитор отметил расхождение лицензированных границ.');
+    else if (p.archive_match !== 'Да') add('archive-unchecked', 'Сверка с архивом не выполнена.');
+    if (data.workflow?.archive_skipped !== 'Да') {
+      if (p.licensed_boundaries_match === 'Нет') add('licensed-boundaries', 'Аудитор отметил расхождение лицензированных границ.');
+      else if (p.licensed_boundaries_match !== 'Да') add('licensed-boundaries-unchecked', 'Соблюдение лицензированных границ не подтверждено.');
+    }
   }
   if (data.object_category === 'tobacco') {
     if (p.tobacco_display === 'Открытая') add('tobacco-display', 'Зафиксирована открытая выкладка табачной продукции.');

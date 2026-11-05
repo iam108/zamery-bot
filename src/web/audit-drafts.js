@@ -1,4 +1,7 @@
 const { randomUUID, createHash } = require('node:crypto');
+const { getSessionLockPool: deliveryLockPool, closeSessionLockPool: closeDeliveryLockPool } = require('../db/session-lock-pool');
+const { activeDraftEvidence } = require('../bot/audit-workflow');
+
 const defaultPool = require('../db/pool');
 const { createAuditEvidenceStore, AuditEvidenceStorageError } = require('./audit-evidence-store');
 
@@ -34,10 +37,12 @@ const DDL = `
     object_key TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     deleted_at TIMESTAMPTZ,
+    mutation_revision INT,
     PRIMARY KEY (draft_id, id)
   );
   ALTER TABLE audit_evidence ADD COLUMN IF NOT EXISTS storage TEXT NOT NULL DEFAULT 'postgres';
   ALTER TABLE audit_evidence ADD COLUMN IF NOT EXISTS object_key TEXT;
+  ALTER TABLE audit_evidence ADD COLUMN IF NOT EXISTS mutation_revision INT;
   ALTER TABLE audit_evidence ALTER COLUMN content DROP NOT NULL;
 `;
 
@@ -161,34 +166,41 @@ function createDraftStore(pool = defaultPool, configuredLimits = LIMITS, options
   }
   async function hydrate(value) {
     const evidence = [];
-    for (const file of value.evidence) evidence.push(Object.assign(evidenceMetadata(file), { buffer: await originals.read(file) }));
+    for (const file of activeDraftEvidence(value)) evidence.push(Object.assign(evidenceMetadata(file), { buffer: await originals.read(file) }));
     return Object.assign({}, value, { evidence });
   }
   async function bump(client, id) {
     return (await client.query('UPDATE audit_drafts SET revision=revision+1,updated_at=NOW() WHERE id=$1 RETURNING revision', [id])).rows[0].revision;
   }
-  async function evidencePreflight(client, owner, id, file) {
+  function checkEvidenceRevision(row, expected, existing, deleted) {
+    const wanted = revision(expected), current = Number(row.revision);
+    const ownRetry = existing && !!existing.deleted_at === deleted &&
+      Number(existing.mutation_revision) === current && wanted + 1 === current;
+    if (wanted !== current && !ownRetry) checkRevision(row, wanted);
+  }
+  async function evidencePreflight(client, owner, id, file, expected) {
     const row = await find(client, owner, id, true);
-    const existing = (await client.query('SELECT id,name,mime,role,subject_id,kind,bytes,sha256,created_at,deleted_at,storage,object_key FROM audit_evidence WHERE draft_id=$1 AND id=$2', [row.id, file.id])).rows[0];
+    const existing = (await client.query('SELECT id,name,mime,role,subject_id,kind,bytes,sha256,created_at,deleted_at,mutation_revision,storage,object_key FROM audit_evidence WHERE draft_id=$1 AND id=$2', [row.id, file.id])).rows[0];
     if (existing) {
       if (['name', 'mime', 'role', 'subject_id', 'kind', 'sha256'].some(key => existing[key] !== file[key])) fail(409, 'FILE_CONFLICT', 'Под этим номером уже сохранён другой файл.');
+      checkEvidenceRevision(row, expected, existing, false);
       let next = Number(row.revision);
       if (existing.deleted_at) {
         mutable(row);
-        await client.query('UPDATE audit_evidence SET deleted_at=NULL WHERE draft_id=$1 AND id=$2', [row.id, file.id]);
+        await client.query('UPDATE audit_evidence SET deleted_at=NULL,mutation_revision=$3 WHERE draft_id=$1 AND id=$2', [row.id, file.id, Number(row.revision) + 1]);
         next = Number(await bump(client, row.id));
       }
       return { result: { evidence: evidenceMetadata(existing), revision: next }, object_key: existing.object_key };
     }
-    mutable(row);
+    mutable(row); checkRevision(row, expected);
     // Removed originals remain recoverable and count against the same limits.
     const totals = (await client.query('SELECT COUNT(*) AS count,COALESCE(SUM(bytes),0) AS bytes FROM audit_evidence WHERE draft_id=$1', [row.id])).rows[0];
     if (Number(totals.count) >= limits.files || Number(totals.bytes) + file.bytes > limits.totalBytes) fail(413, 'EVIDENCE_LIMIT', 'Достигнут лимит материалов проверки: 60 файлов или 100 МБ.');
     return { row };
   }
   async function insertEvidence(client, row, file, objectKey) {
-    const saved = (await client.query('INSERT INTO audit_evidence(draft_id,id,name,mime,role,subject_id,kind,bytes,sha256,content,storage,object_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id,name,mime,role,subject_id,kind,bytes,sha256,created_at',
-      [row.id, file.id, file.name, file.mime, file.role, file.subject_id, file.kind, file.bytes, file.sha256, objectKey ? null : file.content, objectKey ? 's3' : 'postgres', objectKey || null])).rows[0];
+    const saved = (await client.query('INSERT INTO audit_evidence(draft_id,id,name,mime,role,subject_id,kind,bytes,sha256,content,storage,object_key,mutation_revision) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id,name,mime,role,subject_id,kind,bytes,sha256,created_at',
+      [row.id, file.id, file.name, file.mime, file.role, file.subject_id, file.kind, file.bytes, file.sha256, objectKey ? null : file.content, objectKey ? 's3' : 'postgres', objectKey || null, Number(row.revision) + 1])).rows[0];
     return { evidence: evidenceMetadata(saved), revision: Number(await bump(client, row.id)) };
   }
   return {
@@ -196,7 +208,7 @@ function createDraftStore(pool = defaultPool, configuredLimits = LIMITS, options
     async withDraftDeliveryLock(owner, id, run) {
       const draftId = uuid(id);
       await ensureTables();
-      const client = await pool.connect();
+      const client = await deliveryLockPool(pool, options.lockPool).connect();
       let locked = false, unlockError;
       try {
         await find(client, owner, draftId);
@@ -258,11 +270,12 @@ function createDraftStore(pool = defaultPool, configuredLimits = LIMITS, options
     },
     async addEvidence(owner, id, input) {
       const file = prepareEvidence(input, limits);
+      const expected = revision(input.revision);
       if (!originals.configured()) return transaction(async client => {
-        const ready = await evidencePreflight(client, owner, id, file);
+        const ready = await evidencePreflight(client, owner, id, file, expected);
         return ready.result || insertEvidence(client, ready.row, file);
       });
-      const ready = await transaction(client => evidencePreflight(client, owner, id, file));
+      const ready = await transaction(client => evidencePreflight(client, owner, id, file, expected));
       if (ready.result) return ready.result;
       const objectKey = originals.key(ready.row.id);
       let retained = false;
@@ -271,7 +284,7 @@ function createDraftStore(pool = defaultPool, configuredLimits = LIMITS, options
         // transaction. A slow storage service never holds a PostgreSQL lock.
         await originals.put(objectKey, file);
         const stored = await transaction(async client => {
-          const latest = await evidencePreflight(client, owner, id, file);
+          const latest = await evidencePreflight(client, owner, id, file, expected);
           if (latest.result) return latest;
           const saved = await insertEvidence(client, latest.row, file, objectKey);
           return { result: saved, object_key: objectKey };
@@ -289,16 +302,25 @@ function createDraftStore(pool = defaultPool, configuredLimits = LIMITS, options
             return { row, saved };
           });
           retained = recovered.saved?.object_key === objectKey;
-          if (retained && !recovered.saved.deleted_at && ['name', 'mime', 'role', 'subject_id', 'kind', 'sha256'].every(key => recovered.saved[key] === file[key])) return { evidence: evidenceMetadata(recovered.saved), revision: Number(recovered.row.revision) };
-        } catch (_) { retained = true; }
+          if (retained && !recovered.saved.deleted_at && ['name', 'mime', 'role', 'subject_id', 'kind', 'sha256'].every(key => recovered.saved[key] === file[key])) {
+            checkEvidenceRevision(recovered.row, expected, recovered.saved, false);
+            return { evidence: evidenceMetadata(recovered.saved), revision: Number(recovered.row.revision) };
+          }
+        } catch (recoveryError) {
+          if (recoveryError instanceof DraftError) throw recoveryError;
+          retained = true;
+        }
         throw error;
       } finally { if (!retained) await originals.remove(objectKey).catch(() => {}); }
     },
-    async removeEvidence(owner, id, fileId) {
+    async removeEvidence(owner, id, fileId, expected) {
       return transaction(async client => {
         const row = await find(client, owner, id, true); mutable(row);
-        const removed = await client.query('UPDATE audit_evidence SET deleted_at=NOW() WHERE draft_id=$1 AND id=$2 AND deleted_at IS NULL RETURNING id', [row.id, uuid(fileId)]);
-        return { revision: removed.rows.length ? Number(await bump(client, row.id)) : Number(row.revision) };
+        const file = (await client.query('SELECT * FROM audit_evidence WHERE draft_id=$1 AND id=$2', [row.id, uuid(fileId)])).rows[0];
+        checkEvidenceRevision(row, expected, file, true);
+        if (!file || file.deleted_at) return { revision: Number(row.revision) };
+        await client.query('UPDATE audit_evidence SET deleted_at=NOW(),mutation_revision=$3 WHERE draft_id=$1 AND id=$2', [row.id, file.id, Number(row.revision) + 1]);
+        return { revision: Number(await bump(client, row.id)) };
       });
     },
     async downloadEvidence(owner, id, fileId) {
@@ -379,7 +401,7 @@ function setupAuditDrafts(app, draftStore = store) {
     res.json({ ok: true, draft, revision: draft.revision });
   }));
   app.post('/api/audit/drafts/:id/evidence', route(async (req, res) => res.json(Object.assign({ ok: true }, await draftStore.addEvidence(req.tgUser.id, req.params.id, req.body)))));
-  app.delete('/api/audit/drafts/:id/evidence/:fileId', route(async (req, res) => res.json(Object.assign({ ok: true }, await draftStore.removeEvidence(req.tgUser.id, req.params.id, req.params.fileId)))));
+  app.delete('/api/audit/drafts/:id/evidence/:fileId', route(async (req, res) => res.json(Object.assign({ ok: true }, await draftStore.removeEvidence(req.tgUser.id, req.params.id, req.params.fileId, req.body?.revision)))));
   app.get('/api/audit/drafts/:id/evidence/:fileId', route(async (req, res) => {
     const file = await draftStore.downloadEvidence(req.tgUser.id, req.params.id, req.params.fileId);
     const encoded = encodeURIComponent(file.name).replace(/['()*]/g, char => '%' + char.charCodeAt(0).toString(16).toUpperCase());
@@ -387,6 +409,6 @@ function setupAuditDrafts(app, draftStore = store) {
   }));
 }
 
-module.exports = { setupAuditDrafts, createDraftStore, validateData, prepareEvidence, DraftError, LIMITS, DDL,
+module.exports = { setupAuditDrafts, createDraftStore, closeDeliveryLockPool, validateData, prepareEvidence, DraftError, LIMITS, DDL,
   loadDraftForSubmit: store.loadDraftForSubmit, releaseDraftSubmission: store.releaseDraftSubmission, markDraftSubmitted: store.markDraftSubmitted,
   loadDraftDelivery: store.loadDraftDelivery, saveDraftDelivery: store.saveDraftDelivery, withDraftDeliveryLock: store.withDraftDeliveryLock };

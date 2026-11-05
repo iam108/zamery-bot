@@ -16,6 +16,11 @@ function harness({ docs = [], urls = [], downloadedSize = 10, sendError, orderFi
     status_text: 'готова', polls: 1, chat_id: 10, ordered_by: 10, deliver: [], files_sent: 0, ...orderFields };
   const pool = { query: async (sql, params) => {
     queries.push({ sql, params });
+    if(sql.startsWith('UPDATE egrn_orders SET processing_token=gen_random_uuid()')) { order.processing_token='11111111-1111-4111-8111-111111111111';return {rows:[order]}; }
+    if(sql.startsWith('UPDATE egrn_orders SET delivery_manifest=$1')) {order.delivery_manifest=JSON.parse(params[0]);return {rows:[]};}
+    if(sql.startsWith('UPDATE egrn_orders SET processing_token=NULL')) {order.processing_token=null;return {rows:[]};}
+    if(sql.startsWith('UPDATE egrn_orders SET file_msgs=$1')) {order.file_msgs=JSON.parse(params[0]);return {rows:[]};}
+    if(sql.startsWith('UPDATE egrn_orders SET deliver=(')) {order.deliver=(order.deliver||[]).concat(JSON.parse(params[0]));order.delivery_revision=(order.delivery_revision||0)+1;if(order.files_sent>0)order.files_sent=0;return {rows:[order]};}
     if(sql.startsWith('SELECT 1 FROM staff'))return{rows:staffAllowed?[{approved:true}]:[]};
     if(sql.startsWith('UPDATE egrn_orders SET files_sent=0, failures=0, retry_at=NULL, error=NULL')) {
       if(String(params[0])!==String(order.id_statement)||order.status!=='done'||order.files_sent>0)return{rows:[]};
@@ -36,6 +41,7 @@ function harness({ docs = [], urls = [], downloadedSize = 10, sendError, orderFi
     require: (name) => {
       if (name === '../db/pool') return pool;
       if (name === './formatter') return { esc: String };
+      if(name === '../web/order-egrn-links')return {async registerOrderLinks(){}};
       if(name === './egrn-files')return{async get(id){renewed.push(id);if(renewError)throw renewError;return renewFile||null;}};
       if(name === '../web/egrn-downloads')return{createDownloadUrl:id=>'https://bot.example.test/egrn-files/'+id+'/download?exp=fresh&sig=test'};
       if(name === './order-evidence')return{async registerCached(targets,files){renewed.push({targets,files});return{};}};
@@ -77,7 +83,7 @@ function harness({ docs = [], urls = [], downloadedSize = 10, sendError, orderFi
     },
     sendMessage: async (chat, text) => { notices.push({ chat, text }); },
     editMessageText: async (...args) => { notices.push({ edit: args }); },
-    callApi: async () => {},
+    callApi: async () => ({ message_id: 900 }),
   } };
   context.module.exports.setupEgrn(bot);
   return { hooks, sent, queries, order, notices, logs, linkCalls, linkCopies, renewed, apiCalls, actions, commands, poll: () => poll(), attachOrOrder: context.module.exports.attachOrOrder,
@@ -240,7 +246,7 @@ test('overlapping polls share one in-flight request and release the guard afterw
   await first;
   h.order.files_sent = 0;
   await h.poll();
-  assert.equal(calls, 2);
+  assert.equal(calls, 1, 'An already saved original resumes delivery without another provider request');
 });
 
 test('guard is released after status request failure', async () => {

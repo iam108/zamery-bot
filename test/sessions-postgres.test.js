@@ -19,6 +19,8 @@ test('migration and session persistence, expiry, touch and logout in PostgreSQL'
     const context = { module: { exports: {} }, console: { log() {}, error() {} }, require(name) {
       if (name === 'dotenv') return { config() {} };
       if (name === './pool') return pool;
+      if (name === '../web/order-egrn-links') return { DDL: require('../src/web/order-egrn-links').DDL };
+      if (name === '../bot/manual-order-attachments') return { DDL: require('../src/bot/manual-order-attachments').DDL };
       if (name === '../web/order-materials') return { DDL: require('../src/web/order-materials').DDL };
       if (name === '../web/workspace') return { SESSION_DDL: require('../src/web/workspace').SESSION_DDL };
       throw new Error('Unexpected require: ' + name);
@@ -32,7 +34,24 @@ test('migration and session persistence, expiry, touch and logout in PostgreSQL'
     const call = (store, method, ...args) => promisify(store[method]).call(store, ...args);
     try {
       await context.module.exports();
+      await db.exec(`CREATE TABLE cases(id INT PRIMARY KEY, data JSONB DEFAULT '{}');
+        CREATE TABLE case_reminders(id INT PRIMARY KEY);
+        CREATE TABLE egrn_orders(id INT PRIMARY KEY);
+        CREATE TABLE reports(id INT PRIMARY KEY);
+        INSERT INTO cases VALUES(1,'{"answer":"kept"}');
+        INSERT INTO case_reminders VALUES(1);
+        INSERT INTO egrn_orders VALUES(1);
+        INSERT INTO reports VALUES(1);`);
       await context.module.exports(); // Safe to rerun the deployed migration.
+      await context.module.exports();
+      const upgraded = (await db.query('SELECT data,checklist_revision FROM cases WHERE id=1')).rows[0];
+      assert.deepEqual(upgraded.data, { answer: 'kept' }); assert.equal(upgraded.checklist_revision, 0);
+      assert.deepEqual((await db.query('SELECT delivery FROM case_reminders WHERE id=1')).rows[0].delivery, {});
+      assert.deepEqual((await db.query('SELECT delivery_revision,request_key,processing_token,processing_until FROM egrn_orders WHERE id=1')).rows[0],
+        { delivery_revision: 0, request_key: null, processing_token: null, processing_until: null });
+      assert.equal((await db.query('SELECT incoming_key FROM reports WHERE id=1')).rows[0].incoming_key, null);
+      await db.exec("INSERT INTO egrn_orders(id,request_key) VALUES(2,'same-intent')");
+      await assert.rejects(db.exec("INSERT INTO egrn_orders(id,request_key) VALUES(3,'same-intent')"), error => error.code === '23505');
       const expires = new Date(Date.now() + 86400000);
       await call(first, 'set', 'restart-check', { auth: true, cookie: { expires } });
       await first.close();

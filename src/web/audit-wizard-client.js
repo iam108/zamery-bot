@@ -197,6 +197,34 @@
   function evidenceBlock(role,subject,title,help){var imageEvidence=role==='entrance'||role==='zone';return '<div class="section-heading"><div><h3>'+esc(title)+'</h3>'+(help?'<p>'+esc(help)+'</p>':'')+'</div></div><div class="upload-row">'+uploader(role,subject,'Сделать фото',true)+uploader(role,subject,imageEvidence?'Выбрать фото':'Выбрать файл',false,imageEvidence)+'</div>'+evidenceCards(role,subject);}
 
   function packetFiles() { return state.packet && Array.isArray(state.packet.materials) ? state.packet.materials : []; }
+  function packetEgrnLinks() {
+    var packet=state.packet||state.data.request_packet||{};
+    return Array.isArray(packet.egrn_links)?packet.egrn_links:[];
+  }
+  function largeEgrnFilesHtml(packet) {
+    var links=packet?packet.egrn_links||[]:packetEgrnLinks();
+    if(!links.length)return '';
+    return '<div class="manager-files">'+links.map(function(file){
+      return '<article class="manager-file"><div><span class="tag">ЕГРН · оригинал</span><strong>'+esc(file.name)+'</strong><small>'+bytes(file.bytes)+'</small></div>'+
+        '<div class="action-row"><button type="button" class="button secondary" data-open-egrn="'+esc(file.id)+'">'+(file.source==='telegram'?'Открыть в Telegram':'Открыть выписку ↗')+'</button></div></article>';
+    }).join('')+'</div>';
+  }
+  async function openLargeEgrn(fileId,button) {
+    var file=packetEgrnLinks().concat(state.pendingPacket&&state.pendingPacket.egrn_links||[]).find(function(item){return String(item.id)===String(fileId);});
+    if(!file)return;
+    if(!/^\/api\/audit\/orders\/[1-9]\d*\/egrn\/[0-9a-f-]{36}\/link$/i.test(file.url||'')){notify('Ссылка на оригинал выписки недоступна. Обновите заявку.');return;}
+    if(button)button.disabled=true;
+    try{
+      var result=await request(file.url);
+      var url=new URL(result.url,window.location.origin);
+      if(url.protocol!=='https:'&&url.origin!==window.location.origin)throw new Error('Не удалось подтвердить ссылку на выписку.');
+      if(url.hostname==='t.me'&&tg&&typeof tg.openTelegramLink==='function'){
+        try{tg.openTelegramLink(url.href);return;}catch(e){}
+      }
+      if(!openExternal(url.href))notify('Не удалось открыть выписку. Разрешите открытие новой вкладки и повторите.');
+    }catch(error){notify(error.message);}
+    finally{if(button)button.disabled=false;}
+  }
   function packetContactText(raw) {
     if (!raw) return '';
     try { if (typeof raw === 'string') raw = JSON.parse(raw); } catch (e) {}
@@ -237,8 +265,8 @@
     var packet=state.packet||state.data.request_packet||{},p=state.data.inspection,files=packetFiles(),contact=packetContactText(packet.contacts),phone=packetPhone(),archiveFiles=files.filter(function(f){return f.role==='archive';}),hasArchive=!!packet.archive_url||archiveFiles.length>0;
     var html='<section class="request-packet"><div class="packet-title"><span class="tag">Заявка #'+esc(orderId)+'</span><span>'+esc(({catering:'Алкоголь · общепит',retail:'Алкоголь · магазин',tobacco:'Табак'})[state.data.object_category]||'Объект')+' · '+esc(p.service)+'</span></div><h2>'+esc(packet.object_name||packet.org||p.org)+'</h2><p class="packet-address">'+esc(packet.address||p.address)+'</p><div class="action-row"><a class="button secondary" data-route target="_blank" rel="noopener" href="'+esc(actions.routeUrl(p.address||''))+'">Построить маршрут ↗</a>'+(phone?'<a class="button secondary" data-call target="_blank" rel="noopener" href="'+esc(phoneActionUrl(phone))+'">Позвонить ↗</a>':'')+'</div>'+(contact?'<p class="packet-contact">'+esc(contact)+'</p>':'');
     if(packet.zones_info)html+='<details class="packet-details"><summary>Комментарий менеджера</summary><p>'+esc(packet.zones_info)+'</p></details>';
-    html+='<details class="packet-details"><summary>Документы заявки · '+files.length+'</summary>'+(files.length?'<button type="button" class="button secondary full" data-download-materials>Скачать всё</button>':'')+managerFilesHtml(files,false)+'<p class="field-note">Документы и папку объекта прикрепляет менеджер до передачи заявки аудитору.</p></details>';
-    if(isRenewal())html+='<div class="archive-box"><div class="card-top"><h3>Архив объекта</h3><span class="tag">'+(archiveFiles.length?'Приложен':state.data.workflow.archive_skipped==='Да'?'Без архива':'Графика не приложена')+'</span></div>'+(hasArchive?'<div class="action-row"><button type="button" class="button secondary" data-download-archive>Скачать архив</button>'+(packet.archive_url?'<button type="button" class="button secondary" data-copy-archive>Скопировать ссылку</button>':'')+'</div>':'')+(!archiveFiles.length?'<button type="button" class="button secondary full" data-skip-archive>'+ (state.data.workflow.archive_skipped==='Да'?'Добавить архив / отменить пропуск':'Архива нет — продолжить')+'</button>':'')+'</div>';
+    html+='<details class="packet-details"><summary>Документы заявки · '+(files.length+packetEgrnLinks().length)+'</summary>'+(files.length?'<button type="button" class="button secondary full" data-download-materials>'+(packetEgrnLinks().length?'Скачать остальные файлы':'Скачать всё')+'</button>':'')+managerFilesHtml(files,false)+largeEgrnFilesHtml()+'<p class="field-note">Документы и папку объекта прикрепляет менеджер до передачи заявки аудитору.</p></details>';
+    if(isRenewal())html+='<div class="archive-box"><div class="card-top"><h3>Архив объекта</h3><span class="tag">'+(archiveFiles.length?'Приложен':state.data.workflow.archive_skipped==='Да'?'Без архива':'Графика не приложена')+'</span></div>'+(hasArchive?'<div class="action-row"><button type="button" class="button secondary" data-download-archive>Скачать архив</button>'+(packet.archive_url?'<button type="button" class="button secondary" data-copy-archive>Скопировать ссылку</button>':'')+'</div>':'')+(!archiveFiles.length||state.data.workflow.archive_skipped==='Да'?'<button type="button" class="button secondary full" data-skip-archive>'+ (state.data.workflow.archive_skipped==='Да'?'Добавить архив / отменить пропуск':'Архива нет — продолжить')+'</button>':'')+'</div>';
     html+='</section><section class="capture-section"><div class="section-heading"><h3>Здание</h3><a class="inline-link" target="_blank" rel="noopener" href="https://dom.mos.ru/">Проверить на dom.mos.ru ↗</a></div>'+choices('building_type','Здание',[['Жилое','Жилое'],['Нежилое','Нежилое']])+'</section>';
     if(!p.service||!p.address||!p.org)html+='<div class="note-box warning">В заявке не хватает данных объекта или услуги. Это дополняет менеджер.</div>';
     return html;
@@ -392,21 +420,24 @@
 
   function issues(){
     var out=[],p=state.data.inspection,packet=state.packet||{};function add(key,title,view,detail){out.push({key:key,title:title,detail:detail||'',step:view});}
-    if(!p.org||!p.address||!p.service)add('packet','Менеджеру нужно дополнить заявку',0);
+    if(!p.org||!p.address||(state.data.object_category!=='tobacco'&&!p.service))add('packet','Менеджеру нужно дополнить заявку',0);
     if(!state.data.building_type)add('building','Выберите: жилое или нежилое здание',0);
     territoryIssues(add,false);
     [['floor_plan','Этаж на плане'],['floor_actual','Фактический этаж'],['cadastral_count','Количество кадастров'],['rooms_complete','Входит ли вся площадь по плану в объект'],['within_cadastral','Границы помещения'],['kkt_count','Количество касс'],['kkt_ip','Наличие кассы ИП']].forEach(function(pair){if(!p[pair[0]])add(pair[0],'Укажите: '+pair[1].toLowerCase(),1);});
+    if(p.cadastral_count&&!/^[1-9]\d?$/.test(p.cadastral_count))add('cadastral_count','Количество кадастров: целое число от 1 до 99',1);
     if(p.floor_plan&&p.floor_actual&&String(p.floor_plan).trim().toLowerCase().replace(/этаж/g,'').replace(/\s+/g,' ').trim()!==String(p.floor_actual).trim().toLowerCase().replace(/этаж/g,'').replace(/\s+/g,' ').trim())add('floor-mismatch','Этаж на плане и фактический этаж отличаются',1);
     if(isRenewal()&&state.data.workflow.archive_skipped!=='Да'){
       if(p.archive_match==='Нет')add('archive-mismatch','Есть расхождения с архивом',1);
-      if(p.archive_match==='Не проверено')add('archive-unchecked','Сверка с архивом не выполнена',1);
+      if(!p.archive_match||p.archive_match==='Не проверено')add('archive-unchecked','Сверка с архивом не выполнена',1);
       if(p.licensed_boundaries_match==='Нет')add('licensed-boundaries','Лицензированные границы отличаются от архива',1);
+      else if(p.licensed_boundaries_match!=='Да')add('licensed-boundaries-unchecked','Соблюдение лицензированных границ не подтверждено',1);
     }
     if(Number(p.cadastral_count)>1&&!p.inter_cadastral_boundary)add('inter','Укажите сохранность границы между кадастрами',1);
     if(Number(p.cadastral_count)>1&&p.inter_cadastral_boundary==='Объединены')add('inter-cadastral','Граница между кадастровыми помещениями убрана',1);
     if(p.rooms_complete==='Нет')add('rooms-incomplete','Не вся площадь по выбранному плану входит в объект',1,'Указано «Часть не входит». Если ответ выбран случайно, исправьте его в разделе «Помещение». Убранная внутренняя перегородка — это изменение планировки.');
     if(p.within_cadastral==='Нет')add('cadastral-boundaries','Указано нарушение внешних границ помещения',1);
     if(!state.data.plan.evidence_id||!state.data.plan.annotations.length)add('plan','Выберите лист и сохраните разметку плана',1);
+    else if(state.data.plan.pending&&state.data.plan.pending.points&&state.data.plan.pending.points.length)add('plan','Завершите контур на плане или отмените незавершённые точки',1);
     if(!state.data.to)add('to','Укажите, нужно ли техническое описание (ТО)',1);
     if(!state.data.bti)add('compare','Укажите результат сверки планировки',1);
     if(state.data.bti==='Нет'&&!p.plan_note.trim())add('note','Кратко опишите изменения планировки',1);
@@ -419,15 +450,27 @@
     return out;
   }
 
+  function requiredIssues(tasks) {
+    var keys=['packet','building','floor_plan','floor_actual','cadastral_count','rooms_complete','within_cadastral','kkt_count','kkt_ip','inter','plan','to','compare','note','archive'];
+    var required=tasks.filter(function(task){return keys.includes(task.key);});
+    territoryIssues(function(key,title,view){if(!required.some(function(task){return task.key===key;}))required.push({key:key,title:title,step:view});},true);
+    var p=state.data.inspection;
+    if(!p.alcohol_present&&state.data.object_category!=='tobacco')required=required.concat(tasks.filter(function(task){return task.key==='alcohol';}));
+    if(state.data.object_category==='tobacco')required=required.concat(tasks.filter(function(task){return /^tobacco_/.test(task.key)&&!p[task.key];}));
+    var video=state.data.workflow.video_url||'';
+    if(video){try{if(new URL(video).protocol!=='https:')throw new Error();}catch(e){required.push({key:'video-url',title:'Укажите полную HTTPS-ссылку на видео',step:2});}}
+    else if(state.packet&&(state.packet.video_required||state.packet.has_video))required=required.concat(tasks.filter(function(task){return task.key==='video';}));
+    return required;
+  }
   function tasksHtml(tasks) { return '<div class="task-list">' + tasks.map(function (t) { return '<div class="task"><div class="task-main"><p>' + esc(t.title) + '</p>' + (t.detail ? '<small>' + esc(t.detail) + '</small>' : '') + '</div><button type="button" data-go-step="' + t.step + '">'+(['Территория →','Помещение →','Отчёт →'][t.step]||'Открыть')+'</button></div>'; }).join('') + '</div>'; }
   function offersActions(tasks) {
     var outcome=state.data.workflow.conclusion_status;
-    return !state.frozen && tasks.length>0 && (!outcome || outcome==='ready');
+    return !state.frozen && tasks.length>0 && !requiredIssues(tasks).length && (!outcome || outcome==='ready');
   }
   function reportFeedback(tasks) {
     if(!tasks.length)return '<section id="report-feedback" hidden></section>';
-    var ready=state.data.workflow.conclusion_status==='ready';
-    return '<section id="report-feedback" class="report-feedback'+(ready?' report-feedback-warning':'')+'" tabindex="-1" aria-live="polite"><h3>'+(ready?'Итог «Соответствует» расходится с ответами':'Что требует внимания')+'</h3><p>'+(ready?'Если ответы верны, выберите итог с замечаниями. Если ответ выбран случайно — исправьте его в нужном разделе.':'Эти сведения останутся в отчёте вместе с выбранным итогом.')+'</p>'+tasksHtml(tasks)+(ready&&!state.frozen?'<div class="report-feedback-actions"><button type="button" class="button secondary" data-conclusion-choice="actions">Выбрать: Нужны действия</button><button type="button" class="button secondary" data-conclusion-choice="insufficient">Выбрать: Нужно уточнить</button></div>':'')+'</section>';
+    var ready=state.data.workflow.conclusion_status==='ready',missing=requiredIssues(tasks).length>0;
+    return '<section id="report-feedback" class="report-feedback'+(ready?' report-feedback-warning':'')+'" tabindex="-1" aria-live="polite"><h3>'+(missing?'Дополните обязательные сведения':ready?'Итог «Соответствует» расходится с ответами':'Что требует внимания')+'</h3><p>'+(missing?'Откройте указанный раздел и заполните недостающие сведения.':ready?'Если ответы верны, выберите итог с замечаниями. Если ответ выбран случайно — исправьте его в нужном разделе.':'Эти сведения останутся в отчёте вместе с выбранным итогом.')+'</p>'+tasksHtml(tasks)+(ready&&!missing&&!state.frozen?'<div class="report-feedback-actions"><button type="button" class="button secondary" data-conclusion-choice="actions">Выбрать: Нужны действия</button><button type="button" class="button secondary" data-conclusion-choice="insufficient">Выбрать: Нужно уточнить</button></div>':'')+'</section>';
   }
   function bindReportFeedback(scope) {
     scope.querySelectorAll('[data-conclusion-choice]').forEach(function(button){button.onclick=function(){chooseConclusion(button.dataset.conclusionChoice);};});
@@ -478,11 +521,39 @@
 
   function normalizeLayout(){if(!state.frozen){state.data.ui_version=5;state.data.inspection.region='МСК';state.data.map=state.data.map||{evidence_id:'',page:1,annotations:[]};state.data.additional_plans=state.data.additional_plans||[];}}
 
+  function renderPacketUpdate() {
+    if(!state.pendingPacket)return;
+    var previous=state.data.request_packet||state.packet||{},next=state.pendingPacket;
+    var labels={org:'Организация',address:'Адрес',service:'Услуга',object_category:'Тип объекта',cad_num:'Кадастровый номер'};
+    var categories={catering:'Алкоголь · общепит',retail:'Алкоголь · магазин',tobacco:'Табак',other:'Другой объект'};
+    var changes=Object.keys(labels).filter(function(key){return String(previous[key]||'').trim()!==String(next[key]||'').trim();}).map(function(key){
+      var oldValue=key==='object_category'?categories[previous[key]]:previous[key],newValue=key==='object_category'?categories[next[key]]:next[key];
+      return '<p><strong>'+labels[key]+'</strong> · '+esc(oldValue||'Не указано')+' → '+esc(newValue||'Не указано')+'</p>';
+    }).join('');
+    var noticeBox=$('#app-notice');noticeBox.hidden=false;
+    var files=Array.isArray(next.materials)?next.materials:[];
+    noticeBox.innerHTML='<strong>Менеджер изменил данные объекта</strong><p>В черновике сохранены прежние сведения и материалы. Перед отправкой сверьте их с обновлённой заявкой.</p>'+changes+
+      (files.length||next.egrn_links&&next.egrn_links.length?'<details><summary>Документы обновлённой заявки</summary>'+managerFilesHtml(files,false)+largeEgrnFilesHtml(next)+'</details>':'')+
+      '<button type="button" class="button secondary" id="accept-packet-update">Объект и материалы сверены</button>';
+    noticeBox.querySelectorAll('[data-download-material]').forEach(function(button){button.onclick=function(){var file=files.find(function(item){return String(item.id)===button.dataset.downloadMaterial;});if(file)downloadResource(file.url,file.name);};});
+    noticeBox.querySelectorAll('[data-open-egrn]').forEach(function(button){button.onclick=function(){openLargeEgrn(button.dataset.openEgrn,button);};});
+    $('#accept-packet-update').onclick=acceptPacketUpdate;
+  }
+  async function acceptPacketUpdate() {
+    if(!state.pendingPacket||state.frozen||state.submitting||state.conflict||state.blocked||state.needsRestore)return;
+    if(!window.confirm('Вы сверили объект, выбранный план, фотографии и схему с обновлённой заявкой? Подтвердите только если материалы относятся к этому объекту.'))return;
+    var previous=state.data.request_packet||state.packet||{},next=state.pendingPacket;
+    if(next.object_category==='other'){window.location.replace('/audit/legacy'+window.location.search);return;}
+    var history=state.data.packet_rechecks||[];
+    state.data.packet_rechecks=history.concat([{checked_at:new Date().toISOString(),previous:packetIdentity(previous),current:packetIdentity(next)}]).slice(-10);
+    applyPacket(next);state.pendingPacket=null;state.packetError='';notice('');changed();render();
+    try{await saveNow();notify('Обновлённые данные заявки сохранены после сверки.');}catch(error){notify(error.message);}
+  }
   function render() {
     if (editor) { try { editor.destroy(); } catch (e) {} editor = null; }
     fieldId = 0;
     var index = step(); root.innerHTML = [outsideStep, insideStep, reportStep][index](); root.setAttribute('aria-busy', 'false');
-    bind(); refreshChrome(); loadThumbnails(); if(index===0||index===1)mountEditor(); freezeControls();
+    bind(); refreshChrome(); renderPacketUpdate(); loadThumbnails(); if(index===0||index===1)mountEditor(); freezeControls();
   }
   function mountEditor(){
     var kind=step()===0?'map':'plan',mountedPlanId=activePlanId,container=$(kind==='map'?'#map-editor':'#plan-editor');if(!container)return;
@@ -528,6 +599,7 @@
     bindRoot.querySelectorAll('[data-territory-upload]').forEach(function(control){control.onchange=function(){var file=(control.files||[])[0];if(file)uploadTerritoryImage(file,control.dataset.territoryUpload).catch(function(error){notify(error.message);}).finally(function(){control.value='';});};});
     bindRoot.querySelectorAll('[data-open-evidence]').forEach(function (b) { b.onclick = function () { openEvidence(b.dataset.openEvidence); }; });
     bindRoot.querySelectorAll('[data-delete-evidence]').forEach(function (b) { b.onclick = function () { deleteEvidence(b.dataset.deleteEvidence); }; });
+    bindRoot.querySelectorAll('[data-open-egrn]').forEach(function(button){button.onclick=function(){openLargeEgrn(button.dataset.openEgrn,button);};});
     bindRoot.querySelectorAll('[data-download-material]').forEach(function (b) { b.onclick = function () { var file = packetFiles().find(function (f) { return String(f.id) === b.dataset.downloadMaterial; }); if (file) downloadResource(file.url, file.name); }; });
     bindRoot.querySelectorAll('[data-use-plan]').forEach(function (b) { b.onclick = function () { useManagerPlan(b.dataset.usePlan); }; });
     bindRoot.querySelectorAll('[data-choice]').forEach(function(button){button.onclick=async function(){
@@ -798,23 +870,23 @@
       await flush();
       var result=await request('/api/audit/drafts/'+encodeURIComponent(state.draft.id)+'/evidence/'+encodeURIComponent(eid),{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({revision:state.draft.revision})});
       adoptRevision(result);state.evidence=state.evidence.filter(function(e){return String(e.id)!==String(eid);});
-      var plan=state.data.plan,map=state.data.map;
-      if(String(plan.evidence_id)===String(eid)||String(map.evidence_id)===String(eid)){
-        if(String(plan.evidence_id)===String(eid)){plan.evidence_id='';plan.annotations=[];}
-        if(String(map.evidence_id)===String(eid))map.evidence_id='';
-        state.dirty=true;state.version++;await flush();
-      }
+      var removedReference=false;
+      [state.data.plan,state.data.map].concat(state.data.additional_plans).forEach(function(plan){
+        if(String(plan.evidence_id)===String(eid)){plan.evidence_id='';plan.annotations=[];plan.pending=null;delete plan.preview_evidence_id;removedReference=true;}
+        else if(String(plan.preview_evidence_id)===String(eid)){delete plan.preview_evidence_id;removedReference=true;}
+      });
+      if(removedReference){state.dirty=true;state.version++;await flush();}
       if(blobUrls.has(String(eid))){URL.revokeObjectURL(blobUrls.get(String(eid)));blobUrls.delete(String(eid));}
       localSave();render();notify('Файл убран из проверки.');
-    }catch(error){notify(error.message);}});
+    }catch(error){if(error.status===409){state.conflict=true;localSave();$('#conflict-panel').hidden=false;}notify(error.message);}});
   }
   async function removeGeneratedEvidence(eid){var result=await request('/api/audit/drafts/'+encodeURIComponent(state.draft.id)+'/evidence/'+encodeURIComponent(eid),{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({revision:state.draft.revision})});adoptRevision(result);state.evidence=state.evidence.filter(function(e){return e.id!==eid;});}
-  async function exportGraphic(plan,kind,subject){if(!window.AuditPlanEditor||!plan.evidence_id||!plan.annotations.length)return null;var host=document.createElement('div');host.className='export-shell';document.body.appendChild(host);var api;try{api=window.AuditPlanEditor.mount(host,{kind:kind,service:state.data.object_category==='tobacco'?'tobacco':'alcohol',getState:function(){return plan;},onChange:function(){},evidenceUrl:evidenceUrl,evidence:state.evidence});await api.refresh();var result=await api.exportPreview();if(result)result.subject_id=subject;return result;}finally{if(api)api.destroy();host.remove();}}
+  async function exportGraphic(plan,kind,subject){if(!window.AuditPlanEditor||!plan.evidence_id||!plan.annotations.length)return null;var host=document.createElement('div');host.className='export-shell';document.body.appendChild(host);var api;try{api=window.AuditPlanEditor.mount(host,{kind:kind,service:state.data.object_category==='tobacco'?'tobacco':'alcohol',getState:function(){return plan;},onChange:function(){},evidenceUrl:evidenceUrl,evidence:state.evidence});await api.refresh();var result=await api.exportPreview();if(!result)throw new Error('Не удалось подготовить актуальное изображение '+(kind==='map'?'схемы':'плана')+'. Повторите загрузку исходника и отправку отчёта.');result.subject_id=subject;return result;}finally{if(api)api.destroy();host.remove();}}
   async function exportPlan(){return exportGraphic(state.data.plan,'plan','annotation');}
   function freezeControls(){
     if(!state.frozen)return;
     root.querySelectorAll('input,select,textarea').forEach(function(control){control.disabled=true;});
-    root.querySelectorAll('button').forEach(function(button){if(button.id!=='submit-audit'&&!button.hasAttribute('data-open-evidence')&&!button.hasAttribute('data-go-step')&&!button.hasAttribute('data-download-material')&&!button.hasAttribute('data-download-materials')&&!button.hasAttribute('data-download-archive')&&!button.hasAttribute('data-copy-address')&&!button.hasAttribute('data-copy-archive')&&!button.hasAttribute('data-contact'))button.disabled=true;});
+    root.querySelectorAll('button').forEach(function(button){if(button.id!=='submit-audit'&&!button.hasAttribute('data-open-evidence')&&!button.hasAttribute('data-open-egrn')&&!button.hasAttribute('data-go-step')&&!button.hasAttribute('data-download-material')&&!button.hasAttribute('data-download-materials')&&!button.hasAttribute('data-download-archive')&&!button.hasAttribute('data-copy-address')&&!button.hasAttribute('data-copy-archive')&&!button.hasAttribute('data-contact'))button.disabled=true;});
     root.querySelectorAll('.plan-editor-shell canvas').forEach(function(canvas){canvas.style.pointerEvents='none';});
     var submitButton=$('#submit-audit');if(submitButton)submitButton.textContent='Повторить отправку этой версии';
     var submitStatus=$('#submit-status');if(submitStatus)submitStatus.textContent='Отправка началась — версия зафиксирована. Можно просмотреть этапы и повторить отправку без изменений.';
@@ -842,13 +914,14 @@
   }
   async function submit(outcome){
     if(state.submitting)return;
+    if(state.pendingPacket){renderPacketUpdate();notify(state.packetError);return;}
     if(state.pendingUploads){notify('Дождитесь загрузки выбранных файлов.');return;}
     try{if(editor&&editor.flush)await editor.flush();}catch(error){notify(error.message);return;}
     var p=state.data.inspection;
     if(!state.frozen){
-      if(!p.org.trim()||!p.address.trim()||!p.service){notify('В заявке не хватает данных. Менеджеру нужно дополнить объект, адрес или услугу. Наблюдения сохранены в черновике.');go(0);return;}
-      var missingTerritory=[];territoryIssues(function(key,title){missingTerritory.push(title);},true);
-      if(missingTerritory.length){notify(missingTerritory[0]);showReportIssues();return;}
+      if(!p.org.trim()||!p.address.trim()||(state.data.object_category!=='tobacco'&&!p.service)){notify('В заявке не хватает данных. Менеджеру нужно дополнить объект, адрес или услугу. Наблюдения сохранены в черновике.');go(0);return;}
+      var missing=requiredIssues(issues());
+      if(missing.length){notify(missing[0].title);showReportIssues();return;}
       if(outcome==='actions'&&offersActions(issues()))chooseConclusion('actions');
       if(!state.data.workflow.conclusion_status){notify('Выберите результат проверки.');return;}
       if(state.data.workflow.conclusion_status==='ready'&&issues().length){showReportIssues();return;}
@@ -918,19 +991,37 @@
     if(Number(raw&&raw.ui_version)<4){var old=Number(raw&&raw.workflow&&raw.workflow.step)||0;next.workflow.step=old<4?0:old<6?1:2;}
     next.ui_version=preserveVersion&&raw&&raw.ui_version?raw.ui_version:5;next.inspection.region='МСК';return next;
   }
-  async function fetchPacket(){
-    if(state.frozen){state.packet=state.data.request_packet||state.packet;return;}
-    var packet=await request('/api/audit/prefill?order_id='+encodeURIComponent(orderId));
-    if(packet.object_category==='other'){window.location.replace('/audit/legacy'+window.location.search);return;}
-    var before=JSON.stringify(stable(state.data));state.packet=packet;
+  function packetIdentity(packet) {
+    var identity={};
+    ['org','address','service','object_category','cad_num'].forEach(function(key){identity[key]=String(packet&&packet[key]||'').trim();});
+    return identity;
+  }
+  function hasInspectionWork() {
+    if(state.evidence.length||state.data.entrances.length||state.data.zones.length||state.data.building_type||state.data.bti||state.data.to||state.data.conclusion.trim())return true;
+    return ['visit_date','floor_plan','floor_actual','alcohol_present','within_cadastral','cadastral_count','rooms_complete','kkt_count','kkt_ip'].some(function(key){return !!state.data.inspection[key];});
+  }
+  function applyPacket(packet) {
+    state.packet=packet;
     state.data.inspection.org=packet.org||'';state.data.inspection.address=packet.address||'';state.data.inspection.service=packet.service||'';state.data.inspection.region='МСК';
     state.data.object_category=['catering','retail','tobacco'].includes(packet.object_category)?packet.object_category:'catering';
     state.data.request_packet=clone(packet);state.data.order_material_ids=packetFiles().map(function(file){return file.id;});
     prefillContact(packet.contacts);state.data.inspection.archive_url=packet.archive_url||'';
     if(isRenewal())state.data.inspection.archive_available=packet.archive_url||packetFiles().some(function(file){return file.role==='archive';})?'Да':'Не проверено';
     else sanitizeService();
+  }
+  async function fetchPacket(){
+    if(state.frozen){state.packet=state.data.request_packet||state.packet;return;}
+    var packet=await request('/api/audit/prefill?order_id='+encodeURIComponent(orderId));
+    var previous=state.data.request_packet;
+    if(!previous&&hasInspectionWork())previous={org:state.data.inspection.org,address:state.data.inspection.address,service:state.data.inspection.service,object_category:state.data.object_category,cad_num:''};
+    if(previous&&hasInspectionWork()&&!sameData(packetIdentity(previous),packetIdentity(packet))){
+      state.packet=previous;state.pendingPacket=packet;state.packetError='Данные объекта изменились. Сверьте материалы с обновлённой заявкой.';
+      renderPacketUpdate();return;
+    }
+    if(packet.object_category==='other'){window.location.replace('/audit/legacy'+window.location.search);return;}
+    var before=JSON.stringify(stable(state.data));applyPacket(packet);
     if(before!==JSON.stringify(stable(state.data))){state.version++;state.dirty=true;}
-    state.packetError='';
+    state.pendingPacket=null;state.packetError='';
   }
   function setFormNavigation(active) {
     $('#steps').hidden=!active;$('#previous-step').disabled=!active;$('#next-step').disabled=!active;$('#save-now').hidden=!active;
@@ -941,6 +1032,21 @@
     root.innerHTML='<div class="empty-state"><h2>'+esc(title)+'</h2><p>'+esc(message)+'</p>'+(retry?'<button type="button" class="button secondary" id="retry-draft">Повторить</button>':'')+'</div>';
     if(retry)$('#retry-draft').onclick=retry;
   }
+  function localDraftCards() {
+    var prefix='audit-wizard-v3:'+uid+':',cards=[];
+    if(uid==='staff')return cards;
+    try{
+      for(var i=0;i<localStorage.length;i++){
+        var key=localStorage.key(i);if(!key||!key.startsWith(prefix))continue;
+        var id=key.slice(prefix.length);if(!/^[1-9]\d*$/.test(id))continue;
+        var local=JSON.parse(localStorage.getItem(key)||'null');
+        if(!local||!local.dirty||!local.data||String(local.data.order_id)!==id)continue;
+        var p=local.data.inspection||{};
+        cards.push({order_id:Number(id),object_name:p.org||'Заявка #'+id,address:p.address||'',updated_at:local.saved_at,local:true});
+      }
+    }catch(e){}
+    return cards;
+  }
   async function openDrafts(){
     state.blocked=true;status('Загружаю список…');
     var back=document.querySelector('.back-link');if(back)back.hidden=true;
@@ -949,11 +1055,16 @@
       var response=await request('/api/audit/drafts/open');
       if(!Array.isArray(response.drafts))throw new Error('Список черновиков пока недоступен.');
       var items=response.drafts.filter(function(d){return d&&Number.isSafeInteger(Number(d.order_id))&&Number(d.order_id)>0;});
+      localDraftCards().forEach(function(local){
+        var existing=items.find(function(item){return Number(item.order_id)===local.order_id;});
+        if(existing)existing.local=true;else items.push(local);
+      });
+      items.sort(function(a,b){return new Date(b.updated_at).getTime()-new Date(a.updated_at).getTime();});
       if(!items.length){retryScreen('Незавершённых отчётов нет','Чтобы начать, откройте нужную заявку из чата «Замеры 2.0».');status('Черновиков нет');return;}
       setFormNavigation(false);root.setAttribute('aria-busy','false');
       root.innerHTML='<div class="draft-list"><h2>Продолжить отчёт</h2>'+items.map(function(d){
         var url='/audit?order_id='+encodeURIComponent(d.order_id),date=new Date(d.updated_at);
-        var when=d.submitting?'Отправка не подтверждена':d.updated_at&&Number.isFinite(date.getTime())?'Сохранён '+date.toLocaleString('ru-RU',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}):'Черновик';
+        var when=d.local?'Есть правки на этом устройстве':d.submitting?'Отправка не подтверждена':d.updated_at&&Number.isFinite(date.getTime())?'Сохранён '+date.toLocaleString('ru-RU',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}):'Черновик';
         return '<a class="manager-file draft-link" href="'+url+'"><strong>'+esc(d.object_name||'Заявка #'+d.order_id)+'</strong><span>'+esc(d.address||'')+'</span><small>#'+esc(d.order_id)+' · '+esc(when)+'</small></a>';
       }).join('')+'</div>';
       status('Незавершённые отчёты');

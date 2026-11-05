@@ -64,7 +64,8 @@ zamery-bot/
 | `BOT_TOKEN` | токен от @BotFather |
 | `GROUP_CHAT_ID` | ID группы (как получить — см. ниже) |
 | `WEBAPP_URL` | URL твоего приложения на Railway (см. Settings → Domain) |
-| `ADMIN_PASSWORD` | любой пароль для входа в панель |
+| `ADMIN_PASSWORD` | пароль для входа в панель |
+| `ADMIN_TG_IDS` | Telegram ID администраторов через запятую. Нужны для первичного одобрения сотрудников |
 | `SESSION_SECRET` | любая случайная строка (32+ символа) |
 | `NODE_ENV` | `production` |
 
