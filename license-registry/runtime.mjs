@@ -54,6 +54,7 @@ export function privateStateProof(state){
     telegram:{offset:state.telegram?.offset??0,inbox:state.telegram?.inbox??[],
       ...(state.telegram?.ownerInbox?.length?{ownerInbox:state.telegram.ownerInbox}:{})},cursors:state.cursors??{},journal:state.journal??[]};
   if(state.contactReplies)sections.contactReplies=state.contactReplies;
+  if(state.registry)sections.registry=Object.fromEntries(['requests','apiCache','inbox','outbox','processed'].map((key)=>[key,state.registry[key]??(key==='inbox'?[]:{})]));
   if(state.contacts)sections.contacts={
     records:Object.fromEntries(Object.entries(state.contacts.records??{}).map(([key,{notificationPending:_notificationPending,...record}])=>[key,record])),
     reviews:Object.fromEntries(Object.entries(state.contacts.reviews??{}).map(([key,{notifiedAt:_notifiedAt,...review}])=>[key,review]))};
@@ -75,6 +76,10 @@ export function privateStateProof(state){
       sessions:Object.keys(state.contactReplies.sessions??{}).length,
       done:Object.values(state.contactReplies.sessions??{}).filter((item)=>item.status==='done').length,
       pendingMessages:Object.values(state.contactReplies.outbox??{}).filter((item)=>item.status!=='sent').length}}:{}),
+    ...(state.registry?{registryState:{requests:Object.keys(state.registry.requests??{}).length,
+      ...Object.fromEntries(['ready','api_waiting','cache_waiting','awaiting_owner','planned','done','skipped','superseded'].map((status)=>[status,Object.values(state.registry.requests??{}).filter((item)=>item.status===status).length])),
+      pendingInbox:state.registry.inbox?.length??0,pendingMessages:Object.values(state.registry.outbox??{}).filter((item)=>['pending','sending'].includes(item.status)).length,
+      apiCacheEntries:Object.keys(state.registry.apiCache??{}).length}}:{}),
     ...(state.contacts?{contactState:{records:Object.keys(state.contacts.records??{}).length,
       done:Object.values(state.contacts.records??{}).filter((item)=>item.status==='done').length,
       planned:Object.values(state.contacts.records??{}).filter((item)=>item.status==='planned').length,

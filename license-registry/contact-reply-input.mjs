@@ -31,7 +31,7 @@ export function convertOwnerUpdate(update,{ownerChatId,botId}={}){
     const target=callback.message;
     if(String(callback.from?.id)!==owner||callback.from?.is_bot===true||target?.chat?.type!=='private'
       ||String(target.chat.id)!==owner||target.from?.is_bot!==true||String(target.from.id)!==bot)return null;
-    if(typeof callback.data!=='string'||!/^cr:[A-Za-z0-9:_-]+$/u.test(callback.data)||Buffer.byteLength(callback.data,'utf8')>128
+    if(typeof callback.data!=='string'||!/^(?:cr|rg):[A-Za-z0-9:_-]+$/u.test(callback.data)||Buffer.byteLength(callback.data,'utf8')>128
       ||typeof callback.id!=='string'||!callback.id||callback.id.length>256||/[\u0000-\u001f\u007f]/u.test(callback.id))return null;
   }
   if(!Number.isSafeInteger(update.update_id)||update.update_id<0)throw Object.assign(new Error('owner_update_invalid'),{code:'owner_update_invalid'});

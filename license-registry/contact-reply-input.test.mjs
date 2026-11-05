@@ -31,6 +31,7 @@ test('only the configured human owner in the exact private chat becomes a messag
 test('only owner callbacks on this bot private message with reserved bounded data are accepted',()=>{
   const event=convertOwnerUpdate(callback(),options);assert.equal(event.kind,'callback');assert.equal(event.data,'cr:confirm:abc123');
   assert.equal(event.callbackQueryId,'opaque_123');assert.equal(event.replyTo.messageId,102);
+  assert.equal(convertOwnerUpdate(callback({data:'rg:'+ 'a'.repeat(32)+':object:2'}),options).kind,'callback');
   for(const changes of[{from:{id:777}},{data:'other:123'},{data:'cr:'},{data:'cr:'+ 'a'.repeat(129)},
     {data:'cr:bad\nvalue'},{message:{...callback().callback_query.message,from:{id:777,is_bot:true}}},
     {message:{...callback().callback_query.message,chat:{id:Number(owner),type:'group'}}},

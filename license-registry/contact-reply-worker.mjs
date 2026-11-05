@@ -59,10 +59,10 @@ function receiptFor(plan,raw){
 /** Authenticated private replies create durable, row-bound manual contact intents. */
 export class ContactReplyWorker{
   constructor({store,google,telegram,ownerChatId,botId,now=()=>new Date(),log=()=>{},
-    preparePlan=prepareManualContactPlan,applyPlan=applyManualContactPlan,verifyPlan=verifyManualContactPlan}={}){
+    preparePlan=prepareManualContactPlan,applyPlan=applyManualContactPlan,verifyPlan=verifyManualContactPlan,deferEvent=()=>false}={}){
     if(typeof store?.read!=='function'||typeof store?.update!=='function'||typeof google?.context!=='function'
-      ||typeof telegram?.call!=='function'||!positive(ownerChatId)||!positive(botId))throw failure('contact_reply_configuration_invalid');
-    Object.assign(this,{store,google,telegram,ownerChatId:String(ownerChatId),botId:String(botId),now,log,preparePlan,applyPlan,verifyPlan});
+      ||typeof telegram?.call!=='function'||typeof deferEvent!=='function'||!positive(ownerChatId)||!positive(botId))throw failure('contact_reply_configuration_invalid');
+    Object.assign(this,{store,google,telegram,ownerChatId:String(ownerChatId),botId:String(botId),now,log,preparePlan,applyPlan,verifyPlan,deferEvent});
     this.busy=false;
   }
   logCode(code){try{this.log({at:stamp(this.now),type:'contact_reply_error',code});}catch{}}
@@ -81,6 +81,7 @@ export class ContactReplyWorker{
     const event=entry.event;let answer;
     const outcome=await this.store.update((state)=>{
       const replies=initialize(state);const key=`${this.botId}:${this.ownerChatId}:${entry.updateId}`;
+      if(this.authenticated(event)&&this.deferEvent(state,event))return 'deferred';
       const finish=(status)=>{
         replies.processed[key]??={status,at:stamp(this.now)};
         state.telegram.ownerInbox=state.telegram.ownerInbox.filter((item)=>item.updateId!==entry.updateId);
@@ -246,7 +247,7 @@ export class ContactReplyWorker{
     const summary={processed:0,saved:0,sent:0};
     try{
       const inbox=[...((await this.store.read()).telegram?.ownerInbox??[])].sort((a,b)=>a.updateId-b.updateId).slice(0,100);
-      for(const entry of inbox){await this.consume(entry);summary.processed++;}
+      for(const entry of inbox){if(await this.consume(entry)!=='deferred')summary.processed++;}
       const ids=Object.values((await this.store.read()).contactReplies?.sessions??{}).filter((session)=>this.scoped(session)).map((session)=>session.id);
       for(const id of ids){
         try{

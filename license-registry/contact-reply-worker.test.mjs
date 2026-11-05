@@ -9,6 +9,7 @@ import {normalizeAddress} from './core.mjs';
 import {convertOwnerUpdate} from './contact-reply-input.mjs';
 import {renderNotification} from './notifier.mjs';
 import {ContactReplyWorker} from './contact-reply-worker.mjs';
+import {findRegistryRequest} from './registry-request-input.mjs';
 
 const OWNER='123456',BOT='999888';const INN='9721255266';
 const ADDRESS='Москва, пер. Большой Толмачёвский, д. 5, стр. 4';
@@ -73,6 +74,18 @@ async function fixture(t,{duplicates=false,existing=false}={}){
     worker:()=>new ContactReplyWorker(config),advance:(ms)=>{now+=ms;}};
 }
 const sessions=async(h)=>Object.values((await h.store.read()).contactReplies.sessions);
+
+test('a newly arrived registry reply remains durable when the contact consumer runs before routing',async(t)=>{
+  const h=await fixture(t);const id='d'.repeat(32);
+  await h.store.update((state)=>{state.registry={requests:{[id]:{id,ownerChatId:OWNER,botId:BOT,replyMessageIds:[500]}}};});
+  const event=await h.reply(INN);
+  const worker=new ContactReplyWorker({...h.config,deferEvent:(state,input)=>Boolean(findRegistryRequest(state,input))});
+  assert.equal((await worker.tick()).processed,0);
+  const state=await h.store.read();assert.equal(state.telegram.ownerInbox.length,1);
+  assert.equal(state.telegram.ownerInbox[0].event.messageId,event.messageId);
+  assert.equal(Object.keys(state.contactReplies.sessions).length,0);assert.equal(Object.keys(state.contactReplies.processed).length,0);
+  assert.equal(h.sent.length,0);assert.equal(h.batches.length,0);
+});
 
 test('reply to a legacy review fills blank contact cells through a durable plan and verified receipt, then deduplicates after restart',async(t)=>{
   const h=await fixture(t);const event=await h.reply(`${CONTACT}\nTelegram: @anna_client`);

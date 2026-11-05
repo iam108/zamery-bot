@@ -561,6 +561,17 @@ test('owner inbox and manual intent durability are hashed without exposing conta
   assert.ok(!JSON.stringify(planned).includes('PRIVATE_PHONE'));assert.ok(!JSON.stringify(planned).includes('PRIVATE_CONTACT_REPLY'));
 });
 
+test('registry requests and cached responses are included only as private hashes and safe counts',()=>{
+  const state=initialState(CONFIG);
+  state.registry={requests:{one:{status:'awaiting_owner',organization:'PRIVATE_COMPANY',provided:{phone:'PRIVATE_PHONE'}}},
+    apiCache:{one:{privateSource:'PRIVATE_SOURCE'}},inbox:[],outbox:{one:{status:'pending',text:'PRIVATE_TEXT'}},processed:{}};
+  const proof=privateStateProof(state);
+  assert.equal(proof.registryState.awaiting_owner,1);assert.equal(proof.registryState.pendingMessages,1);
+  assert.equal(proof.registryState.apiCacheEntries,1);
+  for(const value of ['PRIVATE_COMPANY','PRIVATE_PHONE','PRIVATE_SOURCE','PRIVATE_TEXT'])assert.ok(!JSON.stringify(proof).includes(value));
+  state.registry.promptWindow={minute:'future',count:5};assert.deepEqual(privateStateProof(state),proof);
+});
+
 test('owner private messages and callbacks are durably isolated before the shared Telegram offset advances',async(t)=>{
   const h=await harness(t);const owner='123456789',bot='9127813428';
   const convertOwner=(u)=>convertOwnerUpdate(u,{ownerChatId:owner,botId:bot});

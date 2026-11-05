@@ -179,3 +179,14 @@ test('owner reply processing has independent readiness and stale detection',()=>
   assert.equal(health.snapshot().dependencies.ownerReplies.lastError,'ownerReplies_stale');
   health.success('ownerReplies');assert.equal(health.snapshot().ready,true);
 });
+
+test('registry completion is an independent dependency and stale processing is visible',()=>{
+  let time=Date.parse(INITIAL);
+  const health=createReadiness({registryCompletionEnabled:true,now:()=>new Date(time)});
+  for(const name of ['telegram','google','api','worker'])health.success(name);health.running();
+  assert.equal(health.snapshot().ready,false);
+  health.success('registryCompletion');assert.equal(health.snapshot().ready,true);
+  time+=180001;health.success('telegram');health.success('worker');
+  assert.equal(health.snapshot().dependencies.registryCompletion.lastError,'registryCompletion_stale');
+  health.success('registryCompletion');assert.equal(health.snapshot().ready,true);
+});
