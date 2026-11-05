@@ -221,6 +221,23 @@ function createDraftStore(pool = defaultPool, configuredLimits = LIMITS, options
         return row ? snapshot(client, row) : null;
       });
     },
+    async listOpen(owner) {
+      const actor = ownerId(owner);
+      await ensureTables();
+      const { rows } = await pool.query(`
+        SELECT d.order_id,
+               COALESCE(NULLIF(btrim(o.object_name), ''), NULLIF(btrim(o.owner_name), ''), '') AS object_name,
+               COALESCE(o.address, '') AS address,
+               d.updated_at,
+               d.submitting_revision IS NOT NULL AS submitting
+        FROM audit_drafts d
+        JOIN orders o ON o.id = d.order_id
+        WHERE d.author_tg_id = $1 AND d.submitted_at IS NULL
+        ORDER BY d.updated_at DESC, d.order_id DESC
+        LIMIT 50
+      `, [actor]);
+      return rows;
+    },
     async create(owner, requestedOrder, data = {}) {
       const actor = ownerId(owner), order = orderId(requestedOrder), safe = validateData(data, limits);
       return transaction(async client => {
@@ -352,6 +369,7 @@ function setupAuditDrafts(app, draftStore = store) {
     }
   }; }
   app.get('/api/audit/drafts/current', route(async (req, res) => res.json({ ok: true, draft: await draftStore.current(req.tgUser.id, req.query.order_id) })));
+  app.get('/api/audit/drafts/open', route(async (req, res) => res.json({ ok: true, drafts: await draftStore.listOpen(req.tgUser.id) })));
   app.post('/api/audit/drafts', route(async (req, res) => {
     const draft = await draftStore.create(req.tgUser.id, req.body.order_id, req.body.data || {});
     res.json({ ok: true, draft, id: draft.id, revision: draft.revision });

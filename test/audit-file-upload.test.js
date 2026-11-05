@@ -31,12 +31,12 @@ const images = [
 function harness() {
   const events = [], notices = [], status = [], uploads = [];
   const c = {
-    window: {}, console, Uint8Array, ArrayBuffer, TextEncoder, TextDecoder,
+    window: {}, tg: null, console, Uint8Array, ArrayBuffer, TextEncoder, TextDecoder,
     btoa: value => Buffer.from(value, 'binary').toString('base64'),
     atob: value => Buffer.from(value, 'base64').toString('binary'),
     setTimeout, clearTimeout, queueMicrotask,
     state: { evidence: [], pendingUploads: 0, submitting: false, frozen: false, conflict: false, packet: {} },
-    tail: Promise.resolve(),
+    tail: Promise.resolve(), queuedJobs: 0,
     status(text) { status.push(text); }, notify(text) { notices.push(text); },
     flush: async () => { events.push('flush'); },
     postEvidence: async (chosen, role, subject, data) => {
@@ -49,7 +49,7 @@ function harness() {
       readAsDataURL() { throw new Error('Unexpected FileReader fallback'); }
     }
   };
-  vm.createContext(c); load(c, 'queue', 'readBase64', 'fileMime', 'uploadFiles');
+  vm.createContext(c); load(c, 'updateClosingConfirmation', 'queue', 'readBase64', 'fileMime', 'uploadFiles');
   return { c, events, notices, status, uploads };
 }
 

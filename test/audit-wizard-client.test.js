@@ -17,8 +17,8 @@ function harness() {
   const node=key=>{if(!nodes.has(key))nodes.set(key,{textContent:'',innerHTML:'',dataset:{},style:{},disabled:false,hidden:false,querySelector:()=>null,querySelectorAll:()=>[],remove(){calls.push(['host-removed']);}});return nodes.get(key);};
   const c={
     state:{data:{schema_version:3,ui_version:5,object_category:'catering',inspection:{org:'Тест',address:'Москва',service:'Получение',visit_date:'2026-10-30'},workflow:{step:2,conclusion_status:'actions',territory_result:'findings'},conclusion:'Есть замечания',entrances:[],zones:[],plan:{evidence_id:'plan-original',page:6,annotations:[{id:'p1',tool:'boundary'}]},map:{evidence_id:'map-original',page:1,annotations:[{id:'e1',tool:'entrance'}]},additional_plans:[]},draft:{id:'draft-test',revision:10},evidence:[],dirty:false,serverError:'',version:0,frozen:false,submitting:false,completed:false,packet:{materials:[]}},
-    $:node,root:node('#root'),calls,tail:Promise.resolve(),timer:null,editor:null,activePlanId:'main',orderId:'123',localKey:'test-only',tg:null,
-    clone:copy,clearTimeout,setTimeout,console,
+    $:node,root:node('#root'),calls,tail:Promise.resolve(),timer:null,pendingSave:null,queuedJobs:0,closingConfirmation:false,saveRetries:0,editor:null,activePlanId:'main',orderId:'123',localKey:'test-only',tg:null,
+    clone:copy,clearTimeout,setTimeout,console,TextEncoder,OUTCOME_LABELS:{ready:'Соответствует по проверенным пунктам',actions:'Нужны действия'},
     document:{body:{classList:{add(){},remove(){}},appendChild(){calls.push(['host-added']);}},createElement:()=>node('export-host')},
     window:{},localStorage:{setItem(){},removeItem(){}},
     render(){calls.push(['render']);},refreshChrome(){},notify(text){calls.push(['notify',text]);},notice(){},status(text){calls.push(['status',text]);},timeLabel:()=> '12:00',localDate:()=> '2026-10-30',localSave(){},issues:()=>[],packetFiles:()=>[],
@@ -31,7 +31,7 @@ function harness() {
     territoryIssues(){},
     defaults:{inspection:{region:'МСК'},workflow:{step:0},plan:{},map:{},additional_plans:[]}
   };
-  vm.createContext(c);load(c,'queue','step','isRenewal','evidenceFor','mapMode','adoptRevision','removeGeneratedEvidence','submit','currentPlan','setCurrentPlan');return c;
+  vm.createContext(c);load(c,'stable','sameData','draftWriteOptions','updateClosingConfirmation','recoverUnconfirmedWrite','setOutcome','queue','step','isRenewal','evidenceFor','mapMode','adoptRevision','removeGeneratedEvidence','submit','currentPlan','setCurrentPlan');return c;
 }
 
 test('the first Call click dispatches the one-shot dial URL without opening a contact dialog',()=>{
@@ -189,10 +189,11 @@ test('unchanged editor snapshot retries a previously failed write instead of fal
   c.window.AuditPlanEditor={mount(container,value){options=value;return {};}};
   c.saveNow=async()=>{writes++;if(writes===1){c.state.serverError='failed';throw new Error('write failed');}c.state.dirty=false;c.state.serverError='';return c.state.draft;};load(c,'mountEditor');c.mountEditor();
   const changed=copy(c.state.data.plan);changed.annotations.push({id:'new-mark',tool:'partition'});
-  await assert.rejects(options.onChange(changed),/write failed/);assert.equal(c.state.data.plan.annotations.length,2);assert.equal(c.state.dirty,true);
-  await options.onChange(copy(changed));assert.equal(writes,2);assert.equal(c.state.dirty,false);
-  await options.onChange(copy(changed));assert.equal(writes,2,'A clean identical snapshot needs no extra request');
-  c.state.frozen=true;assert.equal(options.onChange({annotations:[]}),false);assert.equal(c.state.data.plan.annotations.length,2);
+  assert.equal(options.onSnapshot(changed),true);
+  await assert.rejects(options.onChange(),/write failed/);assert.equal(c.state.data.plan.annotations.length,2);assert.equal(c.state.dirty,true);
+  assert.equal(options.onSnapshot(copy(changed)),true);await options.onChange();assert.equal(writes,2);assert.equal(c.state.dirty,false);
+  assert.equal(options.onSnapshot(copy(changed)),true);await options.onChange();assert.equal(writes,2,'A clean identical snapshot needs no extra request');
+  c.state.frozen=true;assert.equal(options.onSnapshot({annotations:[]}),false);assert.equal(c.state.data.plan.annotations.length,2);
 });
 
 test('extra export receives that exact page, never writes draft facts, and cleans its temporary mount',async()=>{
@@ -218,7 +219,7 @@ test('late callback from a removed extra editor cannot overwrite the main plan',
   // A queued editor callback may settle after the extra was removed/rerendered.
   c.state.data.additional_plans=[];c.activePlanId='main';
   const next=copy(extra);next.annotations.push({id:'last-extra-edit'});
-  const accepted=await mounted.onChange(next);
+  const accepted=mounted.onSnapshot(next);
   assert.deepEqual(copy(c.state.data.plan),main,'A retired editor cannot target whichever plan is now active');
   assert.equal(accepted,false,'A callback for a removed plan must explicitly refuse the save');
 });
@@ -242,10 +243,133 @@ for(const deleted of [false,true])test('manager PDF download keeps its captured 
   const c=harness();c.activePlanId='extra-target';c.state.data.additional_plans=[{id:'extra-target',evidence_id:'old-extra',page:3,annotations:[{id:'old'}]}];
   c.packetFiles=()=>[{id:'manager-pdf',name:'plan.pdf',mime:'application/pdf',role:'egrn',url:'/api/audit/orders/123/materials/manager-pdf/download'}];
   let started,release;const entered=new Promise(resolve=>{started=resolve;}),gate=new Promise(resolve=>{release=resolve;});
-  c.fetch=async()=>{started();await gate;return {ok:true,blob:async()=>({type:'application/pdf'})};};c.readBase64=async()=> 'PDF';load(c,'useManagerPlan');
+  c.fetch=async()=>{started();await gate;return new Response('%PDF-1.4',{headers:{'Content-Type':'application/pdf'}});};c.readBase64=async()=> 'PDF';load(c,'fetchAuditFile','useManagerPlan');
   const main=copy(c.state.data.plan);await c.useManagerPlan('manager-pdf');await entered;
   c.activePlanId='main';if(deleted)c.state.data.additional_plans=[];release();await c.tail;
   assert.deepEqual(copy(c.state.data.plan),main,'The selected target cannot change during the network await');
   if(!deleted)assert.equal(c.state.data.additional_plans[0].manager_material_id,'manager-pdf');
   else assert.equal(c.state.data.additional_plans.length,0);
+});
+
+const auditChallenge = () => new Response('<title>Checking your browser</title>', {headers:{'Content-Type':'text/html; charset=utf-8'}});
+const auditPDF = () => new Response('%PDF-1.4 original', {headers:{'Content-Type':'application/pdf','Content-Disposition':"attachment; filename*=UTF-8''plan.pdf"}});
+
+test('an HTML challenge never occupies the evidence cache and the same original can open again', async () => {
+  const c = harness(), replies = [auditChallenge(), auditPDF()];
+  c.blobUrls = new Map();
+  c.fetch = async (url, options) => { assert.match(url, /\/evidence\/plan-original$/); assert.equal(options.cache,'no-store'); return replies.shift(); };
+  c.URL = {createObjectURL(blob) { assert.equal(blob.type,'application/pdf'); return 'blob:original'; }};
+  load(c,'fetchAuditFile','evidenceUrl');
+  await assert.rejects(c.evidenceUrl('plan-original'), error => error.code === 'AUDIT_FILE_RESPONSE' && /временно ограничил доступ/.test(error.message));
+  assert.equal(c.blobUrls.size,0);
+  assert.equal(await c.evidenceUrl('plan-original'),'blob:original');
+  assert.equal(await c.evidenceUrl('plan-original'),'blob:original');
+  assert.equal(replies.length,0);
+});
+
+test('manager document retries save and import only the actual PDF after an HTML challenge', async () => {
+  const c = harness(), replies = [auditChallenge(), auditPDF(), auditChallenge(), auditPDF()], downloads = [];
+  const url = '/api/audit/orders/123/materials/manager-pdf';
+  c.fetch = async () => replies.shift();
+  c.location = {origin:'https://example.test'};
+  c.downloadJobs = new Set();
+  c.setTimeout = () => {};
+  c.URL = class extends URL { static createObjectURL(blob) { assert.equal(blob.type,'application/pdf'); return 'blob:plan'; } };
+  c.document.createElement = () => ({click() { downloads.push(this.download); },remove() {}});
+  c.packetFiles = () => [{id:'manager-pdf',name:'plan.pdf',mime:'application/pdf',role:'egrn',url}];
+  c.readBase64 = async blob => { assert.equal(await blob.text(),'%PDF-1.4 original'); return 'PDF'; };
+  load(c,'fetchAuditFile','downloadResource','useManagerPlan');
+  await c.downloadResource(url,'fallback.pdf');
+  assert.deepEqual(downloads,[]);
+  assert.match(c.calls.at(-1)[1],/временно ограничил доступ/);
+  await c.downloadResource(url,'fallback.pdf');
+  assert.deepEqual(downloads,['plan.pdf']);
+  assert.equal(c.downloadJobs.size,0);
+  await c.useManagerPlan('manager-pdf'); await c.tail;
+  assert.equal(c.state.data.plan.manager_material_id,undefined);
+  assert.equal(c.calls.filter(call => call[0] === 'upload').length,0);
+  await c.useManagerPlan('manager-pdf'); await c.tail;
+  assert.equal(c.state.data.plan.manager_material_id,'manager-pdf');
+  assert.equal(c.calls.filter(call => call[0] === 'upload').length,1);
+});
+
+test('audit file responses retain supported binary and named attachment types and explain ordinary JSON errors', async () => {
+  const c = harness(); load(c,'fetchAuditFile');
+  for (const type of ['image/jpeg','image/png','application/pdf','application/zip','application/octet-stream','text/plain']) {
+    c.fetch = async () => new Response('original',{headers:{'Content-Type':type,'Content-Disposition':'attachment; filename="original"'}});
+    assert.equal(await (await c.fetchAuditFile('/file','Не удалось открыть файл')).blob.text(),'original');
+  }
+  c.fetch = async () => new Response('rate limited',{headers:{'Content-Type':'text/plain'}});
+  await assert.rejects(c.fetchAuditFile('/file','Не удалось открыть файл'),/временно ограничил доступ/);
+  c.fetch = async () => new Response(JSON.stringify({ok:false,error:'Материал удалён'}),{status:404,headers:{'Content-Type':'application/json'}});
+  await assert.rejects(c.fetchAuditFile('/file','Не удалось открыть файл'),/Материал удалён/);
+});
+
+test('closing with an unconfirmed edit dispatches the write with keepalive, without replacing a not-yet-loaded draft', async () => {
+  const c=harness(),writes=[];
+  load(c,'saveOnExit','flush','saveNow');
+  c.localSave=()=>writes.push('local');
+  c.request=async(url,options)=>{writes.push([url,options]);return {ok:true,revision:11};};
+  c.state.dirty=true;c.state.loaded=false;c.saveOnExit();
+  assert.deepEqual(writes,[]);
+  c.state.loaded=true;c.saveOnExit();const saving=c.pendingSave;
+  assert.equal(writes.filter(Array.isArray).length,1,'the request starts in the exit handler, before any queued microtask');
+  c.saveOnExit();await saving;
+  const calls=writes.filter(Array.isArray);
+  assert.equal(calls.length,1);
+  assert.equal(calls[0][1].keepalive,true);
+  assert.equal(c.state.dirty,false);
+  assert.equal(c.draftWriteOptions('PUT',{text:'я'.repeat(33000)}).keepalive,false,'count UTF-8 bytes, not just characters');
+});
+
+test('after a lost acknowledgement, a newer observation saves on the revision that actually reached the server', async () => {
+  const c=harness();load(c,'flush','saveNow');
+  const first=copy(c.state.data);c.state.attempt={draft_id:c.state.draft.id,data:first};
+  c.state.data.conclusion='Замечание после первого запроса';c.state.dirty=true;
+  const requests=[];c.request=async(url,options)=>{
+    requests.push([url,options]);
+    if(!options)return {draft:{...c.state.draft,revision:11,data:first,evidence:[{id:'original'}]}};
+    return {revision:12};
+  };
+  await c.saveNow();
+  assert.match(requests[0][0],/drafts\/current/);
+  assert.equal(JSON.parse(requests[1][1].body).revision,11);
+  assert.equal(JSON.parse(requests[1][1].body).data.conclusion,'Замечание после первого запроса');
+  assert.equal(c.state.evidence[0].id,'original');
+  assert.equal(c.state.dirty,false);assert.equal(c.state.attempt,null);
+});
+
+test('a newer save by another window is not overwritten while recovering a lost acknowledgement', async () => {
+  const c=harness();load(c,'flush','saveNow');
+  const first=copy(c.state.data);c.state.attempt={draft_id:c.state.draft.id,data:first};
+  c.state.data.conclusion='Мои несохранённые правки';c.state.dirty=true;
+  c.request=async(url,options)=>{
+    assert.equal(options,undefined);
+    return {draft:{...c.state.draft,revision:12,data:{...first,conclusion:'Правка из другого окна'}}};
+  };
+  await assert.rejects(c.saveNow(),/изменился в другом окне/);
+  assert.equal(c.state.conflict,true);
+  assert.equal(c.state.data.conclusion,'Мои несохранённые правки');
+  assert.equal(c.state.attempt.data.conclusion,first.conclusion);
+});
+
+test('changing the outcome removes the old automatic outcome text and keeps actual comments', () => {
+  const c=harness();
+  c.state.data.workflow.conclusion_status='ready';
+  c.state.data.conclusion='Соответствует по проверенным пунктам';
+  c.setOutcome('actions');
+  assert.equal(c.state.data.conclusion,'');
+  c.state.data.conclusion='На плане и по факту разные границы';
+  c.setOutcome('insufficient');
+  assert.equal(c.state.data.conclusion,'На плане и по факту разные границы');
+});
+
+test('reopening a reported conflict does not treat the competing revision as the base of local edits', () => {
+  const c=harness();load(c,'reconcileDraft');
+  const local={draft_id:c.state.draft.id,revision:12,data:copy(c.state.data),dirty:true,conflict:true};
+  const remote={...c.state.draft,revision:12,data:{...copy(c.state.data),conclusion:'Сохранено из другого окна'}};
+  c.state.dirty=true;c.reconcileDraft(local,remote);
+  assert.equal(c.state.conflict,true);
+  assert.equal(c.$('#conflict-panel').hidden,false);
+  assert.equal(c.state.data.conclusion,'Есть замечания');
 });

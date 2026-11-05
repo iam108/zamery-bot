@@ -212,6 +212,11 @@ strong { font-weight:650; }
 .archive-box p { font-size:14px; }
 .archive-box .button { flex:1; }
 .manager-files { display:grid; gap:9px; margin:12px 0; }
+.draft-list { display:grid; gap:10px; }
+.draft-list h2 { margin:0 0 4px; }
+.draft-link { display:grid; gap:4px; color:inherit; text-decoration:none; }
+.draft-link:hover,.draft-link:focus-visible { border-color:var(--accent); }
+.draft-link span { overflow-wrap:anywhere; }
 .manager-file { min-width:0; padding:12px; border:1px solid var(--edge); border-radius:16px; background:var(--well); }
 .manager-file>div:first-child { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
 .manager-file strong { flex:1; min-width:0; overflow-wrap:anywhere; font-size:14px; }

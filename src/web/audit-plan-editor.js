@@ -292,7 +292,13 @@
     const saveQueue = createSaveQueue(async nextState => { const result = await options.onChange(nextState); if (result === false) throw new Error('Изменения не приняты. Повторите сохранение.'); });
     function persist() {
       const rev = ++revision, nextState = copy(state); saveStatus.textContent = 'Сохраняю…'; retry.hidden = true;
-      const job = saveQueue.enqueue(nextState);
+      // The parent writes the latest geometry to device storage now, even
+      // when the previous server request is still waiting for a response.
+      let job;
+      try {
+        if (options.onSnapshot?.(nextState) === false) throw new Error('Изменения не приняты. Повторите сохранение.');
+        job = saveQueue.enqueue(nextState);
+      } catch (e) { job = Promise.reject(e); }
       saveTail = job;
       job.then(() => { if (!alive || rev !== revision) return; saveError = null; saveStatus.textContent = 'Сохранено'; retry.hidden = true; }).catch(e => { if (!alive || rev !== revision) return; saveError = e; saveStatus.textContent = 'Не сохранено'; retry.hidden = false; notice(e.message || 'Не удалось сохранить. Повторите.', true); });
       return job;
@@ -398,7 +404,10 @@
       const evidence = (options.evidence || []).find(e => String(e.id) === String(id)); if (!evidence) return;
       chooserStatus.textContent = 'Открываю файл…';
       try { const resource = await sourceResource(evidence, page || 1); if (!alive || token !== chooserToken || !chooser.open) { resource.pdf?.destroy(); return; } candidate = resource; await candidatePage(resource.page); }
-      catch (e) { if (alive && token === chooserToken) chooserStatus.textContent = 'Файл не открывается. Попробуйте другой PDF или изображение.'; }
+      catch (e) {
+        if (alive && token === chooserToken) chooserStatus.textContent = e?.code === 'AUDIT_FILE_RESPONSE'
+          ? e.message : 'Файл не открывается. Попробуйте другой PDF или изображение.';
+      }
     }
     async function candidatePage(page) {
       if (!candidate || page < 1 || page > candidate.pages) return;

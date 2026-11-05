@@ -16,6 +16,7 @@
     ['Отчёт', 'Результат проверки', 'Краткий вывод и вопросы, которые осталось решить.']
   ];
   var TRI = ['', 'Да', 'Нет', 'Не проверено'];
+  var OUTCOME_LABELS = {ready:'Соответствует по проверенным пунктам',actions:'Нужны действия',insufficient:'Недостаточно данных',obstacle:'Выявлено препятствие'};
   var ZONE_STATUS = {clear:'Без замечаний',licensed:'Есть сведения о лицензии',disputed:'Спорное место',confirmed:'Есть ограничение',pending:'Нужно уточнить',other:'Наблюдение'};
   var MAP_IMAGE_TYPES = ['image/jpeg','image/png'];
   var defaults = {
@@ -28,6 +29,7 @@
   var state = {data:clone(defaults),draft:null,evidence:[],dirty:false,version:0,conflict:false,submitting:false,frozen:false,completed:false,loaded:false,localSaved:false,pendingUploads:0,uploadText:'',serverError:'',recoveryData:null,packet:null,viewStep:null,packetError:''};
   var tail = Promise.resolve();
   var timer = null;
+  var pendingSave = null, queuedJobs = 0, closingConfirmation = false, saveRetries = 0;
   var toastTimer = null;
   var editor = null;
   var activePlanId='main';
@@ -60,25 +62,61 @@
   function timeLabel() { return new Date().toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'}); }
   function notify(message) { $('#toast').textContent=message;$('#toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(function(){$('#toast').hidden=true;},5000); }
   function notice(message) { $('#app-notice').textContent=message;$('#app-notice').hidden=!message; }
-  function status(text,tone) { $('#save-state').textContent=text;$('#save-state').dataset.tone=tone||''; }
-  function queue(fn) { var next=tail.catch(function(){}).then(fn);tail=next.catch(function(){});return next; }
+  function updateClosingConfirmation() {
+    var needed=!state.completed&&(state.dirty||state.pendingUploads>0||state.submitting);
+    if(!tg||needed===closingConfirmation)return;
+    var method=needed?'enableClosingConfirmation':'disableClosingConfirmation';
+    try{if(typeof tg[method]==='function'){tg[method]();closingConfirmation=needed;}}catch(e){}
+  }
+  function status(text,tone) { $('#save-state').textContent=text;$('#save-state').dataset.tone=tone||'';updateClosingConfirmation(); }
+  function queue(fn,immediate) {
+    var startNow=immediate&&!queuedJobs;
+    queuedJobs++;
+    // On real pagehide, Chromium may stop running queued callbacks before
+    // the keepalive request has even been dispatched. Start the idle queue
+    // in this event handler, and serialize it with regular writes.
+    var next=(startNow?fn():tail.then(fn)).finally(function(){queuedJobs--;});
+    tail=next.catch(function(){});return next;
+  }
   function localSave() {
-    if(state.completed||state.frozen)return;
-    try { localStorage.setItem(localKey,JSON.stringify({draft_id:state.draft&&state.draft.id,revision:state.draft&&state.draft.revision,data:state.data,dirty:state.dirty,saved_at:Date.now()}));state.localSaved=true; }
-    catch(e) {state.localSaved=false;if(state.dirty)status('Не удалось сохранить на устройстве. Сохраните на сервер.','warning');}
+    if(!orderId||!state.loaded||state.completed||state.frozen||state.blocked)return;
+    var snapshot={draft_id:state.draft&&state.draft.id,revision:state.draft&&state.draft.revision,data:state.data,dirty:state.dirty,conflict:state.conflict,saved_at:Date.now()};
+    try{
+      // The last dispatched write lets us safely recover a saved request whose
+      // acknowledgement died with the WebView, without overwriting other edits.
+      try{localStorage.setItem(localKey,JSON.stringify(Object.assign({},snapshot,{attempt:state.attempt||null})));}
+      catch(e){localStorage.setItem(localKey,JSON.stringify(snapshot));}
+      state.localSaved=true;
+    }catch(e){state.localSaved=false;if(state.dirty)status('Не удалось сохранить на устройстве. Дождитесь сохранения на сервере.','warning');}
+  }
+  function scheduleSave(delay) {
+    if(timer||!state.dirty||state.conflict||state.blocked||state.needsRestore||state.submitting||state.frozen)return;
+    timer=setTimeout(function(){timer=null;saveNow().catch(function(){});},delay);
   }
   function changed() {
-    if(state.submitting||state.frozen)return;
-    state.version++;state.dirty=true;state.serverError='';localSave();refreshChrome();
-    if(!state.conflict)status(state.localSaved?'На устройстве · сохраняю на сервер…':'Сохраняю на сервер…');
-    clearTimeout(timer);timer=setTimeout(function(){saveNow().catch(function(){});},800);
+    if(state.submitting||state.frozen||state.blocked)return;
+    state.version++;state.dirty=true;state.serverError='';saveRetries=0;localSave();refreshChrome();
+    if(!state.conflict)status(state.needsRestore?(state.localSaved?'Сохранено на устройстве':'Не удалось сохранить на устройстве'):(state.localSaved?'На устройстве · сохраняю на сервер…':'Сохраняю на сервер…'),state.needsRestore?'warning':'');
+    scheduleSave(350);
+  }
+  function saveOnExit() {
+    if(!state.loaded||!orderId||!state.dirty||state.blocked||state.frozen||state.completed)return;
+    localSave();
+    if(!state.conflict&&!state.submitting&&!state.needsRestore)saveNow(true).catch(function(){});
+  }
+  function sameData(a,b) {return !!a&&!!b&&JSON.stringify(stable(a))===JSON.stringify(stable(b));}
+  function draftWriteOptions(method, payload) {
+    var body=JSON.stringify(payload);
+    // Browsers cap all outstanding keepalive bodies at 64 KiB. The writes
+    // here are serialized; oversized drafts still save normally while open.
+    return {method:method,headers:{'Content-Type':'application/json'},body:body,keepalive:typeof TextEncoder!=='undefined'&&body.length<62*1024&&new TextEncoder().encode(body).length<62*1024};
   }
   async function request(url,options) {
     var response,text,data;
     try{response=await fetch(url,options||{});text=await response.text();}
-    catch(e){throw new Error('Нет связи с ботом. Проверьте интернет и повторите действие.');}
+    catch(e){var disconnected=new Error('Нет связи с ботом. Проверьте интернет и повторите действие.');disconnected.retryable=true;throw disconnected;}
     try{data=JSON.parse(text);}catch(e){
-      if(/checking your browser|turnstile|rate limited/i.test(text)||response.status===429)throw new Error('Сервис временно ограничил доступ. Повторите действие через минуту.');
+      if(/checking your browser|turnstile|rate limited/i.test(text)||response.status===429){var restricted=new Error('Сервис временно ограничил доступ. Повторите действие через минуту.');restricted.retryable=true;throw restricted;}
       if(response.status===413)throw new Error('Файл слишком большой. Максимум 12 МБ на файл.');
       throw new Error('Сервер не ответил как ожидалось. Повторите действие. Если файл не появился в отчёте, выберите его заново.');
     }
@@ -93,28 +131,52 @@
     if(result.evidence&&Array.isArray(result.evidence))state.evidence=result.evidence;
     $('#draft-id').textContent=orderId?'Заявка #'+orderId:'Черновик';
   }
+  async function recoverUnconfirmedWrite() {
+    var attempt=state.attempt;
+    if(!attempt)return;
+    var result=await request('/api/audit/drafts/current?order_id='+encodeURIComponent(orderId)), remote=result.draft;
+    var sameVersion=remote&&state.draft&&String(remote.id)===String(state.draft.id)&&Number(remote.revision)===Number(state.draft.revision);
+    var matched=remote&&!remote.submitting&&(!attempt.draft_id||String(attempt.draft_id)===String(remote.id))&&sameData(attempt.data,remote.data);
+    if(matched){adoptRevision(result);state.dirty=!sameData(state.data,remote.data);}
+    else if(!(sameVersion&&!remote.submitting)&&!(!remote&&!state.draft)){
+      var conflict=new Error('Черновик изменился в другом окне. Ваши правки остались на устройстве.');conflict.status=409;throw conflict;
+    }
+    state.attempt=null;localSave();
+  }
   async function flush() {
     if(state.frozen)throw new Error('Версия отчёта зафиксирована. Повторите отправку без изменений.');
+    if(state.blocked||!orderId)throw new Error('Сначала откройте проверку из заявки.');
+    if(state.needsRestore)throw new Error('Сначала восстановите связь с ботом: нажмите «Повторить» над формой.');
     if(state.conflict)throw new Error('Сначала разрешите конфликт версий.');
-    clearTimeout(timer);
+    clearTimeout(timer);timer=null;
     while(state.dirty||!state.draft){
-      var version=state.version;var data=clone(state.data);
       status('Сохраняю на сервер…');
       try{
-        var creating=!state.draft;
-        var result=state.draft?await request('/api/audit/drafts/'+encodeURIComponent(state.draft.id),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({revision:state.draft.revision,data:data})}):await request('/api/audit/drafts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order_id:orderId||null,data:data})});
-        if(creating&&result.draft&&result.draft.data&&JSON.stringify(stable(result.draft.data))!==JSON.stringify(stable(data))){adoptRevision(result);var conflict=new Error('В другом окне уже создана другая версия проверки.');conflict.status=409;throw conflict;}
-        adoptRevision(result);state.dirty=state.version!==version;state.serverError='';localSave();
+        if(state.attempt)await recoverUnconfirmedWrite();
+        if(!state.dirty&&state.draft)break;
+        var version=state.version,data=clone(state.data);
+        var creating=!state.draft,draftId=state.draft&&state.draft.id,rev=state.draft&&state.draft.revision;
+        var path=creating?'/api/audit/drafts':'/api/audit/drafts/'+encodeURIComponent(draftId);
+        state.attempt={draft_id:draftId||null,data:data};localSave();
+        var result=await request(path,draftWriteOptions(creating?'POST':'PUT',creating?{order_id:orderId,data:data}:{revision:rev,data:data}));
+        if(creating&&result.draft&&result.draft.data&&!sameData(result.draft.data,data)){adoptRevision(result);var conflict=new Error('В другом окне уже создана другая версия проверки.');conflict.status=409;throw conflict;}
+        adoptRevision(result);state.dirty=state.version!==version;state.attempt=null;state.serverError='';saveRetries=0;localSave();
       }catch(error){
         state.serverError=error.message;
-        if(error.status===409){state.conflict=true;$('#conflict-panel').hidden=false;status('Конфликт версий · ваши правки на устройстве','warning');}
-        else status((state.localSaved?'Только на устройстве · ':'Не сохранено · ')+error.message,'warning');
+        if(error.status===409){state.conflict=true;localSave();$('#conflict-panel').hidden=false;status(state.localSaved?'Конфликт версий · ваши правки на устройстве':'Конфликт версий · скачайте копию ваших правок','warning');}
+        else {
+          status((state.localSaved?'Только на устройстве · ':'Не сохранено · ')+error.message,'warning');
+          if((error.retryable||error.status>=500)&&saveRetries<3&&document.visibilityState!=='hidden')scheduleSave(2000*Math.pow(2,saveRetries++));
+        }
         throw error;
       }
     }
-    status('Сохранено на сервере · '+timeLabel(),'success');return state.draft;
+    state.serverError='';status('Сохранено на сервере · '+timeLabel(),'success');return state.draft;
   }
-  function saveNow(){return queue(flush);}
+  function saveNow(immediate){
+    if(!pendingSave)pendingSave=queue(flush,immediate).finally(function(){pendingSave=null;});
+    return pendingSave;
+  }
 
   function input(label,path,options) {
     options=options||{};var fid='aw-field-'+(++fieldId),value=get(path),type=options.type||'text';
@@ -380,9 +442,17 @@
     if(button)button.textContent=actions?'Отправить с замечаниями':'Отправить отчёт';
     if(hint)hint.hidden=!actions;
   }
+  function setOutcome(value) {
+    var previous=state.data.workflow.conclusion_status;
+    if(value!==previous&&state.data.conclusion===OUTCOME_LABELS[previous]){
+      state.data.conclusion='';
+      var input=root.querySelector('[data-bind="conclusion"]');if(input)input.value='';
+    }
+    state.data.workflow.conclusion_status=value;
+  }
   function chooseConclusion(value) {
     if(state.submitting||state.frozen||!['actions','insufficient'].includes(value))return;
-    set('workflow.conclusion_status',value);changed();
+    setOutcome(value);changed();
     var select=root.querySelector('[data-bind="workflow.conclusion_status"]');if(select)select.value=value;
     var preview=root.querySelector('.report-preview');if(preview)preview.outerHTML=reportPreview();
     refreshReportFeedback();
@@ -411,18 +481,22 @@
   function render() {
     if (editor) { try { editor.destroy(); } catch (e) {} editor = null; }
     fieldId = 0;
-    if (!orderId) { root.innerHTML = '<div class="empty-state"><h2>Откройте проверку из заявки менеджера</h2><p>В чате «Замеры 2.0» нажмите кнопку проверки у нужной заявки. Адрес и документы подставятся автоматически.</p></div>'; root.setAttribute('aria-busy', 'false'); $('#steps').hidden = true; $('#previous-step').disabled = true; $('#next-step').disabled = true; $('#save-now').hidden = true; return; }
     var index = step(); root.innerHTML = [outsideStep, insideStep, reportStep][index](); root.setAttribute('aria-busy', 'false');
     bind(); refreshChrome(); loadThumbnails(); if(index===0||index===1)mountEditor(); freezeControls();
   }
   function mountEditor(){
     var kind=step()===0?'map':'plan',mountedPlanId=activePlanId,container=$(kind==='map'?'#map-editor':'#plan-editor');if(!container)return;
     function mountedPlan(){return kind==='map'?state.data.map:mountedPlanId==='main'?state.data.plan:state.data.additional_plans.find(function(p){return p.id===mountedPlanId;});}
-    if(window.AuditPlanEditor&&typeof window.AuditPlanEditor.mount==='function'){try{editor=window.AuditPlanEditor.mount(container,{kind:kind,service:state.data.object_category==='tobacco'?'tobacco':'alcohol',getState:mountedPlan,onChange:function(plan){
+    function acceptSnapshot(plan) {
       if(kind==='map')plan=Object.assign({},plan,{mode:'draw'});
-      if(state.frozen||!mountedPlan())return false;var before=JSON.stringify(mountedPlan());if(before===JSON.stringify(plan))return (state.dirty||state.serverError)?saveNow():undefined;
+      if(state.frozen||state.blocked||!mountedPlan())return false;
+      if(sameData(mountedPlan(),plan))return true;
       if(kind==='map'){state.data.map=plan;syncMapCards();}else if(mountedPlanId==='main')state.data.plan=plan;else{var i=state.data.additional_plans.findIndex(function(p){return p.id===mountedPlanId;});if(i<0)return false;state.data.additional_plans[i]=Object.assign({},plan,{id:mountedPlanId});}
-      if(!state.data.inspection.visit_date)state.data.inspection.visit_date=localDate();changed();return saveNow();
+      if(!state.data.inspection.visit_date)state.data.inspection.visit_date=localDate();changed();return true;
+    }
+    if(window.AuditPlanEditor&&typeof window.AuditPlanEditor.mount==='function'){try{editor=window.AuditPlanEditor.mount(container,{kind:kind,service:state.data.object_category==='tobacco'?'tobacco':'alcohol',getState:mountedPlan,onSnapshot:acceptSnapshot,onChange:function(){
+      if(state.frozen||state.blocked||!mountedPlan())return false;
+      return (state.dirty||state.serverError)?saveNow():undefined;
     },evidenceUrl:evidenceUrl,evidence:state.evidence,onUpload:function(file,meta){return uploadEditorSource(file,meta.role);}});}catch(error){container.textContent='Не удалось открыть редактор. Оригинал можно скачать выше.';}}
   }
 
@@ -431,13 +505,14 @@
     $('#steps').querySelectorAll('[data-step]').forEach(function (b) { b.onclick = function () { go(Number(b.dataset.step)); }; });
     $('#object-title').textContent = state.data.inspection.org || 'Данные из заявки менеджера'; $('#step-counter').textContent = (index + 1) + ' из 3'; $('#previous-step').disabled = index === 0 || state.submitting; $('#next-step').textContent = index === 2 ? 'К осмотру' : 'Далее →'; $('#next-step').disabled = state.submitting; $('#save-now').disabled = state.submitting || state.frozen || state.conflict;
   }
-  async function go(index) { if (state.submitting) return;try{if(editor&&editor.flush)await editor.flush();}catch(error){notify(error.message);return;} var next = Math.max(0, Math.min(2, index)); if (state.frozen) state.viewStep = next; else { state.data.workflow.step = next; changed(); } render(); window.scrollTo({ top: 0, behavior: 'auto' }); }
+  async function go(index) { if (state.submitting||state.blocked||!orderId||!state.loaded) return;try{if(editor&&editor.flush)await editor.flush();}catch(error){notify(error.message);return;} var next = Math.max(0, Math.min(2, index)); if (state.frozen) state.viewStep = next; else { state.data.workflow.step = next; changed(); } render(); window.scrollTo({ top: 0, behavior: 'auto' }); }
   function sanitizeService() { if (!isRenewal()) { state.data.inspection.archive_available = ''; state.data.inspection.archive_match = ''; state.data.inspection.archive_url = ''; state.data.inspection.licensed_boundaries_match = ''; state.data.inspection.alcohol_within_licensed = ''; } else if (state.data.inspection.alcohol_present === 'Нет') state.data.inspection.alcohol_within_licensed = ''; }
   function bind(scope) {
     var bindRoot=scope||root;
     bindRoot.querySelectorAll('[data-bind]').forEach(function(control){
       var path=control.dataset.bind,rebuild=['inspection.alcohol_present','bti','workflow.video_url'].includes(path);
-      function capture(){if(state.submitting||state.frozen)return;set(path,control.type==='checkbox'?control.checked:control.value);
+      function capture(){if(state.submitting||state.frozen||state.blocked)return;var value=control.type==='checkbox'?control.checked:control.value;
+        if(path==='workflow.conclusion_status')setOutcome(value);else set(path,value);
         if(path==='inspection.cadastral_count'){
           var boundary=root.querySelector('[data-cadastral-boundary]');
           if(boundary)boundary.hidden=!(Number(control.value)>1);
@@ -532,18 +607,76 @@
     }catch(error){notify('Выделите номер, адрес или ссылку и выберите «Копировать».');return false;}
     finally{if(temporary)temporary.remove();if(previous&&previous.isConnected)previous.focus();}
   }
+  async function fetchAuditFile(url, fallback) {
+    function unavailable(message) { return Object.assign(new Error(message || fallback), {code:'AUDIT_FILE_RESPONSE'}); }
+    var response;
+    try { response = await fetch(url, {cache:'no-store'}); } catch (error) { throw unavailable(); }
+    var type = (response.headers.get('Content-Type') || '').split(';')[0].trim().toLowerCase();
+    var json = /(?:\/|\+)json$/.test(type), html = type === 'text/html' || type === 'application/xhtml+xml';
+    var attachment = /^attachment(?:\s*;|$)/i.test(response.headers.get('Content-Disposition') || '');
+    if (response.ok && !json && !html && (attachment || /^(image|application)\//.test(type))) {
+      var blob;
+      try { blob = await response.blob(); } catch (error) { throw unavailable(); }
+      if (!blob.size) throw unavailable('Сервер вернул пустой файл. Повторите действие.');
+      return {response:response, blob:blob};
+    }
+    var body = '';
+    try { body = await response.text(); } catch (error) {}
+    if (response.status === 429 || /checking your browser|turnstile|rate limited/i.test(body)) {
+      throw unavailable('Сервис временно ограничил доступ. Повторите действие через минуту.');
+    }
+    var error;
+    if (json) { try { error = JSON.parse(body)?.error; } catch (e) {} }
+    throw unavailable(typeof error === 'string' ? error : '');
+  }
   async function downloadResource(url, filename) {
     if(downloadJobs.has(url)){notify('Файл уже готовится. Дождитесь скачивания.');return;}downloadJobs.add(url);
     try {
       var resolved = new URL(url, location.origin); if (resolved.origin !== location.origin || !resolved.pathname.startsWith('/api/audit/orders/')) throw new Error('Некорректная ссылка документа');
-      notify('Подготавливаю файл…'); var response = await fetch(resolved.pathname + resolved.search);
-      if (!response.ok || (response.headers.get('Content-Type')||'').includes('application/json')) { var error; try { error = await response.json(); } catch (e) {} throw new Error(error && error.error || 'Не удалось скачать файл. Проверьте связь.'); }
-      var disposition = response.headers.get('Content-Disposition') || '', named = disposition.match(/filename\*=UTF-8''([^;]+)/i); if (named) { try { filename = decodeURIComponent(named[1]); } catch (e) {} }
-      var blob = await response.blob(), objectUrl = URL.createObjectURL(blob), link = document.createElement('a'); link.href = objectUrl; link.download = filename || 'Документ'; document.body.appendChild(link); link.click(); link.remove(); setTimeout(function () { URL.revokeObjectURL(objectUrl); }, 60000); notify('Файл подготовлен к сохранению. Форма остаётся открытой.');
+      notify('Подготавливаю файл…'); var result=await fetchAuditFile(resolved.pathname+resolved.search,'Не удалось скачать файл. Проверьте связь.');
+      var disposition = result.response.headers.get('Content-Disposition') || '', named = disposition.match(/filename\*=UTF-8''([^;]+)/i); if (named) { try { filename = decodeURIComponent(named[1]); } catch (e) {} }
+      var objectUrl = URL.createObjectURL(result.blob), link = document.createElement('a'); link.href = objectUrl; link.download = filename || 'Документ'; document.body.appendChild(link); link.click(); link.remove(); setTimeout(function () { URL.revokeObjectURL(objectUrl); }, 60000); notify('Файл подготовлен к сохранению. Форма остаётся открытой.');
     } catch (error) { notify(error.message); } finally { downloadJobs.delete(url); }
   }
-  async function useManagerPlan(fileId){var targetPlanId=activePlanId;var file=packetFiles().find(function(f){return String(f.id)===String(fileId);});if(!file||state.frozen||state.submitting)return;queue(async function(){try{await flush();var current=currentPlan(targetPlanId);if(!current)return;if(String(current.manager_material_id||'')===String(fileId)&&state.evidence.some(function(e){return e.id===current.evidence_id;})){notify('Документ уже открыт. Выберите нужную страницу в редакторе.');return;}var response=await fetch(file.url);if(!response.ok)throw new Error('Не удалось получить документ из заявки.');var blob=await response.blob(),encoded=await readBase64(blob),uploaded=await postEvidence({name:file.name,type:file.mime||blob.type},'plan-source','source',encoded);var previous=clone(current);delete previous.versions;delete previous.history;delete previous.pending;var versions=(current.versions||[]).concat(current.evidence_id?[previous]:[]).slice(-20);setCurrentPlan({id:current.id,evidence_id:uploaded.id,manager_material_id:fileId,page:1,annotations:[],versions:versions},targetPlanId);state.data.inspection.plan_source=file.role==='egrn'?'ЕГРН':file.role==='archive'?'Архив':'План из заявки';state.dirty=true;state.version++;await flush();render();notify('Документ открыт. Выберите лист с графикой.');}catch(error){notify(error.message);}});}
-  async function evidenceUrl(eid){if(blobUrls.has(String(eid)))return blobUrls.get(String(eid));if(!state.draft)throw new Error('Сначала сохраните черновик.');var response=await fetch('/api/audit/drafts/'+encodeURIComponent(state.draft.id)+'/evidence/'+encodeURIComponent(eid));if(!response.ok)throw new Error('Не удалось загрузить оригинал файла.');var url=URL.createObjectURL(await response.blob());blobUrls.set(String(eid),url);return url;}
+  async function useManagerPlan(fileId) {
+    var targetPlanId = activePlanId;
+    var file = packetFiles().find(function(f) { return String(f.id) === String(fileId); });
+    if (!file || state.frozen || state.submitting) return;
+    queue(async function() {
+      try {
+        await flush();
+        var current = currentPlan(targetPlanId);
+        if (!current) return;
+        if (String(current.manager_material_id || '') === String(fileId) && state.evidence.some(function(e) { return e.id === current.evidence_id; })) {
+          notify('Документ уже открыт. Выберите нужную страницу в редакторе.');
+          return;
+        }
+        var result = await fetchAuditFile(file.url, 'Не удалось получить документ из заявки. Повторите действие.');
+        var encoded = await readBase64(result.blob);
+        var uploaded = await postEvidence({name:file.name, type:file.mime || result.blob.type}, 'plan-source', 'source', encoded);
+        var previous = clone(current);
+        delete previous.versions; delete previous.history; delete previous.pending;
+        var versions = (current.versions || []).concat(current.evidence_id ? [previous] : []).slice(-20);
+        setCurrentPlan({id:current.id, evidence_id:uploaded.id, manager_material_id:fileId, page:1, annotations:[], versions:versions}, targetPlanId);
+        state.data.inspection.plan_source = file.role === 'egrn' ? 'ЕГРН' : file.role === 'archive' ? 'Архив' : 'План из заявки';
+        state.dirty = true;
+        state.version++;
+        await flush();
+        render();
+        notify('Документ открыт. Выберите лист с графикой.');
+      } catch (error) { notify(error.message); }
+    });
+  }
+  async function evidenceUrl(eid) {
+    var key = String(eid);
+    if (blobUrls.has(key)) return blobUrls.get(key);
+    if (!state.draft) throw new Error('Сначала сохраните черновик.');
+    var path = '/api/audit/drafts/' + encodeURIComponent(state.draft.id) + '/evidence/' + encodeURIComponent(eid);
+    var result = await fetchAuditFile(path, 'Не удалось загрузить оригинал файла. Повторите действие.');
+    var url = URL.createObjectURL(result.blob);
+    blobUrls.set(key, url);
+    return url;
+  }
   function loadThumbnails(scope){(scope||root).querySelectorAll('[data-evidence-image]').forEach(function(image){evidenceUrl(image.dataset.evidenceImage).then(function(url){if(image.isConnected)image.src=url;}).catch(function(){if(image.isConnected)image.alt='Превью недоступно. Оригинал можно открыть повторно.';});});}
   async function openEvidence(eid){try{var url=await evidenceUrl(eid);var e=state.evidence.find(function(x){return String(x.id)===String(eid);});var link=document.createElement('a');link.href=url;link.download=e&&e.name||'document';document.body.appendChild(link);link.click();link.remove();}catch(error){notify(error.message);}}
   async function readBase64(file) {
@@ -643,7 +776,7 @@
         finally { await task.destroy(); }
       }
     } catch (error) { status('Файл не загружен · ' + error.message, 'warning'); throw error; }
-    finally { state.pendingUploads--; }
+    finally { state.pendingUploads--;updateClosingConfirmation(); }
     var saved = await uploadFiles([file], role, 'source', { noRender: true, preparedData: [data] }); return saved && saved[0];
   }
   async function uploadTerritoryImage(file,mode){
@@ -719,7 +852,6 @@
       if(outcome==='actions'&&offersActions(issues()))chooseConclusion('actions');
       if(!state.data.workflow.conclusion_status){notify('Выберите результат проверки.');return;}
       if(state.data.workflow.conclusion_status==='ready'&&issues().length){showReportIssues();return;}
-      if(!state.data.conclusion.trim())state.data.conclusion=({ready:'Соответствует по проверенным пунктам',actions:'Нужны действия',insufficient:'Недостаточно данных',obstacle:'Выявлено препятствие'})[state.data.workflow.conclusion_status];
       state.data.ui_version=5;state.data.inspection.region='МСК';
       p.all_entrances_checked=state.data.entrances.length&&state.data.entrances.every(function(e){return !['Нет доступа','Не осмотрен'].includes(e.access)&&hasEvidenceImage('entrance',e.id);})?'Да':'Не проверено';
       p.zones_checked=state.data.workflow.territory_result==='clear'||state.data.zones.every(function(z){return z.status!=='pending'&&z.dist!=='Не проверено'&&z.name&&hasEvidenceImage('zone',z.id);})?'Да':'Не проверено';
@@ -729,7 +861,7 @@
       state.dirty=true;state.version++;localSave();
     }
     var enteredSubmission=state.frozen;
-    state.submitting=true;document.body.classList.add('submitting');refreshChrome();
+    state.submitting=true;updateClosingConfirmation();document.body.classList.add('submitting');refreshChrome();
     var submitStatus=$('#submit-status');if(submitStatus)submitStatus.textContent=state.frozen?'Повторяю отправку зафиксированной версии…':'Сохраняю последнюю версию и проверяю приложения…';
     try{
       await queue(async function(){
@@ -750,7 +882,7 @@
         try{if(tg)tg.HapticFeedback.notificationOccurred('success');}catch(e){}
       });
     }catch(error){
-      state.submitting=false;document.body.classList.remove('submitting');
+      state.submitting=false;updateClosingConfirmation();document.body.classList.remove('submitting');
       await checkSubmissionState(enteredSubmission,error);
       refreshChrome();
       if(error.status===409&&!state.frozen){state.conflict=true;$('#conflict-panel').hidden=false;}
@@ -763,7 +895,7 @@
   function downloadCopy(){var data=JSON.stringify({exported_at:new Date().toISOString(),draft_id:state.draft&&state.draft.id,data:state.recoveryData||state.data,evidence:state.evidence.map(function(e){return{id:e.id,name:e.name,role:e.role,subject_id:e.subject_id};})},null,2);var link=document.createElement('a');var url=URL.createObjectURL(new Blob([data],{type:'application/json'}));link.href=url;link.download='audit-draft-'+(state.draft&&state.draft.id||'local')+'.json';link.click();setTimeout(function(){URL.revokeObjectURL(url);},1000);}
   async function reloadServer(){
     if(!window.confirm('Загрузить серверную версию вместо локальных правок? При необходимости сначала скачайте свою копию.'))return;
-    try{var result=await request('/api/audit/drafts/current?order_id='+encodeURIComponent(orderId));if(!result.draft)throw new Error('Серверная версия не найдена.');state.data=restoreData(result.draft.data,!!result.draft.submitting);state.draft=result.draft;state.evidence=result.draft.evidence||[];state.conflict=false;state.dirty=false;state.frozen=!!result.draft.submitting;state.viewStep=state.frozen?2:null;state.packet=state.data.request_packet||null;$('#conflict-panel').hidden=true;if(!state.frozen)await fetchPacket();localSave();render();status(state.frozen?'Повторите отправку этой версии':'Загружено с сервера',state.frozen?'warning':'success');}catch(error){notify(error.message);}
+    try{var result=await request('/api/audit/drafts/current?order_id='+encodeURIComponent(orderId));if(!result.draft)throw new Error('Серверная версия не найдена.');state.data=restoreData(result.draft.data,!!result.draft.submitting);state.draft=result.draft;state.evidence=result.draft.evidence||[];state.conflict=false;state.dirty=false;state.attempt=null;state.frozen=!!result.draft.submitting;state.viewStep=state.frozen?2:null;state.packet=state.data.request_packet||null;$('#conflict-panel').hidden=true;if(!state.frozen)await fetchPacket();localSave();render();status(state.frozen?'Повторите отправку этой версии':'Загружено с сервера',state.frozen?'warning':'success');}catch(error){notify(error.message);}
   }
   function prefillContact(raw){
     if(!raw)return;
@@ -800,29 +932,105 @@
     if(before!==JSON.stringify(stable(state.data))){state.version++;state.dirty=true;}
     state.packetError='';
   }
+  function setFormNavigation(active) {
+    $('#steps').hidden=!active;$('#previous-step').disabled=!active;$('#next-step').disabled=!active;$('#save-now').hidden=!active;
+    var footer=document.querySelector('.bottom-bar');if(footer)footer.hidden=!active;
+  }
+  function retryScreen(title,message,retry) {
+    setFormNavigation(false);root.setAttribute('aria-busy','false');
+    root.innerHTML='<div class="empty-state"><h2>'+esc(title)+'</h2><p>'+esc(message)+'</p>'+(retry?'<button type="button" class="button secondary" id="retry-draft">Повторить</button>':'')+'</div>';
+    if(retry)$('#retry-draft').onclick=retry;
+  }
+  async function openDrafts(){
+    state.blocked=true;status('Загружаю список…');
+    var back=document.querySelector('.back-link');if(back)back.hidden=true;
+    $('#draft-id').textContent='Отчёты аудитора';$('#object-title').textContent='Откройте сохранённую проверку';
+    try{
+      var response=await request('/api/audit/drafts/open');
+      if(!Array.isArray(response.drafts))throw new Error('Список черновиков пока недоступен.');
+      var items=response.drafts.filter(function(d){return d&&Number.isSafeInteger(Number(d.order_id))&&Number(d.order_id)>0;});
+      if(!items.length){retryScreen('Незавершённых отчётов нет','Чтобы начать, откройте нужную заявку из чата «Замеры 2.0».');status('Черновиков нет');return;}
+      setFormNavigation(false);root.setAttribute('aria-busy','false');
+      root.innerHTML='<div class="draft-list"><h2>Продолжить отчёт</h2>'+items.map(function(d){
+        var url='/audit?order_id='+encodeURIComponent(d.order_id),date=new Date(d.updated_at);
+        var when=d.submitting?'Отправка не подтверждена':d.updated_at&&Number.isFinite(date.getTime())?'Сохранён '+date.toLocaleString('ru-RU',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}):'Черновик';
+        return '<a class="manager-file draft-link" href="'+url+'"><strong>'+esc(d.object_name||'Заявка #'+d.order_id)+'</strong><span>'+esc(d.address||'')+'</span><small>#'+esc(d.order_id)+' · '+esc(when)+'</small></a>';
+      }).join('')+'</div>';
+      status('Незавершённые отчёты');
+    }catch(error){retryScreen('Не удалось открыть черновики',error.message,openDrafts);status('Список недоступен','warning');}
+  }
+  function reconcileDraft(local,remote) {
+    state.draft=remote;state.evidence=remote.evidence||[];
+    if(remote.submitting){
+      if(local&&local.dirty&&!sameData(local.data,remote.data)){state.recoveryData=clone(local.data);state.conflict=true;}
+      state.data=restoreData(remote.data,true);state.frozen=true;state.viewStep=2;state.dirty=false;
+    }else if(local&&local.dirty){
+      var sameId=String(local.draft_id||'')===String(remote.id);
+      var attempt=local.attempt,matchingAttempt=attempt&&(!attempt.draft_id||String(attempt.draft_id)===String(remote.id))&&sameData(attempt.data,remote.data);
+      if((sameId||!local.draft_id)&&sameData(local.data,remote.data)){state.data=restoreData(remote.data);state.dirty=false;state.attempt=null;}
+      else if(!local.conflict&&(matchingAttempt||(sameId&&Number(local.revision)===Number(remote.revision)))){state.attempt=null;}
+      else state.conflict=true;
+    }else{
+      state.data=restoreData(remote.data);state.dirty=Number(remote.data&&remote.data.ui_version)!==5;
+    }
+    state.packet=state.data.request_packet||null;
+    $('#conflict-panel').hidden=!state.conflict;
+  }
   async function initialize(){
-    if(!orderId){state.loaded=true;render();status('Откройте заявку менеджера');return;}
+    if(!orderId){await openDrafts();return;}
+    var back=document.querySelector('.back-link');if(back){back.href='/audit';back.textContent='← Черновики';}
     var local=null;try{local=JSON.parse(localStorage.getItem(localKey)||'null');}catch(e){}
-    if(local&&local.data){state.data=restoreData(local.data);state.dirty=!!local.dirty;state.draft=local.draft_id?{id:local.draft_id,revision:local.revision}:null;state.localSaved=true;state.packet=state.data.request_packet||null;}
+    if(local&&local.data&&String(local.data.order_id||'')!==orderId)local=null;
+    state.blocked=false;state.needsRestore=false;
+    if(local&&local.data){
+      state.data=restoreData(local.data);state.dirty=!!local.dirty;state.draft=local.draft_id?{id:local.draft_id,revision:local.revision}:null;
+      state.attempt=local.attempt||null;state.localSaved=true;state.packet=state.data.request_packet||null;
+    }
     try{
       var result=await request('/api/audit/drafts/current?order_id='+encodeURIComponent(orderId));
-      if(!result.draft&&local&&!local.dirty){state.data=clone(defaults);state.draft=null;state.evidence=[];state.dirty=false;local=null;state.localSaved=false;try{localStorage.removeItem(localKey);}catch(e){}}
-      if(result.draft){
-        var remote=result.draft;
-        if(remote.submitting){if(local&&local.dirty){state.recoveryData=clone(local.data);state.conflict=true;$('#conflict-panel').hidden=false;}state.draft=remote;state.data=restoreData(remote.data,true);state.evidence=remote.evidence||[];state.frozen=true;state.viewStep=2;state.dirty=false;state.packet=state.data.request_packet||null;}
-        else if(local&&local.dirty){if(String(local.draft_id||'')===String(remote.id)&&Number(local.revision)===Number(remote.revision)){state.draft=remote;state.evidence=remote.evidence||[];}else{state.draft=remote;state.evidence=remote.evidence||[];state.conflict=true;$('#conflict-panel').hidden=false;}}
-        else{state.data=restoreData(remote.data);state.draft=remote;state.evidence=remote.evidence||[];state.dirty=Number(remote.data&&remote.data.ui_version)!==5;}
+      if(!result.draft&&local&&local.draft_id){
+        // A known server draft is no longer current, usually because it was
+        // sent from another window. Keep unsynced data as a recovery copy.
+        if(local.dirty){state.recoveryData=clone(local.data);try{localStorage.setItem(localKey+':recovery',JSON.stringify(local));}catch(e){}}
+        state.data=clone(defaults);state.draft=null;state.evidence=[];state.dirty=false;state.attempt=null;local=null;state.localSaved=false;
+        try{localStorage.removeItem(localKey);}catch(e){}
       }
+      if(result.draft)reconcileDraft(local,result.draft);
       if(!state.frozen&&!state.conflict){try{await fetchPacket();}catch(error){state.packet=state.data.request_packet||null;state.packetError=error.message;notice('Материалы заявки сейчас недоступны. Сохранённые наблюдения остаются в черновике.');}}
-      normalizeLayout();state.data.schema_version=3;state.data.order_id=orderId;state.loaded=true;render();$('#draft-id').textContent='Заявка #'+orderId;localSave();
+      normalizeLayout();state.data.schema_version=3;state.data.order_id=orderId;state.loaded=true;setFormNavigation(true);render();$('#draft-id').textContent='Заявка #'+orderId;localSave();
       if(state.frozen)status('Версия зафиксирована — можно повторить отправку','warning');
       else if(state.conflict)status('Есть другая версия. Ваши правки сохранены на устройстве.','warning');
       else if(state.dirty)saveNow().catch(function(){});
       else status(state.draft?'Черновик загружен':'Данные заявки загружены',state.draft?'success':'');
-    }catch(error){state.loaded=true;state.packet=state.data.request_packet||null;normalizeLayout();render();state.serverError=error.message;status(state.localSaved?'Восстановлено с устройства':'Нет связи с сервером','warning');notice('Можно продолжить текст на этом устройстве. Для файлов и отправки нужен доступ к серверу.');}
+    }catch(error){
+      var authError=error.status===401||error.status===403;
+      if(authError||!local||!local.data||uid==='staff'){
+        state.blocked=true;
+        retryScreen('Не удалось открыть проверку',authError?'Откройте заявку из личного сообщения бота в Telegram. Сохранённый черновик останется на месте.':error.message,authError?null:initialize);
+        status(authError?'Нет доступа к проверке':'Черновик не загружен','warning');return;
+      }
+      state.loaded=true;state.needsRestore=true;setFormNavigation(true);state.packet=state.data.request_packet||null;normalizeLayout();render();state.serverError=error.message;
+      status('Восстановлено с устройства','warning');
+      notice('Можно продолжить текст. Чтобы загрузить сохранённые файлы и отправить отчёт, восстановите связь с ботом.');
+      var retry=document.createElement('button');retry.type='button';retry.className='text-button';retry.textContent='Повторить';retry.onclick=retryRestore;$('#app-notice').append(' ',retry);
+    }
+  }
+  function retryRestore(){
+    if(!state.needsRestore)return;
+    localSave();state.loaded=false;state.needsRestore=false;
+    retryScreen('Восстанавливаю черновик','Проверяю ответы и материалы на сервере.');
+    notice('');status('Проверяю связь с ботом…');initialize();
   }
   $('#previous-step').onclick=function(){go(step()-1);};$('#next-step').onclick=function(){go(step()===2?0:step()+1);};$('#save-now').onclick=function(){saveNow().then(function(){notify('Черновик сохранён на сервере.');}).catch(function(error){notify(error.message);});};$('#download-copy').onclick=downloadCopy;$('#reload-server').onclick=reloadServer;
-  window.addEventListener('online',function(){if(state.dirty&&!state.conflict)saveNow().catch(function(){});});
-  window.addEventListener('beforeunload',function(event){localSave();if(state.dirty||state.pendingUploads){event.preventDefault();event.returnValue='';}});
+  function resumeSave(){if(state.loaded&&state.dirty&&!state.conflict&&!state.frozen&&!state.blocked){saveRetries=0;saveNow().catch(function(){});}}
+  window.addEventListener('online',resumeSave);
+  window.addEventListener('online',retryRestore);
+  window.addEventListener('pageshow',resumeSave);
+  document.addEventListener('visibilitychange',function(){if(document.visibilityState==='hidden')saveOnExit();else resumeSave();});
+  window.addEventListener('pagehide',saveOnExit);
+  window.addEventListener('beforeunload',function(event){
+    saveOnExit();
+    if(!closingConfirmation&&state.loaded&&(state.dirty||state.pendingUploads)){event.preventDefault();event.returnValue='';}
+  });
   initialize();
 })();

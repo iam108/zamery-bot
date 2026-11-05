@@ -31,8 +31,9 @@ function harness(data = compactVisit()) {
     state: { data, evidence, packet: data.request_packet, draft: { id: randomUUID(), revision: 10 }, version: 0, dirty: false,
       pendingUploads: 0, submitting: false, frozen: false, completed: false },
     root: { querySelector: node, querySelectorAll: () => [], innerHTML: '' },
-    $: node, tail: Promise.resolve(), timer: null, clearTimeout, editor: null, tg: null, orderId: '58', localKey: 'synthetic-audit-submit-feedback', clone: copy,
+    $: node, tail: Promise.resolve(), queuedJobs: 0, timer: null, clearTimeout, editor: null, tg: null, orderId: '58', localKey: 'synthetic-audit-submit-feedback', clone: copy,
     defaults: { map: { evidence_id: '', page: 1, annotations: [] } },
+    OUTCOME_LABELS: { ready: 'Соответствует по проверенным пунктам', actions: 'Нужны действия', insufficient: 'Недостаточно данных', obstacle: 'Выявлено препятствие' },
     MAP_IMAGE_TYPES: ['image/jpeg','image/png'], ZONE_STATUS: { clear:'Без замечаний', licensed:'Есть сведения о лицензии', disputed:'Спорное место', confirmed:'Есть ограничение', pending:'Нужно уточнить', other:'Наблюдение' },
     esc: value => String(value == null ? '' : value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;'),
     document: { body: { classList: { add() {}, remove() {} } } },
@@ -57,7 +58,7 @@ function harness(data = compactVisit()) {
     },
   };
   vm.createContext(c);
-  vm.runInContext(['queue','isRenewal','packetFiles','evidenceFor','adoptRevision','removeGeneratedEvidence','mapMode','rememberTerritory','switchTerritoryMode','chooseTerritory','hasEvidenceImage','validDistance','territoryIssues','issues','tasksHtml',
+  vm.runInContext(['updateClosingConfirmation','setOutcome','queue','isRenewal','packetFiles','evidenceFor','adoptRevision','removeGeneratedEvidence','mapMode','rememberTerritory','switchTerritoryMode','chooseTerritory','hasEvidenceImage','validDistance','territoryIssues','issues','tasksHtml',
     'offersActions','reportFeedback','bindReportFeedback','refreshReportFeedback','chooseConclusion','showReportIssues','reportPreview','submit'].map(actualFunction).join('\n'), c);
   return { c, calls, node };
 }

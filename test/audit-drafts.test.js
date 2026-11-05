@@ -1,7 +1,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { randomUUID } = require('node:crypto');
-const { createDraftStore, prepareEvidence, validateData } = require('../src/web/audit-drafts');
+const { createDraftStore, prepareEvidence, setupAuditDrafts, validateData } = require('../src/web/audit-drafts');
 
 function file(text = 'original', changes = {}) {
   return { id: randomUUID(), name: 'план.png', mime: 'image/png', role: 'plan', subject_id: 'plan-main', data: Buffer.from(text).toString('base64'), ...changes };
@@ -79,10 +79,54 @@ async function database(run, limits) {
     return { query, release: unlock };
   } };
   try {
-    await db.exec('CREATE TABLE orders(id INT PRIMARY KEY); INSERT INTO orders(id) VALUES(58),(59);');
+    await db.exec('CREATE TABLE orders(id INT PRIMARY KEY, object_name TEXT, owner_name TEXT, address TEXT); INSERT INTO orders(id) VALUES(58),(59);');
     await run(createDraftStore(pool, limits), db, pool);
   } finally { await db.close(); }
 }
+
+test('open draft route uses authenticated identity, ignores requested owner, and disables caching', async () => {
+  let route, response;
+  const app = {
+    get(path, handler) { if (path === '/api/audit/drafts/open') route = handler; },
+    post() {}, put() {}, delete() {},
+  };
+  setupAuditDrafts(app, { async listOpen(owner) { assert.equal(owner, 108); return [{ order_id: 58 }]; } });
+  await route({ tgUser: { id: 108 }, query: { owner: 999 } }, {
+    set(name, value) { assert.equal(name, 'Cache-Control'); assert.equal(value, 'no-store'); },
+    json(value) { response = value; },
+  });
+  assert.deepEqual(response, { ok: true, drafts: [{ order_id: 58 }] });
+});
+
+test('open draft list returns only owned unfinished linked orders, most recent first, at most 50', { skip: !process.env.PGLITE_TEST_MODULE }, async () => database(async (store, db) => {
+  await db.exec(`
+    UPDATE orders SET object_name='Объект', owner_name='Клиент', address='Адрес' WHERE id=58;
+    UPDATE orders SET object_name='   ', owner_name='Другой объект' WHERE id=59;
+    INSERT INTO orders(id) SELECT generate_series(60, 114);
+  `);
+  await store.create(108, 58, { private: 'Hidden field' });
+  await store.create(108, 59);
+  await store.create(109, 59);
+  await store.create(108, null);
+  const submitted = await store.create(108, 60);
+  const orphaned = await store.create(108, 61);
+  await db.query('DELETE FROM orders WHERE id=61');
+  await db.query('UPDATE audit_drafts SET submitted_at=NOW() WHERE id=$1', [submitted.id]);
+  await db.query("UPDATE audit_drafts SET updated_at='2026-11-02 09:30:00Z' WHERE author_tg_id=108");
+  await db.query("UPDATE audit_drafts SET updated_at='2026-11-02 10:30:00Z', submitting_revision=1 WHERE author_tg_id=108 AND order_id=59");
+  await db.query("UPDATE audit_drafts SET updated_at='2026-11-02 12:30:00Z' WHERE id=$1", [orphaned.id]);
+  const list = await store.listOpen(108);
+  assert.deepEqual(list.map(row => ({ ...row, updated_at: new Date(row.updated_at).toISOString() })), [
+    { order_id: 59, object_name: 'Другой объект', address: '', updated_at: '2026-11-02T10:30:00.000Z', submitting: true },
+    { order_id: 58, object_name: 'Объект', address: 'Адрес', updated_at: '2026-11-02T09:30:00.000Z', submitting: false },
+  ]);
+  assert.deepEqual((await store.listOpen(109)).map(row => row.order_id), [59]);
+  assert.deepEqual(await store.listOpen(110), []);
+  await db.query("INSERT INTO audit_drafts(id,author_tg_id,order_id,updated_at) SELECT gen_random_uuid(),108,id,'2026-11-01 10:30:00Z' FROM orders WHERE id>=62");
+  const capped = await store.listOpen(108);
+  assert.equal(capped.length, 50);
+  assert.deepEqual(capped.slice(0, 3).map(row => row.order_id), [59, 58, 114]);
+}));
 
 test('drafts isolate authors, preserve current draft on retry, and reject stale saves', { skip: !process.env.PGLITE_TEST_MODULE }, async () => database(async store => {
   const a = await store.create(108, 58, { org: 'A', workflow: { step: 1 } });
