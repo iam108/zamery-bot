@@ -1,4 +1,13 @@
 const multer = require('multer');
+const { createHash } = require('node:crypto');
+
+function submissionSignature(data, files) {
+  const packet = {};
+  for (const field of ['address', 'owner_name', 'object_type', 'object_name', 'service', 'cad_num', 'archive_url', 'zones_info', 'contacts', 'deadline', 'has_video']) packet[field] = data[field];
+  packet.egrn_order = data.egrn_order === true || data.egrn_order === '1' || data.egrn_order === 'true';
+  packet.files = files.map(({ id, name, mime, role, bytes, sha256 }) => ({ id, name, mime, role, bytes, sha256 }));
+  return createHash('sha256').update(JSON.stringify(packet)).digest('hex');
+}
 
 function canEditPacket(order, req) {
   return req.staff.role === 'manager' || String(order.submitted_by) === String(req.tgUser.id);
@@ -37,10 +46,10 @@ function createManagerHandlers(options = {}) {
   }
 
   async function save(req, res) {
-    let order, key;
+    let order, key, signature, ownsRecent = false;
     const edit = req.params.id != null;
     const finish = (body, status = 200) => {
-      if (key) { if (body.ok && !body.warning) recent.set(key, body); else recent.delete(key); }
+      if (key && ownsRecent) { if (body.ok && !body.warning) recent.set(key, { signature, body }); else recent.delete(key); }
       return res.status(status).json(body);
     };
     try {
@@ -54,16 +63,17 @@ function createManagerHandlers(options = {}) {
       }
       const sid = String((req.body && req.body.submit_id) || '').slice(0, 40);
       key = sid ? req.tgUser.id + ':' + (edit ? order.id : 'new') + ':' + sid : null;
-      if (key && recent.has(key)) {
-        const previous = recent.get(key);
-        if (previous === 'pending') return res.status(409).json({ ok: false, busy: true, error: 'Заявка уже отправляется' });
-        return res.json(previous);
-      }
-      if (recent.size > 500) recent.clear();
-      if (key) recent.set(key, 'pending');
       const prepared = materials.prepareMaterials(req.files || [], req.body.file_roles || []);
       const data = materials.normalizeManagerOrder(req.body, existing.concat(prepared));
-      const oldCad = order && order.cad_num;
+      signature = submissionSignature(data, prepared);
+      if (key && recent.has(key)) {
+        const previous = recent.get(key);
+        if (previous.signature !== signature) return res.status(409).json({ ok: false, error: 'Эта заявка уже сохранена или отправляется с другими данными. Откройте заявку для изменения.' });
+        if (previous.pending) return res.status(409).json({ ok: false, busy: true, error: 'Заявка уже отправляется' });
+        return res.json(previous.body);
+      }
+      if (recent.size > 500) for (const [cachedKey, cached] of recent) { if (!cached.pending) { recent.delete(cachedKey); break; } }
+      if (key) { recent.set(key, { signature, pending: true }); ownsRecent = true; }
       if (edit) {
         // Сначала добавляем оригиналы: ошибка лимитов не меняет поля заявки.
         await materials.saveOrderMaterials(order.id, prepared);
@@ -71,8 +81,7 @@ function createManagerHandlers(options = {}) {
         if (!order) throw Object.assign(new Error('Заявка не найдена.'), { status: 404 });
         await queries.addLog(order.id, 'packet_updated', req.staff.name, 'Менеджер обновил данные и пакет документов заявки');
       } else {
-        order = await queries.createOrder({ ...data, submitted_by: req.tgUser.id });
-        await materials.saveOrderMaterials(order.id, prepared);
+        order = await queries.createOrderWithMaterials({ ...data, submitted_by: req.tgUser.id }, prepared);
         if (!order.submitted_name) {
           order.submitted_name = req.staff.name;
           await pool.query('UPDATE orders SET submitted_name=$1 WHERE id=$2 AND submitted_name IS NULL', [req.staff.name, order.id]);
@@ -102,12 +111,18 @@ function createManagerHandlers(options = {}) {
           } catch (e) { console.error('order document delivery:', e.message); warnings.push('Не доставлен в чат файл «' + file.name + '».'); }
         }
         const orderEgrn = data.egrn_order === true || data.egrn_order === '1' || data.egrn_order === 'true';
-        if (data.cad_num && (newCard || (edit && (oldCad !== data.cad_num || orderEgrn)))) {
+        // Проверка безопасна и для повтора: ЕГРН хранит заказ и квитанции доставки.
+        // Номер и карточка могли сохраниться до временной ошибки прошлого запроса.
+        if (data.cad_num) {
           try {
             const egrn = await attachOrOrder({ cad: data.cad_num, label: [data.owner_name, data.object_name].filter(Boolean).join(' · '), order: orderEgrn,
+              requestKey: 'manager-order:' + order.id + ':' + data.cad_num,
               orderedBy: req.tgUser.id, orderedName: req.staff.name,
               targets: [{ chat: Number(process.env.GROUP_CHAT_ID), reply: order.telegram_msg_id, order_id: order.id }], note: 'Для заявки на замер #' + order.id });
             if (egrn.packet_warning) warnings.push(egrn.packet_warning);
+            if (orderEgrn && egrn.result === 'none') warnings.push('Выписка ЕГРН не заказана: сервис сейчас недоступен. Повторите доставку позднее.');
+            if (['unavailable', 'failed'].includes(egrn.result)) warnings.push('Доставка выписки ЕГРН остановлена. Требуется проверить заказ; повторный платный заказ не создавался.');
+            if (['uncertain', 'unknown'].includes(egrn.result) && !egrn.packet_warning) warnings.push('Результат заказа ЕГРН не подтверждён. Требуется проверка у поставщика; повторный платный заказ не создавался.');
             const notes = { unavailable: '⚠️ Доставка ранее заказанной выписки остановлена. Повторный заказ не создан.', attached: '📄 Выписка ЕГРН приложена к заявке', ordered: '⏳ Выписка ЕГРН заказана — придёт ответом на заявку', waiting: '⏳ Выписка ЕГРН уже в работе — придёт ответом на заявку' };
             if (notes[egrn.result]) await telegram.sendMessage(process.env.GROUP_CHAT_ID, notes[egrn.result] + ' (' + egrn.cad + ')', { reply_to_message_id: order.telegram_msg_id, disable_notification: true });
           } catch (e) { console.error('egrn for order:', e.message); warnings.push('Не удалось проверить доставку выписки ЕГРН.'); }
@@ -126,6 +141,12 @@ function setupManagerOrders(app) {
   const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 12 * 1024 * 1024, files: 20 } });
   const parse = (req, res, next) => upload.array('files', 20)(req, res, err => {
     if (err) return res.status(413).json({ ok: false, error: 'Можно добавить до 20 файлов, каждый не больше 12 МБ.' });
+    // Браузеры передают filename в UTF-8, а Multer 1.x читает его как Latin-1.
+    for (const file of req.files || []) {
+      if (!/^[\x00-\xff]*$/.test(file.originalname)) continue;
+      const bytes = Buffer.from(file.originalname, 'latin1'), decoded = bytes.toString('utf8');
+      if (Buffer.from(decoded, 'utf8').equals(bytes)) file.originalname = decoded;
+    }
     next();
   });
   const handlers = createManagerHandlers();

@@ -29,7 +29,13 @@ const DDL = `
 `;
 function error(message, status = 400) { return Object.assign(new Error(message), { status }); }
 function orderNumber(value) { const n = Number(value); if (!Number.isSafeInteger(n) || n < 1 || n > 2147483647) throw error('Некорректный номер заявки.'); return n; }
-function cleanName(value) { return String(value || 'Документ').split(/[\\/]/).pop().replace(/[\x00-\x1f\x7f]/g, '').slice(0, 180) || 'Документ'; }
+function cleanName(value) {
+  const name = String(value || 'Документ').split(/[\\/]/).pop().replace(/[\x00-\x1f\x7f]/g, '');
+  const characters = Array.from(name);
+  if (characters.length <= 180) return name || 'Документ';
+  const extension = (name.match(/\.[a-z0-9]{1,10}$/i) || [''])[0];
+  return characters.slice(0, 180 - extension.length).join('') + extension;
+}
 function guessRole(name) { return /егрн|egrn|выписк/i.test(name) ? 'egrn' : /архив|archive/i.test(name) ? 'archive' : /план|график|бти|bti|plan/i.test(name) ? 'plan' : 'document'; }
 function normalizeArchive(value) {
   if (!value) return '';
@@ -39,6 +45,7 @@ function normalizeArchive(value) {
   return url.href;
 }
 const DOCUMENT_MIMES = { pdf: 'application/pdf', doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', xls: 'application/vnd.ms-excel', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', zip: 'application/zip' };
+const IMAGE_MIMES = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif', heic: 'image/heic', heif: 'image/heif', avif: 'image/avif', tif: 'image/tiff', tiff: 'image/tiff', bmp: 'image/bmp' };
 function prepareMaterials(files, roles) {
   if (!Array.isArray(files) || files.length > LIMITS.files) throw error('Можно прикрепить до 20 файлов.');
   let selected = roles || [];
@@ -49,7 +56,7 @@ function prepareMaterials(files, roles) {
     const name = cleanName(file.originalname || file.name);
     let mime = String(file.mimetype || file.mime || '').toLowerCase();
     const extension = (name.match(/\.([a-z0-9]+)$/i) || [])[1]?.toLowerCase();
-    if ((!mime || mime === 'application/octet-stream') && DOCUMENT_MIMES[extension]) mime = DOCUMENT_MIMES[extension];
+    if (!mime || mime === 'application/octet-stream') mime = DOCUMENT_MIMES[extension] || IMAGE_MIMES[extension] || mime;
     if (mime === 'application/x-zip-compressed') mime = 'application/zip';
     const buffer = file.buffer;
     if (!Buffer.isBuffer(buffer) || !buffer.length || buffer.length > LIMITS.fileBytes) throw error('Файл «' + name + '» должен быть не больше 12 МБ.');
@@ -70,6 +77,7 @@ function normalizeManagerOrder(input, files) {
   for (const field of ['address', 'owner_name', 'object_type']) if (!String(data[field] || '').trim()) throw error('Заполните адрес, чей объект и тип объекта.');
   for (const field of ['address', 'owner_name', 'object_type', 'object_name', 'service', 'cad_num', 'zones_info', 'contacts', 'deadline']) data[field] = String(data[field] || '').trim();
   if (data.address.length > 500 || data.owner_name.length > 500 || data.object_name.length > 500 || data.contacts.length > 4000 || data.zones_info.length > 4000 || data.cad_num.length > 100) throw error('Слишком длинное поле заявки.');
+  if ((data.egrn_order === true || data.egrn_order === '1' || data.egrn_order === 'true') && !/^\d{2}:\d{2}:\d{6,7}:\d{1,9}$/.test(data.cad_num)) throw error('Чтобы заказать выписку ЕГРН, укажите кадастровый номер, например 77:17:0120316:38939.');
   if (!/табак|другое/i.test(data.object_type) && !SERVICES.includes(data.service)) throw error('Менеджеру нужно выбрать услугу: получение, продление или переоформление.');
   data.has_video = input.has_video === true || input.has_video === 'true';
   data.archive_url = data.service === 'Продление' ? normalizeArchive(input.archive_url) : '';
@@ -108,17 +116,21 @@ function createMaterialsStore(pool = defaultPool) {
     const rows = (await pool.query('SELECT ' + (originals ? '*' : 'order_id,id,name,mime,role,bytes,sha256,telegram_msg_id') + ' FROM order_materials WHERE order_id=$1' + (role ? ' AND role=$2' : '') + ' ORDER BY created_at,id', role ? [id, role] : [id])).rows;
     return rows.map(row => originals ? { ...metadata(row), buffer: Buffer.from(row.content) } : metadata(row));
   }
+  // The caller has ensured the schema and owns BEGIN/COMMIT. Do not lease a
+  // second connection here: new order metadata and originals must commit together.
+  async function saveInTransaction(client, id, prepared) {
+    id = orderNumber(id);
+    const found = await client.query('SELECT id FROM orders WHERE id=$1 FOR UPDATE', [id]);
+    if (!found.rows.length) throw error('Заявка не найдена.', 404);
+    for (const file of prepared) await client.query('INSERT INTO order_materials(order_id,id,name,mime,role,bytes,sha256,content) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(order_id,id) DO NOTHING', [id, file.id, file.name, file.mime, file.role, file.bytes, file.sha256, file.buffer]);
+    const counts = (await client.query('SELECT COUNT(*) AS count,COALESCE(SUM(bytes),0) AS bytes FROM order_materials WHERE order_id=$1', [id])).rows[0];
+    if (Number(counts.count) > LIMITS.files || Number(counts.bytes) > LIMITS.totalBytes) throw error('В заявке может быть до 20 файлов и не больше 100 МБ.');
+  }
   return {
-    ensure, list,
+    ensure, list, saveInTransaction,
     async save(id, prepared) {
       id = orderNumber(id);
-      return transaction(async client => {
-        const found = await client.query('SELECT id FROM orders WHERE id=$1 FOR UPDATE', [id]);
-        if (!found.rows.length) throw error('Заявка не найдена.', 404);
-        for (const file of prepared) await client.query('INSERT INTO order_materials(order_id,id,name,mime,role,bytes,sha256,content) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(order_id,id) DO NOTHING', [id, file.id, file.name, file.mime, file.role, file.bytes, file.sha256, file.buffer]);
-        const counts = (await client.query('SELECT COUNT(*) AS count,COALESCE(SUM(bytes),0) AS bytes FROM order_materials WHERE order_id=$1', [id])).rows[0];
-        if (Number(counts.count) > LIMITS.files || Number(counts.bytes) > LIMITS.totalBytes) throw error('В заявке может быть до 20 файлов и не больше 100 МБ.');
-      });
+      return transaction(client => saveInTransaction(client, id, prepared));
     },
     async download(id, fileId) {
       id = orderNumber(id);
@@ -169,4 +181,4 @@ function setupOrderMaterials(app, materials = store) {
 }
 
 module.exports = { COMMON_ARCHIVE_URL, SERVICES, ROLES, LIMITS, DDL, prepareMaterials, normalizeManagerOrder, normalizeArchive, guessRole, zipParts, createMaterialsStore, setupOrderMaterials,
-  ensureOrderMaterials: store.ensure, saveOrderMaterials: store.save, listOrderMaterials: store.list, loadOrderMaterials, downloadOrderMaterial: store.download, markOrderMaterialDelivered: store.delivered };
+  ensureOrderMaterials: store.ensure, saveOrderMaterials: store.save, saveOrderMaterialsInTransaction: store.saveInTransaction, listOrderMaterials: store.list, loadOrderMaterials, downloadOrderMaterial: store.download, markOrderMaterialDelivered: store.delivered };

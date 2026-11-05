@@ -11,7 +11,7 @@ function actualFunction(name) {
   const rest = source.slice(start), next = rest.slice(1).search(/\n  (?:(?:async )?function |var )/);
   return next < 0 ? rest : rest.slice(0, next + 1);
 }
-function load(c, ...names) { vm.runInContext(names.map(actualFunction).join('\n'), c); }
+function load(c, ...names) { if(names.includes('fetchAuditFile')||names.includes('request'))names=['requestWithDeadline',...names];vm.runInContext(names.map(actualFunction).join('\n'), c); }
 function harness() {
   const calls=[],nodes=new Map();
   const node=key=>{if(!nodes.has(key))nodes.set(key,{textContent:'',innerHTML:'',dataset:{},style:{},disabled:false,hidden:false,querySelector:()=>null,querySelectorAll:()=>[],remove(){calls.push(['host-removed']);}});return nodes.get(key);};
@@ -108,6 +108,39 @@ test('route click opens the start-point chooser rather than sending an empty ori
   c.showRoute=()=>{opened++;};c.openExternal=()=>{assert.fail('No empty-origin route should be dispatched by the first click');};
   const scope={querySelectorAll:()=>[],querySelector:s=>s==='[data-route]'?button:null};load(c,'bind');c.bind(scope);
   let prevented=false;button.onclick({preventDefault(){prevented=true;}});assert.equal(prevented,true);assert.equal(opened,1);
+});
+
+test('iPhone opens the saved object address in Maps immediately without geocoding or another dialog',()=>{
+  const c=harness(),opened=[],saved=[];
+  c.actions=require('../public/audit-actions');c.tg={platform:'ios'};c.window.TelegramWebviewProxy={postEvent(){}};
+  c.state.packet={address:'Москва, Лесная, 5, этаж 1, комната 75'};
+  c.state.data.inspection.address='Москва, старый адрес';
+  c.window.AuditRoute={open(){assert.fail('The agreed free option needs no intermediate chooser');}};
+  c.fetch=()=>assert.fail('No paid or free geocoder is contacted');
+  c.localSave=()=>saved.push('local');c.saveNow=async()=>{saved.push('server');throw new Error('offline');};
+  c.openExternal=url=>{opened.push(url);return true;};
+  load(c,'opensMapAddress','mapAddress','routeActionUrl','saveBeforePhone','showRoute');
+  c.showRoute();
+  assert.equal(opened.length,1);const url=new URL(opened[0]);assert.equal(url.origin,'https://yandex.ru');
+  assert.equal(url.searchParams.get('text'),'Москва, Лесная, 5');assert.equal(url.searchParams.has('rtext'),false);
+  assert.deepEqual(saved,['local','server']);
+});
+
+test('Android retains route origin and GPS chooser while using the current manager address',()=>{
+  const c=harness(),dialogs=[];
+  c.actions=require('../public/audit-actions');c.tg={platform:'android'};c.window.TelegramWebviewProxy={postEvent(){}};
+  c.state.packet={address:'Москва, Лесная, 5'};
+  c.window.AuditRoute={open:options=>dialogs.push(options)};c.openExternal=()=>assert.fail('The chooser must remain available');
+  load(c,'opensMapAddress','mapAddress','routeActionUrl','showRoute');c.showRoute();
+  assert.equal(dialogs.length,1);assert.equal(dialogs[0].address,c.state.packet.address);assert.equal(dialogs[0].telegram,c.tg);
+  assert.equal(new URL(c.routeActionUrl()).searchParams.get('rtext'),'~Москва, Лесная, 5');
+});
+
+test('a missing iPhone object address does not open a blank map',()=>{
+  const c=harness();c.actions=require('../public/audit-actions');c.tg={platform:'ios'};c.window.TelegramWebviewProxy={postEvent(){}};
+  c.state.packet={address:''};c.state.data.inspection.address='';c.openExternal=()=>assert.fail('A blank map is not a useful destination');
+  load(c,'opensMapAddress','mapAddress','routeActionUrl','showRoute');c.showRoute();
+  assert.match(c.calls.at(-1)[1],/не указан адрес/);
 });
 
 test('the territory picker retains its Android file handle until upload settles',async()=>{

@@ -20,6 +20,7 @@ test('manager packet requires service and object-specific renewal archive, not a
   const acquisition = normalizeManagerOrder({ ...base(), archive_url: 'stale-irrelevant-url' }, []);
   assert.equal(acquisition.archive_url, '');
   assert.equal(acquisition.cad_num, base().cad_num);
+  for (const cad_num of ['', 'номер уточняется']) assert.throws(() => normalizeManagerOrder({ ...base(), cad_num, egrn_order: '1' }, []), /кадастровый номер/);
 });
 
 test('request original files retain bytes, deterministic ids and explicit roles', () => {
@@ -36,6 +37,18 @@ test('request original files retain bytes, deterministic ids and explicit roles'
   assert.equal(office[0].mime, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
   assert.equal(office[1].mime, 'application/zip');
   assert.equal(office[1].role, 'archive');
+  const image = prepareMaterials([{ originalname: 'Фото.jpeg', mimetype: 'application/octet-stream', buffer: Buffer.from([255, 216, 255, 224]) }])[0];
+  assert.equal(image.mime, 'image/jpeg');
+});
+
+test('long filenames retain their extension and complete Unicode characters', () => {
+  const name = 'a'.repeat(179) + '🏠.pdf';
+  const file = prepareMaterials([{ originalname: name, mimetype: 'application/octet-stream', buffer: Buffer.from('%PDF-original') }])[0];
+  assert.ok(file.name.endsWith('.pdf'));
+  assert.doesNotThrow(() => encodeURIComponent(file.name));
+  assert.equal(file.mime, 'application/pdf');
+  const emoji = prepareMaterials([{ originalname: 'a'.repeat(179) + '🏠', mimetype: 'image/png', buffer: Buffer.from('original') }])[0];
+  assert.doesNotThrow(() => encodeURIComponent(emoji.name));
 });
 
 test('download-all ZIP preserves UTF-8 filenames and original file contents', () => {

@@ -120,6 +120,7 @@ async function migrate() {
       DO $$ BEGIN
         IF to_regclass('cases') IS NOT NULL THEN
           ALTER TABLE cases ADD COLUMN IF NOT EXISTS checklist_revision INT NOT NULL DEFAULT 0;
+          ALTER TABLE cases ADD COLUMN IF NOT EXISTS decision_reminder_delivery JSONB NOT NULL DEFAULT '{}';
         END IF;
         IF to_regclass('case_reminders') IS NOT NULL THEN
           ALTER TABLE case_reminders ADD COLUMN IF NOT EXISTS delivery JSONB NOT NULL DEFAULT '{}';
@@ -133,6 +134,7 @@ async function migrate() {
         END IF;
         IF to_regclass('reports') IS NOT NULL THEN
           ALTER TABLE reports ADD COLUMN IF NOT EXISTS incoming_key TEXT;
+          ALTER TABLE reports ADD COLUMN IF NOT EXISTS last_message_at TIMESTAMPTZ;
           CREATE INDEX IF NOT EXISTS reports_incoming_key ON reports(incoming_key);
         END IF;
       END $$;

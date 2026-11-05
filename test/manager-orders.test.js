@@ -2,8 +2,9 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { createManagerHandlers } = require('../src/web/manager-orders');
 const originalMaterials = require('../src/web/order-materials');
+const { Readable } = require('node:stream');
 
-function fixture() {
+function fixture(options = {}) {
   let order = { id: 58, submitted_by: 108, submitted_name: 'Автор', status: 'in_progress', telegram_msg_id: 900, address: 'Москва, старый адрес', owner_name: 'Клиент', object_type: 'Общепит алкоголь', service: null, cad_num: '', created_at: new Date(), request_submit_id: 'original', request_signature: 'original-signature' };
   const files = new Map();
   const calls = [];
@@ -26,7 +27,7 @@ function fixture() {
     sendDocument: async (chat, file) => { calls.push({ document: file.filename, content: file.source.toString() }); return { message_id: 901 }; },
     sendMessage: async () => { throw new Error('Existing order must not create another card'); },
   };
-  const handlers = createManagerHandlers({ materials, queries, pool: {}, getTelegram: () => telegram, format: item => 'order ' + item.id, attachOrOrder: async () => { throw new Error('No EGRN requested'); } });
+  const handlers = createManagerHandlers({ materials, queries, pool: {}, getTelegram: () => telegram, format: item => 'order ' + item.id, attachOrOrder: async () => { throw new Error('No EGRN requested'); }, ...options });
   const request = (role = 'manager', uid = 109) => ({ params: { id: '58' }, tgUser: { id: uid }, staff: { name: 'Менеджер', role }, files: [], body: { address: 'Москва, новый адрес', owner_name: 'Клиент', object_type: 'Общепит алкоголь', service: 'Продление', archive_url: '', submit_id: 'edit-1' } });
   const response = () => ({ statusCode: 200, headers: {}, status(n) { this.statusCode = n; return this; }, set(k,v) { this.headers[k] = v; return this; }, json(value) { this.body = value; return this; } });
   return { handlers, request, response, files, calls, telegram, order: () => order };
@@ -73,6 +74,62 @@ test('Telegram update failure preserves packet and retry skips already delivered
   const second = f.response(); await f.handlers.save(req, second);
   assert.equal(second.body.ok, true); assert.equal(second.body.warning, undefined);
   assert.equal(f.calls.filter(call => call.document).length, 1);
+});
+
+test('a completed submission cannot silently accept a different packet with the same submission id', async () => {
+  const f = fixture(), req = f.request(); req.body.service = 'Получение';
+  const first = f.response(); await f.handlers.save(req, first);
+  assert.equal(first.body.ok, true);
+  req.body.address = 'Москва, другой адрес';
+  const changed = f.response(); await f.handlers.save(req, changed);
+  assert.equal(changed.statusCode, 409);
+  assert.equal(changed.body.ok, false);
+  assert.match(changed.body.error, /другими данными/);
+  assert.equal(f.order().address, 'Москва, новый адрес');
+});
+
+for (const result of ['none', 'unavailable', 'failed', 'unknown', 'uncertain']) test('an explicitly requested EGRN order reports an unresolved result instead of silent success: ' + result, async () => {
+  const f = fixture({ attachOrOrder: async () => ({ result }) }), req = f.request();
+  f.telegram.sendMessage = async () => ({ message_id: 901 });
+  req.body.service = 'Получение'; req.body.cad_num = '77:01:0000001:12'; req.body.egrn_order = '1';
+  const res = f.response(); await f.handlers.save(req, res);
+  assert.equal(res.body.ok, true); assert.match(res.body.warning, /ЕГРН/);
+  assert.match(res.body.warning, /сохранены/);
+});
+
+for (const edit of [false, true]) test('EGRN delivery failure remains retryable after the card and cadastral number are saved, edit=' + edit, async () => {
+  let order = { id: 58, submitted_by: 108, submitted_name: 'Автор', status: 'new', telegram_msg_id: edit ? 900 : null, cad_num: '', created_at: new Date() };
+  let attempts = 0, creates = 0, cards = 0;
+  const handlers = createManagerHandlers({
+    materials: { ...originalMaterials, ensureOrderMaterials: async () => {}, listOrderMaterials: async () => [], saveOrderMaterials: async () => {} },
+    queries: { getOrderById: async () => ({ ...order }), createOrderWithMaterials: async data => { creates++; order = { ...order, ...data }; return { ...order }; },
+      updateOrderPacket: async (id, data) => { order = { ...order, ...data }; return { ...order }; }, setTelegramMsgId: async (id, msg) => { order.telegram_msg_id = msg; }, addLog: async () => {} },
+    pool: {}, format: () => 'order', getTelegram: () => ({ sendMessage: async () => { cards++; return { message_id: 900 }; }, editMessageText: async () => {} }),
+    attachOrOrder: async options => { assert.equal(options.requestKey, 'manager-order:58:77:01:0000001:12'); attempts++; if (attempts === 1) throw new Error('Synthetic EGRN connection failure'); return { result: 'none' }; },
+  });
+  const req = { params: edit ? { id: '58' } : {}, tgUser: { id: 108 }, staff: { name: 'Автор', role: 'manager' }, files: [],
+    body: { address: 'Москва, адрес', owner_name: 'Клиент', object_type: 'Общепит алкоголь', service: 'Получение', cad_num: '77:01:0000001:12', submit_id: 'egrn-retry' } };
+  const response = fixture().response;
+  const first = response(); await handlers.save(req, first); assert.match(first.body.warning, /ЕГРН/);
+  const second = response(); await handlers.save(req, second);
+  assert.equal(second.body.ok, true); assert.equal(second.body.warning, undefined);
+  assert.equal(attempts, 2);
+  assert.equal(cards, edit ? 0 : 1);
+  assert.equal(creates, edit ? 0 : 2);
+});
+
+test('browser multipart uploads preserve Cyrillic and emoji original filenames before preparing the packet', async () => {
+  let parse;
+  require('../src/web/manager-orders').setupManagerOrders({ get() {}, post(url, middleware) { if (url === '/api/order') parse = middleware; } });
+  const form = new FormData(), name = 'План этажа 🏠.pdf';
+  form.append('files', new Blob(['%PDF-1.7 original'], { type: 'application/pdf' }), name);
+  const request = new Request('https://local.test/api/order', { method: 'POST', body: form });
+  const body = Buffer.from(await request.arrayBuffer()), req = Readable.from([body]);
+  req.method = 'POST'; req.headers = { 'content-type': request.headers.get('content-type'), 'content-length': String(body.length) };
+  await new Promise((resolve, reject) => parse(req, { status() { return this; }, json(error) { reject(new Error(error.error)); } }, resolve));
+  assert.equal(req.files[0].originalname, name);
+  const file = originalMaterials.prepareMaterials(req.files)[0];
+  assert.equal(file.name, name); assert.equal(file.buffer.toString(), '%PDF-1.7 original');
 });
 
 test('manager edit form generates valid client script and provides an existing-packet loader', () => {

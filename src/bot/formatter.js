@@ -20,6 +20,36 @@ function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>]/g, function (ch) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;' }[ch]; });
 }
 
+// Limit escaped HTML, not the source string: one '&' takes five characters.
+// Iterate complete code points so a shortened card cannot split an emoji/entity.
+function preview(value, limit) {
+  const text = String(value == null ? '' : value);
+  if (esc(text).length <= limit) return esc(text);
+  let result = '';
+  for (const character of text) {
+    const encoded = esc(character);
+    if (result.length + encoded.length > limit - 1) break;
+    result += encoded;
+  }
+  return result + '…';
+}
+
+function contactPreview(value) {
+  const text = String(value);
+  if (esc(text).length <= 850) return esc(text);
+  const phones = [];
+  for (const pattern of [/(?:^|[^\d+])((?:\+?7|8)?[\s(.-]*\d{3}[\s).-]*\d{3}[\s.-]*\d{2}[\s.-]*\d{2})(?!\d)/g, /(?:^|[^\d+])(\+(?:\d[ ()-]*){7,14}\d)(?!\d)/g]) {
+    for (const match of text.matchAll(pattern)) phones.push({ index: match.index, value: match[1].trim() });
+  }
+  const unique = new Map();
+  for (const phone of phones.sort((a, b) => a.index - b.index)) {
+    const digits = phone.value.replace(/\D/g, '').replace(/^8(?=\d{10}$)/, '7');
+    if (!unique.has(digits)) unique.set(digits, phone.value);
+  }
+  const prefix = unique.size ? preview('Телефоны: ' + [...unique.values()].slice(0, 8).join('; ') + '\n', 320) : '';
+  return prefix + preview(text, 850 - prefix.length);
+}
+
 function formatOrderMessage(order) {
   const deadline = order.deadline
     ? format(new Date(order.deadline), 'd MMMM yyyy', { locale: ru })
@@ -28,25 +58,25 @@ function formatOrderMessage(order) {
   const lines = [
     '📋 <b>Заявка #' + order.id + '</b>',
     '',
-    '📍 <b>Адрес:</b> ' + esc(order.address),
-    '👤 <b>Чей объект:</b> ' + esc(order.owner_name),
-    '🏢 <b>Тип:</b> ' + esc(order.object_type),
+    '📍 <b>Адрес:</b> ' + preview(order.address, 500),
+    '👤 <b>Чей объект:</b> ' + preview(order.owner_name, 350),
+    '🏢 <b>Тип:</b> ' + preview(order.object_type, 120),
   ];
 
-  if (order.object_name) lines.push('🏷 <b>Название:</b> ' + esc(order.object_name));
-  if (order.service) lines.push('📋 <b>Услуга:</b> ' + esc(order.service));
-  if (order.cad_num) lines.push('📄 <b>Кадастровый номер:</b> ' + esc(order.cad_num));
-  if (order.service === 'Продление' && order.archive_url) lines.push('🗂 <b>Архив объекта:</b> ' + esc(order.archive_url));
+  if (order.object_name) lines.push('🏷 <b>Название:</b> ' + preview(order.object_name, 350));
+  if (order.service) lines.push('📋 <b>Услуга:</b> ' + preview(order.service, 80));
+  if (order.cad_num) lines.push('📄 <b>Кадастровый номер:</b> ' + preview(order.cad_num, 120));
+  if (order.service === 'Продление' && order.archive_url) lines.push('🗂 <b>Архив объекта:</b> ' + (esc(order.archive_url).length <= 300 ? esc(order.archive_url) : 'Ссылка сохранена в заявке'));
   lines.push('🎥 <b>Нужно видео:</b> ' + (order.has_video ? 'Да' : 'Нет'));
-  if (order.zones_info) lines.push('📐 <b>Задача и известные зоны:</b> ' + esc(String(order.zones_info).slice(0, 800)));
+  if (order.zones_info) lines.push('📐 <b>Задача и известные зоны:</b> ' + preview(order.zones_info, 800));
   lines.push('⏰ <b>Крайний срок:</b> ' + deadline);
-  if (order.contacts) lines.push('📞 <b>Контакты:</b> ' + esc(String(order.contacts).slice(0, 700)));
+  if (order.contacts) lines.push('📞 <b>Контакты:</b> ' + contactPreview(order.contacts));
 
   lines.push('');
   lines.push(STATUS_EMOJI[order.status] + ' <b>Статус:</b> ' + STATUS_LABEL[order.status]);
 
   const createdAt = format(new Date(order.created_at), 'd MMM HH:mm', { locale: ru });
-  if (order.submitted_name) lines.push('👤 <b>Заявку оставил(а):</b> ' + esc(order.submitted_name));
+  if (order.submitted_name) lines.push('👤 <b>Заявку оставил(а):</b> ' + preview(order.submitted_name, 160));
   lines.push('🕐 <i>Создана: ' + createdAt + '</i>');
 
   return lines.join('\n');

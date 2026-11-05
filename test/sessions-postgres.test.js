@@ -44,12 +44,14 @@ test('migration and session persistence, expiry, touch and logout in PostgreSQL'
         INSERT INTO reports VALUES(1);`);
       await context.module.exports(); // Safe to rerun the deployed migration.
       await context.module.exports();
-      const upgraded = (await db.query('SELECT data,checklist_revision FROM cases WHERE id=1')).rows[0];
+      const upgraded = (await db.query('SELECT data,checklist_revision,decision_reminder_delivery FROM cases WHERE id=1')).rows[0];
       assert.deepEqual(upgraded.data, { answer: 'kept' }); assert.equal(upgraded.checklist_revision, 0);
+      assert.deepEqual(upgraded.decision_reminder_delivery, {});
       assert.deepEqual((await db.query('SELECT delivery FROM case_reminders WHERE id=1')).rows[0].delivery, {});
       assert.deepEqual((await db.query('SELECT delivery_revision,request_key,processing_token,processing_until FROM egrn_orders WHERE id=1')).rows[0],
         { delivery_revision: 0, request_key: null, processing_token: null, processing_until: null });
       assert.equal((await db.query('SELECT incoming_key FROM reports WHERE id=1')).rows[0].incoming_key, null);
+      assert.equal((await db.query('SELECT last_message_at FROM reports WHERE id=1')).rows[0].last_message_at, null);
       await db.exec("INSERT INTO egrn_orders(id,request_key) VALUES(2,'same-intent')");
       await assert.rejects(db.exec("INSERT INTO egrn_orders(id,request_key) VALUES(3,'same-intent')"), error => error.code === '23505');
       const expires = new Date(Date.now() + 86400000);

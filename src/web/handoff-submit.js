@@ -41,11 +41,22 @@ function fields(body) {
 }
 function sourceReport(picked) {
   if(!picked||!picked.chat_id||!Array.isArray(picked.msg_ids))fail(409,'HANDOFF_REPORT_UNAVAILABLE','Не найдены сохранённые сообщения выбранного отчёта.');
-  const ids=[...new Set(picked.msg_ids.concat(picked.extra||[]).map(Number))].sort((a,b)=>a-b);
-  if(!ids.length||ids.length>5000||ids.some(id=>!Number.isSafeInteger(id)||id<1)||! /^-?\d+$/.test(String(picked.chat_id)))fail(409,'HANDOFF_REPORT_UNAVAILABLE','Проверьте сохранённый комплект сообщений отчёта.');
-  const data=json(picked.report_data),hashes=[...new Set([...(Array.isArray(data.evidence)?data.evidence:[]),...(Array.isArray(data.documents)?data.documents:[])].map(file=>value(file?.sha256).toLowerCase()).filter(hash=>/^[a-f\d]{64}$/.test(hash)))];
-  return {chat_id:String(picked.chat_id),message_ids:ids,hashes};
+  const grouped=new Map(),raw=[{chat_id:picked.chat_id,msg_ids:picked.msg_ids.concat(picked.extra||[])},...(Array.isArray(picked.sources)?picked.sources:[])];
+  for(const item of raw){
+    if(!item||! /^-?\d+$/.test(String(item.chat_id))||!Array.isArray(item.msg_ids))fail(409,'HANDOFF_REPORT_UNAVAILABLE','Проверьте сохранённый комплект сообщений отчёта.');
+    const chat=String(item.chat_id),ids=[...new Set([...(grouped.get(chat)||[]),...item.msg_ids.map(Number)])].sort((a,b)=>a-b);
+    if(ids.some(id=>!Number.isSafeInteger(id)||id<1))fail(409,'HANDOFF_REPORT_UNAVAILABLE','Проверьте сохранённый комплект сообщений отчёта.');
+    grouped.set(chat,ids);
+  }
+  const sources=[...grouped].filter(([,ids])=>ids.length).map(([chat_id,message_ids])=>({chat_id,message_ids}));
+  const total=sources.reduce((count,source)=>count+source.message_ids.length,0);
+  if(!total||total>5000)fail(409,'HANDOFF_REPORT_UNAVAILABLE','Проверьте сохранённый комплект сообщений отчёта.');
+  const data=[picked.report_data,...(Array.isArray(picked.report_data_sources)?picked.report_data_sources:[])].map(json);
+  const hashes=[...new Set(data.flatMap(item=>[...(Array.isArray(item.evidence)?item.evidence:[]),...(Array.isArray(item.documents)?item.documents:[])])
+    .map(file=>value(file?.sha256).toLowerCase()).filter(hash=>/^[a-f\d]{64}$/.test(hash)))];
+  return {...sources[0],sources,hashes};
 }
+function sourceParts(source) {return Array.isArray(source.sources)?source.sources:[source];}
 function short(item,limit) {const s=value(item);return s.length>limit?s.slice(0,limit-1).replace(/[\uD800-\uDBFF]$/,'')+'…':s;}
 function cardText(c,state) {
   const report=state.packet.report,lines=['⚖️ <b>Клиент передан юристу</b>','🏢 <b>'+esc(c.org)+'</b>','📍 '+esc(c.address),esc([c.kind,c.service,c.region].join(' · '))];
@@ -157,7 +168,7 @@ function createHandoffSubmitter(options={}) {
           const row=(await client.query('SELECT chat_id,msg_ids,first_id FROM reports WHERE id=$1',[requestId])).rows[0];
           if(!row)fail(409,'HANDOFF_REQUEST_UNAVAILABLE','Сохранённая исходная заявка не найдена. Обновите форму перед передачей.');
           const original=sourceReport({...row,msg_ids:Array.isArray(row.msg_ids)&&row.msg_ids.length?row.msg_ids:row.first_id?[row.first_id]:[]});
-          const alreadyIncluded=new Set(original.chat_id===source.chat_id?source.message_ids:[]);
+          const alreadyIncluded=new Set(sourceParts(source).filter(part=>part.chat_id===original.chat_id).flatMap(part=>part.message_ids));
           request={id:requestId,...original,first_id:Number(row.first_id)||null,copy_ids:original.message_ids.filter(id=>!alreadyIncluded.has(id))};
         }
         const recipients=[{chat:String(lawyer.tg_id),role:'lawyer'}];
@@ -191,17 +202,23 @@ function createHandoffSubmitter(options={}) {
         state.cards[target.chat]=Number(sent.message_id);state.inflight=null;await save();receiptPending=false;
       }
       for(const target of state.recipients){
-        const checkpoint=state.auditCopies[target.chat]||{offset:0,messageIds:[]};state.auditCopies[target.chat]=checkpoint;
-        while(checkpoint.offset<state.source.message_ids.length){
-          const batch=state.source.message_ids.slice(checkpoint.offset,checkpoint.offset+100);
-          const copied=await send({type:'audit',chat:target.chat,sourceIds:batch},()=>tg.callApi('copyMessages',{chat_id:target.chat,from_chat_id:state.source.chat_id,message_ids:batch}));
-          const ids=Array.isArray(copied)?copied.map(item=>Number(item?.message_id)):[];
-          if(ids.some(id=>!Number.isSafeInteger(id)||id<1)||ids.length!==batch.length){
-            checkpoint.partial={sourceIds:batch,messageIds:ids.filter(id=>Number.isSafeInteger(id)&&id>0)};
-            state.manual_review='Telegram подтвердил не все сообщения отчёта. Проверьте доставленный комплект вручную; повторная передача этого блока остановлена, чтобы не создавать дубли.';
-            state.inflight=null;await save();receiptPending=false;return partial(c,state,state.manual_review,false);
+        const recipient=state.auditCopies[target.chat]||{offset:0,messageIds:[]};state.auditCopies[target.chat]=recipient;
+        for(const [index,source] of sourceParts(state.source).entries()){
+          // Version 2 originally stored one source and this flat cursor. Keep
+          // using it for the first source so old in-progress cases resume safely.
+          let checkpoint=recipient;
+          if(index>0){recipient.sources||={};checkpoint=recipient.sources[source.chat_id]||{offset:0,messageIds:[]};recipient.sources[source.chat_id]=checkpoint;}
+          while(checkpoint.offset<source.message_ids.length){
+            const batch=source.message_ids.slice(checkpoint.offset,checkpoint.offset+100);
+            const copied=await send({type:'audit',chat:target.chat,sourceChat:source.chat_id,sourceIds:batch},()=>tg.callApi('copyMessages',{chat_id:target.chat,from_chat_id:source.chat_id,message_ids:batch}));
+            const ids=Array.isArray(copied)?copied.map(item=>Number(item?.message_id)):[];
+            if(ids.some(id=>!Number.isSafeInteger(id)||id<1)||ids.length!==batch.length){
+              checkpoint.partial={sourceIds:batch,messageIds:ids.filter(id=>Number.isSafeInteger(id)&&id>0)};
+              state.manual_review='Telegram подтвердил не все сообщения отчёта. Проверьте доставленный комплект вручную; повторная передача этого блока остановлена, чтобы не создавать дубли.';
+              state.inflight=null;await save();receiptPending=false;return partial(c,state,state.manual_review,false);
+            }
+            checkpoint.offset+=batch.length;checkpoint.messageIds.push(...ids);state.inflight=null;await save();receiptPending=false;
           }
-          checkpoint.offset+=batch.length;checkpoint.messageIds.push(...ids);state.inflight=null;await save();receiptPending=false;
         }
       }
       if(state.request){

@@ -513,6 +513,7 @@ var attachedFiles = [];
 var existingFiles = [];
 var editOrderId = new URLSearchParams(location.search).get('order_id');
 var packetReady = !editOrderId, packetCanEdit = !editOrderId;
+var preservePacketInputs = false;
 var submitId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 function enablePacketEditing(enabled) {
   document.querySelectorAll('input,select,textarea').forEach(function(el){el.disabled=!enabled;});
@@ -535,8 +536,9 @@ function renderExistingFiles() {
     var button=document.createElement('button');button.type='button';button.textContent='↓ '+file.name;button.style.cssText='display:block;text-align:left;overflow-wrap:anywhere;width:100%;padding:12px;border:0;border-radius:10px;background:var(--tg-theme-secondary-bg-color,#1e293b);color:var(--tg-theme-link-color,#7bb5ff);margin-bottom:6px;font-size:14px';button.onclick=function(){downloadExistingFile(file,button);};box.appendChild(button);
   });
 }
-async function loadExistingPacket() {
+async function loadExistingPacket(preserveInputs) {
   if(!editOrderId) return;
+  if(preserveInputs) preservePacketInputs=true;
   packetReady=false;packetCanEdit=false;enablePacketEditing(false);
   var status=document.getElementById('packet-status');status.hidden=false;status.textContent='Загружаем заявку #'+editOrderId+'…';document.getElementById('packet-retry').hidden=true;
   document.getElementById('form-heading').textContent='📋 Заявка #'+editOrderId+' · Москва';
@@ -545,6 +547,7 @@ async function loadExistingPacket() {
     var response=await fetch('/api/order/'+encodeURIComponent(editOrderId)), data=await response.json();
     if(!response.ok || !data.ok) throw new Error(data.error || 'Не удалось открыть заявку.');
     var order=data.order;
+    if(!preservePacketInputs) {
     ['address','owner_name','object_type','object_name','service','cad_num','archive_url','zones_info','contacts'].forEach(function(id){
       var field=document.getElementById(id),value=order[id] || '';
       if(field.tagName === 'SELECT' && value && !Array.from(field.options).some(function(option){return option.value===value;})) {var option=document.createElement('option');option.value=value;option.textContent=value;field.appendChild(option);}
@@ -553,8 +556,10 @@ async function loadExistingPacket() {
     document.getElementById('deadline').value=order.deadline ? String(order.deadline).slice(0,10) : '';
     document.getElementById('has_video').checked=!!order.has_video;
     document.getElementById('egrn_order').checked=false;
+    }
     existingFiles=data.materials || [];renderExistingFiles();renderFiles();updateService();
     packetReady=true;packetCanEdit=!!data.can_edit;enablePacketEditing(packetCanEdit);
+    preservePacketInputs=false;
     status.textContent=packetCanEdit ? 'Изменения попадут в эту же заявку. Можно добавить документы — сохранённые файлы останутся в пакете аудитора.' : 'Просмотр заявки. Дополнить её может автор или менеджер.';
   } catch(e) { status.textContent=e.message;document.getElementById('packet-retry').hidden=false; }
 }
@@ -609,6 +614,7 @@ async function submitForm() {
   if (btn.disabled) return;
   btn.disabled = true; btn.textContent = 'Отправляем...';
   try {
+  var submittedFiles = attachedFiles.slice();
   var formData = new FormData();
 formData.append('address', document.getElementById('address').value.trim());
 formData.append('owner_name', document.getElementById('owner_name').value.trim());
@@ -616,7 +622,7 @@ formData.append('object_type', document.getElementById('object_type').value);
 formData.append('object_name', document.getElementById('object_name').value.trim());
 formData.append('service', service);
 formData.append('archive_url', service === 'Продление' ? document.getElementById('archive_url').value.trim() : '');
-formData.append('file_roles', JSON.stringify(attachedFiles.map(function(f){return f.materialRole || 'document';})));
+formData.append('file_roles', JSON.stringify(submittedFiles.map(function(f){return f.materialRole || 'document';})));
 formData.append('has_video', document.getElementById('has_video').checked);
 formData.append('zones_info', document.getElementById('zones_info').value.trim());
 formData.append('deadline', document.getElementById('deadline').value || '');
@@ -624,7 +630,7 @@ formData.append('contacts', document.getElementById('contacts').value.trim());
 formData.append('tg_user_id', tgUserId());
 formData.append('cad_num', document.getElementById('cad_num').value.trim());
 formData.append('egrn_order', document.getElementById('egrn_order').checked ? '1' : '');
-attachedFiles.forEach(function(f) {
+submittedFiles.forEach(function(f) {
   formData.append('files', f, f.name);
 });
 formData.append('submit_id', submitId);
@@ -640,16 +646,23 @@ for (var attempt = 0; attempt < waits.length; attempt++) {
     if (result && result.ok) break;
     var snippet = String(txt || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80);
     lastErr = result ? (result.error || 'ошибка сервера') + ' [' + r.status + ']' : 'сервер ответил ' + r.status + (snippet ? ': ' + snippet : '');
-    var retry = r.status === 429 || r.status === 409 || r.status >= 500 || !result || (result && result.busy);
+    var retry = r.status === 429 || r.status >= 500 || !result || (result && result.busy);
     if (!retry) break;
   } catch (ne) { lastErr = 'нет связи (' + ne.message + ')'; }
   result = null;
 }
     if (result && result.ok) {
-      if (result.warning) { btn.disabled = false; btn.textContent = 'Повторить доставку'; tg.showAlert(result.warning); return; }
+      if (result.warning) {
+        editOrderId=String(result.id);
+        attachedFiles=attachedFiles.filter(function(file){return submittedFiles.indexOf(file)<0;});
+        submitId=Date.now().toString(36)+Math.random().toString(36).slice(2,8);
+        await loadExistingPacket(true);
+        if(packetReady && packetCanEdit) btn.textContent='Повторить доставку';
+        tg.showAlert(result.warning);return;
+      }
       if(editOrderId) {
-        attachedFiles=[];submitId=Date.now().toString(36)+Math.random().toString(36).slice(2,8);
-        await loadExistingPacket();tg.showAlert('Заявка #'+result.id+' обновлена. Пакет документов доступен аудитору.');return;
+        attachedFiles=attachedFiles.filter(function(file){return submittedFiles.indexOf(file)<0;});submitId=Date.now().toString(36)+Math.random().toString(36).slice(2,8);
+        await loadExistingPacket(true);tg.showAlert('Заявка #'+result.id+' обновлена. Пакет документов доступен аудитору.');return;
       }
       btn.textContent = '✅ Заявка отправлена!';
 if (attachedFiles.length > 0) {

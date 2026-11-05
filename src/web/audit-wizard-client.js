@@ -111,17 +111,31 @@
     // here are serialized; oversized drafts still save normally while open.
     return {method:method,headers:{'Content-Type':'application/json'},body:body,keepalive:typeof TextEncoder!=='undefined'&&body.length<62*1024&&new TextEncoder().encode(body).length<62*1024};
   }
+  async function requestWithDeadline(url,options,consume,timeoutMs) {
+    var controller=typeof AbortController==='function'?new AbortController():null;
+    var sourceSignal=options&&options.signal,requestOptions=Object.assign({},options||{}),deadlineTimer;
+    var relayAbort=function(){if(controller)controller.abort(sourceSignal.reason);};
+    if(controller){requestOptions.signal=controller.signal;if(sourceSignal){if(sourceSignal.aborted)relayAbort();else sourceSignal.addEventListener('abort',relayAbort,{once:true});}}
+    var deadline=new Promise(function(resolve,reject){deadlineTimer=setTimeout(function(){
+      var error=new Error('Сервер долго не отвечает. Повторите действие; сохранённый черновик останется на месте.');
+      error.code='REQUEST_TIMEOUT';error.retryable=true;if(controller)controller.abort(error);reject(error);
+    },timeoutMs);});
+    try{return await Promise.race([Promise.resolve().then(function(){return fetch(url,requestOptions);}).then(consume),deadline]);}
+    finally{clearTimeout(deadlineTimer);if(sourceSignal)sourceSignal.removeEventListener('abort',relayAbort);}
+  }
   async function request(url,options) {
     var response,text,data;
-    try{response=await fetch(url,options||{});text=await response.text();}
-    catch(e){var disconnected=new Error('Нет связи с ботом. Проверьте интернет и повторите действие.');disconnected.retryable=true;throw disconnected;}
+    var timeoutMs=url==='/api/audit'?120000:options&&options.method==='POST'&&/\/evidence$/.test(url)?90000:30000;
+    try{text=await requestWithDeadline(url,options,function(result){response=result;return response.text();},timeoutMs);}
+    catch(e){if(e.code==='REQUEST_TIMEOUT')throw e;var disconnected=new Error('Нет связи с ботом. Проверьте интернет и повторите действие.');disconnected.retryable=true;throw disconnected;}
     try{data=JSON.parse(text);}catch(e){
       if(/checking your browser|turnstile|rate limited/i.test(text)||response.status===429){var restricted=new Error('Сервис временно ограничил доступ. Повторите действие через минуту.');restricted.retryable=true;throw restricted;}
-      if(response.status===413)throw new Error('Файл слишком большой. Максимум 12 МБ на файл.');
-      throw new Error('Сервер не ответил как ожидалось. Повторите действие. Если файл не появился в отчёте, выберите его заново.');
+      if(response.status===413){var oversized=new Error('Файл слишком большой. Максимум 12 МБ на файл.');oversized.status=413;throw oversized;}
+      var unexpected=new Error('Сервер не ответил как ожидалось. Повторите действие. Если файл не появился в отчёте, выберите его заново.');
+      unexpected.status=response.status;unexpected.retryable=response.status>=500||[408,425,429].indexOf(response.status)>=0;throw unexpected;
     }
     if(!data||typeof data!=='object'||Array.isArray(data))throw new Error('Сервер вернул некорректные данные. Повторите действие.');
-    if(!response.ok||data.ok===false){var error=new Error(data.error||'Не удалось выполнить запрос.');error.status=response.status;error.payload=data;throw error;}
+    if(!response.ok||data.ok===false){var error=new Error(data.error||'Не удалось выполнить запрос.');error.status=response.status;error.retryable=response.status>=500||[408,425,429].indexOf(response.status)>=0;error.payload=data;throw error;}
     return data;
   }
   function adoptRevision(result) {
@@ -263,7 +277,7 @@
   }
   function packetSummary(){
     var packet=state.packet||state.data.request_packet||{},p=state.data.inspection,files=packetFiles(),contact=packetContactText(packet.contacts),phone=packetPhone(),archiveFiles=files.filter(function(f){return f.role==='archive';}),hasArchive=!!packet.archive_url||archiveFiles.length>0;
-    var html='<section class="request-packet"><div class="packet-title"><span class="tag">Заявка #'+esc(orderId)+'</span><span>'+esc(({catering:'Алкоголь · общепит',retail:'Алкоголь · магазин',tobacco:'Табак'})[state.data.object_category]||'Объект')+' · '+esc(p.service)+'</span></div><h2>'+esc(packet.object_name||packet.org||p.org)+'</h2><p class="packet-address">'+esc(packet.address||p.address)+'</p><div class="action-row"><a class="button secondary" data-route target="_blank" rel="noopener" href="'+esc(actions.routeUrl(p.address||''))+'">Построить маршрут ↗</a>'+(phone?'<a class="button secondary" data-call target="_blank" rel="noopener" href="'+esc(phoneActionUrl(phone))+'">Позвонить ↗</a>':'')+'</div>'+(contact?'<p class="packet-contact">'+esc(contact)+'</p>':'');
+    var html='<section class="request-packet"><div class="packet-title"><span class="tag">Заявка #'+esc(orderId)+'</span><span>'+esc(({catering:'Алкоголь · общепит',retail:'Алкоголь · магазин',tobacco:'Табак'})[state.data.object_category]||'Объект')+' · '+esc(p.service)+'</span></div><h2>'+esc(packet.object_name||packet.org||p.org)+'</h2><p class="packet-address">'+esc(packet.address||p.address)+'</p><div class="action-row"><a class="button secondary" data-route target="_blank" rel="noopener" href="'+esc(routeActionUrl())+'">'+(opensMapAddress()?'Открыть адрес в Картах ↗':'Построить маршрут ↗')+'</a>'+(phone?'<a class="button secondary" data-call target="_blank" rel="noopener" href="'+esc(phoneActionUrl(phone))+'">Позвонить ↗</a>':'')+'</div>'+(opensMapAddress()?'<p class="field-note">Маршрут выберите в Яндекс Картах. Вернуться к отчёту можно через Telegram.</p>':'')+(contact?'<p class="packet-contact">'+esc(contact)+'</p>':'');
     if(packet.zones_info)html+='<details class="packet-details"><summary>Комментарий менеджера</summary><p>'+esc(packet.zones_info)+'</p></details>';
     html+='<details class="packet-details"><summary>Документы заявки · '+(files.length+packetEgrnLinks().length)+'</summary>'+(files.length?'<button type="button" class="button secondary full" data-download-materials>'+(packetEgrnLinks().length?'Скачать остальные файлы':'Скачать всё')+'</button>':'')+managerFilesHtml(files,false)+largeEgrnFilesHtml()+'<p class="field-note">Документы и папку объекта прикрепляет менеджер до передачи заявки аудитору.</p></details>';
     if(isRenewal())html+='<div class="archive-box"><div class="card-top"><h3>Архив объекта</h3><span class="tag">'+(archiveFiles.length?'Приложен':state.data.workflow.archive_skipped==='Да'?'Без архива':'Графика не приложена')+'</span></div>'+(hasArchive?'<div class="action-row"><button type="button" class="button secondary" data-download-archive>Скачать архив</button>'+(packet.archive_url?'<button type="button" class="button secondary" data-copy-archive>Скопировать ссылку</button>':'')+'</div>':'')+(!archiveFiles.length||state.data.workflow.archive_skipped==='Да'?'<button type="button" class="button secondary full" data-skip-archive>'+ (state.data.workflow.archive_skipped==='Да'?'Добавить архив / отменить пропуск':'Архива нет — продолжить')+'</button>':'')+'</div>';
@@ -653,10 +667,17 @@
     b = $('#submit-audit'); if (b) b.onclick = function(){return submit(!state.frozen&&offersActions(issues())?'actions':'');};
   }
   function openExternal(url){return actions.openExternal(url,tg,function(href,target){return window.open(href,target);},window);}
+  function opensMapAddress(){return !!(tg&&tg.platform==='ios'&&actions.hasTelegramBridge(window));}
+  function mapAddress(){return String(((state.packet||state.data.request_packet||{}).address)||state.data.inspection.address||'');}
+  function routeActionUrl(){return opensMapAddress()?actions.searchUrl(mapAddress()):actions.routeUrl(mapAddress());}
   function showRoute(){
+    if(opensMapAddress()){
+      var url=routeActionUrl();if(!url){notify('В заявке не указан адрес объекта.');return;}
+      saveBeforePhone();if(openExternal(url)===false)notify('Карты не открылись. Повторите нажатие.');return;
+    }
     localSave();
     if(!window.AuditRoute){notify('Не удалось открыть выбор маршрута. Закройте и откройте форму заново.');return;}
-    window.AuditRoute.open({address:state.data.inspection.address,actions:actions,telegram:actions.hasTelegramBridge(window)?tg:null,openExternal:openExternal,onBeforeLeave:function(){localSave();saveNow().catch(function(){});}});
+    window.AuditRoute.open({address:mapAddress(),actions:actions,telegram:actions.hasTelegramBridge(window)?tg:null,openExternal:openExternal,onBeforeLeave:function(){localSave();saveNow().catch(function(){});}});
   }
   function showContact(){
     var phone=packetPhone();if(!phone){notify('Телефон не указан в заявке.');return;}
@@ -681,8 +702,7 @@
   }
   async function fetchAuditFile(url, fallback) {
     function unavailable(message) { return Object.assign(new Error(message || fallback), {code:'AUDIT_FILE_RESPONSE'}); }
-    var response;
-    try { response = await fetch(url, {cache:'no-store'}); } catch (error) { throw unavailable(); }
+    try{return await requestWithDeadline(url,{cache:'no-store'},async function(response){
     var type = (response.headers.get('Content-Type') || '').split(';')[0].trim().toLowerCase();
     var json = /(?:\/|\+)json$/.test(type), html = type === 'text/html' || type === 'application/xhtml+xml';
     var attachment = /^attachment(?:\s*;|$)/i.test(response.headers.get('Content-Disposition') || '');
@@ -700,6 +720,7 @@
     var error;
     if (json) { try { error = JSON.parse(body)?.error; } catch (e) {} }
     throw unavailable(typeof error === 'string' ? error : '');
+    },180000);}catch(error){if(error.code==='AUDIT_FILE_RESPONSE')throw error;throw unavailable(error.code==='REQUEST_TIMEOUT'?error.message:'');}
   }
   async function downloadResource(url, filename) {
     if(downloadJobs.has(url)){notify('Файл уже готовится. Дождитесь скачивания.');return;}downloadJobs.add(url);

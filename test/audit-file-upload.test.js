@@ -11,7 +11,7 @@ function actualFunction(name) {
   const rest = source.slice(start), next = rest.slice(1).search(/\n  (?:(?:async )?function |var )/);
   return next < 0 ? rest : rest.slice(0, next + 1);
 }
-function load(context, ...names) { vm.runInContext(names.map(actualFunction).join('\n'), context); }
+function load(context, ...names) { if(names.includes('request'))names=['requestWithDeadline',...names];vm.runInContext(names.map(actualFunction).join('\n'), context); }
 function deferred() {
   let resolve, reject;
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });

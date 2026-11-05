@@ -1,8 +1,9 @@
 const pool = require('./pool');
 
-async function createOrder(data) {
-  await require('../web/order-materials').ensureOrderMaterials();
-  const { rows } = await pool.query(
+async function createOrder(data, client) {
+  if (!client) await require('../web/order-materials').ensureOrderMaterials();
+  const connection = client || pool;
+  const { rows } = await connection.query(
     `INSERT INTO orders 
       (address, owner_name, object_type, object_name, has_video, zones_info, deadline, contacts, submitted_by, service, cad_num, archive_url, request_submit_id, request_signature)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
@@ -26,10 +27,28 @@ async function createOrder(data) {
     ]
   );
   if (rows[0]) return rows[0];
-  const existing = (await pool.query('SELECT * FROM orders WHERE submitted_by=$1 AND request_submit_id=$2', [data.submitted_by, data.request_submit_id])).rows[0];
+  const existing = (await connection.query('SELECT * FROM orders WHERE submitted_by=$1 AND request_submit_id=$2', [data.submitted_by, data.request_submit_id])).rows[0];
   if (!existing) throw new Error('Не удалось сохранить заявку.');
   if (existing.request_signature !== data.request_signature) throw new Error('Эта заявка уже сохранена с другими данными. Откройте новую форму для новой заявки.');
   return existing;
+}
+
+async function createOrderWithMaterials(data, prepared) {
+  const materials = require('../web/order-materials');
+  // Schema setup uses its own connection. Finish it before leasing the single
+  // transaction client so this also works when the pool has max: 1.
+  await materials.ensureOrderMaterials();
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const order = await createOrder(data, client);
+    await materials.saveOrderMaterialsInTransaction(client, order.id, prepared);
+    await client.query('COMMIT');
+    return order;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally { client.release(); }
 }
 
 async function getOrders({ status, search, limit = 50, offset = 0 } = {}) {
@@ -190,7 +209,7 @@ async function getOrdersByObject(address, objectName) {
   return rows;
 }
 module.exports = { 
-  createOrder, getOrders, getOrderById, updateOrderPacket, updateOrderStatus,
+  createOrder, createOrderWithMaterials, getOrders, getOrderById, updateOrderPacket, updateOrderStatus,
   setTelegramMsgId, addLog, getOrderLogs, getStats,
   getStatsByMonth, getStatsByType, searchObjects, getOrdersByObject
 };
