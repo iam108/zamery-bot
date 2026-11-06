@@ -57,6 +57,16 @@ test('ready large-link notices and free cached copies read current accounting wi
   text='Заказано выписок: 2. По учтённым пополнениям: осталось 1 выписка.';await h.service.copy(record,{chat:4444});assert.ok(h.sends.at(-1).text.includes(text));assert.equal(h.state.saveCount,1);assert.doesNotMatch(JSON.stringify(h.records),/Заказано|осталось/);
 });
 
+test('large-link accounting callback receives each actual destination and may omit only the measurements chat counter',async()=>{
+  const working=-100456,seen=[],counter='Заказано выписок: 1. Расчётно осталось: 6.';
+  const h=fixture({budgetText:async chat=>{seen.push(chat);return String(chat)===String(working)?'':counter;}});h.order.deliver=[{chat:working,reply:88}];
+  const record=await h.service.deliver(h.order,h.file,KEY,h.records);
+  assert.deepEqual(seen,[-1001,working,3003]);assert.doesNotMatch(h.sends.find(call=>call.chat===working).text,/Заказано выписок|Расчётно осталось/);
+  assert.match(h.sends.find(call=>call.chat===-1001).text,/Заказано выписок/);assert.match(h.sends.find(call=>call.chat===3003).text,/Расчётно осталось/);
+  await h.service.copy(record,{chat:working,reply:99});assert.equal(seen.at(-1),working);assert.doesNotMatch(h.sends.at(-1).text,/Заказано выписок|Расчётно осталось/);
+  assert.equal(h.state.saveCount,1);assert.doesNotMatch(JSON.stringify(h.records),/Заказано выписок|Расчётно осталось/);
+});
+
 test('an unavailable accounting snapshot does not prevent the original large-link delivery or its receipt',async()=>{
   const h=fixture({budgetText:async()=>{throw new Error('Synthetic counter read failure');}});await h.service.deliver(h.order,h.file,KEY,h.records);
   assert.equal(h.records[0].deliveries.length,3);assert.ok(h.sends.every(call=>call.text.includes('Учёт заказов временно недоступен')));

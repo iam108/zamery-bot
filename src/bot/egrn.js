@@ -23,7 +23,9 @@ async function readBudgetText() {
   try { return budget().describe(await budget().snapshot()); }
   catch (_) { return 'Учёт заказов временно недоступен; остаток не сверён.'; }
 }
-async function messageBudgetText() { return 'Учёт на момент сообщения: ' + await readBudgetText(); }
+function isMeasurementsChat(chat) { return !!process.env.GROUP_CHAT_ID && String(chat) === String(process.env.GROUP_CHAT_ID); }
+function budgetSuffix(chat, text) { return !isMeasurementsChat(chat) && text ? '\n' + text : ''; }
+async function messageBudgetText(chat) { return isMeasurementsChat(chat) ? '' : 'Учёт на момент сообщения: ' + await readBudgetText(); }
 async function budgetText(order) {
   try {
     if (order?.id_statement) await budget().accept(order.id, order.id_statement);
@@ -37,7 +39,7 @@ function budgetCaption(text, accounting) {
 }
 async function budgetResult(result, order) {
   const text = await budgetText(order);
-  return { ...result, ...(result.packet_warning ? { packet_warning: result.packet_warning + '\n' + text } : {}), budget_text: text };
+  return { ...result, budget_text: text };
 }
 
 function checkDocumentSize(buf) {
@@ -134,7 +136,7 @@ async function sendNativePrimary(order, file, key, extra) {
   // Read only the current counter after the protocol preflight, then retain
   // its final recipient and lease checks immediately before the transport.
   const message = await telegramDelivery().send(order, { kind: 'native-primary', key, target }, async recheck => {
-    configured.caption=budgetCaption(configured.caption,await messageBudgetText());
+    configured.caption=budgetCaption(configured.caption,await messageBudgetText(target.chat));
     if(recheck)await recheck();
     return tgApi.sendDocument(target.chat,{source:file.buf,filename:file.name},configured);
   });
@@ -153,7 +155,7 @@ async function deliverNativeRecord(order, record, records) {
   }
   let blocked;
   for (const target of nativeDeliveryTargets(order, record)) try { await copyFiles([record], [target], { strict: true, confirmed,
-    budgetText: order.budget_text,
+    budgetText: true,
     deliveryOrder: order,
     onSourceRepaired: () => persistFileRecords(order, records),
     async onCopied(key, message) {
@@ -612,7 +614,7 @@ function cardText(o, extra) {
   return icon + ' <b>Выписка ЕГРН ' + t.short + '</b>\n' +
     '<code>' + esc(o.cad_num) + '</code>' + (o.label ? ' — ' + esc(o.label) : '') + '\n' +
     'Статус: ' + esc(o.status_text || 'заказана') + (o.id_statement ? ' · заявка №' + o.id_statement : '') + '\n' +
-    'Заказал(а): ' + esc(o.ordered_name || '') + (o.budget_text ? '\n' + esc(o.budget_text) : '') + (extra ? '\n' + extra : '');
+    'Заказал(а): ' + esc(o.ordered_name || '') + budgetSuffix(o.chat_id, esc(o.budget_text || '')) + (extra ? '\n' + extra : '');
 }
 
 function setupEgrn(bot) {
@@ -706,15 +708,15 @@ function setupEgrn(bot) {
         requestKey: ctx.match[3] ? 'telegram:' + p.id : null,
         targets: [{ chat: cbChat }], note: 'Заказ из Telegram' });
       if (result.result === 'attached') {
-        return ctx.reply('Готовая выписка отправлена выше. Новую выписку заказывать не потребовалось.\n' + result.budget_text, {
+        return ctx.reply('Готовая выписка отправлена выше. Новую выписку заказывать не потребовалось.' + budgetSuffix(cbChat, result.budget_text), {
           reply_markup: { inline_keyboard: [[{ text: 'Заказать новую выписку ещё раз', callback_data: 'eg:' + p.id + ':' + ctx.match[2] + ':force' }]] },
         });
       }
-      if (result.result === 'uncertain') return ctx.reply(result.packet_warning);
-      if (result.result === 'waiting') return ctx.reply('Выписка по ' + p.cad_num + ' уже в работе. Пришлю её после готовности.\n' + result.budget_text);
+      if (result.result === 'uncertain') return ctx.reply(result.packet_warning + budgetSuffix(cbChat, result.budget_text));
+      if (result.result === 'waiting') return ctx.reply('Выписка по ' + p.cad_num + ' уже в работе. Пришлю её после готовности.' + budgetSuffix(cbChat, result.budget_text));
       if (result.result === 'unavailable') return ctx.reply('Выписка уже заказана, но её доставка остановлена. Передайте администратору номер ' + result.id + ' для повтора доставки.');
       if (result.result !== 'ordered') return ctx.reply('Не удалось подтвердить заказ выписки. Повторный платный заказ не создавался.');
-      await ctx.reply('⏳ Выписка по ' + p.cad_num + ' заказана (№' + result.id + '). Пришлю, когда будет готова.\n' + result.budget_text);
+      await ctx.reply('⏳ Выписка по ' + p.cad_num + ' заказана (№' + result.id + '). Пришлю, когда будет готова.' + budgetSuffix(cbChat, result.budget_text));
       await closeRow(ctx, p.id, '✅ Заказано · ' + nameOf(ctx.from));
     } catch (e) {
       console.error('egrn order:', e.message);
@@ -900,7 +902,7 @@ function setupEgrn(bot) {
         if (st.done && !/выполн/i.test(st.text)) st.text = 'готова';
         Object.assign(o, { status: newStatus, status_text: st.text, polls: o.polls + 1 });
         if (changed && o.status_msg_id) {
-          try { o.budget_text=await messageBudgetText();await telegramDelivery().authorize(o,{chat:o.chat_id});await bot.telegram.editMessageText(o.chat_id, Number(o.status_msg_id), undefined, cardText(o), { parse_mode: 'HTML' }); } catch (e) {}
+          try { o.budget_text=await messageBudgetText(o.chat_id);await telegramDelivery().authorize(o,{chat:o.chat_id});await bot.telegram.editMessageText(o.chat_id, Number(o.status_msg_id), undefined, cardText(o), { parse_mode: 'HTML' }); } catch (e) {}
         }
         if (newStatus === 'failed') {
           await pool.query('UPDATE egrn_orders SET files_sent = -1 WHERE id=$1 AND processing_token=$2', [o.id, o.processing_token]);
@@ -1057,11 +1059,13 @@ async function checkCopyTarget(options, destination) {
 async function copyNativeOriginal(record, destination, options) {
   const copy = () => telegramDelivery().send(options.deliveryOrder, {kind:'native-copy',key:sourceKey(record),target:destination}, async recheck => {
     await checkCopyTarget(options, destination);
-    const accounting=options.budgetText ? await messageBudgetText() : '';
+    const accounting=options.budgetText ? await messageBudgetText(destination.chat) : '';
     await checkCopyTarget(options,destination);
     if(recheck)await recheck();
+    // Override the source caption in the measurements chat so a cached copy
+    // cannot inherit accounting text from the EGRN chat's original.
     return tgApi.callApi('copyMessage', Object.assign({ chat_id: destination.chat, from_chat_id: record.chat, message_id: record.id },
-      accounting ? { caption: budgetCaption('📄 ' + String(record.name || 'Выписка ЕГРН'), accounting) } : {},
+      options.budgetText || isMeasurementsChat(destination.chat) ? { caption: budgetCaption('📄 ' + String(record.name || 'Выписка ЕГРН'), accounting) } : {},
       destination.reply ? { reply_parameters: { message_id: Number(destination.reply), allow_sending_without_reply: true } } : {}));
   });
   try { return await copy(); }
@@ -1082,7 +1086,7 @@ async function copyNativeOriginal(record, destination, options) {
     if (sameChat && destination.reply) extra.reply_parameters = { message_id: Number(destination.reply), allow_sending_without_reply: true };
     const repaired = await telegramDelivery().send(options.deliveryOrder,{kind:'native-repair',key,target:{chat:repairChat,...(sameChat&&destination.case_id!=null?{case_id:destination.case_id}:{})}},async recheck=>{
       await checkCopyTarget(options,destination);
-      extra.caption=budgetCaption('📄 '+String(record.name||'Выписка ЕГРН').slice(0,220),options.budgetText?await messageBudgetText():'');
+      extra.caption=budgetCaption('📄 '+String(record.name||'Выписка ЕГРН').slice(0,220),options.budgetText?await messageBudgetText(repairChat):'');
       await checkCopyTarget(options,destination);
       if(recheck)await recheck();
       return tgApi.sendDocument(repairChat,record.file_id,extra);
@@ -1160,7 +1164,7 @@ async function deliverCachedCopy(order, targets, copyOptions = {}) {
   }
   for (const target of targets) for (const record of records) {
     await renewDelivery(order);
-    await copyFiles([record], [target], { ...copyOptions, deliveryOrder:order, budgetText: order.budget_text, strict: true, confirmed,
+    await copyFiles([record], [target], { ...copyOptions, deliveryOrder:order, budgetText: true, strict: true, confirmed,
       onSourceRepaired: () => persistFileRecords(order, records),
       async onCopied(key, message) {
         if (message?.message_id) {
@@ -1201,7 +1205,7 @@ async function attachOrOrder(opts) {
       order.budget_text = await budgetText(order);
       if (tgApi && order.chat_id) {
         try {
-          order.budget_text=await messageBudgetText();
+          order.budget_text=await messageBudgetText(order.chat_id);
           await telegramDelivery().authorize(order,{chat:order.chat_id});
           const message = await tgApi.sendMessage(order.chat_id, cardText(order, opts.note ? esc(opts.note) : ''), { parse_mode: 'HTML' });
           await pool.query('UPDATE egrn_orders SET status_msg_id=$1 WHERE id=$2', [message.message_id, order.id]);

@@ -144,7 +144,7 @@ function createLargeDelivery(options = {}) {
     const dispatch = async recheck => {
       await checkRecipient();
       let accounting = '';
-      try { accounting = options.budgetText ? await options.budgetText() : ''; }
+      try { accounting = options.budgetText ? await options.budgetText(destination.chat) : ''; }
       catch (_) { accounting = 'Учёт заказов временно недоступен; остаток не сверён.'; }
       await checkRecipient();
       if(typeof recheck==='function')await recheck();

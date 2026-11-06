@@ -33,7 +33,7 @@ async function fixture(options = {}) {
   const actions = [], commands = [];
   const sandbox = {
     module: { exports: {} }, Buffer, AbortSignal, URL, Date: Clock,
-    process: { env: { EGRN_TOKEN: 'synthetic', EGRN_DECLARANT_ID: '1', EGRN_CHAT_ID: '-100123', ADMIN_TG_IDS: options.adminIDs || '111' } },
+    process: { env: { EGRN_TOKEN: 'synthetic', EGRN_DECLARANT_ID: '1', EGRN_CHAT_ID: '-100123', ADMIN_TG_IDS: options.adminIDs || '111', ...(options.groupChatId?{GROUP_CHAT_ID:options.groupChatId}:{}) } },
     console: { log() {}, error() {} }, setTimeout(fn) { poll = fn; }, setInterval() {},
     require(name) {
       if (name === '../db/pool') return pool;
@@ -52,7 +52,7 @@ async function fixture(options = {}) {
     },
   };
   vm.createContext(sandbox);
-  vm.runInContext(source + '\nmodule.exports.qa={ensureTables,reserveOrder,setStatus(fn){apiStatus=fn;},setDownload(fn){download=fn;}};', sandbox, { filename });
+  vm.runInContext(source + '\nmodule.exports.qa={ensureTables,reserveOrder,copyFiles,setStatus(fn){apiStatus=fn;},setDownload(fn){download=fn;}};', sandbox, { filename });
   const api = sandbox.module.exports;
   const telegram = {
     async sendMessage(chat, text) { calls.messages.push({ chat, text }); return { message_id: 100 + calls.messages.length }; },
@@ -82,6 +82,64 @@ async function fixture(options = {}) {
 }
 
 function retryContext(id, message_id, replies=[],actor=111) { return {from:{id:actor},chat:{type:'private',id:actor},message:{text:'/egrn_retry '+id,message_id},async reply(text){replies.push(text);}}; }
+
+const measurementsChat='-100456';
+const accountingPattern=/Заказано выписок|Расчётно осталось|По учтённым пополнениям|Учёт на момент|Остаток не сверён/i;
+test('new EGRN delivery retains accounting in the EGRN chat and private receipts but strips it from the measurements destination',pg,async()=>{
+  const h=await fixture({groupChatId:measurementsChat});try{
+    await h.budget.syncBalance('1000',{sourceKey:'synthetic-opening'});await h.attach(111,{targets:[{chat:Number(measurementsChat),reply:88}]});await h.poll();
+    assert.match(h.calls.messages.find(value=>String(value.chat)==='-100123').text,accountingPattern);
+    assert.match(h.calls.documents.find(value=>String(value.chat)==='-100123').extra.caption,accountingPattern);
+    assert.match(h.calls.copies.find(value=>String(value.chat_id)==='111').caption,accountingPattern);
+    const working=h.calls.copies.find(value=>String(value.chat_id)===measurementsChat);assert.ok(working);assert.equal(Object.hasOwn(working,'caption'),true);assert.doesNotMatch(working.caption,accountingPattern);
+    assert.match(h.calls.edits.find(value=>String(value.chat)==='-100123').text,accountingPattern);
+    const budget=await h.budget.snapshot();assert.equal(budget.confirmedOrders,1);assert.equal(budget.balanceKopecks,87100);assert.equal(h.calls.paid,1);
+  }finally{await h.close();}
+});
+
+test('cached copies into the measurements chat explicitly replace inherited source captions even without requested accounting',pg,async()=>{
+  const h=await fixture({groupChatId:measurementsChat});try{
+    await h.budget.syncBalance('1000',{sourceKey:'synthetic-opening'});await h.attach();await h.poll();
+    const result=await h.attach(111,{targets:[{chat:measurementsChat,reply:88}]});assert.equal(result.result,'attached');
+    const first=h.calls.copies.at(-1);assert.equal(String(first.chat_id),measurementsChat);assert.equal(Object.hasOwn(first,'caption'),true);assert.doesNotMatch(first.caption,accountingPattern);
+    const order=(await h.pool.query('SELECT * FROM egrn_orders ORDER BY id LIMIT 1')).rows[0];
+    await h.api.qa.copyFiles(order.file_msgs,[{chat:measurementsChat,reply:99}],{strict:true});
+    const plain=h.calls.copies.at(-1);assert.equal(Object.hasOwn(plain,'caption'),true,'Omitting caption would inherit the EGRN source counter in Telegram');assert.doesNotMatch(plain.caption,accountingPattern);
+    assert.equal(h.calls.paid,1);assert.equal((await h.budget.snapshot()).balanceKopecks,87100);
+  }finally{await h.close();}
+});
+
+test('deleted-source repair into the measurements chat uses the retained original without inheriting accounting or making another paid request',pg,async()=>{
+  let missing=true;const h=await fixture({groupChatId:measurementsChat,copy(value){if(missing&&String(value.chat_id)===measurementsChat){missing=false;throw{response:{error_code:400,description:'Bad Request: message to copy not found'}};}}});try{
+    await h.budget.syncBalance('1000',{sourceKey:'synthetic-opening'});await h.attach();await h.poll();
+    assert.equal((await h.attach(111,{targets:[{chat:measurementsChat}]})).result,'attached');
+    const repaired=h.calls.documents.at(-1);assert.equal(String(repaired.chat),measurementsChat);assert.equal(typeof repaired.file,'string');assert.doesNotMatch(repaired.extra.caption,accountingPattern);
+    assert.doesNotMatch(h.calls.copies.at(-1).caption,accountingPattern);assert.equal(h.calls.paid,1);assert.equal((await h.budget.snapshot()).confirmedOrders,1);assert.equal((await h.budget.snapshot()).balanceKopecks,87100);
+  }finally{await h.close();}
+});
+
+test('an older order whose primary card and original target are the measurements chat omits accounting on its refreshed card and original',pg,async()=>{
+  const h=await fixture({groupChatId:measurementsChat});try{
+    await h.budget.syncBalance('1000',{sourceKey:'synthetic-opening'});await h.attach();
+    await h.pool.query('UPDATE egrn_orders SET chat_id=$1',[measurementsChat]);await h.poll();
+    const refreshed=h.calls.edits.find(value=>String(value.chat)===measurementsChat);assert.ok(refreshed);assert.doesNotMatch(refreshed.text,accountingPattern);
+    const original=h.calls.documents.find(value=>String(value.chat)===measurementsChat);assert.ok(original);assert.doesNotMatch(original.extra.caption,accountingPattern);
+    assert.match(h.calls.copies.find(value=>String(value.chat_id)==='111').caption,accountingPattern);assert.equal(h.calls.paid,1);assert.equal((await h.budget.snapshot()).balanceKopecks,87100);
+  }finally{await h.close();}
+});
+
+test('uncertain Telegram order replies filter the counter by destination without hiding the provider warning or changing the reserved charge',pg,async()=>{
+  const h=await fixture({groupChatId:measurementsChat,orderApi(){throw new Error('Synthetic provider ACK lost');}});try{
+    await h.budget.syncBalance('1000',{sourceKey:'synthetic-opening'});await assert.rejects(h.attach());
+    const pending=(await h.pool.query('INSERT INTO egrn_pending(cad_num,label) VALUES($1,$2) RETURNING id',[CAD,'Synthetic order'])).rows[0];
+    const action=h.actions.find(value=>String(value.pattern).includes('eg:')).handler;
+    for(const chat of [Number(measurementsChat),'-100123',111]){
+      const replies=[];await action({from:{id:111,first_name:'Synthetic manager'},chat:{id:chat},callbackQuery:{message:{chat:{id:chat}}},match:['eg:'+pending.id+':kv',String(pending.id),'kv'],answerCbQuery:async()=>{},reply:async text=>replies.push(text)});
+      assert.equal(replies.length,1);assert.match(replies[0],/требует проверки у поставщика/);if(String(chat)===measurementsChat)assert.doesNotMatch(replies[0],accountingPattern);else assert.match(replies[0],accountingPattern);
+    }
+    const budget=await h.budget.snapshot();assert.equal(h.calls.paid,1);assert.equal(budget.confirmedOrders,0);assert.equal(budget.pendingOrders,1);assert.equal(budget.balanceKopecks,100000);assert.equal(budget.reservedKopecks,12900);
+  }finally{await h.close();}
+});
 
 for(const busyStage of ['native-send','provider-status'])test('runtime busy retry consumes its actor cursor during '+busyStage+' and cannot reopen a later unknown attempt',pg,async()=>{
   const entered=gate(),release=gate();let first=true;

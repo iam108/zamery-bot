@@ -147,7 +147,7 @@ function createManagerHandlers(options = {}) {
             if (['unavailable', 'failed'].includes(egrn.result)) warnings.push('Доставка выписки ЕГРН остановлена. Требуется проверить заказ; повторный платный заказ не создавался.');
             if (['uncertain', 'unknown'].includes(egrn.result) && !egrn.packet_warning) warnings.push('Результат заказа ЕГРН не подтверждён. Требуется проверка у поставщика; повторный платный заказ не создавался.');
             const notes = { unavailable: '⚠️ Доставка ранее заказанной выписки остановлена. Повторный заказ не создан.', attached: '📄 Выписка ЕГРН приложена к заявке', ordered: '⏳ Выписка ЕГРН заказана — придёт ответом на заявку', waiting: '⏳ Выписка ЕГРН уже в работе — придёт ответом на заявку' };
-            if (notes[egrn.result]) await telegram.sendMessage(process.env.GROUP_CHAT_ID, notes[egrn.result] + ' (' + egrn.cad + ')' + (egrn.budget_text ? '\n' + egrn.budget_text : ''), { reply_to_message_id: order.telegram_msg_id, disable_notification: true });
+            if (notes[egrn.result]) await telegram.sendMessage(process.env.GROUP_CHAT_ID, notes[egrn.result] + ' (' + egrn.cad + ')', { reply_to_message_id: order.telegram_msg_id, disable_notification: true });
           } catch (e) { console.error('egrn for order:', e.message); warnings.push('Не удалось проверить доставку выписки ЕГРН.'); }
         }
       }

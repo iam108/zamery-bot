@@ -110,6 +110,23 @@ for (const result of ['none', 'unavailable', 'failed', 'unknown', 'uncertain']) 
   assert.match(res.body.warning, /сохранены/);
 });
 
+for (const result of ['attached', 'ordered', 'waiting', 'unavailable']) test('the measurements chat receives the EGRN status without the shared balance: ' + result, async () => {
+  const previousGroup = process.env.GROUP_CHAT_ID;
+  process.env.GROUP_CHAT_ID = '-100456';
+  try {
+    const notices = [], cad = '77:01:0000001:12';
+    const f = fixture({ attachOrOrder: async () => ({ result, cad, budget_text: 'Заказано выписок: 43. Расчётно осталось: 34 (доступно 4453,00 ₽).' }) });
+    f.telegram.sendMessage = async (chat, text) => { notices.push({ chat, text }); return { message_id: 901 }; };
+    const req = f.request(); req.body.service = 'Получение'; req.body.cad_num = cad; req.body.egrn_order = '1';
+    const res = f.response(); await f.handlers.save(req, res);
+    assert.equal(res.body.ok, true); assert.equal(notices.length, 1);
+    assert.equal(notices[0].chat, '-100456'); assert.ok(notices[0].text.includes(cad));
+    assert.doesNotMatch(notices[0].text, /Заказано выписок|Расчётно осталось|4453|Учёт/);
+  } finally {
+    if (previousGroup === undefined) delete process.env.GROUP_CHAT_ID; else process.env.GROUP_CHAT_ID = previousGroup;
+  }
+});
+
 for (const edit of [false, true]) test('EGRN delivery failure remains retryable after the card and cadastral number are saved, edit=' + edit, async () => {
   let order = { id: 58, packet_revision: 1, submitted_by: 108, submitted_name: 'Автор', status: 'new', telegram_msg_id: edit ? 900 : null, cad_num: '', created_at: new Date() };
   let attempts = 0, creates = 0, cards = 0;
