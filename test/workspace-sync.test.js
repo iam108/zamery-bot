@@ -90,7 +90,9 @@ async function database(run) {
         (21, 2, '2026-11-06', 'Чужая задача', false),
         (31, 3, '2026-11-06', 'Архивная задача', false);
     `);
+    let beforeQuery;
     const pool = { async query(sql, args) {
+      if(beforeQuery)await beforeQuery(sql,args);
       const result = await db.query(sql, args);
       return { rows: result.rows, rowCount: result.rows.length || result.affectedRows };
     } };
@@ -100,7 +102,7 @@ async function database(run) {
       assert.equal(await approvePairing(pool, id, pairing(credential)), true);
       return credential;
     }
-    await run({ db, pool, request, connect });
+    await run({ db, pool, request, connect,interleave(fn){beforeQuery=fn;} });
   } finally {
     await db.close();
   }
@@ -122,6 +124,23 @@ test('only approved roles can pair, and logout, expiry or revocation stop access
   const revokedStaff = await connect(101);
   await db.exec('UPDATE staff SET approved=false WHERE tg_id=101');
   assert.equal((await request('GET', 'snapshot', revokedStaff)).status, 401);
+}));
+
+for(const operation of ['snapshot','note','reminder'])for(const change of ['approval','role','logout','expiry'])test('workspace '+operation+' rejects '+change+' changed after initial authentication but before its final query',pg,async()=>database(async h=>{
+  const credential=await h.connect(101);let changed=false;
+  h.interleave(async sql=>{
+    const target=operation==='snapshot'?sql.includes('SELECT c.id, c.org'):operation==='note'?sql.includes('WITH target AS MATERIALIZED'):sql.includes('UPDATE case_reminders r SET done');
+    if(!changed&&target){changed=true;await h.db.exec(change==='approval'?'UPDATE staff SET approved=false WHERE tg_id=101':change==='role'?"UPDATE staff SET role='manager' WHERE tg_id=101":change==='logout'?'UPDATE workspace_sessions SET revoked_at=NOW()':"UPDATE workspace_sessions SET expires_at=NOW()-INTERVAL '1 minute'");}
+  });
+  const result=operation==='snapshot'?await h.request('GET','snapshot',credential):operation==='note'?await h.request('PATCH','cases/:id/note',credential,{note:'Must not save',expectedNote:'Исходная заметка'},{id:'1'}):await h.request('PATCH','reminders/:id',credential,{completed:true},{id:'11'});
+  assert.equal(changed,true);assert.equal(result.status,401);assert.equal(result.body.clients,undefined);
+  assert.equal((await h.db.query("SELECT data->>'_comment' AS note FROM cases WHERE id=1")).rows[0].note,'Исходная заметка');assert.equal((await h.db.query('SELECT done FROM case_reminders WHERE id=11')).rows[0].done,false);
+}));
+
+for(const operation of ['note','reminder'])test('workspace '+operation+' cannot write a case reassigned after authentication',pg,async()=>database(async h=>{
+  const credential=await h.connect(101);let changed=false;h.interleave(async sql=>{if(!changed&&(operation==='note'?sql.includes('WITH target AS MATERIALIZED'):sql.includes('UPDATE case_reminders r SET done'))){changed=true;await h.db.exec('UPDATE cases SET lawyer_tg_id=102 WHERE id=1');}});
+  const result=operation==='note'?await h.request('PATCH','cases/:id/note',credential,{note:'Must not save',expectedNote:'Исходная заметка'},{id:'1'}):await h.request('PATCH','reminders/:id',credential,{completed:true},{id:'11'});
+  assert.equal(result.status,404);assert.equal((await h.db.query("SELECT data->>'_comment' AS note FROM cases WHERE id=1")).rows[0].note,'Исходная заметка');assert.equal((await h.db.query('SELECT done FROM case_reminders WHERE id=11')).rows[0].done,false);
 }));
 
 test('lawyers see assigned active cases, managers see cases they handed off, and private fields stay out of JSON', pg, async () => database(async ({ request, connect }) => {

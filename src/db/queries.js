@@ -130,14 +130,14 @@ async function updateOrderPacketWithMaterials(id, data, prepared, intent) {
   } finally { client.release(); }
 }
 
-async function updateOrderStatus(id, status, actor = 'admin', expectedStatuses = null) {
+async function updateOrderStatus(id, status, actor = 'admin', expectedStatuses = null, requiredStaffId = null) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const { rows } = await client.query(
-      'UPDATE orders SET status = $1 WHERE id = $2' + (expectedStatuses ? ' AND status = ANY($3::text[])' : '') + ' RETURNING *',
-      expectedStatuses ? [status, id, expectedStatuses] : [status, id]
-    );
+    const params = expectedStatuses ? [status,id,expectedStatuses] : [status,id];
+    let permission = '';
+    if(requiredStaffId!=null){params.push(requiredStaffId);permission=' AND EXISTS (SELECT 1 FROM staff WHERE tg_id=$'+params.length+' AND approved IS TRUE)';}
+    const { rows } = await client.query('UPDATE orders SET status = $1 WHERE id = $2' + (expectedStatuses ? ' AND status = ANY($3::text[])' : '') + permission + ' RETURNING *',params);
     if (rows[0]) {
       await client.query('INSERT INTO logs (order_id,action,actor,details) VALUES($1,$2,$3,$4)',
         [id, 'status_change', actor, 'Статус изменён на: ' + status]);

@@ -553,8 +553,10 @@ function enablePacketEditing(enabled) {
 async function downloadExistingFile(file, button) {
   var label = button.textContent; button.disabled=true;button.textContent='Скачиваем…';
   try {
-    var response=await fetch(file.url); if(!response.ok) { var failure=await response.json(); throw new Error(failure.error || 'Не удалось скачать документ.'); }
-    var blob=await response.blob(), url=URL.createObjectURL(blob), link=document.createElement('a');
+    var blob=await managerFetch(file.url,undefined,async function(response){
+      if(!response.ok){var failure=await response.json();throw new Error(failure.error||'Не удалось скачать документ.');}
+      return response.blob();
+    },180000), url=URL.createObjectURL(blob), link=document.createElement('a');
     link.href=url;link.download=file.name;document.body.appendChild(link);link.click();link.remove();setTimeout(function(){URL.revokeObjectURL(url);},60000);
   } catch(e) { tg.showAlert(e.message); }
   finally {button.disabled=false;button.textContent=label;}

@@ -18,14 +18,15 @@ function text(value,limit=500) {
   return clean.length>limit?clean.slice(0,limit-1).replace(/[\uD800-\uDBFF]$/,'')+'…':clean;
 }
 function selection(row) {
-  const order=positive(row.order_id,2147483647);if(!order)return null;
+  const order=positive(row.order_id,2147483647);
   if(row.handoff_version===2) {
     const report=positive(row.report_id,2147483647);
-    return positive(row.selected_order_id,2147483647)===order&&report&&['a','r'].includes(row.report_src)?{order,report,src:row.report_src}:null;
+    const matches=order?positive(row.selected_order_id,2147483647)===order:row.order_id==null&&row.selected_order_id==null;
+    return matches&&report&&['a','r'].includes(row.report_src)?{order,report,src:row.report_src}:null;
   }
   // An unknown/corrupt saved selection must never be silently replaced with
   // a newer report. Only an old case with no selection uses the current audit.
-  if(row.has_selection)return null;
+  if(row.has_selection||!order)return null;
   const report=positive(row.latest_audit_id,2147483647);return report?{order,report,src:'a',legacy:true}:null;
 }
 function urls(baseValue,caseId,report) {
@@ -33,7 +34,7 @@ function urls(baseValue,caseId,report) {
   if(base.protocol!=='https:'||base.username||base.password)throw new Error('Invalid WebApp base');
   const make=(pathname,params)=>{const url=new URL(pathname,base);url.search=new URLSearchParams(params).toString();if(url.origin!==base.origin)throw new Error('Invalid WebApp origin');return url.href;};
   const buttons=[[{text:'📋 Чек-лист клиента',web_app:{url:make('/checklist',{case_id:String(caseId)})}}]];
-  if(report)buttons.push([{text:report.legacy?'Последний отчёт по заявке':'Отчёт и материалы',web_app:{url:make('/handoff',{view:'report',order_id:String(report.order),report_src:report.src,report_id:String(report.report)})}}]);
+  if(report)buttons.push([{text:report.legacy?'Последний отчёт по заявке':'Отчёт и материалы',web_app:{url:make('/handoff',{view:'report',...(report.order?{order_id:String(report.order)}:{case_id:String(caseId)}),report_src:report.src,report_id:String(report.report)})}}]);
   return {disable_web_page_preview:true,reply_markup:{inline_keyboard:buttons}};
 }
 function createCaseOpener(options={}) {

@@ -179,6 +179,9 @@ const SELECT_CASES = `
   ) reminders ON true
   WHERE (($2 = 'lawyer' AND c.lawyer_tg_id = $1) OR ($2 = 'manager' AND c.created_by = $1))
     AND COALESCE(c.data ->> '_stage', '') <> 'Архив'
+    AND EXISTS (SELECT 1 FROM workspace_sessions current_session JOIN staff current_staff ON current_staff.tg_id=current_session.staff_id
+      WHERE current_session.token_digest=$3 AND current_session.staff_id=$1 AND current_session.expires_at>NOW()
+        AND current_session.revoked_at IS NULL AND current_staff.approved IS TRUE AND current_staff.role=$2)
   ORDER BY c.created_at DESC NULLS LAST, c.id DESC
 `;
 
@@ -187,6 +190,9 @@ const UPDATE_NOTE = `
     SELECT id, COALESCE(data ->> '_comment', '') AS note
     FROM cases
     WHERE id = $1 AND lawyer_tg_id = $2 AND COALESCE(data ->> '_stage', '') <> 'Архив'
+      AND EXISTS (SELECT 1 FROM workspace_sessions current_session JOIN staff current_staff ON current_staff.tg_id=current_session.staff_id
+        WHERE current_session.token_digest=$5 AND current_session.staff_id=$2 AND current_session.expires_at>NOW()
+          AND current_session.revoked_at IS NULL AND current_staff.approved IS TRUE AND current_staff.role='lawyer')
     FOR UPDATE
   ), saved AS (
     UPDATE cases c
@@ -239,6 +245,13 @@ function setupWorkspace(app, options = {}) {
   function notFound(res) {
     return sendError(res, 404, 'not_found', 'Запись недоступна.');
   }
+  async function currentAccount(res, account, digest) {
+    const {rows:[fresh]}=await pool.query(SELECT_ACCOUNT,[digest]);
+    if (!fresh || fresh.id!==account.id || fresh.role!==account.role) {
+      sendError(res,401,'unauthorized','Доступ изменился. Обновите подключение в боте.');return false;
+    }
+    return true;
+  }
 
   app.use(namespace, (req, res, next) => {
     res.set('Cache-Control', 'no-store');
@@ -256,11 +269,12 @@ function setupWorkspace(app, options = {}) {
     }
     return res.json({ version: 1, botUsername: await botUsername });
   }));
-  app.get(namespace + '/snapshot', authenticated(async (req, res, account) => {
-    const { rows } = await pool.query(SELECT_CASES, [account.id, account.role]);
+  app.get(namespace + '/snapshot', authenticated(async (req, res, account, digest) => {
+    const { rows } = await pool.query(SELECT_CASES, [account.id, account.role,digest]);
+    if(!rows.length&&!await currentAccount(res,account,digest))return;
     return res.json(makeSnapshot(account, rows, now()));
   }));
-  app.patch(namespace + '/reminders/:id', authenticated(async (req, res, account) => {
+  app.patch(namespace + '/reminders/:id', authenticated(async (req, res, account,digest) => {
     if (account.role !== 'lawyer') return readOnly(res);
     const { id } = req.params;
     if (!positiveId(id) || typeof req.body?.completed !== 'boolean') {
@@ -271,11 +285,15 @@ function setupWorkspace(app, options = {}) {
       FROM cases c
       WHERE r.id = $1 AND r.case_id = c.id AND c.lawyer_tg_id = $2
         AND COALESCE(c.data ->> '_stage', '') <> 'Архив'
+        AND EXISTS (SELECT 1 FROM workspace_sessions current_session JOIN staff current_staff ON current_staff.tg_id=current_session.staff_id
+          WHERE current_session.token_digest=$4 AND current_session.staff_id=$2 AND current_session.expires_at>NOW()
+            AND current_session.revoked_at IS NULL AND current_staff.approved IS TRUE AND current_staff.role='lawyer')
       RETURNING r.id
-    `, [id, account.id, req.body.completed]);
+    `, [id, account.id, req.body.completed,digest]);
+    if(!result.rowCount&&!await currentAccount(res,account,digest))return;
     return result.rowCount ? res.json({ ok: true }) : notFound(res);
   }));
-  app.patch(namespace + '/cases/:id/note', authenticated(async (req, res, account) => {
+  app.patch(namespace + '/cases/:id/note', authenticated(async (req, res, account,digest) => {
     if (account.role !== 'lawyer') return readOnly(res);
     const { id } = req.params;
     const { note, expectedNote } = req.body || {};
@@ -283,8 +301,8 @@ function setupWorkspace(app, options = {}) {
         note.length > MAX_NOTE_LENGTH || note.includes('\u0000') || expectedNote.includes('\u0000')) {
       return sendError(res, 400, 'invalid_note', 'Некорректная заметка. Допустимо до 16 000 символов.');
     }
-    const { rows: [result] } = await pool.query(UPDATE_NOTE, [id, account.id, note, expectedNote]);
-    if (!result) return notFound(res);
+    const { rows: [result] } = await pool.query(UPDATE_NOTE, [id, account.id, note, expectedNote,digest]);
+    if (!result) {if(!await currentAccount(res,account,digest))return;return notFound(res);}
     return result.ok ? res.json({ ok: true }) :
       sendError(res, 409, 'note_conflict', 'Заметка изменилась в боте. Обновите данные перед сохранением.');
   }));

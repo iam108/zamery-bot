@@ -1,5 +1,5 @@
 const multer = require('multer');
-const { createHash } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 
 function submissionSignature(data, files) {
   const packet = {};
@@ -45,6 +45,39 @@ function createManagerHandlers(options = {}) {
   const delivery = options.telegramDelivery || require('./order-telegram-delivery').createOrderTelegramDelivery({ pool, telegram: getTelegram, groupId: options.groupId, ready: materials.ensureOrderMaterials });
   const recent = new Map();
 
+  async function publishEgrnNotice(order, egrn, telegram, text) {
+    const chat = String((typeof options.groupId === 'function' ? options.groupId() : options.groupId) ?? process.env.GROUP_CHAT_ID);
+    const category = ['ordered', 'waiting'].includes(egrn.result) ? 'pending' : egrn.result;
+    const key = createHash('sha256').update(JSON.stringify([chat, String(order.telegram_msg_id), egrn.cad, category])).digest('hex');
+    const unknown = 'Отправка служебного сообщения о ЕГРН не подтверждена. Проверьте рабочий чат; автоматический повтор этого сообщения остановлен.';
+    const row = (await pool.query("SELECT telegram_delivery->'egrn_notices'->$2 AS notice FROM orders WHERE id=$1", [order.id, key])).rows[0];
+    if (!row) throw new Error('Заявка больше недоступна.');
+    if (row.notice?.state === 'confirmed') return;
+    if (row.notice && row.notice.state !== 'rejected') return unknown;
+    const token = randomUUID(), intent = { state: 'sending', token, chat, started_at: new Date().toISOString() };
+    const claimed = await pool.query(`UPDATE orders SET telegram_delivery=COALESCE(telegram_delivery,'{}'::jsonb)||jsonb_build_object('egrn_notices',
+      COALESCE(telegram_delivery->'egrn_notices','{}'::jsonb)||jsonb_build_object($2::text,$3::jsonb))
+      WHERE id=$1 AND COALESCE(telegram_delivery->'egrn_notices'->$2->>'state','') IN ('','rejected') RETURNING id`, [order.id, key, JSON.stringify(intent)]);
+    if (!claimed.rows.length) return unknown;
+    const checkpoint = async slot => {
+      const saved = await pool.query(`UPDATE orders SET telegram_delivery=jsonb_set(telegram_delivery,ARRAY['egrn_notices',$2],$3::jsonb)
+        WHERE id=$1 AND telegram_delivery->'egrn_notices'->$2->>'token'=$4 RETURNING id`, [order.id, key, JSON.stringify(slot), token]);
+      if (!saved.rows.length) throw new Error('Не удалось подтвердить служебное сообщение.');
+    };
+    let sent;
+    try {
+      sent = await telegram.sendMessage(chat, text, { reply_to_message_id: order.telegram_msg_id, disable_notification: true });
+      const receipt = require('./order-telegram-delivery').messageId(sent?.message_id);
+      const matchingChat = sent?.chat == null || (chat.startsWith('@') ? String(sent.chat.username || '').toLowerCase() === chat.slice(1).toLowerCase() : String(sent.chat.id) === chat);
+      if (!receipt || String(receipt) === String(order.telegram_msg_id) || !matchingChat) throw new Error('Telegram не подтвердил служебное сообщение.');
+    } catch (error) {
+      const code = error?.response?.error_code, rejected = Number.isSafeInteger(code) && code >= 400 && code < 500;
+      try { await checkpoint({ ...intent, state: rejected ? 'rejected' : 'unknown' }); } catch (_) { return unknown; }
+      return rejected ? 'Telegram отклонил служебное сообщение о ЕГРН. Повторите проверку доставки позднее.' : unknown;
+    }
+    try { await checkpoint({ ...intent, state: 'confirmed', message_id: Number(sent.message_id) }); } catch (_) { return unknown; }
+  }
+
   async function read(req, res) {
     try {
       await materials.ensureOrderMaterials();
@@ -60,7 +93,9 @@ function createManagerHandlers(options = {}) {
     let order, key, signature, ownsRecent = false, savedRevision, replayed = false;
     const edit = req.params.id != null;
     const finish = (body, status = 200) => {
-      if (key && ownsRecent) { if (!edit && body.ok && !body.warning) recent.set(key, { signature, body }); else recent.delete(key); }
+      // Only coalesce active requests in memory. Completed retries must read
+      // their durable receipt and the current packet before resuming delivery.
+      if (key && ownsRecent) recent.delete(key);
       return res.status(status).json(body);
     };
     try {
@@ -147,7 +182,10 @@ function createManagerHandlers(options = {}) {
             if (['unavailable', 'failed'].includes(egrn.result)) warnings.push('Доставка выписки ЕГРН остановлена. Требуется проверить заказ; повторный платный заказ не создавался.');
             if (['uncertain', 'unknown'].includes(egrn.result) && !egrn.packet_warning) warnings.push('Результат заказа ЕГРН не подтверждён. Требуется проверка у поставщика; повторный платный заказ не создавался.');
             const notes = { unavailable: '⚠️ Доставка ранее заказанной выписки остановлена. Повторный заказ не создан.', attached: '📄 Выписка ЕГРН приложена к заявке', ordered: '⏳ Выписка ЕГРН заказана — придёт ответом на заявку', waiting: '⏳ Выписка ЕГРН уже в работе — придёт ответом на заявку' };
-            if (notes[egrn.result]) await telegram.sendMessage(process.env.GROUP_CHAT_ID, notes[egrn.result] + ' (' + egrn.cad + ')', { reply_to_message_id: order.telegram_msg_id, disable_notification: true });
+            if (notes[egrn.result]) {
+              const warning = await publishEgrnNotice(order, egrn, telegram, notes[egrn.result] + ' (' + egrn.cad + ')');
+              if (warning) warnings.push(warning);
+            }
           } catch (e) { console.error('egrn for order:', e.message); warnings.push('Не удалось проверить доставку выписки ЕГРН.'); }
         }
       }

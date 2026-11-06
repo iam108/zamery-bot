@@ -13,6 +13,7 @@ const CAD_RE = /\b\d{2}:\d{2}:\d{6,7}:\d{1,9}\b/g;
 const MAX_POLL_HOURS = 72;
 const MAX_DOCUMENT_BYTES = 50 * 1024 * 1024;
 const MAX_RECEIVED_BYTES = 2 * 1024 * 1024 * 1024 - 1;
+const MAX_DOCUMENT_FILES = 32; // Same bounded packet size as egrn-source MAX_FILES.
 const MAX_FAILURES = 5;
 const REQUEST_TIMEOUT_MS = 20 * 60 * 1000;
 let budgetService;
@@ -837,7 +838,7 @@ function setupEgrn(bot) {
 
   // ── Опрос статусов
   async function notifyStopped(o, tooLarge) {
-    const text = o.delivery_unknown ? '⚠️ Результат отправки оригинала не подтверждён. Проверьте сообщения в чате. После проверки администратор может разрешить повтор: /egrn_retry ' + o.id_statement + '. Новый платный заказ не создавался.' : o.recipient_unavailable ? '⚠️ Доставка выписки ожидает проверки доступа получателя или назначения юриста. Подтверждённые файлы сохранены; новый платный заказ не создавался.' : o.identity_unconfirmed ? '⚠️ Не удалось подтвердить оригиналы в старом частичном комплекте. Проверьте ранее доставленные файлы вручную; автоматическая пересылка остановлена и новый платный заказ не создан.' : o.status === 'done'
+    const text = o.file_limit_exceeded ? '⚠️ Поставщик передал больше 32 файлов или ссылок на оригиналы. Полный комплект не подтверждён; новые файлы не отправлены. Проверьте комплект у поставщика. Новый платный заказ не создавался.' : o.delivery_unknown ? '⚠️ Результат отправки оригинала не подтверждён. Проверьте сообщения в чате. После проверки администратор может разрешить повтор: /egrn_retry ' + o.id_statement + '. Новый платный заказ не создавался.' : o.recipient_unavailable ? '⚠️ Доставка выписки ожидает проверки доступа получателя или назначения юриста. Подтверждённые файлы сохранены; новый платный заказ не создавался.' : o.identity_unconfirmed ? '⚠️ Не удалось подтвердить оригиналы в старом частичном комплекте. Проверьте ранее доставленные файлы вручную; автоматическая пересылка остановлена и новый платный заказ не создан.' : o.status === 'done'
       ? '⚠️ Выписка готова, но ' + (tooLarge ? 'не удалось подготовить файл для скачивания.' : 'не все файлы удалось доставить после нескольких попыток.')
       : '⚠️ Не удалось проверить готовность выписки после нескольких попыток.';
     const fallback = '\nСкачайте выписку или проверьте заявку №' + o.id_statement + ' в личном кабинете: https://armrus.org';
@@ -915,7 +916,11 @@ function setupEgrn(bot) {
         }
 
         const embedded = source ? await source.documents(o.cad_num) : extractDocs(item, o.cad_num);
-        const urls = embedded.length ? [] : findFileUrls(item);
+        const urls = findFileUrls(item);
+        // A response may mix embedded originals with separately downloadable
+        // graphics. Validate the whole candidate list before any new send;
+        // a bounded incomplete packet must never become a successful prefix.
+        if (new Set(embedded.map(originalHash)).size + urls.length > MAX_DOCUMENT_FILES) throw Object.assign(new Error('Поставщик передал больше 32 файлов или ссылок на оригиналы. Полный комплект не подтверждён.'), { code: 'EGRN_SOURCE_FILES' });
         if (!embedded.length && !urls.length) {
           await saveFailure(o, ['файлы не найдены в ответе API'], false, o.file_msgs || []);
           continue;
@@ -925,7 +930,8 @@ function setupEgrn(bot) {
         // inflight marker still requires explicit review if that write fails.
         o.file_msgs = fileMsgs;
         await verifyPartialRecords(o, fileMsgs);
-        const manifest = embedded.length ? [...new Set(embedded.map(file => matchingOriginal(file, fileMsgs).key))] : urls.slice(0, 6).map((_, index) => 'pending-url:' + index);
+        const embeddedKeys = [...new Set(embedded.map(file => matchingOriginal(file, fileMsgs).key))];
+        const manifest = embeddedKeys.concat(urls.map((_, index) => 'pending-url:' + index));
         await pool.query('UPDATE egrn_orders SET delivery_manifest=$1 WHERE id=$2 AND processing_token=$3', [JSON.stringify(manifest), o.id, o.processing_token]);
         o.delivery_manifest = manifest;
         const deliveryErrors = [];
@@ -966,12 +972,12 @@ function setupEgrn(bot) {
             fileError(e, d.name, documentBytes(d));
           }
         }
-        for (const [index, u] of urls.slice(0, 6).entries()) {
+        for (const [index, u] of urls.entries()) {
           let f;
           try {
             f = await download(u);
             const { existing, key, hash } = matchingOriginal(f, fileMsgs); f.sha256 = hash;
-            manifest[index] = key;
+            manifest[embeddedKeys.length + index] = key;
             await pool.query('UPDATE egrn_orders SET delivery_manifest=$1 WHERE id=$2 AND processing_token=$3', [JSON.stringify([...new Set(manifest)]), o.id, o.processing_token]);
             o.delivery_manifest = [...new Set(manifest)];
             if (existing) { if (existing.kind === 'link') await largeDelivery(o).retry(o, existing, fileMsgs); continue; }
@@ -1007,9 +1013,10 @@ function setupEgrn(bot) {
         console.error('egrn status', o.id_statement, e.message,
           JSON.stringify({ source_code: e.source_code, source_name: e.source_name, source_bytes: e.source_bytes }));
         if (e.code === 'EGRN_LEGACY_FILE_IDENTITY') o.identity_unconfirmed = true;
+        if (e.code === 'EGRN_SOURCE_FILES') o.file_limit_exceeded = true;
         if(e.uncertain===true)o.delivery_unknown=true;
         if(e.code==='EGRN_RECIPIENT_UNAVAILABLE'||e.failure_code==='EGRN_RECIPIENT_UNAVAILABLE')o.recipient_unavailable=true;
-        if (e.code !== 'EGRN_LEASE_LOST') await saveFailure(o, [String(e.message || 'ошибка проверки статуса')], e.uncertain===true||['EGRN_FILE_TOO_LARGE', 'EGRN_LEGACY_FILE_IDENTITY'].includes(e.code), o.file_msgs || []);
+        if (e.code !== 'EGRN_LEASE_LOST') await saveFailure(o, [String(e.message || 'ошибка проверки статуса')], e.uncertain===true||['EGRN_FILE_TOO_LARGE', 'EGRN_LEGACY_FILE_IDENTITY', 'EGRN_SOURCE_FILES'].includes(e.code), o.file_msgs || []);
       } finally {
         try { if (source) await source.cleanup(); } finally { await lease.close(); }
       }

@@ -55,6 +55,25 @@ test('unapproved or non-private actors cannot create receipts, download files or
   assert.equal((await h.db.query("SELECT COUNT(*) FROM information_schema.tables WHERE table_name='manual_order_attachments'")).rows[0].count,0);
 }));
 
+test('revocation during an original download prevents storage and group publication',pg,async()=>fixture(async h=>{
+  let release;h.downloadWait=new Promise(resolve=>{release=resolve;});const running=h.create().receive(h.context());while(!h.downloads.length)await new Promise(resolve=>setImmediate(resolve));h.approved=false;release();await running;
+  assert.equal(h.sends.length,0);assert.equal(h.saves.length,0);assert.equal((await h.row()).stage,'pending');assert.match(h.replies.at(-1).text,/в документы заявки он не добавлен/);
+}));
+test('revocation while a manual attachment waits for the order lock blocks download and publication',pg,async()=>{
+  const options={};await fixture(async h=>{options.withOrderDeliveryLock=async(id,run)=>{h.approved=false;return run();};await h.create().receive(h.context());assert.equal(h.downloads.length,0);assert.equal(h.saves.length,0);assert.equal(h.sends.length,0);assert.match(h.replies.at(-1).text,/Нет доступа/);},options);
+});
+for(const boundary of ['saved-original','durable-intent'])test('revocation after '+boundary+' keeps saved bytes and a known unsent retry',pg,async()=>fixture(async h=>{
+  if(boundary==='saved-original'){const save=h.materials.saveOrderMaterials;h.materials.saveOrderMaterials=async(...args)=>{const result=await save(...args);h.approved=false;return result;};}
+  else{const query=h.pool.query;h.pool.query=async(sql,args)=>{const result=await query(sql,args);if(sql.includes("SET stage='sending'"))h.approved=false;return result;};}
+  const handler=h.create();await handler.receive(h.context());assert.equal(h.sends.length,0);assert.equal((await h.row()).stage,'saved');assert.equal((await h.store.list(58)).length,1);assert.doesNotMatch(h.replies.at(-1).text,/могло дойти|не получено/);
+  h.approved=true;if(boundary==='durable-intent')h.pool.query=async(sql,args)=>!args&&sql.split(';').filter(s=>s.trim()).length>1?(await h.db.exec(sql),{rows:[]}):h.db.query(sql,args);
+  await h.create().retry(await h.callback('manual_retry:321'));assert.equal(h.sends.length,1);assert.equal(h.downloads.length,1);assert.equal((await h.store.list(58)).length,1);
+}));
+test('closing the source order during the durable intent stops publication and retains its saved original',pg,async()=>fixture(async h=>{
+  const query=h.pool.query;h.pool.query=async(sql,args)=>{const result=await query(sql,args);if(sql.includes("SET stage='sending'"))await h.db.exec("UPDATE orders SET status='done' WHERE id=58");return result;};
+  await h.create().receive(h.context());assert.equal(h.sends.length,0);assert.equal((await h.row()).stage,'saved');assert.equal((await h.store.list(58)).length,1);
+}));
+
 test('oversized originals remain in Telegram without false packet success or a download attempt',pg,async()=>fixture(async h=>{
   const ctx=h.context();ctx.message.document.file_size=13*1024*1024;await h.create().receive(ctx);
   assert.equal(h.downloads.length,0);assert.equal(h.saves.length,0);assert.equal(h.sends.length,0);assert.match(h.replies[0].text,/больше 12 МБ.*не добавлен/);assert.equal((await h.row()).material_id,null);

@@ -293,3 +293,27 @@ test('the assigned lawyer can download media from the exact unlinked historical 
     assert.equal((await fetch(origin + packet.report.media[0].url.split('?')[0])).status, 403);
   } finally { server.close(); await once(server, 'close'); }
 }));
+
+test('a no-order case authorizes only its assigned current staff and frozen report, including exact original-file URLs',pg,async()=>database(async h=>{
+  await h.db.exec("CREATE TABLE staff(tg_id BIGINT PRIMARY KEY,role TEXT,approved BOOLEAN);INSERT INTO staff VALUES(101,'lawyer',true),(102,'lawyer',true),(103,'manager',true);UPDATE audits SET order_id=NULL WHERE id IN(14,15)");
+  const state={_handoff:{version:2,body:{order_id:null,report_src:'a',report_id:15}}};
+  await h.db.query('INSERT INTO cases(id,order_id,lawyer_tg_id,data) VALUES(800,NULL,101,$1),(801,NULL,102,$1)',[JSON.stringify(state)]);
+  let actor=101;const express=require('express'),app=express();app.use((req,res,next)=>{req.staff={role:actor===103?'manager':'lawyer',approved:true};req.tgUser={id:actor};next();});setupHandoffPacket(app,{service:h.service,pool:h.pool});
+  const server=app.listen(0,'127.0.0.1');await once(server,'listening');const origin='http://127.0.0.1:'+server.address().port;
+  const check=async(path,status)=>{const r=await fetch(origin+path);assert.equal(r.status,status,path);return r;};
+  try{
+    const p=await(await check('/api/handoff/packet?case_id=800&report_src=a&report_id=15',200)).json();assert.equal(p.order,null);assert.equal(p.report.id,15);assert.equal(p.request,undefined);
+    for(const file of p.report.media){assert.equal(new URL(file.url,origin).searchParams.get('case_id'),'800');assert.deepEqual(Buffer.from(await(await check(file.url,200)).arrayBuffer()),h.files.find(value=>value.id===file.id).content);}
+    for(const path of ['/api/handoff/packet?case_id=801&report_id=15','/api/handoff/packet?case_id=800&report_id=14','/api/handoff/packet?case_id=800&report_id=15&order_id=60',p.report.media[0].url.replace('case_id=800','case_id=801'),p.report.media[0].url.split('?')[0]]){await(await check(path,403)).json();}
+    await h.db.query('UPDATE staff SET approved=false WHERE tg_id=101');await(await check('/api/handoff/packet?case_id=800&report_id=15',403)).json();await h.db.query("UPDATE staff SET approved=true,role='auditor' WHERE tg_id=101");await(await check('/api/handoff/packet?case_id=800&report_id=15',403)).json();
+    actor=103;await(await check('/api/handoff/packet?case_id=800&report_id=15',200)).json();await(await check('/api/handoff/packet?case_id=800&report_id=14',403)).json();
+  }finally{server.close();await once(server,'close');}
+}));
+
+test('a no-order original download rechecks its case after the private object read before exposing bytes',pg,async()=>database(async h=>{
+  await h.db.exec("CREATE TABLE staff(tg_id BIGINT PRIMARY KEY,role TEXT,approved BOOLEAN);INSERT INTO staff VALUES(101,'lawyer',true),(102,'lawyer',true);UPDATE audits SET order_id=NULL WHERE id=15");
+  await h.db.query('INSERT INTO cases(id,order_id,lawyer_tg_id,data) VALUES(800,NULL,101,$1)',[JSON.stringify({_handoff:{version:2,body:{order_id:null,report_src:'a',report_id:15}}})]);
+  const read=h.store.read;h.store.read=async row=>{const result=await read(row);await h.db.exec('UPDATE cases SET lawyer_tg_id=102 WHERE id=800');return result;};
+  const express=require('express'),app=express();app.use((req,res,next)=>{req.staff={role:'lawyer',approved:true};req.tgUser={id:101};next();});setupHandoffPacket(app,{service:h.service,pool:h.pool});const server=app.listen(0,'127.0.0.1');await once(server,'listening');
+  try{const r=await fetch('http://127.0.0.1:'+server.address().port+'/api/handoff/reports/15/files/'+h.files[0].id+'?case_id=800');assert.equal(r.status,403);assert.equal((await r.json()).code,'CASE_FORBIDDEN');}finally{server.close();await once(server,'close');}
+}));

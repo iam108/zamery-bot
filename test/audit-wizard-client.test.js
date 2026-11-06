@@ -34,6 +34,20 @@ function harness() {
   vm.createContext(c);load(c,'requiredIssues','stable','sameData','draftWriteOptions','updateClosingConfirmation','recoverUnconfirmedWrite','setOutcome','queue','step','isRenewal','evidenceFor','mapMode','adoptRevision','removeGeneratedEvidence','submit','currentPlan','setCurrentPlan');return c;
 }
 
+for(const cancelled of [false,true])test('PDF '+(cancelled?'chooser cancellation':'worker deadline')+' releases the actual upload count and cannot apply a late original', {timeout:1000},async()=>{
+  const c=harness(),tools=require('../src/web/audit-plan-editor').helpers,controller=new AbortController();let finish,destroyed=0,uploads=0;
+  c.state.pendingUploads=0;const before=copy(c.state.data.plan);
+  const task={promise:new Promise(resolve=>{finish=resolve;}),destroy(){destroyed++;return new Promise(()=>{});}};
+  c.window.AuditPlanEditor={helpers:{...tools,loadPdf:(bytes,options)=>tools.loadPdf(bytes,{...options,timeoutMs:cancelled?60000:10,loadLibrary:async()=>({getDocument:()=>task})})}};
+  c.readBase64=async()=>Buffer.from('%PDF-1.7\nSynthetic original').toString('base64');c.fileMime=()=> 'application/pdf';c.atob=value=>Buffer.from(value,'base64').toString('binary');
+  c.uploadFiles=async()=>{uploads++;assert.fail('Unvalidated PDF must not reach evidence POST');};
+  load(c,'uploadEditorSource');const pending=c.uploadEditorSource({name:'Delayed.pdf',type:'application/pdf',size:30},'plan-source',controller.signal);
+  if(cancelled){await new Promise(setImmediate);assert.equal(c.state.pendingUploads,1);controller.abort();}
+  await assert.rejects(pending,error=>error.code===(cancelled?'AUDIT_PDF_CANCELLED':'AUDIT_PDF_TIMEOUT'));
+  assert.equal(c.state.pendingUploads,0);assert.equal(destroyed,1);assert.equal(uploads,0);assert.deepEqual(copy(c.state.data.plan),before);
+  const calls=c.calls.length;finish({numPages:6,destroy(){}});await new Promise(setImmediate);assert.equal(c.calls.length,calls);assert.equal(uploads,0);
+});
+
 test('unknown delivery disables ordinary submit and offers an explicit checked-chat retry', async () => {
   const c=harness();c.state.frozen=true;c.state.draft.delivery_unknown={cursor:'attempt-1',stage:'photos',count:2};
   load(c,'freezeControls');c.freezeControls();

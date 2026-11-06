@@ -115,7 +115,8 @@ for (const result of ['attached', 'ordered', 'waiting', 'unavailable']) test('th
   process.env.GROUP_CHAT_ID = '-100456';
   try {
     const notices = [], cad = '77:01:0000001:12';
-    const f = fixture({ attachOrOrder: async () => ({ result, cad, budget_text: 'Заказано выписок: 43. Расчётно осталось: 34 (доступно 4453,00 ₽).' }) });
+    // Receipt fault/replay semantics use actual SQL in manager-order-concurrency.
+    const f = fixture({ pool: { query: async () => ({ rows: [{ id: 58 }] }) }, attachOrOrder: async () => ({ result, cad, budget_text: 'Заказано выписок: 43. Расчётно осталось: 34 (доступно 4453,00 ₽).' }) });
     f.telegram.sendMessage = async (chat, text) => { notices.push({ chat, text }); return { message_id: 901 }; };
     const req = f.request(); req.body.service = 'Получение'; req.body.cad_num = cad; req.body.egrn_order = '1';
     const res = f.response(); await f.handlers.save(req, res);

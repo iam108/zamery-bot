@@ -215,6 +215,7 @@ function setupBot() {
 
     try {
       await withOrderDeliveryLock(Number(orderId), async () => {
+      if (!await approvedActor(ctx)) return;
       const current = await getOrderById(Number(orderId));
       if (!current) return ctx.answerCbQuery('Заявка не найдена');
       if (current.status === newStatus) {
@@ -226,8 +227,8 @@ function setupBot() {
         await refreshOrderCard(ctx, current);
         return ctx.answerCbQuery('Карточка обновлена. Статус уже изменился.', { show_alert: true });
       }
-      const order = await updateOrderStatus(Number(orderId), newStatus, actor, allowed);
-      if (!order) return ctx.answerCbQuery('Статус заявки уже изменился. Обновите карточку.');
+      const order = await updateOrderStatus(Number(orderId), newStatus, actor, allowed, ctx.from.id);
+      if (!order) { if (!await approvedActor(ctx)) return; return ctx.answerCbQuery('Статус заявки уже изменился. Обновите карточку.'); }
 
       await refreshOrderCard(ctx, order);
 

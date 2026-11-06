@@ -257,7 +257,16 @@ function setupHandoffPacket(app, options = {}) {
   const service = options.service || createPacketService(options);
   const pool = options.pool || require('../db/pool');
   const { canManageCases, canAccessCase } = require('./auth');
-  async function authorize(req, orderId, report) {
+  async function authorize(req, orderId, report, caseId) {
+    if(caseId!=null){
+      const record=(await pool.query('SELECT to_jsonb(c) AS access_case,s.tg_id,s.role,s.approved FROM cases c LEFT JOIN staff s ON s.tg_id=$2 WHERE c.id=$1',[caseId,req.tgUser&&req.tgUser.id])).rows[0];
+      const client=object(record?.access_case),state=object(object(client.data)._handoff),selection=object(state.body);
+      const nullable=value=>value==null?null:Number(value);
+      if(!canAccessCase(record,req.tgUser&&req.tgUser.id,record?.access_case)||nullable(client.order_id)!==nullable(orderId)||state.version!==2||nullable(selection.order_id)!==nullable(client.order_id)||
+        (report?Number(selection.report_id)!==Number(report.id)||selection.report_src!==report.src:selection.report_id!=null||selection.report_src!=null))
+        fail(403,'CASE_FORBIDDEN','Этот отчёт не входит в доступный вам комплект клиента.');
+      return canManageCases(record,req.tgUser&&req.tgUser.id);
+    }
     if (canManageCases(req.staff, req.tgUser && req.tgUser.id)) return true;
     const row = (await pool.query('SELECT * FROM cases WHERE order_id=$1 AND lawyer_tg_id=$2 ORDER BY id DESC LIMIT 1', [orderId, req.tgUser && req.tgUser.id])).rows[0];
     if (!canAccessCase(req.staff, req.tgUser && req.tgUser.id, row)) fail(403, 'CASE_FORBIDDEN', 'Этот клиент недоступен вашему аккаунту.');
@@ -280,7 +289,9 @@ function setupHandoffPacket(app, options = {}) {
   // requireStaff middleware protects metadata and every original-file request.
   app.get('/api/handoff/packet', route(async (req,res) => {
     const packet = await service.packet(req.query);
-    const manager = await authorize(req, packet.order && packet.order.id, packet.report);
+    const caseId=integer(req.query.case_id,true);
+    const manager = await authorize(req, packet.order && packet.order.id, packet.report,caseId);
+    if(caseId&&packet.report?.media)for(const file of packet.report.media){const url=new URL(file.url,'https://handoff.invalid');url.searchParams.set('case_id',String(caseId));file.url=url.pathname+url.search;}
     if (packet.assignment) packet.assignment.can_resume = manager && !packet.assignment.manual_review &&
       (packet.assignment.delivery_complete === false || packet.assignment.delivery_complete === true && packet.assignment.group_notice?.retry === true);
     if (!manager) delete packet.request;
@@ -288,8 +299,10 @@ function setupHandoffPacket(app, options = {}) {
   }));
   app.get('/api/handoff/reports/:auditId/files/:fileId', route(async (req,res) => {
     const packet = await service.packet({ report_id: req.params.auditId, report_src: 'a', order_id: req.query.order_id });
-    await authorize(req, packet.order && packet.order.id, packet.report);
+    const caseId=integer(req.query.case_id,true);
+    await authorize(req, packet.order && packet.order.id, packet.report,caseId);
     const file = await service.file(req.params.auditId,req.params.fileId);
+    if(caseId)await authorize(req,packet.order&&packet.order.id,packet.report,caseId);
     res.set('Content-Type',file.mime).set('Content-Length',String(file.buffer.length)).set('Content-Disposition',disposition(file.name,req.query.download === '1')).send(file.buffer);
   }));
   return service;

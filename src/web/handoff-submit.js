@@ -17,7 +17,7 @@ function esc(item) {return String(item??'').replace(/[&<>"']/g,c=>({'&':'&amp;',
 function positive(item,label) {if(!/^[1-9]\d*$/.test(String(item))||!Number.isSafeInteger(Number(item)))fail(400,'HANDOFF_INVALID',label);return Number(item);}
 const messageId=item=>(typeof item==='number'||typeof item==='string'&&/^[1-9]\d*$/.test(item))&&Number.isSafeInteger(Number(item))&&Number(item)>0?Number(item):null;
 function https(item) {try{const url=new URL(value(item));return url.protocol==='https:'&&!url.username&&!url.password?url.href:'';}catch(_){return '';}}
-function fields(body) {
+function fields(body, optionalContacts = false) {
   const d={};
   for(const key of ['org','address','region','kind','service','inn','cad_num','priority','comment'])d[key]=value(body[key]);
   if(!d.org||d.org.length>500||!d.address||d.address.length>500)fail(400,'HANDOFF_INVALID','Укажите организацию и адрес объекта.');
@@ -35,8 +35,8 @@ function fields(body) {
     if(c.name.length>200||c.phone.length>100||c.tg.length>100||c.comment.length>1000||/[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(Object.values(c).join('')))fail(400,'HANDOFF_CONTACTS','Проверьте длину и формат контактов клиента.');
     return c;
   }).filter(c=>c.name||c.phone||c.tg||c.comment);
-  if(!d.contacts.some(c=>c.name||c.phone||c.tg))fail(400,'HANDOFF_CONTACTS','Добавьте контакт клиента для юриста.');
-  const primary=d.contacts.find(c=>c.name||c.phone||c.tg);d.client=primary.name;d.phone=primary.phone;
+  if(!optionalContacts&&!d.contacts.some(c=>c.name||c.phone||c.tg))fail(400,'HANDOFF_CONTACTS','Добавьте контакт клиента для юриста.');
+  const primary=d.contacts.find(c=>c.name||c.phone||c.tg)||{};d.client=primary.name||'';d.phone=primary.phone||'';
   if(body.egrn_order!==undefined&&typeof body.egrn_order!=='boolean')fail(400,'HANDOFF_INVALID','Подтверждение заказа ЕГРН должно быть явным.');
   if(body.egrn_order===true&&!d.cad_num)fail(400,'HANDOFF_INVALID','Для заказа ЕГРН нужен кадастровый номер.');
   return d;
@@ -83,7 +83,7 @@ function hasPendingLinkedEgrn(state,chat) {
 }
 function short(item,limit) {const s=value(item);return s.length>limit?s.slice(0,limit-1).replace(/[\uD800-\uDBFF]$/,'')+'…':s;}
 function cardText(c,state) {
-  const report=state.packet.report,lines=['⚖️ <b>Клиент передан юристу</b>','🏢 <b>'+esc(c.org)+'</b>','📍 '+esc(c.address),esc([c.kind,c.service,c.region].join(' · '))];
+  const report=state.packet.report||{},lines=['⚖️ <b>Клиент передан юристу</b>','🏢 <b>'+esc(c.org)+'</b>','📍 '+esc(c.address),esc([c.kind,c.service,c.region].join(' · '))];
   if(c.inn)lines.push('ИНН: '+esc(c.inn));
   if(state.fields.cad_num)lines.push('Кадастр: '+esc(state.fields.cad_num));
   const contacts=c.contacts.filter(contact=>contact.name||contact.phone||contact.tg);
@@ -93,20 +93,26 @@ function cardText(c,state) {
   if(report.actor)lines.push('Аудитор: '+esc(short(report.actor,100)));
   const status={ready:'Соответствует по проверенным пунктам',actions:'Нужны действия',insufficient:'Нужно уточнить',obstacle:'Есть препятствие'}[report.status];
   if(status)lines.push('Итог аудита: '+esc(status));
-  lines.push('Полный отчёт и оригиналы — следом.','Документы заявки: '+state.packet.materials.length+'.');
+  if(state.packet.report)lines.push('Полный отчёт и оригиналы — следом.');
+  else if(c.audit_text)lines.push(esc(short(c.audit_text,1000)));
+  if(state.packet.materials.length)lines.push('Документы заявки: '+state.packet.materials.length+'.');
   if(c.comment)lines.push('💬 '+esc(short(c.comment,500)));
   if(state.manager_name)lines.push('Передал: '+esc(short(state.manager_name,100)));
   lines.push('#заявка'+c.id);return lines.join('\n');
 }
-function reportUrl(base,state) {
+function reportUrl(base,state,caseId) {
   let url;try{url=new URL('/handoff',base);}catch(_){fail(503,'HANDOFF_CONFIG','Не настроена ссылка на карточку передачи.');}
   if(!['https:','http:'].includes(url.protocol)||url.username||url.password)fail(503,'HANDOFF_CONFIG','Не настроена ссылка на карточку передачи.');
-  url.search=new URLSearchParams({view:'report',order_id:String(state.body.order_id),report_src:state.body.report_src,report_id:String(state.body.report_id)}).toString();return url.href;
+  if(!state.body.report_id||!['a','r'].includes(state.body.report_src))return null;
+  const params={view:'report',report_src:state.body.report_src,report_id:String(state.body.report_id)};
+  if(state.body.order_id)params.order_id=String(state.body.order_id);
+  else if(caseId)params.case_id=String(caseId);
+  url.search=new URLSearchParams(params).toString();return url.href;
 }
 function cardOptions(base,c,state) {
-  const keyboard=[],report=state.packet.report,url=reportUrl(base,state);
+  const keyboard=[],report=state.packet.report||{},url=reportUrl(base,state,c.id);
   if(c.checklist_key)keyboard.push([{text:'📋 Чек-лист клиента',web_app:{url:new URL('/checklist?case_id='+c.id,base).href}}]);
-  keyboard.push([{text:'Отчёт и материалы',web_app:{url}}]);
+  if(url)keyboard.push([{text:'Отчёт и материалы',web_app:{url}}]);
   const video=https(report.video_url),archive=https(state.packet.archive_url);
   if(video)keyboard.push([{text:'▶ Видео осмотра',url:video}]);
   if(archive)keyboard.push([{text:'Архив объекта',url:archive}]);
@@ -160,9 +166,12 @@ function createHandoffSubmitter(options={}) {
       body = checkpoint.body;
     }
     if (!body || typeof body !== 'object' || Array.isArray(body) || body.handoff_version !== 2 || !UUID.test(body.submit_id || '')) fail(400, 'HANDOFF_INVALID', 'Для передачи нужен постоянный номер отправки и версия формы 2.');
-    const orderId=positive(body.order_id,'Выберите заявку на выезд.'),reportId=positive(body.report_id,'Выберите сохранённый отчёт аудитора.');
+    const orderId=body.order_id==null?null:positive(body.order_id,'Выберите заявку на выезд.'),reportId=body.report_id==null?null:positive(body.report_id,'Выберите сохранённый отчёт аудитора.');
     if(orderId>2147483647||reportId>2147483647)fail(400,'HANDOFF_INVALID','Некорректный номер заявки или отчёта.');
-    if(!['a','r'].includes(body.report_src))fail(400,'HANDOFF_INVALID','Выберите сохранённый отчёт аудитора.');
+    if(orderId&&!reportId||reportId&&!['a','r'].includes(body.report_src)||!reportId&&body.report_src!=null)fail(400,'HANDOFF_INVALID','Выберите сохранённый отчёт аудитора.');
+    const requestId=body.request_id?positive(body.request_id,'Некорректный номер исходной заявки.'):null;
+    if(requestId>2147483647)fail(400,'HANDOFF_INVALID','Некорректный номер исходной заявки.');
+    const assignmentKey=orderId||requestId&&-requestId;
     let serialized;try{serialized=canonical(body);}catch(_){fail(400,'HANDOFF_INVALID','Не удалось прочитать данные передачи.');}
     if(Buffer.byteLength(serialized)>2*1024*1024)fail(413,'HANDOFF_INVALID','Слишком большой текст передачи.');
     const signature=createHash('sha256').update(serialized).digest('hex'),submitId=body.submit_id.toLowerCase();
@@ -177,8 +186,8 @@ function createHandoffSubmitter(options={}) {
       c=await getExisting(client,owner,submitId);
       if(c){state=compatible(c,signature);if(state.completed&&!hasPendingLinkedEgrn(state,c.lawyer_tg_id))return await finishNotice(c,state,client,user.id);if(state.inflight||state.materials?.inflight)state.manual_review='Не удалось сохранить подтверждение предыдущей отправки. Проверьте уже доставленные сообщения вручную; автоматический повтор остановлен, чтобы не создавать дубли.';if(state.manual_review)return partial(c,state,state.manual_review,false);}
       else {
-        orderLocked=!!(await client.query('SELECT pg_try_advisory_lock(112,$1) AS locked',[orderId])).rows[0]?.locked;
-        const assigned=(await client.query('SELECT * FROM cases WHERE order_id=$1 ORDER BY id DESC LIMIT 1',[orderId])).rows[0];
+        if(assignmentKey)orderLocked=!!(await client.query('SELECT pg_try_advisory_lock(112,$1) AS locked',[assignmentKey])).rows[0]?.locked;
+        const assigned=orderId?(await client.query('SELECT * FROM cases WHERE order_id=$1 ORDER BY id DESC LIMIT 1',[orderId])).rows[0]:requestId?(await client.query('SELECT * FROM cases WHERE request_id=$1 ORDER BY id DESC LIMIT 1',[requestId])).rows[0]:null;
         if(assigned){
           const error=new HandoffError(409,'HANDOFF_ALREADY_ASSIGNED','Заявка уже передана юристу «'+(value(assigned.lawyer_name)||'не указан')+'», клиент №'+assigned.id+'.');
           const assignedState = json(json(assigned.data)._handoff);
@@ -188,17 +197,17 @@ function createHandoffSubmitter(options={}) {
           }
           error.case_created=true;error.case_id=Number(assigned.id);error.retry=false;throw error;
         }
-        if(!orderLocked){const busy=new HandoffError(409,'HANDOFF_BUSY','Передача этой заявки уже выполняется. Проверьте результат перед повтором.');delete busy.case_created;busy.retry=true;throw busy;}
-        const d=fields(body),lawyerId=positive(body.lawyer_tg_id,'Выберите юриста.');
+        if(assignmentKey&&!orderLocked){const busy=new HandoffError(409,'HANDOFF_BUSY','Передача этой заявки уже выполняется. Проверьте результат перед повтором.');delete busy.case_created;busy.retry=true;throw busy;}
+        const d=fields(body,!orderId),lawyerId=positive(body.lawyer_tg_id,'Выберите юриста.');
         const packet=await packetService().packet({order_id:orderId,report_src:body.report_src,report_id:reportId,request_id:body.request_id||null});
-        if(!packet?.order||!packet.report||packet.report.id!==reportId||packet.report.src!==body.report_src||Number(packet.order.id)!==orderId)fail(409,'HANDOFF_REPORT_UNAVAILABLE','Не удалось подтвердить выбранный отчёт и заявку.');
+        if(!packet||Number(packet.order?.id||0)!==Number(orderId||0)||reportId&&(!packet.report||packet.report.id!==reportId||packet.report.src!==body.report_src)||!reportId&&packet.report)fail(409,'HANDOFF_REPORT_UNAVAILABLE','Не удалось подтвердить выбранный отчёт и заявку.');
+        if(!orderId&&((packet.materials||[]).length||(packet.egrn_links||[]).length))fail(409,'HANDOFF_REPORT_UNAVAILABLE','У материалов должна быть сохранённая исходная заявка. Откройте её перед передачей.');
         if(!/^[a-f\d]{64}$/i.test(body.packet_signature||'')||body.packet_signature!==packet.signature)fail(409,'HANDOFF_PACKET_CHANGED','Заявка или её документы изменились. Обновите комплект перед передачей.');
         const lawyer=(await client.query("SELECT tg_id,name FROM staff WHERE tg_id=$1 AND role='lawyer' AND approved=true",[lawyerId])).rows[0];
         if(!lawyer)fail(400,'HANDOFF_LAWYER','Юрист не найден среди одобренных сотрудников.');
         const checklist=(options.pickChecklist||require('../checklists').pickChecklist)(d.region,d.kind,d.service);
         if(!checklist)fail(400,'HANDOFF_CHECKLIST','Для выбранной услуги не найден чек-лист.');
-        const picked=await loadReport(body.report_src,reportId),source=sourceReport(picked);
-        const requestId=body.request_id?positive(body.request_id,'Некорректный номер исходной заявки.'):null;
+        const picked=reportId?await loadReport(body.report_src,reportId):null,source=picked?sourceReport(picked):{sources:[],hashes:[]};
         if (requestId !== (packet.request ? Number(packet.request.id) : null)) fail(409, 'HANDOFF_REQUEST_MISMATCH', 'Исходная заявка не совпадает с просмотренным комплектом. Обновите форму.');
         let request=null;
         if(requestId){
@@ -210,12 +219,12 @@ function createHandoffSubmitter(options={}) {
         }
         const recipients=[{chat:String(lawyer.tg_id),role:'lawyer'}];
         const groupNotice=initialNotice(options.clientsChatId??process.env.CLIENTS_CHAT_ID);
-        state={version:2,body:JSON.parse(serialized),fields:d,packet,source,request,manager_name:value(staff?.name),recipients,cards:{},auditCopies:{},requestCopies:{},materials:{confirmed:{},completed:false},linkedEgrn:{files:linkedOriginals(packet),confirmed:{},completed:false},egrn:{completed:false,order_started:false},completed:false,...(groupNotice?{groupNotice}:{})};
+        state={version:2,body:JSON.parse(serialized),fields:d,packet,source,request,manager_name:value(staff?.name),recipients,cards:{},auditCopies:{},requestCopies:{},materials:{confirmed:{},completed:!orderId},linkedEgrn:{files:linkedOriginals(packet),confirmed:{},completed:false},egrn:{completed:false,order_started:false},completed:false,...(groupNotice?{groupNotice}:{})};
         reportUrl(options.webappUrl||process.env.WEBAPP_URL,state);
         c=(await client.query(`INSERT INTO cases(order_id,lawyer_tg_id,lawyer_name,checklist_key,org,inn,client,phone,address,region,kind,service,priority,comment,audit_text,total,created_by,contacts,request_id,handoff_submit_id,handoff_signature,data)
           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,0,$16,$17,$18,$19,$20,$21)
           ON CONFLICT(created_by,handoff_submit_id) WHERE handoff_submit_id IS NOT NULL DO NOTHING RETURNING *`,
-          [orderId,lawyer.tg_id,lawyer.name,checklist,d.org,d.inn,d.client,d.phone,d.address,d.region,d.kind,d.service,d.priority,d.comment,packet.report.text,owner,JSON.stringify(d.contacts),requestId,submitId,signature,JSON.stringify({_handoff:state})])).rows[0];
+          [orderId,lawyer.tg_id,lawyer.name,checklist,d.org,d.inn,d.client,d.phone,d.address,d.region,d.kind,d.service,d.priority,d.comment,packet.report?.text||value(body.audit_text).slice(0,12000),owner,JSON.stringify(d.contacts),requestId,submitId,signature,JSON.stringify({_handoff:state})])).rows[0];
         if(!c){c=await getExisting(client,owner,submitId);if(!c)throw new Error('No durable handoff case');state=compatible(c,signature);}
       }
       c.contacts=Array.isArray(c.contacts)?c.contacts:json(c.contacts);if(!Array.isArray(c.contacts))c.contacts=state.fields.contacts;
@@ -386,7 +395,7 @@ function createHandoffSubmitter(options={}) {
       const safe=new Error('Не удалось подтвердить создание или доставку клиента. Повторите ту же передачу без изменения данных.');safe.status=503;safe.code='HANDOFF_UNAVAILABLE';throw safe;
     } finally {
       if(client){
-        if(orderLocked){try{await client.query('SELECT pg_advisory_unlock(112,$1)',[orderId]);}catch(error){unlockError=error;}}
+        if(orderLocked){try{await client.query('SELECT pg_advisory_unlock(112,$1)',[assignmentKey]);}catch(error){unlockError=error;}}
         if(locked){try{await client.query('SELECT pg_advisory_unlock(111,hashtext($1))',[owner+':'+submitId]);}catch(error){unlockError=error;}}
         client.release(unlockError);
       }

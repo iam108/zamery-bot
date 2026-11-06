@@ -2,6 +2,19 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { harness, response, savedPacket, settle } = require('./helpers/manager-form');
 
+for(const stage of ['headers','blob body'])test('existing manager file '+stage+' has a bounded download, ignores a late response and can be retried',async()=>{
+  const h=harness({virtualClock:true}),button={textContent:'Download original',disabled:false},file={url:'/api/audit/orders/58/materials/original',name:'Original.pdf'};
+  let release,finished=false,clicked=0;const objects=[];
+  h.c.URL={createObjectURL(blob){objects.push(blob);return 'blob:synthetic-original';},revokeObjectURL(){}};
+  h.c.document.body={appendChild(){}};h.c.document.createElement=()=>({click(){clicked++;},remove(){}});
+  h.c.respond=()=>stage==='headers'?new Promise(resolve=>{release=resolve;}):{ok:true,blob:()=>new Promise(resolve=>{release=resolve;})};
+  h.c.downloadExistingFile(file,button).then(()=>{finished=true;});await settle();await h.tick(179999);assert.equal(finished,false);assert.equal(button.disabled,true);
+  await h.tick(1);assert.equal(finished,true);assert.equal(button.disabled,false);assert.equal(button.textContent,'Download original');assert.equal(h.requests[0].options.signal.aborted,true);assert.equal(objects.length,0);assert.match(h.alerts.at(-1),/долго|ответ/i);
+  release(stage==='headers'?{ok:true,blob:async()=>({late:true})}:{late:true});await settle();assert.equal(objects.length,0);assert.equal(clicked,0);
+  const original={bytes:'full original'};h.c.respond=()=>({ok:true,blob:async()=>original});await h.c.downloadExistingFile(file,button);
+  assert.deepEqual(objects,[original]);assert.equal(clicked,1);assert.equal(button.disabled,false);assert.equal(h.requests.length,2);await h.tick(60000);assert.equal(h.timers.size,0);
+});
+
 for (const stalled of ['headers', 'JSON body']) test('a stalled manager packet ' + stalled + ' stops loading after 30 seconds without losing typed input', async () => {
   const h = harness({ virtualClock: true }); h.c.editOrderId = '58';
   let signal, completed = false;

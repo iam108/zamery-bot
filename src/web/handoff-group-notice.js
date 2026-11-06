@@ -20,7 +20,7 @@ const SAVE_CHECKPOINT_SQL = `UPDATE cases SET data=jsonb_set(COALESCE(data,'{}':
         WHERE key ~ '^[1-9][0-9]{0,15}$' GROUP BY key
       ) merged WHERE cursor>0)),true)
   ELSE $1::jsonb END,true) WHERE id=$2`;
-const STATE_SQL = `SELECT c.id,c.order_id,c.created_by,c.handoff_submit_id,c.lawyer_tg_id,c.lawyer_name,c.org,c.address,c.kind,c.service,c.priority,c.data,
+const STATE_SQL = `SELECT c.id,c.order_id,c.created_by,c.handoff_submit_id,c.lawyer_tg_id,c.lawyer_name,c.org,c.address,c.kind,c.service,c.priority,c.data,to_jsonb(c)->>'request_id' AS request_id,
   o.object_name,o.telegram_msg_id AS order_message_id,
   actor.tg_id AS actor_id,actor.role AS actor_role,actor.approved AS actor_approved,
   recipient.role AS recipient_role,recipient.approved AS recipient_approved,
@@ -46,7 +46,7 @@ function noticeWarning(state, caseId) {
 function summary(row, state) {
   const lines = ['Клиент передан юристу', 'Организация: ' + clean(row.org)];
   if (clean(row.object_name) && clean(row.object_name) !== clean(row.org)) lines.push('Объект: ' + clean(row.object_name));
-  lines.push('Адрес: ' + clean(row.address), 'Заявка #' + row.order_id + ' · Клиент #' + row.id,
+  lines.push('Адрес: ' + clean(row.address), (row.order_id ? 'Заявка #' + row.order_id + ' · ' : row.request_id ? 'Исходная заявка #' + row.request_id + ' · ' : '') + 'Клиент #' + row.id,
     [clean(row.kind, 100), clean(row.service, 100)].filter(Boolean).join(' · '),
     'Юрист: ' + clean(row.lawyer_name, 200), 'Приоритет: ' + clean(row.priority, 100),
     'Отчёт и собранные материалы — в личке юриста.');
@@ -73,7 +73,7 @@ function createHandoffNoticePublisher(options = {}) {
     if (state.groupNotice?.target && state.groupNotice.target !== target()) return 'Настройка чата клиентов изменилась. Нужна проверка сохранённого назначения уведомления.';
     if (state.version !== 2 || state.completed !== true || state.manual_review || state.inflight || state.materials?.inflight || state.materials?.completed !== true || state.egrn?.completed !== true ||
       require('./handoff-submit').hasPendingLinkedEgrn(state, row.lawyer_tg_id)) return 'Личная доставка полного собранного комплекта ещё не подтверждена; карточка в общий чат не отправлена.';
-    if (!positive(row.order_id) || Number(state.body?.order_id) !== Number(row.order_id) || Number(state.body?.lawyer_tg_id) !== Number(row.lawyer_tg_id) || typeof state.body?.submit_id !== 'string' || !row.handoff_submit_id || state.body.submit_id.toLowerCase() !== row.handoff_submit_id.toLowerCase()) return 'Сохранённая передача не совпадает с текущим клиентом и назначением. Нужна проверка карточки.';
+    if ((row.order_id == null ? state.body?.order_id != null || Number(state.body?.request_id || 0) !== Number(row.request_id || 0) : !positive(row.order_id) || Number(state.body?.order_id) !== Number(row.order_id)) || Number(state.body?.lawyer_tg_id) !== Number(row.lawyer_tg_id) || typeof state.body?.submit_id !== 'string' || !row.handoff_submit_id || state.body.submit_id.toLowerCase() !== row.handoff_submit_id.toLowerCase()) return 'Сохранённая передача не совпадает с текущим клиентом и назначением. Нужна проверка карточки.';
     const lawyer = String(row.lawyer_tg_id);
     if (!positive(state.cards?.[lawyer]) || !Array.isArray(state.recipients) || !state.recipients.some(recipient => String(recipient.chat) === lawyer) ||
       !auth.canAccessCase({ role: row.recipient_role, approved: row.recipient_approved }, lawyer, row)) return 'Назначение или доступ юриста изменились. Проверьте получателя перед публикацией карточки.';

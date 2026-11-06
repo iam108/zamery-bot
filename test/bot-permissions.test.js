@@ -151,6 +151,11 @@ test('a busy order tells the bot user to wait without changing its status or car
   assert.match(h.calls.find(call => Array.isArray(call) && call[0] === 'answer')[1], /сейчас обновляется/);
 });
 
+test('revocation while the order delivery lock waits blocks the pending status callback',async()=>{
+  const staff={tg_id:42,role:'auditor',approved:true},h=harness(staff,{withOrderDeliveryLock:async(id,run)=>{staff.approved=false;return run();}});
+  await h.action('status:done:17');assert.equal(h.order.status,'new');assert.equal(h.calls.some(call=>Array.isArray(call)&&call[0]==='status'),false);assert.equal(h.calls.includes('edit'),false);assert.equal(h.calls.includes('message'),false);assert.ok(h.calls.some(call=>Array.isArray(call)&&call[0]==='answer'&&/Нет доступа/.test(call[1])));
+});
+
 test('bot status updates and stale callbacks preserve the latest report under the common lock',async()=>{
   for(const [initial,target]of [['new','in_progress'],['in_progress','done'],['in_progress','cancelled'],['done','done'],['done','in_progress'],['new','new']]){
     let locked=false,lookups=0;const h=harness(undefined,{withOrderDeliveryLock:async(id,run)=>{assert.equal(id,17);locked=true;try{return await run();}finally{locked=false;}},loadOrderReportLink:async id=>{assert.equal(locked,true);assert.equal(id,17);lookups++;return{url:'https://t.me/c/111111/209'};}});h.order.status=initial;

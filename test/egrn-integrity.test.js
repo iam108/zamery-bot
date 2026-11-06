@@ -74,6 +74,11 @@ async function fixture(options = {}) {
     'INSERT INTO egrn_orders(cad_num,type_doc,id_statement,status,status_text,chat_id,ordered_by,status_msg_id,deliver,file_msgs,files_sent) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
     [cad, 'kvarmrusxmlpdf', id, status, 'В работе', -100123, 111, card, JSON.stringify(targets), JSON.stringify(files), filesSent])).rows[0];
   return { db, pool, calls, api, actions, commands, telegram, add, budget: require('../src/bot/egrn-budget').createEgrnBudget({pool}), poll: () => poll(), anotherPoller() { api.setupEgrn(bot); const run = poll; return run; },
+    restartApi() {
+      const fresh = { ...sandbox, module: { exports: {} } }; vm.createContext(fresh);
+      vm.runInContext(source + '\nmodule.exports.qa={ensureTables,setStatus(fn){apiStatus=fn;},setDownload(fn){download=fn;}};', fresh, { filename });
+      const next = fresh.module.exports; next.setupEgrn(bot); return next;
+    },
     advanceClock(ms) { clockOffset += ms; },
     restartCommands() { const start = commands.length; api.setupEgrn(bot); return commands.slice(start); },
     row: async id => (await pool.query('SELECT * FROM egrn_orders WHERE id=$1', [id])).rows[0],
@@ -459,6 +464,84 @@ for(const sourceKind of ['embedded','url'])test('partial '+sourceKind+' delivery
     await h.poll();assert.equal((await h.row(order.id)).file_msgs.length,1);await h.pool.query('UPDATE egrn_orders SET retry_at=NULL WHERE id=$1',[order.id]);await h.poll();
     const row=await h.row(order.id),delivered=h.calls.documents.filter(call=>call.delivered);assert.equal(row.files_sent,2);assert.equal(delivered.filter(call=>call.file.source.equals(a)).length,1);assert.equal(delivered.filter(call=>call.file.source.equals(b)).length,1);assert.equal(h.calls.paid,0);assert.equal(new Set(row.file_msgs.map(record=>record.sha256)).size,2);
   }finally{await h.close();}
+});
+
+const providerPdf = label => Buffer.from('%PDF-1.7\n' + label + '\n' + label.repeat(300) + '\n%%EOF');
+async function providerSource(id, embedded, urls) {
+  const body = JSON.stringify({ id_req: id, status: [{ type: 'processed', statusDescription: 'Выполнено',
+    originals: embedded.map(file => file.toString('base64')), downloads: urls }] });
+  return require('../src/bot/egrn-source').readStatusResponse(require('node:stream').Readable.from([Buffer.from(body)]), { idReq: id });
+}
+
+test('seven URL originals all join the delivered manifest instead of silently completing after six', pg, async () => {
+  const h = await fixture(), urls = Array.from({ length: 7 }, (_, i) => 'https://provider.invalid/statement-' + i + '.pdf');
+  try {
+    const order = await h.add(); h.api.qa.setStatus(id => providerSource(id, [], urls));
+    h.api.qa.setDownload(async url => ({ name: url.split('/').pop(), kind: 'pdf', buf: providerPdf(url) }));
+    await h.poll(); const row = await h.row(order.id);
+    assert.equal(row.files_sent, 7); assert.equal(row.file_msgs.length, 7); assert.equal(row.delivery_manifest.length, 7);
+    assert.equal(h.calls.documents.filter(call => call.delivered).length, 7); assert.equal(h.calls.paid, 0);
+  } finally { await h.close(); }
+});
+
+test('mixed embedded and URL originals share one SHA-deduplicated complete manifest', pg, async () => {
+  const h = await fixture(), a = providerPdf('Embedded A'), b = providerPdf('URL B'), c = providerPdf('URL C');
+  const urls = ['https://provider.invalid/duplicate-A.pdf', 'https://provider.invalid/B.pdf', 'https://provider.invalid/mirror-B.pdf', 'https://provider.invalid/C.pdf'];
+  try {
+    const order = await h.add(); h.api.qa.setStatus(id => providerSource(id, [a], urls.concat(urls[1])));
+    h.api.qa.setDownload(async url => ({ name: url.split('/').pop(), kind: 'pdf', buf: url.includes('duplicate-A') ? a : url.endsWith('/C.pdf') ? c : b }));
+    await h.poll(); const row = await h.row(order.id), accepted = h.calls.documents.filter(call => call.delivered);
+    assert.equal(row.files_sent, 3); assert.equal(row.delivery_manifest.length, 3); assert.equal(new Set(row.file_msgs.map(file => file.sha256)).size, 3);
+    for (const original of [a, b, c]) assert.equal(accepted.filter(call => call.file.source.equals(original)).length, 1);
+    assert.equal(h.calls.paid, 0);
+  } finally { await h.close(); }
+});
+
+test('failure after six originals survives a module restart, reordered URLs and a new recipient without duplicate originals or paid orders', pg, async () => {
+  let attempt = 0;
+  const h = await fixture({ sendDocument() { if (++attempt === 7) throw Object.assign(new Error('Rejected seventh original'), { response: { error_code: 400 } }); } });
+  const urls = Array.from({ length: 7 }, (_, i) => 'https://provider.invalid/original-' + i + '.pdf');
+  const download = async url => ({ name: url.split('/').pop(), kind: 'pdf', buf: providerPdf(url) });
+  try {
+    const order = await h.add({ targets: [{ chat: 222 }] }); h.api.qa.setStatus(id => providerSource(id, [], urls)); h.api.qa.setDownload(download);
+    await h.poll(); const partial = await h.row(order.id);
+    assert.equal(partial.files_sent, 0); assert.equal(partial.file_msgs.length, 6); assert.equal(partial.delivery_manifest.length, 7);
+    const savedIds = partial.file_msgs.map(file => file.id), restarted = h.restartApi(); await restarted.qa.ensureTables();
+    restarted.qa.setStatus(id => providerSource(id, [], [...urls].reverse())); restarted.qa.setDownload(download);
+    assert.equal((await restarted.attachOrOrder({ cad: CAD, order: false, orderedBy: 333, targets: [{ chat: 333 }] })).result, 'waiting');
+    await h.poll(); const complete = await h.row(order.id), accepted = h.calls.documents.filter(call => call.delivered);
+    assert.equal(complete.files_sent, 7); assert.equal(complete.delivery_manifest.length, 7);
+    for (const id of savedIds) assert.ok(complete.file_msgs.some(file => file.id === id));
+    for (const url of urls) assert.equal(accepted.filter(call => call.file.source.equals(providerPdf(url))).length, 1);
+    for (const chat of [111, 222, 333]) assert.equal(h.calls.copies.filter(copy => Number(copy.chat_id) === chat).length, 7);
+    const sent = h.calls.documents.length + h.calls.copies.length;
+    assert.equal((await restarted.attachOrOrder({ cad: CAD, order: false, orderedBy: 333, targets: [{ chat: 333 }] })).result, 'attached');
+    assert.equal(h.calls.documents.length + h.calls.copies.length, sent); assert.equal(h.calls.paid, 0);
+  } finally { await h.close(); }
+});
+
+for (const embedded of [false, true]) test('more than 32 original candidates fail visibly before any new send or URL download; mixed=' + embedded, pg, async () => {
+  const h = await fixture(); let downloads = 0, cleanups = 0;
+  try {
+    const order = await h.add(), urls = Array.from({ length: embedded ? 32 : 33 }, (_, i) => 'https://provider.invalid/file-' + i + '.pdf');
+    h.api.qa.setStatus(async id => { const result = await providerSource(id, embedded ? [providerPdf('Embedded')] : [], urls), cleanup = result.cleanup;
+      result.cleanup = async () => { cleanups++; await cleanup(); }; return result; });
+    h.api.qa.setDownload(async () => { downloads++; return { name: 'original.pdf', kind: 'pdf', buf: providerPdf('URL') }; });
+    await h.poll(); const row = await h.row(order.id);
+    assert.equal(row.files_sent, -1); assert.equal(row.file_msgs.length, 0); assert.match(row.error, /32/);
+    assert.equal(h.calls.documents.length, 0); assert.equal(h.calls.copies.length, 0); assert.equal(downloads, 0); assert.equal(cleanups, 1);
+    assert.ok(h.calls.messages.some(call => /32/.test(call.text))); assert.equal(h.calls.paid, 0);
+  } finally { await h.close(); }
+});
+
+test('the bounded URL packet still supports all 32 original candidates', pg, async () => {
+  const h = await fixture(), urls = Array.from({ length: 32 }, (_, i) => 'https://provider.invalid/file-' + i + '.pdf');
+  try {
+    const order = await h.add(); h.api.qa.setStatus(id => providerSource(id, [], urls));
+    h.api.qa.setDownload(async url => ({ name: url.split('/').pop(), kind: 'pdf', buf: providerPdf(url) }));
+    await h.poll(); const row = await h.row(order.id);
+    assert.equal(row.files_sent, 32); assert.equal(row.delivery_manifest.length, 32); assert.equal(h.calls.documents.length, 32); assert.equal(h.calls.paid, 0);
+  } finally { await h.close(); }
 });
 
 test('an incomplete legacy native packet without a content identity is explicitly stopped before any guessed replacement or resend',pg,async()=>{

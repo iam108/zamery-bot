@@ -615,7 +615,7 @@
     if(window.AuditPlanEditor&&typeof window.AuditPlanEditor.mount==='function'){try{editor=window.AuditPlanEditor.mount(container,{kind:kind,service:state.data.object_category==='tobacco'?'tobacco':'alcohol',getState:mountedPlan,onSnapshot:acceptSnapshot,onChange:function(){
       if(state.frozen||state.blocked||!mountedPlan())return false;
       return (state.dirty||state.serverError)?saveNow():undefined;
-    },evidenceUrl:evidenceUrl,evidence:state.evidence,onUpload:function(file,meta){return uploadEditorSource(file,meta.role);}});}catch(error){container.textContent='Не удалось открыть редактор. Оригинал можно скачать выше.';}}
+    },evidenceUrl:evidenceUrl,evidence:state.evidence,onUpload:function(file,meta){return uploadEditorSource(file,meta.role,meta.signal);}});}catch(error){container.textContent='Не удалось открыть редактор. Оригинал можно скачать выше.';}}
   }
 
   function refreshChrome() {
@@ -923,24 +923,26 @@
       }
     });
   }
-  async function uploadEditorSource(file, role) {
+  async function uploadEditorSource(file, role, signal) {
     if (state.submitting || state.frozen || state.conflict) throw new Error('Сначала завершите текущую операцию с черновиком.');
     if (file.size > 12 * 1024 * 1024) throw new Error('Файл ' + file.name + ' больше 12 МБ.');
     state.pendingUploads++; status('Читаю выбранный файл…');
     var data;
     try {
       data = await readBase64(file);
+      if(signal&&signal.aborted)throw Object.assign(new Error('Открытие файла отменено.'),{code:'AUDIT_PDF_CANCELLED'});
       var type = fileMime(file, data);
       if (type !== file.type) file = { name: file.name, size: file.size, type: type };
       if (file.type === 'application/pdf') {
-        var pdfjs = await import('/vendor/pdfjs/pdf.mjs'); pdfjs.GlobalWorkerOptions.workerSrc = '/vendor/pdfjs/pdf.worker.mjs';
+        var pdfTools=window.AuditPlanEditor&&window.AuditPlanEditor.helpers;
+        if(!pdfTools||!pdfTools.loadPdf)throw new Error('Редактор PDF не загрузился. Закройте и откройте форму заново.');
         var raw = atob(data), bytes = new Uint8Array(raw.length); for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
-        var task = pdfjs.getDocument({ data: bytes, isEvalSupported: false });
-        try { var pdf = await task.promise; if (!pdf.numPages) throw new Error('В PDF нет страниц.'); }
-        catch (error) { throw new Error('Не удалось прочитать PDF. Выберите другой файл.'); }
-        finally { await task.destroy(); }
+        var loaded;
+        try { loaded=await pdfTools.loadPdf(bytes,{signal:signal}); }
+        catch (error) { if(error.code==='AUDIT_PDF_TIMEOUT'||error.code==='AUDIT_PDF_CANCELLED')throw error;throw new Error('Не удалось прочитать PDF. Выберите другой файл.'); }
+        finally { pdfTools.releasePdf(loaded); }
       }
-    } catch (error) { status('Файл не загружен · ' + error.message, 'warning'); throw error; }
+    } catch (error) { if(!signal||!signal.aborted)status('Файл не загружен · ' + error.message, 'warning');else if(state.pendingUploads===1)status('Выбор файла отменён.','');throw error; }
     finally { state.pendingUploads--;updateClosingConfirmation(); }
     var saved = await uploadFiles([file], role, 'source', { noRender: true, preparedData: [data] }); return saved && saved[0];
   }

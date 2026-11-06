@@ -230,6 +230,43 @@
     if (!pdfModule) pdfModule = import('/vendor/pdfjs/pdf.mjs').then(lib => { lib.GlobalWorkerOptions.workerSrc = '/vendor/pdfjs/pdf.worker.mjs'; return lib; }).catch(e => { pdfModule = null; throw e; });
     return pdfModule;
   }
+  const releasedPdfs = new WeakSet();
+  function releasePdf(value) {
+    const target = value?.loadingTask || value?.pdf || value;
+    if (!target || !['object', 'function'].includes(typeof target) || releasedPdfs.has(target)) return;
+    releasedPdfs.add(target);
+    try { Promise.resolve(target.destroy?.()).catch(() => {}); } catch (_) {}
+  }
+  async function pdfOperation(run, options = {}) {
+    const timeoutMs = options.timeoutMs ?? 60000, signal = options.signal;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 180000) throw new TypeError('Invalid PDF deadline');
+    let stopped = false, stopError, rejectStop, timer;
+    const stopping = new Promise((_, reject) => { rejectStop = reject; });
+    const stop = cancelled => {
+      if (stopped) return; stopped = true;
+      stopError = Object.assign(new Error(cancelled ? 'Открытие PDF отменено.' : 'PDF долго не отвечает. Проверьте связь и выберите файл ещё раз.'), { code: cancelled ? 'AUDIT_PDF_CANCELLED' : 'AUDIT_PDF_TIMEOUT' });
+      rejectStop(stopError);
+      try { Promise.resolve(options.cancel?.()).catch(() => {}); } catch (_) {}
+    };
+    const abort = () => stop(true);
+    timer = setTimeout(() => stop(false), timeoutMs);
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+    const pending = Promise.resolve().then(() => { if (stopped) throw stopError; return run(); });
+    pending.then(value => { if (stopped) try { Promise.resolve(options.late?.(value)).catch(() => {}); } catch (_) {} }, () => {});
+    try { return await Promise.race([pending, stopping]); }
+    finally { clearTimeout(timer); signal?.removeEventListener('abort', abort); }
+  }
+  async function loadPdf(bytes, options = {}) {
+    const lib = await pdfOperation(options.loadLibrary || pdfJS, options);
+    let task;
+    try {
+      task = lib.getDocument({ data: new Uint8Array(bytes), isEvalSupported: false, useSystemFonts: true });
+      const pdf = await pdfOperation(() => task.promise, { ...options, cancel: () => releasePdf(task), late: releasePdf });
+      if (!pdf?.numPages) throw new Error('В PDF нет страниц.');
+      return { pdf, loadingTask: task };
+    } catch (error) { releasePdf(task); throw error; }
+  }
   function mount(container, options) {
     if (!G) throw new Error('Не загружен модуль геометрии редактора.');
     const kind = options.kind === 'map' ? 'map' : 'plan', service = options.service || 'alcohol';
@@ -239,6 +276,7 @@
     let choosing = false;
     let past = [], future = [], saveTail = Promise.resolve(), saveError = null, revision = 0, pointer = null;
     let chooserToken = 0, chooserIntent = 0, candidate = null, renderTask = null;
+    let selectedLoad = null, candidateLoad = null, uploadController = null;
     const el = (tag, text, cls) => { const n = document.createElement(tag); if (text !== undefined && text !== null) n.textContent = text; if (cls) n.className = cls; return n; };
     const on = (node, event, fn) => node.addEventListener(event, fn, { signal });
     const button = (text, cls, fn) => { const b = el('button', text, 'ape-button ' + (cls || '')); b.type = 'button'; if (fn) on(b, 'click', fn); return b; };
@@ -366,11 +404,13 @@
       if (state.versions?.length) markList.append(button(kind === 'map' ? 'Вернуть предыдущий скриншот' : 'Вернуть предыдущий лист', 'ape-secondary', async () => { try { state = restoreSource(state); past = []; future = []; const loading = (ready = loadSelected()), saving = persist(); await Promise.all([loading, saving]); } catch (e) { notice(e.message, true); } }));
     }
     function refreshEndpointLabels() { panel.querySelectorAll('[data-endpoint]').forEach(select => Array.from(select.options).forEach(option => { const m = state.annotations.find(m => String(m.id) === option.value); if (m) option.textContent = m.code + ' · ' + (m.label || TOOLS[m.tool].label); })); }
-    async function sourceResource(evidence, page) {
-      const url = await options.evidenceUrl(evidence.id);
-      const response = await fetch(url, { credentials: 'same-origin' }); if (!response.ok) throw new Error('Исходный файл недоступен.');
-      const bytes = await response.arrayBuffer();
-      if (isPDF(evidence, bytes)) { const lib = await pdfJS(), pdf = await lib.getDocument({ data: new Uint8Array(bytes), isEvalSupported: false, useSystemFonts: true }).promise; if ((page || 1) > pdf.numPages) { pdf.destroy(); throw new Error('В исходнике нет сохранённой страницы ' + page + '. Выберите лист заново.'); } return { evidence, pdf, page: page || 1, pages: pdf.numPages }; }
+    async function sourceResource(evidence, page, sourceSignal = signal) {
+      const url = await pdfOperation(() => options.evidenceUrl(evidence.id), { signal: sourceSignal, timeoutMs: 180000 });
+      const bytes = await pdfOperation(async () => {
+        const response = await fetch(url, { credentials: 'same-origin', signal: sourceSignal }); if (!response.ok) throw new Error('Исходный файл недоступен.');
+        return response.arrayBuffer();
+      }, { signal: sourceSignal, timeoutMs: 180000 });
+      if (isPDF(evidence, bytes)) { const loaded = await loadPdf(bytes, { signal: sourceSignal }), pdf = loaded.pdf; if ((page || 1) > pdf.numPages) { releasePdf(loaded); throw new Error('В исходнике нет сохранённой страницы ' + page + '. Выберите лист заново.'); } return { ...loaded, evidence, signal: sourceSignal, page: page || 1, pages: pdf.numPages }; }
       const blob = new Blob([bytes], { type: evidence.mime || 'application/octet-stream' }), objectUrl = URL.createObjectURL(blob), img = new Image();
       try { await new Promise((resolve, reject) => { img.onload = resolve; img.onerror = () => reject(new Error('Не удалось прочитать изображение.')); img.src = objectUrl; }); } finally { URL.revokeObjectURL(objectUrl); }
       const resized = document.createElement('canvas'), ratio = Math.min(1, 2600 / Math.max(img.naturalWidth, img.naturalHeight)); resized.width = Math.max(1, Math.round(img.naturalWidth * ratio)); resized.height = Math.max(1, Math.round(img.naturalHeight * ratio)); resized.getContext('2d').drawImage(img, 0, 0, resized.width, resized.height);
@@ -378,20 +418,21 @@
     }
     async function pageImage(resource, page, setTask) {
       if (resource.image) return resource.image;
-      const pdfPage = await resource.pdf.getPage(page), base = pdfPage.getViewport({ scale: 1 }), scale = Math.min(2, 2600 / Math.max(base.width, base.height)), bounds = pdfPage.getViewport({ scale });
+      const pdfPage = await pdfOperation(() => resource.pdf.getPage(page), { signal: resource.signal }), base = pdfPage.getViewport({ scale: 1 }), scale = Math.min(2, 2600 / Math.max(base.width, base.height)), bounds = pdfPage.getViewport({ scale });
       const output = document.createElement('canvas'); output.width = Math.ceil(bounds.width); output.height = Math.ceil(bounds.height);
-      const task = pdfPage.render({ canvasContext: output.getContext('2d'), viewport: bounds, background: '#fff' }); if (setTask) setTask(task); await task.promise; return output;
+      const task = pdfPage.render({ canvasContext: output.getContext('2d'), viewport: bounds, background: '#fff' }); if (setTask) setTask(task); await pdfOperation(() => task.promise, { signal: resource.signal, cancel: () => task.cancel() }); return output;
     }
     async function loadSelected() {
       const token = ++loadToken; sourceLoading = true; image = null; draw();
+      selectedLoad?.abort(); selectedLoad = new AbortController();
       if (!state.evidence_id) { sourceLoading = false; notice(kind === 'map' ? 'Выберите скриншот Яндекс Карт.' : 'Выберите страницу с графикой помещения.'); return; }
       const evidence = (options.evidence || []).find(e => String(e.id) === String(state.evidence_id));
       if (!evidence) { sourceLoading = false; notice('Исходник не найден в комплекте. Разметка сохранена; добавьте исходный документ.', true); return; }
       notice('Открываю исходный файл…');
       let resource;
-      try { resource = await sourceResource(evidence, state.page); const rendered = await pageImage(resource, resource.page); if (token !== loadToken || !alive) return; image = rendered; sourceLoading = false; notice(''); draw(); requestAnimationFrame(() => { if (alive && token === loadToken) fitImage(); }); }
+      try { resource = await sourceResource(evidence, state.page, selectedLoad.signal); const rendered = await pageImage(resource, resource.page); if (token !== loadToken || !alive) return; image = rendered; sourceLoading = false; notice(''); draw(); requestAnimationFrame(() => { if (alive && token === loadToken) fitImage(); }); }
       catch (e) { if (token === loadToken && alive) { sourceLoading = false; notice('Не удалось открыть исходник. Выберите файл повторно. ' + (e.message || ''), true); } }
-      finally { resource?.pdf?.destroy(); }
+      finally { releasePdf(resource); }
     }
     function availableEvidence() { return (options.evidence || []).filter(e => eligible(e, kind) || String(e.id) === String(state.evidence_id)); }
     async function openChooser() {
@@ -402,11 +443,11 @@
     }
     async function loadCandidate(id, page) {
       if (choosing) return;
-      const token = ++chooserToken; renderTask?.cancel(); renderTask = null; candidate?.pdf?.destroy(); candidate = null; selectPage.disabled = true; prev.disabled = next.disabled = true; previewCanvas.width = previewCanvas.height = 1;
+      const token = ++chooserToken; candidateLoad?.abort(); candidateLoad = new AbortController(); renderTask?.cancel(); renderTask = null; releasePdf(candidate); candidate = null; selectPage.disabled = true; prev.disabled = next.disabled = true; previewCanvas.width = previewCanvas.height = 1;
       if (!id) { chooserStatus.textContent = 'Выберите исходный файл.'; return; }
       const evidence = (options.evidence || []).find(e => String(e.id) === String(id)); if (!evidence) return;
       chooserStatus.textContent = 'Открываю файл…';
-      try { const resource = await sourceResource(evidence, page || 1); if (!alive || token !== chooserToken || !chooser.open) { resource.pdf?.destroy(); return; } candidate = resource; await candidatePage(resource.page); }
+      try { const resource = await sourceResource(evidence, page || 1, candidateLoad.signal); if (!alive || token !== chooserToken || !chooser.open) { releasePdf(resource); return; } candidate = resource; await candidatePage(resource.page); }
       catch (e) {
         if (alive && token === chooserToken) chooserStatus.textContent = e?.code === 'AUDIT_FILE_RESPONSE'
           ? e.message : 'Файл не открывается. Попробуйте другой PDF или изображение.';
@@ -452,17 +493,17 @@
         if (candidate) { prev.disabled = candidate.page <= 1; next.disabled = candidate.page >= candidate.pages; }
       }
     }
-    on(sourceSelect, 'change', () => { chooserIntent++; return loadCandidate(sourceSelect.value, 1); });
-    on(uploadInput, 'change', async () => { const file = uploadInput.files?.[0]; if (!file) return; const token = ++chooserIntent; chooserStatus.textContent = 'Загружаю оригинал…'; upload.disabled = true; try {
-      const result = await options.onUpload(file, { role: kind === 'map' ? 'map-source' : 'plan-source' });
+    on(sourceSelect, 'change', () => { chooserIntent++; uploadController?.abort(); uploadController = null; upload.disabled = false; uploadInput.value = ''; return loadCandidate(sourceSelect.value, 1); });
+    on(uploadInput, 'change', async () => { const file = uploadInput.files?.[0]; if (!file) return; uploadController?.abort(); const uploading = uploadController = new AbortController(), token = ++chooserIntent; chooserStatus.textContent = 'Загружаю оригинал…'; upload.disabled = true; try {
+      const result = await options.onUpload(file, { role: kind === 'map' ? 'map-source' : 'plan-source', signal: uploading.signal });
       const evidence = Array.isArray(result) ? result.at(-1) : result?.id ? result : Array.isArray(result?.evidence) ? result.evidence.at(-1) : result?.evidence;
       if (!evidence?.id) throw new Error('Загрузка не вернула исходный файл.');
       if (!alive) return;
       options.evidence = [...(options.evidence || []).filter(e => String(e.id) !== String(evidence.id)), evidence]; sourceSelect.append(new Option(evidence.name || file.name, evidence.id));
       if (!chooser.open || token !== chooserIntent) return;
       sourceSelect.value = evidence.id; await loadCandidate(evidence.id, 1);
-    } catch (e) { if (alive && chooser.open && token === chooserIntent) chooserStatus.textContent = e.message || 'Файл не загружен.'; } finally { upload.disabled = false; uploadInput.value = ''; } });
-    on(chooser, 'close', () => { chooserIntent++; chooserToken++; renderTask?.cancel(); renderTask = null; candidate?.pdf?.destroy(); candidate = null; });
+    } catch (e) { if (alive && chooser.open && token === chooserIntent) chooserStatus.textContent = e.message || 'Файл не загружен.'; } finally { if (uploadController === uploading) { uploadController = null; upload.disabled = false; uploadInput.value = ''; } } });
+    on(chooser, 'close', () => { chooserIntent++; chooserToken++; uploadController?.abort(); uploadController = null; upload.disabled = false; uploadInput.value = ''; candidateLoad?.abort(); renderTask?.cancel(); renderTask = null; releasePdf(candidate); candidate = null; });
     on(toolSelect, 'change', () => setTool(toolSelect.value));
     function eventPoint(e) { const rect = canvas.getBoundingClientRect(); return point({ x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height }); }
     on(canvas, 'pointerdown', e => {
@@ -504,8 +545,8 @@
       updateEvidence(files) { options.evidence = files; },
       refresh(nextOptions) { if (nextOptions) Object.assign(options, nextOptions); return ready = saveTail.catch(() => {}).then(() => { state = normalise(options.getState?.() || state); return loadSelected(); }); },
       flush, exportPreview,
-      destroy() { alive = false; loadToken++; chooserIntent++; chooserToken++; renderTask?.cancel(); candidate?.pdf?.destroy(); controller.abort(); if (chooser.open) chooser.close(); container.replaceChildren(); image = null; },
+      destroy() { alive = false; loadToken++; chooserIntent++; chooserToken++; selectedLoad?.abort(); candidateLoad?.abort(); uploadController?.abort(); renderTask?.cancel(); releasePdf(candidate); controller.abort(); if (chooser.open) chooser.close(); container.replaceChildren(); image = null; },
     };
   }
-  return { mount, helpers: { normalise, addMark, selectSource, restoreSource, assertExportable, eligible, isPDF, toolNames, legendEntries, hitTest, renderScene, wrapText, pathMidpoint, createSaveQueue, measurementEndpoints, removeAnnotation }, tools: TOOLS };
+  return { mount, helpers: { normalise, addMark, selectSource, restoreSource, assertExportable, eligible, isPDF, toolNames, legendEntries, hitTest, renderScene, wrapText, pathMidpoint, createSaveQueue, measurementEndpoints, removeAnnotation, pdfOperation, loadPdf, releasePdf }, tools: TOOLS };
 });

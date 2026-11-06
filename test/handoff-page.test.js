@@ -8,8 +8,13 @@ const pause = async () => { for (let i = 0; i < 12; i++) await new Promise(resol
 function packet() {
   return { ok: true, signature: 'immutable-snapshot', order: { id: 60, org: 'ООО «ЧООКДИ»', address: 'Москва, Лесная, 5', region: 'МСК', kind: 'Общепит', service: 'Продление', inn: '1234567890', cad_num: '77:01:0004016:1064', contacts: [{ name: 'Карина', phone: '+79991234567', comment: 'Позвонить до выезда' }] }, report: { id: 15, src: 'a', text: 'Организация: ООО «ЧООКДИ»\nАдрес: Москва, Мясницкая, 15\nАудитор: @blanjik\n\nНужны действия\n\nПолный комментарий\nПоследняя строка.', address: 'Москва, Мясницкая, 15', status: 'actions', created_at: '2026-11-02T10:00:00Z', actor: '@blanjik', inspection: { address: 'Москва, Мясницкая, 15' }, telegram_url: 'https://t.me/c/4422574657/845', video_url: 'https://disk.yandex.ru/d/video', media: [{ id: 'map', name: 'Территория.png', mime: 'image/png', role: 'map', subject_id: 'annotation', caption: 'Схема · В3 — Вход', bytes: 100, url: '/api/handoff/reports/15/files/map' }, { id: 'plan', name: 'План.jpg', mime: 'image/jpeg', role: 'plan', subject_id: 'annotation', caption: 'План · лист 2 · этаж 1', bytes: 200, url: '/api/handoff/reports/15/files/plan' }, { id: 'entrance', name: 'Вход.png', mime: 'image/png', role: 'entrance', subject_id: 'e3', caption: 'В3 · Вход', bytes: 300, url: '/api/handoff/reports/15/files/entrance' }, { id: 'source', name: 'ЕГРН.pdf', mime: 'application/pdf', role: 'plan-source', subject_id: 'source', bytes: 400, url: '/api/handoff/reports/15/files/source' }] }, materials: [{ id: 'manager-egrn', name: 'Выписка.pdf', mime: 'application/pdf', role: 'egrn', bytes: 500, url: '/api/audit/orders/60/materials/manager-egrn' }], egrn: { status: 'available' }, archive_url: 'https://disk.yandex.ru/d/archive' };
 }
+function emptyPacket(requestId) {
+  return {ok:true,signature:'e'.repeat(64),order:null,report:null,request:requestId?{id:Number(requestId),text:'Saved source request',created_at:'2026-11-02T10:00:00Z'}:null,materials:[],egrn_links:[],egrn:{status:'missing'},archive_url:'',assignment:null};
+}
+function unboundPrefill(id=9){return{ok:true,order:null,report:null,lawyers:[{tg_id:108,name:'Елена'}],request:{id,text:'Saved request',f:{org:'ООО Пример',address:'Москва, Тестовая, 1',kind:'Общепит',region:'МСК',service:'Получение',client:'Анна',phone:'+79991234567'}}};}
 function harness(options = {}) {
   const nodes = new Map(), calls = [], stored = new Map(Object.entries(options.stored || {})), events = new Map(), revoked = [], created = [];
+  const timers=new Map();let now=0,timerId=0;
   class Node {
     constructor(id = '') { this.id = id; this.children = []; this.listeners = {}; this.hidden = false; this.disabled = false; this.value = ''; this.textContent = ''; this.parts = new Map(); this.innerHTML = ''; this.dataset = {}; this.style = {}; this.open = false; this.checked = false; this.classList = { add() {}, remove() {}, toggle() {} }; }
     set innerHTML(value) { this._html = value; this.children = []; this.parts.clear(); }
@@ -30,12 +35,18 @@ function harness(options = {}) {
   const node = id => { if (!nodes.has(id)) nodes.set(id, new Node(id)); return nodes.get(id); };
   const document = { activeElement: null, documentElement: { dataset: {} }, body: new Node('body'), getElementById: node, createElement: tag => new Node(tag), querySelector: selector => selector === 'dialog[open]' ? [...nodes.values()].find(n => n.id.endsWith('dialog') && n.open) || null : null };
   const responses = { packet: options.packet || packet(), prefill: { ok: true, lawyers: [{ tg_id: 108, name: 'Елена' }, { tg_id: 109, name: 'Мария' }], report: { src: 'a', id: 15 }, order: { id: 60 } } };
-  let packetRequests = 0, postRequests = 0;
+  let packetRequests = 0, sourcePacketRequests=0,postRequests = 0;
   async function fetch(url, init = {}) {
     calls.push(['fetch', url, init]);
+    if(options.fetch){const custom=options.fetch(url,init,response);if(custom!==undefined)return custom;}
     if (url.startsWith('/api/handoff/prefill')) return response(options.prefill || responses.prefill);
-    if (url.startsWith('/api/handoff/packet')) { packetRequests++; if (options.packetFetch) return options.packetFetch(url, packetRequests, response); if (options.packetError && packetRequests === 1) throw new Error('Сеть недоступна'); return response(responses.packet); }
-    if (url === '/api/handoff' && init.method === 'POST') { postRequests++; if (options.post) return options.post(postRequests, JSON.parse(init.body)); return response({ ok: true, id: 75, delivery_complete: true }); }
+    if (url.startsWith('/api/handoff/packet')) {
+      packetRequests++;const query=new URL(url,'https://bot.example').searchParams;
+      if(!query.get('order_id')&&!query.get('report_id'))return options.emptyPacketFetch?options.emptyPacketFetch(url,response):response(emptyPacket(query.get('request_id')));
+      sourcePacketRequests++;if(options.packetFetch)return options.packetFetch(url,sourcePacketRequests,response);if(options.packetError&&sourcePacketRequests===1)throw new Error('Сеть недоступна');
+      return response({...responses.packet,...(query.get('request_id')?{request:emptyPacket(query.get('request_id')).request}:{})});
+    }
+    if (url === '/api/handoff' && init.method === 'POST') { postRequests++; if (options.post) return options.post(postRequests, JSON.parse(init.body),init); return response({ ok: true, id: 75, delivery_complete: true }); }
     if (url.startsWith('/api/reports/search')) return response({ ok: true, items: options.searchItems || [] });
     if (url.startsWith('/api/reports/get')) return response({ ok: true, text: 'Аудитор: @only-auditor\nКомментарий: не превращать в контакт', metadata: { org: 'ООО Тест', address: 'Москва, Тестовая, 1', service: 'Получение' } });
     if (url.startsWith('/api/handoff/reports/') || url.startsWith('/api/audit/orders/')) { if (options.imageError && !/download=1/.test(url)) throw new Error('Image offline'); return { ok: true, blob: async () => ({ type: 'image/png', size: 100 }) }; }
@@ -46,11 +57,11 @@ function harness(options = {}) {
   class TestURL extends URL {}
   TestURL.createObjectURL = () => { const url = 'blob:protected-' + (created.length + 1); created.push(url); return url; };
   TestURL.revokeObjectURL = url => revoked.push(url);
-  const window = { HandoffModel: page.model(), crypto: { randomUUID: () => 'd6fcab88-fb9e-4a29-8cd7-47ad66a0875e' }, addEventListener: (name, fn) => events.set(name, fn), matchMedia: () => ({ matches: false }) };
+  const window = { HandoffModel: page.model(), crypto: { randomUUID: require('node:crypto').randomUUID }, addEventListener: (name, fn) => events.set(name, fn), matchMedia: () => ({ matches: false }) };
   const location = { search: options.query || '?order_id=60', origin: 'https://bot.example', href: 'https://bot.example/handoff' + (options.query || '?order_id=60') };
-  const context = { window, document, location, history, fetch, URL: TestURL, URLSearchParams, AbortController, sessionStorage: { getItem: key => stored.get(key) || null, setItem: (key, value) => stored.set(key, value) }, setTimeout: (fn, ms) => { const timer = setTimeout(fn, ms); timer.unref(); return timer; }, clearTimeout, Date, Math, console };
+  const context = { window, document, location, history, fetch, URL: TestURL, URLSearchParams, AbortController, sessionStorage: { getItem: key => stored.get(key) || null, setItem: (key, value) => stored.set(key, value) }, setTimeout: (fn, ms) => { if(options.virtualClock){const id=++timerId;timers.set(id,{fn,at:now+ms});return id;}const timer = setTimeout(fn, ms); timer.unref(); return timer; }, clearTimeout:id=>{if(options.virtualClock)timers.delete(id);else clearTimeout(id);}, Date, Math, console };
   vm.createContext(context); vm.runInContext('(' + page.client.toString() + ')();', context);
-  return { context, node, nodes, calls, stored, events, revoked, created, responses, response, postRequests: () => postRequests, packetRequests: () => packetRequests, cached: () => JSON.parse(stored.get('handoff-v2:staff:order-60') || 'null') };
+  return { context, node, nodes, calls, stored, events, revoked, created, responses, response,timers,async tick(ms){const target=now+ms;for(;;){const next=[...timers].filter(([,v])=>v.at<=target).sort((a,b)=>a[1].at-b[1].at)[0];if(!next)break;now=next[1].at;timers.delete(next[0]);next[1].fn();await pause();}now=target;await pause();}, postRequests: () => postRequests, packetRequests: () => packetRequests, cached: () => JSON.parse(stored.get('handoff-v2:staff:order-60') || 'null') };
 }
 function lawyer(h) { h.node('lawyers').value = '108'; h.node('lawyers').onchange(); }
 
@@ -86,7 +97,7 @@ test('a failed known-order report packet stays blocked and retry retains V2 orde
   h.node('confirm-send').click();await pause();assert.equal(h.postRequests(),0);
   h.node('retry-load').click();await pause();assert.equal(h.node('packet-error').hidden,true);lawyer(h);h.node('go').click();h.node('confirm-send').click();await pause();
   assert.equal(bodies.length,1);assert.equal(bodies[0].handoff_version,2);assert.equal(bodies[0].order_id,60);assert.equal(bodies[0].report_id,15);assert.equal(bodies[0].packet_signature,packet().signature);
-  const urls=h.calls.filter(call=>call[0]==='fetch'&&call[1].startsWith('/api/handoff/packet')).map(call=>new URL(call[1],'https://bot.example'));
+  const urls=h.calls.filter(call=>call[0]==='fetch'&&call[1].startsWith('/api/handoff/packet')).map(call=>new URL(call[1],'https://bot.example')).filter(url=>url.searchParams.has('report_id'));
   assert.equal(urls.length,2);assert.ok(urls.every(url=>url.searchParams.get('order_id')==='60'&&url.searchParams.get('report_id')==='15'));
 });
 
@@ -98,15 +109,68 @@ for (const failure of ['network', '500']) test('report search without an order h
   assert.equal(h.node('packet-error').hidden,false);assert.equal(h.node('go').disabled,true);
   h.node('retry-load').click();await pause();assert.equal(h.node('packet-error').hidden,true);lawyer(h);h.node('go').click();h.node('confirm-send').click();await pause();
   const body=JSON.parse(h.calls.find(call=>call[1]==='/api/handoff')[2].body);assert.equal(body.order_id,60);assert.equal(body.report_id,15);assert.equal(body.handoff_version,2);
-  const urls=h.calls.filter(call=>call[0]==='fetch'&&call[1].startsWith('/api/handoff/packet')).map(call=>new URL(call[1],'https://bot.example'));
+  const urls=h.calls.filter(call=>call[0]==='fetch'&&call[1].startsWith('/api/handoff/packet')).map(call=>new URL(call[1],'https://bot.example')).filter(url=>url.searchParams.has('report_id'));
   assert.equal(urls.length,2);assert.ok(urls.every(url=>url.searchParams.get('report_id')==='15'));
 });
 
 test('a successful packet explicitly without an order keeps a legacy report available', async () => {
-  const p=packet();p.order=null;p.report={...p.report,id:21,src:'r'};p.materials=[];
+  const p=packet();p.order=null;p.report={...p.report,id:21,src:'r',media:[]};p.materials=[];
   const h=harness({query:'?request_id=9',packet:p,prefill:{ok:true,lawyers:[{tg_id:108,name:'Елена'}],request:{f:{org:'ООО Пример',address:'Москва, Тестовая, 1',kind:'Общепит',region:'МСК',service:'Получение',client:'Карина'}}},searchItems:[{src:'r',id:21}]});
   await pause();h.node('choose-report').click();await pause();h.node('search-results').children[0].click();await pause();lawyer(h);h.node('go').click();h.node('confirm-send').click();await pause();
-  const body=JSON.parse(h.calls.find(call=>call[1]==='/api/handoff')[2].body);assert.equal(body.order_id,null);assert.equal(body.report_id,21);assert.equal(body.report_src,'r');assert.equal(body.handoff_version,undefined);
+  const body=JSON.parse(h.calls.find(call=>call[1]==='/api/handoff')[2].body);assert.equal(body.order_id,null);assert.equal(body.report_id,21);assert.equal(body.report_src,'r');assert.equal(body.handoff_version,2);assert.match(body.submit_id,/^[a-f\d-]{36}$/);assert.equal(body.packet_signature,p.signature);assert.equal(body.request_id,9);
+});
+
+test('a no-order request freezes one V2 identity across double click, lost response, reopen and retry',async()=>{
+  const bodies=[];let reject;const first=harness({query:'?request_id=9',prefill:unboundPrefill(),post:(_,body)=>{bodies.push(body);return new Promise((resolve,no)=>{reject=no;});}});
+  await pause();lawyer(first);first.node('go').click();first.node('confirm-send').click();first.node('confirm-send').click();await pause();assert.equal(bodies.length,1);
+  const body=bodies[0];assert.equal(body.order_id,null);assert.equal(body.report_id,null);assert.equal(body.report_src,null);assert.equal(body.handoff_version,2);assert.match(body.submit_id,/^[a-f\d-]{36}$/);assert.equal(body.packet_signature,emptyPacket(9).signature);assert.equal(body.request_id,9);
+  reject(new Error('Synthetic lost HTTP acknowledgement'));await pause();assert.equal(first.node('retry-send').hidden,false);
+  const saved=JSON.parse(first.stored.get('handoff-v2:staff:request-9'));assert.deepEqual(saved.pending.payload,body);
+  const reopened=harness({query:'?request_id=9',prefill:unboundPrefill(),stored:Object.fromEntries(first.stored),post:async(_,payload)=>{bodies.push(payload);return reopened.response({ok:true,id:75,delivery_complete:true});}});await pause();
+  reopened.node('retry-send').click();await pause();assert.equal(bodies.length,2);assert.deepEqual(bodies[1],body);assert.equal(reopened.node('retry-send').hidden,true);assert.match(reopened.node('delivery-title').textContent,/Передано/);
+});
+
+test('a no-order request packet failure stays blocked until its same source request is loaded successfully',async()=>{
+  let fails=true;const h=harness({query:'?request_id=9',prefill:unboundPrefill(),emptyPacketFetch(url,response){if(fails)throw new Error('Source request unavailable');return response(emptyPacket(9));}});await pause();
+  assert.equal(h.node('packet-error').hidden,false);lawyer(h);h.node('go').click();h.node('confirm-send').click();await pause();assert.equal(h.postRequests(),0);
+  fails=false;h.node('retry-load').click();await pause();assert.equal(h.node('packet-error').hidden,true);lawyer(h);h.node('go').click();h.node('confirm-send').click();await pause();
+  const sent=JSON.parse(h.calls.find(call=>call[1]==='/api/handoff')[2].body);assert.equal(sent.handoff_version,2);assert.equal(sent.request_id,9);assert.equal(sent.packet_signature,emptyPacket(9).signature);assert.ok(h.calls.filter(call=>call[1].startsWith('/api/handoff/packet')).every(call=>new URL(call[1],'https://bot.example').searchParams.get('request_id')==='9'));
+});
+
+test('a no-order readonly report forwards its case identity through prefill and every selected packet request',async()=>{
+  const p=packet();p.order=null;p.materials=[];p.report={...p.report,id:15,src:'a',order_id:null};p.report.media=p.report.media.map(file=>({...file,url:file.url+'?case_id=75'}));
+  const h=harness({query:'?case_id=75&report_src=a&report_id=15&view=report',packet:p,prefill:{ok:true,order:{org:'Saved case',address:'Saved address',kind:'Общепит',service:'Получение',contacts:[]},report:{src:'a',id:15},lawyers:[{tg_id:108,name:'Елена'}]}});await pause();
+  assert.equal(h.node('report-dialog').open,true);assert.equal(h.node('assignment').hidden,true);assert.equal(h.node('footer').hidden,true);assert.equal(h.node('org').value,'Saved case');
+  const urls=h.calls.filter(call=>call[1].startsWith('/api/handoff/prefill')||call[1].startsWith('/api/handoff/packet')).map(call=>new URL(call[1],'https://bot.example'));assert.ok(urls.length>=2);assert.ok(urls.every(url=>url.searchParams.get('case_id')==='75'));
+  assert.ok(urls.filter(url=>url.pathname.endsWith('/packet')).every(url=>url.searchParams.get('report_id')==='15'&&url.searchParams.get('report_src')==='a'));
+  h.node('confirm-send').click();h.node('retry-send').click();await pause();assert.equal(h.postRequests(),0);assert.ok(h.calls.filter(call=>call[1].startsWith('/api/handoff/reports/')).every(call=>new URL(call[1],'https://bot.example').searchParams.get('case_id')==='75'));
+});
+
+function unlinkedPacket(id){const p=packet();p.order=null;p.materials=[];p.signature='unlinked-report-'+id;p.report={...p.report,id,src:'a',text:'Unlinked report '+id,media:[]};return p;}
+for(const sameSource of [false,true])test('reopening a completed no-order handoff '+(sameSource?'keeps the exact source completed':'allows an explicitly different reviewed report'),async()=>{
+  const first=harness({query:'?request_id=9&report_src=a&report_id=15',prefill:unboundPrefill(),packet:unlinkedPacket(15)});await pause();lawyer(first);
+  first.node('org').listeners.change.call({value:'Saved A edited profile'});first.node('go').click();first.node('confirm-send').click();await pause();
+  const sent=JSON.parse(first.calls.find(call=>call[1]==='/api/handoff')[2].body);assert.equal(sent.report_id,15);assert.match(first.node('delivery-title').textContent,/Передано/);
+  const id=sameSource?15:16,h=harness({query:'?request_id=9&report_src=a&report_id='+id,prefill:unboundPrefill(),packet:unlinkedPacket(id),stored:Object.fromEntries(first.stored)});await pause();
+  if(sameSource){assert.match(h.node('delivery-title').textContent,/Передано/);assert.equal(h.node('org').value,'Saved A edited profile');h.node('go').click();h.node('confirm-send').click();await pause();assert.equal(h.postRequests(),0);}
+  else{assert.equal(h.node('delivery').hidden,true);assert.equal(h.node('go').disabled,false);assert.equal(h.node('org').value,'ООО Пример');h.node('go').click();h.node('confirm-send').click();await pause();const body=JSON.parse(h.calls.find(call=>call[1]==='/api/handoff')[2].body);assert.equal(body.report_id,16);assert.equal(body.packet_signature,unlinkedPacket(16).signature);assert.notEqual(body.submit_id,sent.submit_id);}
+});
+test('a different no-order report never discards an unknown frozen pending body',async()=>{
+  const first=harness({query:'?request_id=9&report_src=a&report_id=15',prefill:unboundPrefill(),packet:unlinkedPacket(15),post:()=>{throw new Error('Lost acknowledgement');}});await pause();lawyer(first);first.node('go').click();first.node('confirm-send').click();await pause();
+  const body=JSON.parse(first.calls.find(call=>call[1]==='/api/handoff')[2].body),h=harness({query:'?request_id=9&report_src=a&report_id=16',prefill:unboundPrefill(),packet:unlinkedPacket(16),stored:Object.fromEntries(first.stored)});await pause();
+  assert.equal(h.node('retry-send').hidden,false);h.node('retry-send').click();await pause();assert.deepEqual(JSON.parse(h.calls.find(call=>call[1]==='/api/handoff')[2].body),body);
+});
+
+for(const phase of ['headers','body'])test('handoff '+phase+' timeout releases sending, ignores late success and retries the exact frozen intent',async()=>{
+  let release,signal;const bodies=[],h=harness({virtualClock:true,post(n,body,init){bodies.push(body);if(n!==1)return h.response({ok:true,id:75,delivery_complete:true});signal=init.signal;const held=new Promise(resolve=>{release=resolve;});return phase==='headers'?held:{ok:true,status:200,json:()=>held};}});await pause();lawyer(h);h.node('go').click();h.node('confirm-send').click();await pause();
+  assert.equal(h.node('confirm-send').disabled,true);await h.tick(120000);assert.equal(h.node('confirm-send').disabled,false);assert.equal(h.node('retry-send').hidden,false);assert.match(h.node('delivery-text').textContent,/не подтверждена/i);assert.equal(signal.aborted,true);
+  release(phase==='headers'?h.response({ok:true,id:999,delivery_complete:true}):{ok:true,id:999,delivery_complete:true});await pause();assert.doesNotMatch(h.node('delivery-title').textContent,/Передано/);
+  h.node('retry-send').click();await pause();assert.equal(bodies.length,2);assert.deepEqual(bodies[1],bodies[0]);assert.match(h.node('delivery-title').textContent,/Передано/);assert.equal(h.timers.size,0);
+});
+for(const phase of ['headers','body'])test('a stalled packet '+phase+' reaches a bounded visible load error and can be retried',async()=>{
+  let release,signal,reads=0;const h=harness({virtualClock:true,fetch(url,init,response){if(!url.startsWith('/api/handoff/packet'))return;reads++;if(reads>1)return response(packet());signal=init.signal;const held=new Promise(resolve=>{release=resolve;});return phase==='headers'?held:{ok:true,status:200,json:()=>held};}});await pause();assert.equal(h.node('go').disabled,true);
+  await h.tick(30000);assert.equal(h.node('packet-error').hidden,false);assert.equal(signal.aborted,true);h.node('retry-load').click();await pause();assert.equal(h.node('packet-error').hidden,true);assert.equal(h.node('address').value,packet().order.address);
+  const stale=packet();stale.order.address='Late stale data';release(phase==='headers'?h.response(stale):stale);await pause();assert.equal(h.node('address').value,packet().order.address);assert.equal(h.timers.size,0);
 });
 
 for(const olderFails of [false,true]) test('a late '+(olderFails?'failed':'successful')+' packet cannot replace the latest chosen report',async()=>{
@@ -271,10 +335,10 @@ test('legacy request starts from labelled request data and does not copy its his
   const h = harness({ query: '?request_id=7', prefill: { ok: true, lawyers: [{ tg_id: 108, name: 'Елена' }], order: null, report: null, request: { id: 7, text: 'Аудитор: @do-not-use\nТелефон аудитора: +79990000000', f: { org: 'ООО Клиент', address: 'Москва, Тестовая, 1', region: 'МСК', kind: 'Магазин', service: 'Получение', client: 'Анна', phone: '+79998887766', comment: 'Старое длинное задание менеджера' } } } });
   await pause(); assert.equal(h.node('org').value, 'ООО Клиент'); assert.equal(h.node('comment').value, '');
   assert.match(h.node('contacts').innerHTML, /Анна/); assert.doesNotMatch(h.node('contacts').innerHTML, /do-not-use|79990000000/);
-  assert.match(h.node('materials-state').textContent, /не подтверждён/);
+  assert.equal(h.node('materials-state').textContent,'Документы заявки · 0 файлов');assert.equal(h.node('open-report').disabled,true);
   lawyer(h); h.node('go').click(); h.node('confirm-send').click(); await pause();
   const body = JSON.parse(h.calls.find(c => c[1] === '/api/handoff')[2].body);
-  assert.equal(body.request_id, 7); assert.equal(body.order_id, null); assert.equal(body.handoff_version, undefined);
+  assert.equal(body.request_id,7);assert.equal(body.order_id,null);assert.equal(body.handoff_version,2);assert.match(body.submit_id,/^[a-f\d-]{36}$/);assert.equal(body.packet_signature,emptyPacket(7).signature);assert.equal(body.report_id,null);assert.equal(body.report_src,null);
 });
 
 test('new package invalidates an old completed session instead of permanently blocking another handoff', async () => {

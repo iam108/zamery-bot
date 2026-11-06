@@ -48,6 +48,13 @@ test('approval, role and ownership are read again on each request; managers and 
 test('V2 links the exact frozen historical report, including imported source, rather than a newer order audit',pg,()=>fixture(async h=>{
   for(const src of ['a','r']){await h.save({_handoff:{version:2,body:{order_id:62,report_src:src,report_id:15}}});const c=await h.open(),url=new URL(buttons(c)[1].web_app.url);assert.equal(buttons(c)[1].text,'Отчёт и материалы');assert.equal(url.pathname,'/handoff');assert.equal(url.searchParams.get('view'),'report');assert.equal(url.searchParams.get('order_id'),'62');assert.equal(url.searchParams.get('report_src'),src);assert.equal(url.searchParams.get('report_id'),'15');}
 }));
+
+test('a V2 no-order case opens its exact saved report through case_id without credentials or a fabricated order',pg,()=>fixture(async h=>{
+  await h.db.exec('UPDATE cases SET order_id=NULL WHERE id=39;UPDATE audits SET order_id=NULL WHERE id=15');
+  await h.save({_handoff:{version:2,body:{order_id:null,report_src:'a',report_id:15}}});
+  const c=await h.open(),url=new URL(buttons(c)[1].web_app.url);assert.equal(url.pathname,'/handoff');assert.equal(url.searchParams.get('case_id'),'39');assert.equal(url.searchParams.get('view'),'report');assert.equal(url.searchParams.get('report_id'),'15');assert.equal(url.searchParams.has('order_id'),false);assert.equal(url.searchParams.has('u'),false);assert.equal(url.searchParams.has('k'),false);
+  for(const body of [{order_id:null,report_src:null,report_id:null},{order_id:62,report_src:'a',report_id:15}]){await h.save({_handoff:{version:2,body}});assert.equal(buttons(await h.open()).length,1);}
+}));
 test('invalid or unknown saved report bindings never fall back to the latest audit or inject an external URL',pg,()=>fixture(async h=>{
   for(const change of [{order_id:63},{report_id:'15&report_id=99'},{report_src:'https://evil.invalid'},{report_id:null}]){await h.save({_handoff:{version:2,body:{order_id:62,report_src:'a',report_id:15,...change}}});assert.equal(buttons(await h.open()).length,1);}
   await h.save({_handoff:{version:99,body:{order_id:62,report_src:'a',report_id:15}}});assert.equal(buttons(await h.open()).length,1);

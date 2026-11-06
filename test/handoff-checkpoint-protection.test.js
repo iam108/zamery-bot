@@ -10,12 +10,13 @@ const pg = { skip: !process.env.PGLITE_TEST_MODULE };
 
 // Run the actual registered route and actual SQL against PostgreSQL semantics.
 // Only Telegram, staff auth, timers and unrelated packet routes are synthetic.
-async function fixture(run) {
+async function fixture(run,options={}) {
   const { PGlite } = require(process.env.PGLITE_TEST_MODULE), db = new PGlite();
   const routes = new Map(), queries = [], initialization = [], telegram = [];
-  let beforeWrite = null, writes = 0;
+  let beforeWrite = null, beforeAccess=null,writes = 0;
   const pool = { async query(sql, params) {
     queries.push(sql);
+    if(beforeAccess&&sql.startsWith('SELECT to_jsonb(c) AS access_case'))await beforeAccess(db);
     if (/^UPDATE cases SET data=/.test(sql)) {
       writes++;
       if (beforeWrite) await beforeWrite({ sql, params, number: writes, db });
@@ -24,15 +25,16 @@ async function fixture(run) {
     initialization.push(operation);
     return operation;
   } };
-  const context = {
+  const environment={};const context = {
     module: { exports: {} }, URL,
-    console: { log() {}, error() {} }, process: { env: {} }, setTimeout() {}, setInterval() {},
+    console: { log() {}, error() {} }, process: { env: environment }, setTimeout() {}, setInterval() {},
     require(name) {
       if (name === '../db/pool') return pool;
-      if (name === '../checklists') return { LISTS: {}, STAGES: ['Сбор документов', 'Подано', 'Выездная проверка', 'Архив'], pickChecklist: () => 'QA', flagLabels: () => ({}) };
+      if (name === '../checklists') return { LISTS: {}, STAGES: ['Сбор документов', 'Подано', 'Выездная проверка', 'Архив'], pickChecklist: () => 'QA', flagLabels: () => options.flagLabels||{} };
       if (name === '../bot/instance') return { telegram: { async sendMessage(...args) { telegram.push(args); return { message_id: telegram.length }; } } };
       if (name === './handoff-packet') return { setupHandoffPacket: () => ({}) };
       if (name === './auth') return require('../src/web/auth');
+      if (name === './reminder-recipients') return require('../src/web/reminder-recipients');
       if (name === './http-errors') return require('../src/web/http-errors');
       throw new Error('Unexpected dependency: ' + name);
     },
@@ -42,32 +44,75 @@ async function fixture(run) {
   try {
     context.module.exports.setupHandoff(app);
     await Promise.all(initialization);
+    await db.exec("ALTER TABLE staff ADD COLUMN approved BOOLEAN;INSERT INTO staff(tg_id,name,role,approved) VALUES(808,'Тестовый юрист','lawyer',true),(909,'Другой юрист','lawyer',true),(101,'Менеджер','manager',true),(102,'Новый менеджер','manager',true),(999,'Администратор','auditor',true)");
     const route = routes.get('POST /api/checklist/save'); assert.equal(typeof route, 'function');
-    async function rawSave(data, extra = {}) {
+    async function rawSave(data, extra = {}, actor={id:808,role:'lawyer'}) {
       let result, status = 200;
       const row = (await db.query('SELECT checklist_revision FROM cases WHERE id=17')).rows[0];
-      await route({ body: { case_id: 17, data, done: 1, total: 4, expectedRevision: Number(row?.checklist_revision || 0), ...extra }, tgUser: { id: 808 }, staff: { name: 'Тестовый юрист', role: 'lawyer', approved: true }, get: () => 'application/json' }, {
+      await route({ body: { case_id: 17, data, done: 1, total: 4, expectedRevision: Number(row?.checklist_revision || 0), ...extra }, tgUser: { id: actor.id }, staff: { name: 'Тестовый сотрудник', role: actor.role, approved: true }, get: () => 'application/json' }, {
         status(value) { status = value; return this; }, json(value) { result = value; },
       });
       return { status, result };
     }
-    await run({ db, queries, telegram,
+    await run({ db, queries, telegram,environment,
       async seed(data) {
         await db.query(`INSERT INTO cases(id,org,lawyer_name,lawyer_tg_id,created_by,region,checklist_key,data)
           VALUES(17,'ООО Проверка','Тестовый юрист',808,101,'МСК','QA',$1)`, [data]);
       },
       rawSave,
+      async prefill(query,actor=808){let result,status=200;await routes.get('GET /api/handoff/prefill')({query,tgUser:{id:actor},staff:{name:'Сотрудник',role:actor===101?'manager':'lawyer',approved:true}},{json(value){result=value;},status(value){status=value;return this;}});return{status,result};},
+      async requestDocuments(){let result,status=200;await routes.get('POST /api/checklist/request')({body:{case_id:17,missing:['Synthetic required document']},tgUser:{id:808},staff:{name:'Тестовый юрист',role:'lawyer',approved:true}},{json(value){result=value;},status(value){status=value;return this;}});return{status,result};},
       async save(data, extra = {}) {
         const { result, status } = await rawSave(data, extra);
         assert.equal(status, 200); assert.equal(result?.ok, true, result?.error); return result;
       },
       row: async () => (await db.query('SELECT * FROM cases WHERE id=17')).rows[0],
       interleave(fn) { beforeWrite = fn; },
+      interleaveAccess(fn){beforeAccess=fn;},
     });
   } finally { await db.close(); }
 }
 const checkpoint = generation => ({ version: 2, generation, completed: generation > 1, cards: { '808': 900 + generation }, materials: { confirmed: { '808': [1000 + generation] } }, egrn: { copies: { confirmed: true } } });
 const asDate = value => value instanceof Date ? value.toISOString().slice(0, 10) : String(value).slice(0, 10);
+
+for(const change of ['approval','role','assignment'])test('checklist saving rejects a current '+change+' change in its atomic write and preserves answers and checkpoint',pg,async()=>fixture(async h=>{
+  await h.seed({answer:'Original',_comment:'Private original note',_handoff:checkpoint(2)});let changed=false;
+  h.interleave(async({db})=>{if(!changed){changed=true;await db.exec(change==='approval'?'UPDATE staff SET approved=false WHERE tg_id=808':change==='role'?"UPDATE staff SET role='auditor' WHERE tg_id=808":'UPDATE cases SET lawyer_tg_id=909 WHERE id=17');}});
+  const result=await h.rawSave({answer:'Must not save',_comment:'Must not replace'},{expectedNote:'Private original note'});
+  assert.equal(result.status,403);assert.equal(result.result.code,'CASE_FORBIDDEN');assert.equal(result.result.note,undefined);const row=await h.row();assert.equal(row.data.answer,'Original');assert.equal(row.data._comment,'Private original note');assert.deepEqual(row.data._handoff,checkpoint(2));assert.equal(row.checklist_revision,0);assert.equal(h.telegram.length,0);
+}));
+
+test('checklist writes retain approved manager and configured administrator access, while a revoked administrator is denied',pg,async()=>fixture(async h=>{
+  const before=process.env.ADMIN_TG_IDS;process.env.ADMIN_TG_IDS='999';try{
+    await h.seed({answer:'Original',_handoff:checkpoint(2)});
+    let result=await h.rawSave({answer:'Manager update'},{},{id:101,role:'manager'});assert.equal(result.status,200);assert.equal(result.result.ok,true);
+    result=await h.rawSave({answer:'Admin update'},{},{id:999,role:'auditor'});assert.equal(result.status,200);assert.equal(result.result.ok,true);
+    h.interleave(async({db})=>{await db.exec('UPDATE staff SET approved=false WHERE tg_id=999');});
+    result=await h.rawSave({answer:'Revoked admin update'},{},{id:999,role:'auditor'});assert.equal(result.status,403);assert.equal((await h.row()).data.answer,'Admin update');assert.deepEqual((await h.row()).data._handoff,checkpoint(2));
+  }finally{if(before===undefined)delete process.env.ADMIN_TG_IDS;else process.env.ADMIN_TG_IDS=before;}
+}));
+
+for(const branch of ['documents','redflag'])for(const change of ['normal','disabled','foreign','changed-creator','revoked-during-lookup','missing-creator','lookup-error'])test('checklist '+branch+' private notice checks its current creator: '+change,pg,async()=>fixture(async h=>{
+  h.environment.CLIENTS_CHAT_ID='-100222';await h.seed({answer:'Original',_handoff:checkpoint(2)});
+  if(change==='disabled')await h.db.exec('UPDATE staff SET approved=false WHERE tg_id=101');
+  if(change==='foreign')await h.db.exec("UPDATE staff SET role='lawyer' WHERE tg_id=101");
+  if(change==='missing-creator')await h.db.exec('UPDATE cases SET created_by=NULL WHERE id=17');
+  let changed=false;h.interleaveAccess(async db=>{if(change==='lookup-error')throw new Error('Synthetic staff lookup failure');if(!changed&&['changed-creator','revoked-during-lookup'].includes(change)){changed=true;await db.exec(change==='changed-creator'?'UPDATE cases SET created_by=102 WHERE id=17':'UPDATE staff SET approved=false WHERE tg_id=101');}});
+  const response=branch==='documents'?await h.requestDocuments():await h.rawSave({answer:'New answer',fl_egrn:{s:'yes',c:'Synthetic finding'}});
+  assert.equal(response.status,200);assert.equal(response.result.ok,true);const targets=h.telegram.map(args=>String(args[0]));
+  assert.deepEqual(targets,change==='normal'?['-100222','101']:change==='changed-creator'?['-100222','102']:['-100222']);
+  if(branch==='redflag')assert.equal((await h.row()).data.fl_egrn.s,'yes');assert.deepEqual((await h.row()).data._handoff,checkpoint(2));
+}, {flagLabels:{fl_egrn:'Synthetic restriction'}}));
+
+test('no-order handoff prefill uses the assigned current case profile and frozen report without inventing a source order',pg,async()=>fixture(async h=>{
+  await h.seed({_handoff:{version:2,body:{order_id:null,report_src:'r',report_id:15},fields:{cad_num:'77:01:0000001:2'}}});
+  await h.db.query('UPDATE cases SET address=$1,kind=$2,service=$3,contacts=$4,audit_text=$5 WHERE id=17',['Saved case address','Общепит','Продление',JSON.stringify([{name:'Client',phone:'+79990000000'}]),'Frozen saved report text']);
+  const opened=await h.prefill({case_id:'17'});assert.equal(opened.status,200);assert.equal(opened.result.ok,true);assert.equal(opened.result.order.id,null);assert.equal(opened.result.order.org,'ООО Проверка');assert.equal(opened.result.order.address,'Saved case address');assert.equal(opened.result.order.cad_num,'77:01:0000001:2');assert.equal(opened.result.report.id,15);assert.equal(opened.result.report.src,'r');assert.deepEqual(opened.result.lawyers.map(value=>Number(value.tg_id)),[808]);
+  assert.equal((await h.prefill({case_id:'17',order_id:'60'})).status,403);assert.equal((await h.prefill({case_id:'999'})).status,403);
+  await h.db.exec('UPDATE staff SET approved=false WHERE tg_id=808');assert.equal((await h.prefill({case_id:'17'})).status,403);
+  await h.db.exec('UPDATE staff SET approved=true WHERE tg_id=808;UPDATE cases SET lawyer_tg_id=909 WHERE id=17');assert.equal((await h.prefill({case_id:'17'})).status,403);
+  assert.equal((await h.prefill({case_id:'17'},101)).status,200);
+}));
 
 test('a stale checklist form without internal state preserves a newer backend checkpoint atomically', pg, async () => fixture(async h => {
   await h.seed({ _stage: 'Сбор документов', _handoff: checkpoint(1), older: { s: 'no' } });

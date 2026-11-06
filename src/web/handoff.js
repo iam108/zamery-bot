@@ -766,15 +766,19 @@ function requestsPage() {
 
 // ── Срок решения после подачи: Москва 15 рабочих дней, Подмосковье 10 ─────
 // Нерабочие праздничные дни (производственный календарь РФ). Выходные сб/вс учитываются автоматически.
+// Переносы 2027: постановление 17.09.2026 №1187, официальный источник:
+// https://www.mintrans.gov.ru/eye/press-center/branch-news/9491
 var HOLIDAYS = {
   2026: ['01-01', '01-02', '01-05', '01-06', '01-07', '01-08', '01-09', '02-23', '03-09', '05-01', '05-11', '06-12', '11-04', '12-31'],
-  2027: ['01-01', '01-04', '01-05', '01-06', '01-07', '01-08', '02-23', '03-08', '05-03', '05-10', '06-14', '11-04']
+  2027: ['01-01', '01-04', '01-05', '01-06', '01-07', '01-08', '02-22', '02-23', '03-08', '05-03', '05-10', '06-14', '11-04', '11-05', '12-31']
 };
+var WORKING_DAYS = { 2027: ['02-20'] };
 var DEFAULT_HOLIDAYS = ['01-01', '01-02', '01-03', '01-04', '01-05', '01-06', '01-07', '01-08', '02-23', '03-08', '05-01', '05-09', '06-12', '11-04'];
 function isWorkday(d) {
+  var key = ('0' + (d.getUTCMonth() + 1)).slice(-2) + '-' + ('0' + d.getUTCDate()).slice(-2);
+  if ((WORKING_DAYS[d.getUTCFullYear()] || []).indexOf(key) !== -1) return true;
   var wd = d.getUTCDay();
   if (wd === 0 || wd === 6) return false;
-  var key = ('0' + (d.getUTCMonth() + 1)).slice(-2) + '-' + ('0' + d.getUTCDate()).slice(-2);
   return (HOLIDAYS[d.getUTCFullYear()] || DEFAULT_HOLIDAYS).indexOf(key) === -1;
 }
 // date — 'YYYY-MM-DD'; срок считается со следующего дня после подачи
@@ -1340,20 +1344,44 @@ function setupHandoff(app) {
   const WEBAPP_URL = process.env.WEBAPP_URL;
   const packetService = require('./handoff-packet').setupHandoffPacket(app);
   let submitV2;
+  async function notifyCaseCreator(snapshot, message) {
+    for(let attempt=0;attempt<2;attempt++){
+      const wanted=String(snapshot?.created_by||'');
+      if(!/^[1-9]\d*$/.test(wanted))return false;
+      const checked=await require('./reminder-recipients').loadRecipientAccess(pool,snapshot,[wanted]);
+      if(!checked.access.checked||!checked.client)return false;
+      const current=checked.client;
+      if(String(current.created_by||'')!==wanted){snapshot=current;continue;}
+      if(wanted===String(current.lawyer_tg_id)||!checked.access.allowed.includes(wanted))return false;
+      await bot.telegram.sendMessage(wanted,message,{parse_mode:'HTML'});return true;
+    }
+    return false;
+  }
 
   // Данные для предзаполнения формы
   app.get('/api/handoff/prefill', async function (req, res) {
     try {
       var orderId = parseInt(req.query.order_id) || 0;
       var manager = canManageCases(req.staff, req.tgUser.id);
-      if (!manager) {
+      var selectedCase=null,caseProfile=null,caseReport=null;
+      if(req.query.case_id!=null&&req.query.case_id!==''){
+        if(!/^[1-9]\d*$/.test(String(req.query.case_id))||!Number.isSafeInteger(Number(req.query.case_id))||Number(req.query.case_id)>2147483647)return res.status(400).json({ok:false,error:'Некорректный номер клиента.'});
+        const record=(await pool.query('SELECT to_jsonb(c) AS access_case,s.tg_id,s.role,s.approved FROM cases c LEFT JOIN staff s ON s.tg_id=$2 WHERE c.id=$1',[Number(req.query.case_id),req.tgUser.id])).rows[0];
+        selectedCase=record?.access_case;
+        if(!canAccessCase(record,req.tgUser.id,selectedCase)||orderId&&Number(selectedCase.order_id)!==orderId)return res.status(403).json({ok:false,code:'CASE_FORBIDDEN',error:'Этот клиент недоступен вашему аккаунту.'});
+        manager=canManageCases(record,req.tgUser.id);orderId=Number(selectedCase.order_id)||0;
+        const checkpoint=selectedCase.data?._handoff,body=checkpoint?.body;
+        if(checkpoint?.version===2&&body&&(body.order_id==null?selectedCase.order_id==null:selectedCase.order_id!=null&&/^[1-9]\d*$/.test(String(body.order_id))&&Number(body.order_id)===Number(selectedCase.order_id))&&['a','r'].includes(body.report_src)&&/^[1-9]\d*$/.test(String(body.report_id))&&Number.isSafeInteger(Number(body.report_id))&&Number(body.report_id)>0)
+          caseReport={src:body.report_src,id:Number(body.report_id),text:selectedCase.audit_text||'',order_id:selectedCase.order_id||null};
+        if(!orderId)caseProfile={id:null,org:selectedCase.org||'',address:selectedCase.address||'',inn:selectedCase.inn||'',cad_num:checkpoint?.fields?.cad_num||'',region:selectedCase.region||'',kind:selectedCase.kind||'',service:selectedCase.service||'',contacts:Array.isArray(selectedCase.contacts)?selectedCase.contacts:[]};
+      }else if (!manager) {
         var ownedCase = orderId && (await pool.query('SELECT * FROM cases WHERE order_id=$1 AND lawyer_tg_id=$2 ORDER BY id DESC LIMIT 1', [orderId, req.tgUser.id])).rows[0];
         if (!requireCase(req, res, ownedCase || null)) return;
       }
       var order = null, audit = null;
       if (orderId) {
         order = (await pool.query('SELECT * FROM orders WHERE id=$1', [orderId])).rows[0] || null;
-        audit = (await pool.query('SELECT * FROM audits WHERE order_id=$1 ORDER BY created_at DESC LIMIT 1', [orderId])).rows[0] || null;
+        if(!selectedCase)audit = (await pool.query('SELECT * FROM audits WHERE order_id=$1 ORDER BY created_at DESC LIMIT 1', [orderId])).rows[0] || null;
       }
       var lawyers = manager
         ? (await pool.query(`SELECT s.tg_id, s.name, COUNT(c.id)::int AS active_cases
@@ -1368,14 +1396,14 @@ function setupHandoff(app) {
       }
       res.json({
         ok: true, lawyers: lawyers, request: request,
-        report: audit ? { src: 'a', id: audit.id, text: audit.text, created_at: audit.created_at, order_id: audit.order_id, metadata: auditMetadata(audit) } : null,
-        order: order ? {
+        report: selectedCase?caseReport:audit ? { src: 'a', id: audit.id, text: audit.text, created_at: audit.created_at, order_id: audit.order_id, metadata: auditMetadata(audit) } : null,
+        order: caseProfile|| (order ? {
           id: order.id, org: order.object_name || '', client: order.owner_name || '',
           owner: order.owner_name || '', name: order.object_name || '', zones: order.zones_info || '',
           inn: order.inn || '', cad_num: order.cad_num || '', service: order.service || '',
           address: order.address || '', contacts: order.contacts || '',
           region: guessRegion(order.address), kind: guessKind(order.object_type)
-        } : null,
+        } : null),
         audit_text: audit ? audit.text : ''
       });
     } catch (e) { console.error(e); res.json({ ok: false, error: e.message }); }
@@ -1393,76 +1421,7 @@ function setupHandoff(app) {
         });
         return res.json(await submitV2({ body: d, user: req.tgUser, staff: req.staff }));
       }
-      var lawyer = (await pool.query("SELECT * FROM staff WHERE tg_id=$1 AND role='lawyer' AND approved = true", [d.lawyer_tg_id])).rows[0];
-      if (!lawyer) return res.json({ ok: false, error: 'Юрист не найден. Он должен нажать /start в боте и выбрать роль «Юрист».' });
-      d.checklist_key = pickChecklist(d.region, d.kind, d.service);
-      var contacts = Array.isArray(d.contacts) ? d.contacts.filter(function (x) { return x && (x.name || x.phone || x.tg); }).slice(0, 10) : [];
-      if (contacts.length) { d.client = d.client || contacts[0].name || ''; d.phone = d.phone || contacts[0].phone || ''; }
-      var picked = null;
-      if (d.report_src && d.report_id) {
-        picked = await getReport(d.report_src, parseInt(d.report_id));
-        if (picked && picked.text) d.audit_text = picked.text;
-      }
-      var total = 0;
-      var audit = null;
-      if (picked) audit = picked;
-      if (audit && audit.msg_ids) audit.msg_ids = Array.from(new Set(audit.msg_ids.concat(audit.extra || []).map(Number))).sort(function (x, y) { return x - y; });
-      if (audit && audit.text && !d.audit_text_manual) d.audit_text = audit.text;
-      var auditVideo = auditVideoUrl(audit);
-      var auditWarnings = [];
-      var c = (await pool.query(
-        `INSERT INTO cases (order_id, lawyer_tg_id, lawyer_name, checklist_key, org, inn, client, phone, address,
-          region, kind, service, priority, comment, audit_text, total, created_by, contacts, request_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING *`,
-        [d.order_id || null, lawyer.tg_id, lawyer.name, d.checklist_key, d.org, d.inn, d.client, d.phone, d.address,
-          d.region, d.kind, d.service, d.priority, d.comment, d.audit_text, total, req.tgUser.id, JSON.stringify(contacts), parseInt(d.request_id) || null]
-      )).rows[0];
-
-      var text = caseText(c);
-      var reqRow = c.request_id ? (await pool.query('SELECT chat_id, msg_ids, first_id FROM reports WHERE id=$1', [c.request_id])).rows[0] : null;
-
-      // Отмечаем исходную заявку без нового сообщения в общем чате.
-      if (reqRow && String(reqRow.chat_id) === String(process.env.CLIENTS_CHAT_ID)) {
-        try { await bot.telegram.editMessageReplyMarkup(reqRow.chat_id, Number(reqRow.first_id), undefined, { inline_keyboard: [[{ text: '✅ Передано: ' + lawyer.name, callback_data: 'noop' }]] }); }
-        catch (e) { /* заявка опубликована другим ботом — кнопку не поменять */ }
-      }
-
-      // Комплект передачи получает только назначенный юрист в личку.
-      if (reqRow && reqRow.msg_ids && reqRow.msg_ids.length) {
-        try { await bot.telegram.callApi('copyMessages', { chat_id: lawyer.tg_id, from_chat_id: reqRow.chat_id, message_ids: reqRow.msg_ids.map(Number).sort(function (x, y) { return x - y; }) }); }
-        catch (e) { console.error('copy request to lawyer:', e.message); }
-      }
-      if (audit && audit.msg_ids && audit.msg_ids.length) {
-        try { await copyAuditPacket(bot.telegram, lawyer.tg_id, audit); }
-        catch (e) { console.error('copy to lawyer:', e.message); auditWarnings.push('Не все материалы отчёта доставлены юристу. Проверьте комплект.'); }
-      }
-      var recipientButtons = [];
-      if (c.checklist_key) recipientButtons.push([{ text: '📋 Открыть чек-лист', web_app: { url: WEBAPP_URL + '/checklist?case_id=' + c.id } }]);
-      if (auditVideo) recipientButtons.push([{ text: '▶ Видео осмотра', url: auditVideo }]);
-      var kb = recipientButtons.length ? { inline_keyboard: recipientButtons } : undefined;
-      var lawyerMsg = null, dmWarn = null;
-      try {
-        lawyerMsg = await bot.telegram.sendMessage(lawyer.tg_id, '🆕 <b>У вас новый клиент</b>\n\n' + text, { parse_mode: 'HTML', reply_markup: kb });
-      } catch (e) {
-        console.error('lawyer DM:', e.message);
-        dmWarn = 'Юрист не получил личную карточку клиента — пусть нажмёт /start в боте. Проверьте доставку полного комплекта.';
-      }
-
-      // Выписка ЕГРН: прикладываем юристу либо доставим ему после готовности.
-      var egrnNote = '';
-      if (d.cad_num) {
-        try {
-          var targets = [];
-          if (lawyerMsg) targets.push({ chat: Number(lawyer.tg_id), reply: lawyerMsg.message_id, case_id: Number(c.id) });
-          // в «Заявки по клиенту» выписку не копируем — она живёт в чате выписок
-          var eg = await require('../bot/egrn').attachOrOrder({
-            cad: d.cad_num, label: d.org, order: !!d.egrn_order, orderedBy: req.tgUser.id, orderedName: req.staff.name,
-            targets: targets, note: 'Для клиента ' + d.org + ' (юрист ' + lawyer.name + ')',
-          });
-          egrnNote = { unavailable: 'Доставка ранее заказанной выписки ЕГРН остановлена. Проверьте её в кабинете https://armrus.org — повторный заказ не создан.', attached: 'Выписка ЕГРН приложена юристу.', ordered: 'Выписка ЕГРН заказана — придёт в чат выписок и юристу.', waiting: 'Выписка ЕГРН уже в работе — придёт в чат выписок и юристу.' }[eg.result] || '';
-        } catch (e) { console.error('egrn for handoff:', e.message); egrnNote = 'Выписку ЕГРН заказать не удалось: ' + e.message; }
-      }
-      res.json({ ok: true, id: c.id, warn: [dmWarn, egrnNote].concat(auditWarnings).filter(Boolean).join(' ') || undefined });
+      return res.status(409).json({ ok: false, code: 'HANDOFF_FORM_OUTDATED', error: 'Эта форма передачи устарела. Проверьте, не был ли клиент уже создан, затем откройте форму заново. Повтор без постоянного номера отправки остановлен, чтобы не создать дубликат.' });
     } catch (e) { console.error('api/handoff error:', e.message); res.status(e.status || 500).json({ ok: false, error: e.message, code: e.code,
       ...(typeof e.case_created === 'boolean' ? { case_created: e.case_created } : {}),
       ...(e.case_id ? { case_id: e.case_id } : {}),
@@ -1530,6 +1489,8 @@ function setupHandoff(app) {
           submitted_on=$9::date, decision_due=$10::date,
           reminded_on=CASE WHEN decision_due IS DISTINCT FROM $10::date THEN NULL ELSE reminded_on END
           WHERE id=$4
+          AND EXISTS (SELECT 1 FROM staff current_actor WHERE current_actor.tg_id=$11 AND current_actor.approved IS TRUE
+            AND (current_actor.role='manager' OR $12::boolean OR current_actor.role='lawyer' AND cases.lawyer_tg_id=current_actor.tg_id))
           AND (checklist_revision=$8 OR
             (data - '_handoff' - '_workspaceNote' - '_comment') = ($1::jsonb - '_handoff' - '_workspaceNote' - '_comment'))
           AND (
@@ -1538,11 +1499,12 @@ function setupHandoff(app) {
             OR ($6::text IS NULL AND (NOT COALESCE(data ? '_workspaceNote', false) OR NOT ($1::jsonb ? '_comment')))
           )
           RETURNING COALESCE(data ->> '_comment', '') AS note, checklist_revision`,
-        [data, done, total, id, preserveNote, expectedNote, requestedNote, expectedRevision, subOn, due]
+        [data, done, total, id, preserveNote, expectedNote, requestedNote, expectedRevision, subOn, due,req.tgUser.id,canManageCases({approved:true,role:'auditor'},req.tgUser.id)]
       )).rows[0];
       if (!saved) {
-        var latest = (await pool.query("SELECT COALESCE(data ->> '_comment', '') AS note, checklist_revision, (data - '_handoff' - '_workspaceNote' - '_comment') IS DISTINCT FROM ($2::jsonb - '_handoff' - '_workspaceNote' - '_comment') AS checklist_changed FROM cases WHERE id=$1", [id, data])).rows[0];
+        var latest = (await pool.query("SELECT to_jsonb(c) AS access_case, actor.tg_id,actor.role,actor.approved,COALESCE(c.data ->> '_comment', '') AS note, c.checklist_revision, (c.data - '_handoff' - '_workspaceNote' - '_comment') IS DISTINCT FROM ($2::jsonb - '_handoff' - '_workspaceNote' - '_comment') AS checklist_changed FROM cases c LEFT JOIN staff actor ON actor.tg_id=$3 WHERE c.id=$1", [id, data,req.tgUser.id])).rows[0];
         if (!latest) return res.status(404).json({ ok: false, error: 'Клиент не найден' });
+        if(!canAccessCase(latest,req.tgUser.id,latest.access_case))return res.status(403).json({ok:false,code:'CASE_FORBIDDEN',error:'Этот клиент недоступен вашему аккаунту.'});
         var checklistConflict = latest.checklist_changed && Number(latest.checklist_revision) !== expectedRevision;
         return res.status(409).json({
           ok: false, code: checklistConflict ? 'checklist_conflict' : 'note_conflict', note: latest.note,
@@ -1563,9 +1525,7 @@ function setupHandoff(app) {
           fresh.map(function (fid) { return '• ' + esc(labels[fid]) + (data[fid].c ? ' — ' + esc(data[fid].c) : ''); }).join('\n') +
           '\n\n⚖️ ' + esc(c.lawyer_name) + '\n#заявка' + c.id;
         if (CLIENTS) { try { await bot.telegram.sendMessage(CLIENTS, msg, { parse_mode: 'HTML' }); } catch (e) { console.error(e.message); } }
-        if (c.created_by && String(c.created_by) !== String(c.lawyer_tg_id)) {
-          try { await bot.telegram.sendMessage(c.created_by, msg, { parse_mode: 'HTML' }); } catch (e) { console.error(e.message); }
-        }
+        try { await notifyCaseCreator(c,msg); } catch (e) { console.error(e.message); }
       }
       if (data._stage && data._stage !== old._stage && CLIENTS) {
         var stageMsg = data._stage === 'Подано'
@@ -1594,7 +1554,7 @@ function setupHandoff(app) {
         '\n\n⚖️ ' + esc(req.staff.name || c.lawyer_name) + '\n#заявка' + c.id;
       var sent = 0;
       if (process.env.CLIENTS_CHAT_ID) { try { await bot.telegram.sendMessage(process.env.CLIENTS_CHAT_ID, msg, { parse_mode: 'HTML' }); sent++; } catch (e) { console.error(e.message); } }
-      if (c.created_by && String(c.created_by) !== String(c.lawyer_tg_id)) { try { await bot.telegram.sendMessage(c.created_by, msg, { parse_mode: 'HTML' }); sent++; } catch (e) { console.error(e.message); } }
+      try { if(await notifyCaseCreator(c,msg))sent++; } catch (e) { console.error(e.message); }
       res.json({ ok: sent > 0, error: sent ? null : 'Не удалось отправить' });
     } catch (e) { console.error(e); res.json({ ok: false, error: e.message }); }
   });
@@ -2889,7 +2849,7 @@ function checklistPage(c, L) {
     '<div id="probs" class="glass" hidden></div>' +
     '<main id="list"></main>' +
     '<div class="dock glass"><span id="st" class="st"></span><button id="printBtn" class="pbtn" type="button">Печать</button></div>' +
-    '<script>var HOLIDAYS=' + json(HOLIDAYS) + ';var DEFAULT_HOLIDAYS=' + json(DEFAULT_HOLIDAYS) + ';' +
+    '<script>var HOLIDAYS=' + json(HOLIDAYS) + ';var WORKING_DAYS=' + json(WORKING_DAYS) + ';var DEFAULT_HOLIDAYS=' + json(DEFAULT_HOLIDAYS) + ';' +
     [isWorkday, addWorkdays, workdaysBetween, decisionDays, mskToday, ruDate].map(function (f) { return f.toString(); }).join('\n') +
     '\nwindow.__CFG=' + json(cfg) + ';(' + checklistClient.toString() + ')();</script>' +
     '</body></html>';
