@@ -8,6 +8,7 @@ const pg = { skip: !process.env.PGLITE_TEST_MODULE };
 async function fixture(run, options = {}) {
   const { PGlite } = require(process.env.PGLITE_TEST_MODULE), db = new PGlite();
   await db.exec(`CREATE TABLE orders(id INT PRIMARY KEY,submitted_by BIGINT,status TEXT,address TEXT,object_name TEXT,owner_name TEXT,telegram_msg_id BIGINT,created_at TIMESTAMPTZ DEFAULT NOW());
+    CREATE TABLE audits(id INT PRIMARY KEY,order_id INT,chat_id BIGINT,msg_ids BIGINT[],created_at TIMESTAMPTZ DEFAULT NOW());
     INSERT INTO orders(id,submitted_by,status,address,object_name,telegram_msg_id) VALUES(58,108,'new','Москва, Лесная, 5','ООО ЧООКДИ',901),(59,109,'new','Другой объект','Чужая заявка',902),(60,108,'done','Закрыта','Закрытая',903);`);
   const pool = { async query(sql, params) { return !params && sql.split(';').filter(s=>s.trim()).length > 1 ? (await db.exec(sql), {rows:[]}) : db.query(sql, params); }, async connect() { return { query: (...args) => pool.query(...args), release() {} }; } };
   const store = createMaterialsStore(pool), sends=[], replies=[], downloads=[], saves=[];

@@ -15,7 +15,7 @@ function harness(staff = { tg_id: 42, role: 'auditor', approved: true }, options
   const queries = {
     getStats: async () => { calls.push('stats'); return {}; },
     getOrderById: async () => ({ ...order }),
-    updateOrderStatus: async (...args) => { calls.push(['status', ...args]); return { ...order, status: args[1] }; },
+    updateOrderStatus: async (...args) => { calls.push(['status', ...args]); order.status=args[1]; return { ...order }; },
     createOrder: async () => { calls.push('create'); return order; }, addLog: async () => calls.push('log'), setTelegramMsgId: async () => calls.push('message-checkpoint') };
   const markup = { button: { callback: () => ({}), webApp: () => ({}), url: () => ({}) },
     inlineKeyboard: () => ({}), removeKeyboard: () => ({}), keyboard: () => ({ resize: () => ({}) }) };
@@ -25,7 +25,9 @@ function harness(staff = { tg_id: 42, role: 'auditor', approved: true }, options
       if (name === 'telegraf') return { Telegraf: function () { return bot; }, Markup: markup };
       if (name === '../db/queries') return queries;
       if (name === './formatter') return { formatOrderMessage: options.format || (() => 'Synthetic order'), STATUS_EMOJI: {}, esc: x => x };
-      if (name === '../web/manager-orders') return { cardOptions: () => ({ parse_mode: 'HTML' }) };
+      if (name === '../web/manager-orders') return { cardOptions: require('../src/web/manager-orders').cardOptions };
+      if (name === './report-link-admin') return require('../src/bot/report-link-admin');
+      if (name === '../web/order-report-link') return { loadOrderReportLink: options.loadOrderReportLink || (async () => null) };
       if (name === '../db/order-delivery-lock') return { withOrderDeliveryLock: options.withOrderDeliveryLock || (async (id, run) => run()) };
       if (name === './audit-handler') return { handleAuditReport: async () => calls.push('audit') };
       if (name === '../web/handoff') return { setupReportsBot() {} };
@@ -41,7 +43,7 @@ function harness(staff = { tg_id: 42, role: 'auditor', approved: true }, options
   function ctx(data) {
     return { from: { id: 42 }, chat: { id: -10042, type: 'supergroup' }, callbackQuery: { data },
       telegram: { sendMessage: async () => { calls.push('message'); return { message_id: 7 }; } },
-      editMessageText: async text => { calls.push('edit'); calls.push(['card', text]); }, answerCbQuery: async text => calls.push(['answer', text]),
+      editMessageText: async (text,opts) => { calls.push('edit'); calls.push(['card', text,opts]); }, answerCbQuery: async text => calls.push(['answer', text]),
       reply: async text => calls.push(['reply', text]) };
   }
   async function action(data, overrides) {
@@ -140,4 +142,20 @@ test('a busy order tells the bot user to wait without changing its status or car
   await h.action('status:in_progress:17');
   assert.equal(h.calls.includes('edit'), false); assert.equal(h.calls.some(call => Array.isArray(call) && call[0] === 'status'), false);
   assert.match(h.calls.find(call => Array.isArray(call) && call[0] === 'answer')[1], /сейчас обновляется/);
+});
+
+test('bot status updates and stale callbacks preserve the latest report under the common lock',async()=>{
+  for(const [initial,target]of [['new','in_progress'],['in_progress','done'],['in_progress','cancelled'],['done','done'],['done','in_progress'],['new','new']]){
+    let locked=false,lookups=0;const h=harness(undefined,{withOrderDeliveryLock:async(id,run)=>{assert.equal(id,17);locked=true;try{return await run();}finally{locked=false;}},loadOrderReportLink:async id=>{assert.equal(locked,true);assert.equal(id,17);lookups++;return{url:'https://t.me/c/111111/209'};}});h.order.status=initial;
+    await h.action('status:'+target+':17');assert.equal(lookups,1);
+    const buttons=h.calls.find(call=>Array.isArray(call)&&call[0]==='card')[2].reply_markup.inline_keyboard.flat();assert.equal(buttons.find(button=>button.text==='Перейти к отчёту').url,'https://t.me/c/111111/209');
+    if(h.order.status==='cancelled')assert.equal(buttons.length,1);else assert.ok(buttons.some(button=>button.callback_data));
+  }
+});
+
+test('bot report lookup failure preserves the existing keyboard and saved status; repeat refreshes rather than changes status again',async()=>{
+  let failed=true;const h=harness(undefined,{loadOrderReportLink:async()=>{if(failed)throw new Error('Synthetic report lookup failure');return{url:'https://t.me/c/111111/210'};}});
+  await h.action('status:done:17');assert.equal(h.order.status,'done');assert.equal(h.calls.includes('edit'),false);assert.ok(h.calls.some(call=>Array.isArray(call)&&call[0]==='answer'&&/Ошибка|сохран/iu.test(call[1])));
+  failed=false;await h.action('status:done:17');assert.equal(h.calls.filter(call=>Array.isArray(call)&&call[0]==='status').length,1);
+  assert.equal(h.calls.find(call=>Array.isArray(call)&&call[0]==='card')[2].reply_markup.inline_keyboard.flat().find(button=>button.url).url,'https://t.me/c/111111/210');
 });

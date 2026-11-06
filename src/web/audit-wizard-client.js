@@ -980,7 +980,7 @@
         adoptRevision(result);state.dirty=false;state.completed=true;document.body.classList.remove('submitting');
         try{if(state.recoveryData)localStorage.setItem(localKey+':recovery',JSON.stringify({data:state.recoveryData,saved_at:Date.now()}));localStorage.removeItem(localKey);}catch(e){}
         if(editor){editor.destroy();editor=null;}
-        root.innerHTML='<div class="success-screen"><div class="success-mark">✓</div><h2>Отчёт отправлен</h2><p>Материалы и замечания сохранены с этой заявкой.</p><a class="button secondary" href="/requests">К заявкам</a></div>';
+        root.innerHTML='<div class="success-screen"><div class="success-mark">✓</div><h2>Отчёт отправлен</h2><p>Материалы и замечания сохранены с этой заявкой.</p>'+(result.warning?'<p role="status">'+esc(result.warning)+'</p>':'')+'<a class="button secondary" href="/requests">К заявкам</a></div>';
         $('#next-step').disabled=true;$('#previous-step').disabled=true;status('Отчёт отправлен · '+timeLabel(),'success');
         try{if(tg)tg.HapticFeedback.notificationOccurred('success');}catch(e){}
       });

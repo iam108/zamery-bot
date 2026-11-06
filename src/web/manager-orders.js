@@ -17,11 +17,19 @@ function orderId(value) {
   if (!Number.isSafeInteger(id) || id <= 0) throw Object.assign(new Error('Некорректный номер заявки.'), { status: 400 });
   return id;
 }
-function cardOptions(order) {
+function validReportUrl(value) {
+  if (typeof value !== 'string') return null;
+  // Telegram deep links point to an existing summary, never to an arbitrary
+  // URL supplied by a form or to the editable auditor workflow.
+  return /^https:\/\/t\.me\/(?:c\/[1-9]\d*|[A-Za-z][A-Za-z0-9_]{4,31})\/[1-9]\d*$/.test(value) ? value : null;
+}
+function cardOptions(order, reportUrl) {
   let buttons = [];
   if (order.status === 'in_progress') buttons = [[{ text: '✅ Готово', callback_data: 'status:done:' + order.id }, { text: '❌ Отменить', callback_data: 'status:cancelled:' + order.id }], [{ text: '🔍 Продолжить проверку', callback_data: 'report:' + order.id }]];
   else if (order.status === 'done') buttons = [[{ text: '🔍 Открыть проверку', callback_data: 'report:' + order.id }]];
   else if (order.status !== 'cancelled') buttons = [[{ text: '🔧 Взять в работу', callback_data: 'status:in_progress:' + order.id }]];
+  const report = validReportUrl(reportUrl);
+  if (report) buttons.push([{ text: 'Перейти к отчёту', url: report }]);
   return { parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: { inline_keyboard: buttons } };
 }
 
@@ -33,6 +41,7 @@ function createManagerHandlers(options = {}) {
   const format = options.format || require('../bot/formatter').formatOrderMessage;
   const attachOrOrder = options.attachOrOrder || (data => require('../bot/egrn').attachOrOrder(data));
   const withOrderLock = options.withOrderDeliveryLock || require('../db/order-delivery-lock').createOrderDeliveryLock(pool, options.orderLockOptions);
+  const loadReportLink = options.loadOrderReportLink || (id => require('./order-report-link').loadOrderReportLink(id, { pool }));
   const recent = new Map();
 
   async function read(req, res) {
@@ -98,13 +107,17 @@ function createManagerHandlers(options = {}) {
       const newCard = !order.telegram_msg_id;
       if (newCard) {
         try {
-          const msg = await telegram.sendMessage(process.env.GROUP_CHAT_ID, format(order), cardOptions(order));
+          const report = await loadReportLink(order.id);
+          const msg = await telegram.sendMessage(process.env.GROUP_CHAT_ID, format(order), cardOptions(order, report?.url));
           await queries.setTelegramMsgId(order.id, msg.message_id);
           order.telegram_msg_id = msg.message_id;
           await queries.addLog(order.id, 'created', req.staff.name, 'Заявка и материалы сохранены; карточка отправлена в чат');
         } catch (e) { console.error('order card delivery:', e.message); warnings.push('Карточка не доставлена в чат.'); }
       } else {
-        try { await telegram.editMessageText(process.env.GROUP_CHAT_ID, Number(order.telegram_msg_id), undefined, format(order), cardOptions(order)); }
+        try {
+          const report = await loadReportLink(order.id);
+          await telegram.editMessageText(process.env.GROUP_CHAT_ID, Number(order.telegram_msg_id), undefined, format(order), cardOptions(order, report?.url));
+        }
         catch (e) { if (!/message is not modified/i.test(e.message)) { console.error('order card update:', e.message); warnings.push('Не удалось обновить карточку в чате.'); } }
       }
       if (order.telegram_msg_id) {
@@ -138,7 +151,7 @@ function createManagerHandlers(options = {}) {
             if (['unavailable', 'failed'].includes(egrn.result)) warnings.push('Доставка выписки ЕГРН остановлена. Требуется проверить заказ; повторный платный заказ не создавался.');
             if (['uncertain', 'unknown'].includes(egrn.result) && !egrn.packet_warning) warnings.push('Результат заказа ЕГРН не подтверждён. Требуется проверка у поставщика; повторный платный заказ не создавался.');
             const notes = { unavailable: '⚠️ Доставка ранее заказанной выписки остановлена. Повторный заказ не создан.', attached: '📄 Выписка ЕГРН приложена к заявке', ordered: '⏳ Выписка ЕГРН заказана — придёт ответом на заявку', waiting: '⏳ Выписка ЕГРН уже в работе — придёт ответом на заявку' };
-            if (notes[egrn.result]) await telegram.sendMessage(process.env.GROUP_CHAT_ID, notes[egrn.result] + ' (' + egrn.cad + ')', { reply_to_message_id: order.telegram_msg_id, disable_notification: true });
+            if (notes[egrn.result]) await telegram.sendMessage(process.env.GROUP_CHAT_ID, notes[egrn.result] + ' (' + egrn.cad + ')' + (egrn.budget_text ? '\n' + egrn.budget_text : ''), { reply_to_message_id: order.telegram_msg_id, disable_notification: true });
           } catch (e) { console.error('egrn for order:', e.message); warnings.push('Не удалось проверить доставку выписки ЕГРН.'); }
         }
       }

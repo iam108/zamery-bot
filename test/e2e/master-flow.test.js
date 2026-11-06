@@ -40,6 +40,8 @@ test('master: new manager originals become an annotated audit, complete private 
     const material=(await service.pool.query('SELECT * FROM order_materials WHERE order_id=$1 ORDER BY name',[orderId])).rows;
     assert.equal(material.length,2);for(const bytes of [plan,lease])assert.ok(material.some(f=>f.sha256===hash(bytes)&&Buffer.from(f.content).equals(bytes)));
     t.diagnostic('Created a new order through the real manager form, with two byte-exact PDF originals.');
+    const originalCard=service.messages.find(event=>event.method==='sendMessage'&&event.args[2]?.reply_markup?.inline_keyboard?.flat().some(button=>button.callback_data==='status:in_progress:'+orderId));
+    assert.ok(originalCard);assert.equal(originalCard.args[2].reply_markup.inline_keyboard.flat().some(button=>button.text==='Перейти к отчёту'),false);
 
     const auditor=await openPage(browser,service,1001,{pathname:'/audit?order_id='+orderId});visits.push(auditor);const a=auditor.page;
     await a.locator('#step-content[aria-busy=false]').waitFor();await choice(a,'building_type','Нежилое').click();await choice(a,'workflow.territory_result','clear').click();
@@ -61,6 +63,11 @@ test('master: new manager originals become an annotated audit, complete private 
     await a.locator('#save-now').click();await until(async()=>{const row=await service.draft(orderId);return row?.data.to==='Нужно'&&row.data.plan.page===4&&row.data.plan.annotations.length>0;},'Truthful observations saved');
     await a.locator('#submit-audit').click();await a.getByRole('heading',{name:'Отчёт отправлен'}).waitFor();
     const audit=(await service.pool.query('SELECT * FROM audits WHERE order_id=$1',[orderId])).rows[0];assert.ok(audit);assert.equal(audit.report_data.to,'Нужно');assert.equal(audit.report_data.inspection.alcohol_present,'Да');assert.equal(audit.report_data.workflow.conclusion_status,'actions');assert.equal(audit.report_data.plan.manager_material_id,planId);assert.equal(audit.report_data.plan.page,4);assert.ok(audit.report_data.plan.annotations.length);assert.match(audit.text,/ТО требуется/);assert.match(audit.text,/Алкоголь на объекте есть/);
+    const requestCard=(await service.pool.query('SELECT telegram_msg_id FROM orders WHERE id=$1',[orderId])).rows[0];
+    const linkEdit=service.messages.filter(event=>event.method==='editMessageReplyMarkup'&&String(event.args[1])===String(requestCard.telegram_msg_id)).at(-1);
+    assert.ok(linkEdit,'The original request must receive the report button after delivery');
+    const reportButton=linkEdit.args[3].inline_keyboard.flat().find(button=>button.text==='Перейти к отчёту');
+    assert.equal(reportButton?.url,'https://t.me/c/'+String(audit.chat_id).slice(4)+'/'+audit.msg_ids[0]);
     t.diagnostic('Auditor used the manager PDF fourth page, added photos/geometry and sent actual TO/alcohol findings.');
 
     const handoff=await openPage(browser,service,2001,{pathname:'/handoff?order_id='+orderId,mobile:false});visits.push(handoff);const h=handoff.page;

@@ -126,6 +126,23 @@ test('a newly supplied source packet blocks delivery until the auditor explicitl
   await page.locator('#submit-audit').click();await page.getByRole('heading',{name:'Отчёт отправлен'}).waitFor();const audit=(await service.pool.query('SELECT report_data FROM audits WHERE order_id=59')).rows[0];assert.ok(audit.report_data.request_packet.materials.some(file=>file.id===id));assert.ok(service.messages.length>messages);clean(visit);
 }));
 
+test('a delivered report without an original request card shows its warning and survives a lost HTTP response without redelivery', { timeout:60000 }, t => run(t,async()=>{
+  await service.pool.query('UPDATE orders SET telegram_msg_id=NULL WHERE id=60');
+  const visit=await openPage(browser,service,1001,{pathname:'/audit?order_id=60'}),{page}=visit;
+  await page.locator('#step-content[aria-busy=false]').waitFor();await prepareReport(page,multiPagePdf());await save(page);
+  const draft=await service.draft(60);let submitted;
+  await page.route('**/api/audit',async route=>{
+    if(route.request().method()!=='POST')return route.continue();
+    const response=await route.fetch();assert.equal(response.status(),200);submitted=await response.json();return route.abort('failed');
+  });
+  await page.locator('#submit-audit').click();await until(()=>!!submitted,'Successful delivery before lost HTTP response');
+  const count=service.messages.length;assert.match(submitted.warning,/нет исходной карточки/);
+  await page.unroute('**/api/audit');await page.locator('#submit-audit').click();await page.getByRole('heading',{name:'Отчёт отправлен'}).waitFor();
+  await page.locator('.success-screen [role=status]').getByText(submitted.warning,{exact:true}).waitFor();
+  assert.equal(service.messages.length,count);assert.equal((await service.pool.query('SELECT id FROM audits WHERE order_id=60')).rows.length,1);
+  assert.ok((await service.pool.query('SELECT submitted_at FROM audit_drafts WHERE id=$1',[draft.id])).rows[0].submitted_at);clean(visit);
+}));
+
 test('failed or unacknowledged sheet changes keep source state and raster aligned through close zoom retry and restore', { timeout:60000 }, t => run(t,async()=>{
   for(const mode of ['failed-save','lost-ack']){
     const visit=await openPage(browser,service),{page}=visit;await page.locator('#step-content[aria-busy=false]').waitFor();await step(page,1);

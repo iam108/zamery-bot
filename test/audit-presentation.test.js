@@ -88,6 +88,7 @@ function harness(options = {}) {
     console: { log() {}, error() {} }, setTimeout: () => ({ unref() {} }), require(name) {
       if (name === '../db/queries') return { getOrderById: async () => ({ telegram_msg_id: 77 }) };
       if (name === '../web/handoff') return { saveAudit: async (...args) => { if (options.saveFailure) await options.saveFailure(); saves.push(args); events.push({ method: 'saveAudit', args }); } };
+      if (name === '../web/order-report-link') return { ...require('../src/web/order-report-link'), syncOrderReportLink: async (...args) => { events.push({ method: 'syncOrderReportLink', args }); return options.linkSync ? options.linkSync(...args) : { state: 'linked' }; } };
       if (name.startsWith('./')) return require(path.join(ROOT, name));
       if (name === 'crypto' || name === 'node:crypto') return require('node:crypto');
       throw new Error('Unexpected handler dependency: ' + name);
@@ -126,6 +127,61 @@ test('empty optional video and basic group do not produce broken action URLs', a
   assert.equal(keys.some(b => b.url), false, 'A basic group has no private-supergroup message link; ZIP remains a message');
   assert.ok(keys.some(b => b.callback_data === 'handoff:58'));
   assert.equal(h.delivered.filter(m => m.kind === 'document').length, 1);
+});
+
+test('the original order card is linked only after the complete saved report and before the final acknowledgement', async () => {
+  const h = harness(); await h.send(report());
+  const sync = h.events.findIndex(event => event.method === 'syncOrderReportLink');
+  assert.ok(sync > h.events.findIndex(event => event.method === 'saveAudit'));
+  assert.ok(sync > h.events.findIndex(event => event.method === 'editMessageReplyMarkup'));
+  assert.ok(sync < h.events.findIndex(event => event.method === 'reply'));
+  assert.equal(h.holder.value.orderCardLinked, true);
+  assert.equal(h.holder.value.orderCardLinkSkipped, undefined);
+  assert.equal(h.events[sync].args[0], 58);
+});
+
+test('a partially delivered new report never updates the original order link', async () => {
+  const holder = { value: {} }, data = report();
+  const first = harness({ holder, fail: onceFailure('sendDocument') });
+  await assert.rejects(first.send(data));
+  assert.equal(first.events.some(event => event.method === 'syncOrderReportLink'), false);
+  assert.equal(first.saves.length, 0);
+  const second = harness({ holder }); await second.send(data);
+  assert.equal(second.events.filter(event => event.method === 'syncOrderReportLink').length, 1);
+  assert.equal(second.holder.value.orderCardLinked, true);
+});
+
+for (const failure of ['transport', 'lost-ack']) test('order-link ' + failure + ' retries only its markup phase after a restart', async () => {
+  const holder = { value: {} }, saves = [], data = report(); let attempts = 0;
+  const first = harness({ holder, saves, linkSync: async () => { attempts++; throw new Error(failure === 'lost-ack' ? 'Synthetic acknowledgement lost after markup applied' : 'Synthetic transport failure'); } });
+  await assert.rejects(first.send(data), error => error.code === 'ORDER_CARD_LINK_RETRY');
+  assert.equal(holder.value.saved, true); assert.equal(holder.value.handoffSent, true); assert.equal(holder.value.orderCardLinked, false);
+  assert.equal(first.events.some(event => event.method === 'reply'), false);
+  const second = harness({ holder, saves, linkSync: async () => { attempts++; return { state: 'linked' }; } }); await second.send(data);
+  assert.equal(second.delivered.length, 0); assert.equal(saves.length, 1); assert.equal(attempts, 2);
+  assert.equal(holder.value.orderCardLinked, true); assert.equal(holder.value.replied, true);
+});
+
+test('a failed link checkpoint stays resumable in the same process without repeating any report messages', async () => {
+  const data = report(); let failed = false;
+  const h = harness({ checkpointFailure: async progress => { if (progress.orderCardLinked && !failed) { failed = true; throw new Error('Synthetic link checkpoint failure'); } } });
+  await assert.rejects(h.send(data), error => error.code === 'ORDER_CARD_LINK_RETRY');
+  const delivered = h.delivered.length;
+  assert.equal(h.holder.value.orderCardLinked, false); assert.equal(h.holder.value.saved, true);
+  await h.send(data);
+  assert.equal(h.events.filter(event => event.method === 'syncOrderReportLink').length, 2);
+  assert.equal(h.delivered.length, delivered); assert.equal(h.saves.length, 1); assert.equal(h.holder.value.orderCardLinked, true);
+});
+
+test('a missing original card records an explicit durable warning without claiming linkage or blocking the saved report', async () => {
+  const data = report(), holder = { value: {} }, warning = 'Отчёт сохранён. Исходная карточка недоступна; кнопка не добавлена.';
+  const first = harness({ holder, linkSync: async () => ({ state: 'skipped', code: 'ORDER_CARD_UNAVAILABLE', warning }) });
+  const result = await first.send(data);
+  assert.equal(result.warning, warning); assert.equal(holder.value.orderCardLinked, false);
+  assert.equal(holder.value.orderCardLinkSkipped.code, 'ORDER_CARD_UNAVAILABLE'); assert.equal(holder.value.replied, true);
+  assert.ok(first.events.find(event => event.method === 'reply').args[0].includes(warning));
+  const second = harness({ holder, linkSync: () => assert.fail('A completed permanent skip is not a new send attempt') });
+  const repeated = await second.send(data); assert.equal(repeated.warning, warning); assert.equal(second.delivered.length, 0);
 });
 
 for (const method of ['sendMessage', 'sendMediaGroup', 'sendDocument', 'editMessageReplyMarkup']) {

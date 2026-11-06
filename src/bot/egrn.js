@@ -15,6 +15,23 @@ const MAX_DOCUMENT_BYTES = 50 * 1024 * 1024;
 const MAX_RECEIVED_BYTES = 2 * 1024 * 1024 * 1024 - 1;
 const MAX_FAILURES = 5;
 const REQUEST_TIMEOUT_MS = 20 * 60 * 1000;
+let budgetService;
+function budget() { return budgetService ||= require('./egrn-budget').createEgrnBudget({ pool }); }
+async function budgetText(order) {
+  try {
+    if (order?.id_statement) await budget().accept(order.id, order.id_statement);
+    return budget().describe(await budget().snapshot());
+  } catch (_) { return 'Учёт заказов временно недоступен; остаток не сверён.'; }
+}
+function budgetCaption(text, accounting) {
+  if (!accounting) return String(text).slice(0, 1000);
+  const suffix = '\n' + accounting;
+  return String(text).slice(0, Math.max(0, 1000 - suffix.length)).replace(/[\uD800-\uDBFF]$/, '') + suffix;
+}
+async function budgetResult(result, order) {
+  const text = await budgetText(order);
+  return { ...result, ...(result.packet_warning ? { packet_warning: result.packet_warning + '\n' + text } : {}), budget_text: text };
+}
 
 function checkDocumentSize(buf) {
   if (buf.length <= MAX_DOCUMENT_BYTES) return;
@@ -38,6 +55,7 @@ async function registerOriginal(targets, file) {
 
 function largeDelivery() {
   return require('./egrn-large-delivery').createLargeDelivery({ telegram: tgApi,
+    budgetText: () => budgetText(),
     persist: async function (order, records) {
       await persistFileRecords(order, records);
     }
@@ -105,6 +123,7 @@ async function deliverNativeRecord(order, record, records) {
     if (receipt && receipt.id) confirmed[JSON.stringify([String(receipt.chat), record.key || String(record.chat) + ':' + String(record.id)])] = true;
   }
   await copyFiles([record], nativeDeliveryTargets(order, record), { strict: true, confirmed,
+    budgetText: order.budget_text,
     onSourceRepaired: () => persistFileRecords(order, records),
     async onCopied(key, message) {
       const chat = JSON.parse(key)[0];
@@ -240,6 +259,7 @@ async function apiOrder(cad, typeDoc) {
 }
 
 async function reserveOrder(cad, opts) {
+  await budget().ensure();
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -260,6 +280,7 @@ async function reserveOrder(cad, opts) {
     const order = (await client.query(
       "INSERT INTO egrn_orders(cad_num,label,type_doc,ordered_by,ordered_name,status,status_text,chat_id,deliver,request_key) VALUES($1,$2,$3,$4,$5,'ordering','Подтверждаю заказ у поставщика',$6,$7,$8) RETURNING *",
       [cad, opts.label || '', TYPE_DOC, opts.orderedBy, opts.orderedName || '', target, JSON.stringify(opts.targets || []), opts.requestKey || null])).rows[0];
+    await budget().reserveInTransaction(client, order.id);
     await client.query('COMMIT');
     return { order, created: true };
   } catch (error) {
@@ -272,14 +293,32 @@ async function placeReservedOrder(order) {
   let statement;
   try {
     statement = await apiOrder(order.cad_num, order.type_doc);
+    await budget().accept(order.id, statement);
     const result = await pool.query("UPDATE egrn_orders SET id_statement=$1,status='ordered',status_text='заказана',error=NULL,updated_at=NOW() WHERE id=$2 RETURNING *", [statement, order.id]);
     return result.rows[0];
   } catch (error) {
     // A lost HTTP or database acknowledgement must not trigger another paid
     // POST. Retain the reservation even after a process restart.
-    const status = error.uncertain === false ? 'failed' : 'order_unknown';
+    if (error.uncertain === false && !statement) {
+      let client, failed;
+      try {
+        client = await pool.connect(); await client.query('BEGIN');
+        // Use the same order-row -> account-row lock order as reconciliation.
+        // Neither a failed order with a stranded reserve nor a released
+        // reserve with an unconfirmed local order may escape this transaction.
+        await client.query('UPDATE egrn_orders SET status=$1,status_text=$2,error=$2,updated_at=NOW() WHERE id=$3', ['failed', error.message, order.id]);
+        await budget().rejectInTransaction(client, order.id);
+        await client.query('COMMIT');
+      } catch (failure) {
+        failed = failure;
+        if (client) await client.query('ROLLBACK').catch(() => {});
+      } finally { if (client) client.release(); }
+      if (!failed) throw error;
+      error = Object.assign(new Error('Поставщик отклонил заказ, но подтверждение учёта не сохранилось. Администратору нужно сверить запись бота ' + order.id + ' командой /egrn_reconcile ' + order.id + ' no_order. Повторный платный заказ не создан.'), { uncertain: true, code: 'EGRN_ORDER_REJECTION_CHECKPOINT' });
+    }
+    const details = error.code === 'EGRN_ORDER_REJECTION_CHECKPOINT' ? error.message : 'Заказ требует проверки у поставщика';
     await pool.query('UPDATE egrn_orders SET status=$1,status_text=$2,error=$2,id_statement=COALESCE($3,id_statement),updated_at=NOW() WHERE id=$4',
-      [status, error.uncertain === false ? error.message : 'Заказ требует проверки у поставщика', statement || null, order.id]).catch(() => {});
+      ['order_unknown', details, statement || null, order.id]).catch(() => {});
     if (statement) error = Object.assign(new Error('Заказ создан у поставщика, но подтверждение в боте не сохранено. Передайте администратору номер ' + statement + '.'), { uncertain: true, code: 'EGRN_ORDER_CHECKPOINT' });
     throw error;
   }
@@ -501,7 +540,7 @@ function cardText(o, extra) {
   return icon + ' <b>Выписка ЕГРН ' + t.short + '</b>\n' +
     '<code>' + esc(o.cad_num) + '</code>' + (o.label ? ' — ' + esc(o.label) : '') + '\n' +
     'Статус: ' + esc(o.status_text || 'заказана') + (o.id_statement ? ' · заявка №' + o.id_statement : '') + '\n' +
-    'Заказал(а): ' + esc(o.ordered_name || '') + (extra ? '\n' + extra : '');
+    'Заказал(а): ' + esc(o.ordered_name || '') + (o.budget_text ? '\n' + esc(o.budget_text) : '') + (extra ? '\n' + extra : '');
 }
 
 function setupEgrn(bot) {
@@ -595,15 +634,15 @@ function setupEgrn(bot) {
         requestKey: ctx.match[3] ? 'telegram:' + p.id : null,
         targets: [{ chat: cbChat }], note: 'Заказ из Telegram' });
       if (result.result === 'attached') {
-        return ctx.reply('Готовая выписка отправлена выше. Новую выписку заказывать не потребовалось.', {
+        return ctx.reply('Готовая выписка отправлена выше. Новую выписку заказывать не потребовалось.\n' + result.budget_text, {
           reply_markup: { inline_keyboard: [[{ text: 'Заказать новую выписку ещё раз', callback_data: 'eg:' + p.id + ':' + ctx.match[2] + ':force' }]] },
         });
       }
       if (result.result === 'uncertain') return ctx.reply(result.packet_warning);
-      if (result.result === 'waiting') return ctx.reply('Выписка по ' + p.cad_num + ' уже в работе. Пришлю её после готовности.');
+      if (result.result === 'waiting') return ctx.reply('Выписка по ' + p.cad_num + ' уже в работе. Пришлю её после готовности.\n' + result.budget_text);
       if (result.result === 'unavailable') return ctx.reply('Выписка уже заказана, но её доставка остановлена. Передайте администратору номер ' + result.id + ' для повтора доставки.');
       if (result.result !== 'ordered') return ctx.reply('Не удалось подтвердить заказ выписки. Повторный платный заказ не создавался.');
-      await ctx.reply('⏳ Выписка по ' + p.cad_num + ' заказана (№' + result.id + '). Пришлю, когда будет готова.');
+      await ctx.reply('⏳ Выписка по ' + p.cad_num + ' заказана (№' + result.id + '). Пришлю, когда будет готова.\n' + result.budget_text);
       await closeRow(ctx, p.id, '✅ Заказано · ' + nameOf(ctx.from));
     } catch (e) {
       console.error('egrn order:', e.message);
@@ -640,6 +679,33 @@ function setupEgrn(bot) {
     }
   });
 
+  // These commands record the provider account; they never transfer money.
+  function budgetAdmin(ctx) {
+    return ctx.chat?.type === 'private' && String(process.env.ADMIN_TG_IDS || '').split(/[\s,;]+/).includes(String(ctx.from?.id));
+  }
+  for (const [command, operation] of [['egrn_topup', 'topup'], ['egrn_balance', 'syncBalance']]) {
+    bot.command(command, async function (ctx) {
+      if (!budgetAdmin(ctx)) return;
+      const match = String(ctx.message?.text || '').match(new RegExp('^/' + command + '(?:@[a-z\\d_]+)?\\s+(.+?)\\s*$', 'i'));
+      if (!match) return ctx.reply(operation === 'topup' ? 'Учесть уже выполненное пополнение: /egrn_topup 2500,50. Сумма может быть любой. Команда денег не переводит.' : 'Зафиксировать известный остаток: /egrn_balance 2500,50. Это необязательная сверка, а не пополнение.');
+      if (!Number.isSafeInteger(ctx.message.message_id) || ctx.message.message_id < 1) return ctx.reply('Не удалось определить номер сообщения. Отправьте команду отдельным сообщением.');
+      try {
+        await ensureTables();
+        const snapshot = await budget()[operation](match[1], { actorId: ctx.from.id, sourceKey: 'telegram:' + ctx.chat.id + ':' + ctx.message.message_id });
+        return ctx.reply((operation === 'topup' ? 'Пополнение учтено: ' : 'Сверка остатка записана: ') + match[1] + ' ₽.\n' + budget().describe(snapshot));
+      } catch (failure) { return ctx.reply(failure.status ? failure.message : 'Не удалось подтвердить запись. Проверьте /egrn_budget перед повторной командой.'); }
+    });
+  }
+  bot.command('egrn_budget', async function (ctx) {
+    if (!budgetAdmin(ctx)) return;
+    try {
+      await ensureTables();
+      const snapshot = await budget().snapshot(), history = await budget().previewHistory();
+      const range = history.fromDate ? new Date(history.fromDate).toLocaleDateString('ru-RU', { timeZone: 'Europe/Moscow' }) + ' — ' + new Date(history.toDate).toLocaleDateString('ru-RU', { timeZone: 'Europe/Moscow' }) : 'даты не сохранены';
+      return ctx.reply(budget().describe(snapshot) + '\n\nДо начала учёта: ' + history.confirmedOrders + ' подтверждённых заказов (' + range + '). Оценка по текущей цене: ' + (history.estimatedKopecks / 100).toFixed(2) + ' ₽; это не подтверждение списаний. Неопределённых старых заказов: ' + history.unknownOrders + '. Старое пополнение автоматически не добавлено.');
+    } catch (_) { return ctx.reply('Учёт временно недоступен. Повторите позднее; платный заказ не создавался.'); }
+  });
+
   // Resolve an ambiguous paid request only after an administrator has checked
   // the provider cabinet. This operation binds an existing order; it never POSTs.
   bot.command('egrn_reconcile', async function (ctx) {
@@ -650,20 +716,28 @@ function setupEgrn(bot) {
     if (!match || Number(match[1]) > 2147483647 || match[2].toLowerCase() !== 'no_order' && BigInt(match[2]) > 9223372036854775807n) {
       return ctx.reply('После проверки кабинета поставщика укажите номер записи бота и существующего заказа: /egrn_reconcile запись номер_поставщика. Если подтверждено отсутствие заказа: /egrn_reconcile запись no_order. Команда ничего не заказывает.');
     }
+    let client;
     try {
-      await ensureTables();
+      await ensureTables(); await budget().ensure();
+      client = await pool.connect(); await client.query('BEGIN');
       const absent = match[2].toLowerCase() === 'no_order';
-      const result = await pool.query(`UPDATE egrn_orders SET id_statement=$1,status=$2,status_text=$3,
+      const result = await client.query(`UPDATE egrn_orders SET id_statement=$1,status=$2,status_text=$3,
         files_sent=0,failures=0,retry_at=NULL,error=NULL,updated_at=NOW()
         WHERE id=$4 AND status IN ('ordering','order_unknown')
           AND ($1::bigint IS NULL OR id_statement IS NULL OR id_statement=$1)
           AND ($1::bigint IS NULL OR NOT EXISTS (SELECT 1 FROM egrn_orders other WHERE other.id<>$4 AND other.id_statement=$1))
         RETURNING id`, [absent ? null : match[2], absent ? 'failed' : 'ordered',
         absent ? 'Отсутствие заказа подтверждено администратором' : 'Заказ сверён с поставщиком', match[1]]);
+      if (result.rows.length) {
+        if (absent) await budget().rejectInTransaction(client, match[1]);
+        else await budget().acceptInTransaction(client, match[1], match[2]);
+      }
+      await client.query('COMMIT');
       return ctx.reply(result.rows.length
         ? absent ? 'Отсутствие заказа зафиксировано. Следующий заказ можно создать обычной кнопкой.' : 'Существующий заказ привязан. Бот проверит его готовность и доставит выписку.'
         : 'Не найдена подходящая неопределённая запись. Уже подтверждённые заказы не изменены.');
-    } catch (error) { console.error('egrn reconcile:', error.code || 'unavailable'); return ctx.reply('Не удалось сохранить сверку. Заказ не создавался.'); }
+    } catch (error) { if (client) await client.query('ROLLBACK').catch(() => {}); console.error('egrn reconcile:', error.code || 'unavailable'); return ctx.reply('Не удалось сохранить сверку. Заказ не создавался.'); }
+    finally { if (client) client.release(); }
   });
 
   // Админу: сырой ответ API по заказу — чтобы разобраться с форматом
@@ -727,6 +801,7 @@ function setupEgrn(bot) {
       const lease = keepDeliveryAlive(o);
       let source;
       try {
+        o.budget_text = await budgetText(o);
         if (await resumeLargeDelivery(o)) continue;
         const j = await apiStatus(o.id_statement);
         source = j && typeof j.cleanup === 'function' && typeof j.documents === 'function' ? j : null;
@@ -773,7 +848,7 @@ function setupEgrn(bot) {
           deliveryErrors.push(String(e.message || 'ошибка доставки'));
           if (e.code === 'EGRN_FILE_TOO_LARGE' || e.code === 'EGRN_FILE_TYPE') permanent = true;
         }
-        const caption = '📄 Выписка ЕГРН ' + o.cad_num + (o.label ? ' — ' + o.label : '');
+        const caption = budgetCaption('📄 Выписка ЕГРН ' + o.cad_num + (o.label ? ' — ' + o.label : ''), o.budget_text);
         // PDF — в чат; XML и архив — тоже в чат, но без звука, для архива и будущего разбора
         for (const [index, original] of embedded.entries()) {
           let d = original;
@@ -785,7 +860,7 @@ function setupEgrn(bot) {
             d = await smallDocument(d);
             checkDocumentSize(d.buf);
             await registerOriginal(o.deliver, d);
-            const extra = { caption: d.kind === 'pdf' ? caption.slice(0, 1000) : (d.kind === 'xml' ? 'XML ' + o.cad_num : 'Архив ' + o.cad_num), disable_notification: d.kind !== 'pdf' };
+            const extra = { caption: d.kind === 'pdf' ? caption : budgetCaption((d.kind === 'xml' ? 'XML ' : 'Архив ') + o.cad_num, o.budget_text), disable_notification: d.kind !== 'pdf' };
             if (o.status_msg_id) extra.reply_parameters = { message_id: Number(o.status_msg_id), allow_sending_without_reply: true };
             await renewDelivery(o);
             let m;
@@ -872,6 +947,7 @@ function setupEgrn(bot) {
 
 async function copyNativeOriginal(record, destination, options) {
   const copy = () => tgApi.callApi('copyMessage', Object.assign({ chat_id: destination.chat, from_chat_id: record.chat, message_id: record.id },
+    options.budgetText ? { caption: budgetCaption('📄 ' + String(record.name || 'Выписка ЕГРН'), options.budgetText) } : {},
     destination.reply ? { reply_parameters: { message_id: Number(destination.reply), allow_sending_without_reply: true } } : {}));
   try { return await copy(); }
   catch (error) {
@@ -882,7 +958,7 @@ async function copyNativeOriginal(record, destination, options) {
     const originChat = record.chat, originId = record.id, key = sourceKey(record);
     const repairChat = /^-100[1-9]\d+$/.test(String(destination.chat)) ? destination.chat : originChat;
     const sameChat = String(repairChat) === String(destination.chat);
-    const extra = { disable_notification: true, caption: '📄 ' + String(record.name || 'Выписка ЕГРН').slice(0, 220) };
+    const extra = { disable_notification: true, caption: budgetCaption('📄 ' + String(record.name || 'Выписка ЕГРН').slice(0, 220), options.budgetText) };
     if (sameChat && destination.reply) extra.reply_parameters = { message_id: Number(destination.reply), allow_sending_without_reply: true };
     const repaired = await tgApi.sendDocument(repairChat, record.file_id, extra);
     if (!Number.isSafeInteger(Number(repaired?.message_id)) || Number(repaired.message_id) < 1)
@@ -958,7 +1034,7 @@ async function deliverCachedCopy(order, targets, copyOptions = {}) {
   }
   for (const target of targets) for (const record of records) {
     await renewDelivery(order);
-    await copyFiles([record], [target], { ...copyOptions, strict: true, confirmed,
+    await copyFiles([record], [target], { ...copyOptions, budgetText: order.budget_text, strict: true, confirmed,
       onSourceRepaired: () => persistFileRecords(order, records),
       async onCopied(key, message) {
         if (message?.message_id) {
@@ -990,33 +1066,35 @@ async function attachOrOrder(opts) {
     "SELECT * FROM egrn_orders WHERE cad_num=$1 AND type_doc=$2 AND status <> 'failed' AND created_at > NOW() - INTERVAL '30 days' ORDER BY id DESC LIMIT 1",
     [cad, TYPE_DOC])).rows[0];
   if (!prev) {
-    if (!opts.order || !configured()) return { result: 'none', cad };
+    if (!opts.order || !configured()) return budgetResult({ result: 'none', cad });
     const reservation = await reserveOrder(cad, opts);
     prev = reservation.order;
     if (reservation.created) {
       const order = await placeReservedOrder(prev);
+      order.budget_text = await budgetText(order);
       if (tgApi && order.chat_id) {
         try {
           const message = await tgApi.sendMessage(order.chat_id, cardText(order, opts.note ? esc(opts.note) : ''), { parse_mode: 'HTML' });
           await pool.query('UPDATE egrn_orders SET status_msg_id=$1 WHERE id=$2', [message.message_id, order.id]);
         } catch (error) { console.error('egrn card:', error.message); }
       }
-      return { result: 'ordered', cad, id: order.id_statement };
+      return { result: 'ordered', cad, id: order.id_statement, budget_text: order.budget_text };
     }
   }
   if (prev.status === 'ordering' && Date.now() - new Date(prev.created_at).getTime() > 2 * 60 * 1000) {
     prev = (await pool.query("UPDATE egrn_orders SET status='order_unknown',status_text='Заказ требует проверки у поставщика',updated_at=NOW() WHERE id=$1 AND status='ordering' RETURNING *", [prev.id])).rows[0] || prev;
   }
-  if (prev.status === 'order_unknown') return uncertainOrder(await mergeTargets(prev, opts.targets), cad);
-  if (prev.status === 'ordering') { await mergeTargets(prev, opts.targets); return { result: 'waiting', cad }; }
-  if (prev.status === 'failed') return { result: 'unavailable', cad, id: prev.id_statement };
+  if (prev.status === 'order_unknown') return budgetResult(uncertainOrder(await mergeTargets(prev, opts.targets), cad), prev);
+  if (prev.status === 'ordering') { await mergeTargets(prev, opts.targets); return budgetResult({ result: 'waiting', cad }, prev); }
+  if (prev.status === 'failed') return budgetResult({ result: 'unavailable', cad, id: prev.id_statement }, prev);
   if ((prev.files_sent > 0 || hasReusableFiles(prev)) && Array.isArray(prev.file_msgs) && prev.file_msgs.length) {
     const wasComplete = prev.files_sent > 0;
     prev = await mergeTargets(prev, opts.targets);
     const leased = await claimDelivery(prev.id);
-    if (!leased) return { result: 'waiting', cad };
+    if (!leased) return budgetResult({ result: 'waiting', cad }, prev);
     const lease = keepDeliveryAlive(leased);
     try {
+      leased.budget_text = await budgetText(leased);
       if (!Array.isArray(leased.delivery_manifest) || !leased.delivery_manifest.length) {
         leased.delivery_manifest = [...new Set(leased.file_msgs.map(sourceKey))];
         await pool.query('UPDATE egrn_orders SET delivery_manifest=$1 WHERE id=$2 AND processing_token=$3', [JSON.stringify(leased.delivery_manifest), leased.id, leased.processing_token]);
@@ -1034,12 +1112,12 @@ async function attachOrOrder(opts) {
       // The cached order was already complete before these targets joined.
       // Only this generation may be acknowledged; another join leaves it open.
       if (wasComplete) await markDelivered(leased, records);
-      return { result: 'attached', cad, ...packet };
+      return { result: 'attached', cad, ...packet, budget_text: leased.budget_text };
     } finally { await lease.close(); }
   }
-  if (prev.files_sent < 0) return { result: 'unavailable', cad, id: prev.id_statement };
+  if (prev.files_sent < 0) return budgetResult({ result: 'unavailable', cad, id: prev.id_statement }, prev);
   await mergeTargets(prev, opts.targets);
-  return { result: 'waiting', cad };
+  return budgetResult({ result: 'waiting', cad }, prev);
 }
 
 module.exports = { setupEgrn, parseCads, readStatus, findFileUrls, findReq, attachOrOrder, CAD_RE, extractDocs, unzip, stripB64 };

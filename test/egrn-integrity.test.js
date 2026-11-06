@@ -40,9 +40,9 @@ async function fixture(options = {}) {
       return localRequire(name);
     },
     async fetch(url, request = {}) {
-      assert.equal(request.method, 'POST'); calls.paid++;
-      await options.orderApi?.(calls.paid);
-      return new Response(JSON.stringify({ id_statement: 9000 + calls.paid }));
+      assert.equal(request.method, 'POST'); const attempt = ++calls.paid;
+      const response = await options.orderApi?.(attempt); if (response instanceof Response) return response;
+      return new Response(JSON.stringify({ id_statement: 9000 + attempt }));
     },
   };
   vm.createContext(sandbox);
@@ -65,7 +65,7 @@ async function fixture(options = {}) {
   const add = async ({ id = 7001, cad = CAD, status = 'ordered', filesSent = 0, files = [], targets = [], card = null } = {}) => (await pool.query(
     'INSERT INTO egrn_orders(cad_num,type_doc,id_statement,status,status_text,chat_id,ordered_by,status_msg_id,deliver,file_msgs,files_sent) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
     [cad, 'kvarmrusxmlpdf', id, status, 'В работе', -100123, 111, card, JSON.stringify(targets), JSON.stringify(files), filesSent])).rows[0];
-  return { db, pool, calls, api, actions, commands, telegram, add, poll: () => poll(), anotherPoller() { api.setupEgrn(bot); const run = poll; return run; },
+  return { db, pool, calls, api, actions, commands, telegram, add, budget: require('../src/bot/egrn-budget').createEgrnBudget({pool}), poll: () => poll(), anotherPoller() { api.setupEgrn(bot); const run = poll; return run; },
     row: async id => (await pool.query('SELECT * FROM egrn_orders WHERE id=$1', [id])).rows[0],
     attach: (chat = 111, extra = {}) => api.attachOrOrder({ cad: CAD, order: true, orderedBy: chat, targets: [{ chat }], ...extra }),
     close: () => db.close() };
@@ -125,7 +125,72 @@ test('successful provider order followed by a failed checkpoint keeps its known 
     const order = (await h.pool.query('SELECT * FROM egrn_orders')).rows[0];
     assert.equal(order.status, 'order_unknown'); assert.equal(Number(order.id_statement), 9001);
     assert.equal((await h.attach()).result, 'uncertain'); assert.equal(h.calls.paid, 1);
+    const accounting=await h.budget.snapshot();assert.equal(accounting.confirmedOrders,1);assert.equal(accounting.pendingOrders,0);assert.equal(accounting.trackedNetKopecks,-12900);
   } finally { await h.close(); }
+});
+
+test('a failed atomic accounting reservation rolls back the local order before any paid POST', pg, async () => {
+  let fail=true;const h=await fixture({beforeQuery(sql){if(fail&&sql.startsWith('INSERT INTO egrn_budget_orders'))throw new Error('Synthetic reservation checkpoint failure');}});
+  try {
+    await assert.rejects(h.attach(),/reservation checkpoint/);assert.equal(h.calls.paid,0);assert.equal((await h.pool.query('SELECT * FROM egrn_orders')).rows.length,0);
+    assert.equal((await h.budget.snapshot()).pendingOrders,0);fail=false;await h.attach();assert.equal(h.calls.paid,1);assert.equal((await h.budget.snapshot()).confirmedOrders,1);
+  }finally{await h.close();}
+});
+
+test('parallel distinct cadastral orders preserve shared topups and one charge per accepted provider statement', pg, async () => {
+  const h=await fixture();try{
+    await h.budget.topup('1000',{sourceKey:'new-topup',actorId:111});await Promise.all([h.attach(),h.attach(222,{cad:'77:17:0120316:998'})]);
+    const state=await h.budget.snapshot();assert.equal(h.calls.paid,2);assert.equal(state.confirmedOrders,2);assert.equal(state.pendingOrders,0);assert.equal(state.trackedNetKopecks,74200);assert.equal(state.trackedRemainingOrders,5);assert.equal(state.balanceKnown,false);
+  }finally{await h.close();}
+});
+
+test('an unconfirmed paid POST reserves money until reconciliation and cannot debit or POST twice', pg, async () => {
+  const h=await fixture({orderApi(){throw new Error('Synthetic provider ACK loss');}});try{
+    await h.budget.topup('500',{sourceKey:'new-topup',actorId:111});await assert.rejects(h.attach());let state=await h.budget.snapshot();assert.equal(state.confirmedOrders,0);assert.equal(state.pendingOrders,1);assert.equal(state.trackedAvailableKopecks,37100);
+    await h.attach();assert.equal(h.calls.paid,1);const row=(await h.pool.query('SELECT * FROM egrn_orders')).rows[0];
+    const handler=h.commands.find(c=>c.name==='egrn_reconcile').handler;await handler({chat:{type:'private'},from:{id:111},message:{text:'/egrn_reconcile '+row.id+' 9001'},reply:async()=>{}});
+    state=await h.budget.snapshot();assert.equal(state.confirmedOrders,1);assert.equal(state.pendingOrders,0);assert.equal(state.trackedNetKopecks,37100);await h.attach();assert.equal(h.calls.paid,1);assert.equal((await h.budget.snapshot()).confirmedOrders,1);
+  }finally{await h.close();}
+});
+
+test('a definite provider rejection releases the reservation without creating an unknown or a charge', pg, async () => {
+  const h=await fixture({orderApi(){return new Response('{}',{status:422});}});try{
+    await assert.rejects(h.attach(),error=>error.code==='EGRN_ORDER_REJECTED');assert.equal(h.calls.paid,1);const state=await h.budget.snapshot();assert.equal(state.confirmedOrders,0);assert.equal(state.pendingOrders,0);assert.equal((await h.pool.query('SELECT * FROM egrn_orders')).rows[0].status,'failed');
+  }finally{await h.close();}
+});
+
+for(const failedWrite of ['order','budget'])test('a rejected provider request with a lost '+failedWrite+' checkpoint remains atomically reserved and explicitly reconcilable', pg, async()=>{
+  let fail=true;const h=await fixture({orderApi(){return new Response('{}',{status:400});},beforeQuery(sql,params){
+    const target=failedWrite==='budget'?sql.startsWith("UPDATE egrn_budget_orders SET state='rejected'"):sql.startsWith('UPDATE egrn_orders SET status=$1')&&params?.[0]==='failed';
+    if(fail&&target){fail=false;throw new Error('Synthetic lost rejection checkpoint');}
+  }});
+  try{
+    await h.budget.topup('500',{sourceKey:'before-rejected-order',actorId:111});
+    await assert.rejects(h.attach(),error=>error.code==='EGRN_ORDER_REJECTION_CHECKPOINT');
+    const row=(await h.pool.query('SELECT * FROM egrn_orders')).rows[0],pending=await h.budget.snapshot();assert.equal(row.status,'order_unknown');assert.equal(pending.pendingOrders,1);assert.equal(pending.confirmedOrders,0);assert.equal(pending.trackedAvailableKopecks,37100);
+    assert.equal((await h.attach()).result,'uncertain');assert.equal(h.calls.paid,1);
+    const replies=[],handler=h.commands.find(command=>command.name==='egrn_reconcile').handler;
+    await handler({chat:{type:'private'},from:{id:111},message:{text:'/egrn_reconcile '+row.id+' no_order'},reply:async text=>replies.push(text)});
+    assert.match(replies.at(-1),/Отсутствие заказа зафиксировано/);const resolved=await h.budget.snapshot();assert.equal(resolved.pendingOrders,0);assert.equal(resolved.confirmedOrders,0);assert.equal(resolved.trackedAvailableKopecks,50000);assert.equal(h.calls.paid,1);
+    assert.equal((await h.budget.syncBalance('500',{sourceKey:'after-reconciliation',actorId:111})).balanceKnown,true);
+  }finally{await h.close();}
+});
+
+test('private admin topups accept arbitrary amounts and repeat Telegram update IDs do not double the recorded credit', pg, async () => {
+  const h=await fixture();try{
+    const handler=h.commands.find(c=>c.name==='egrn_topup').handler,replies=[];
+    const ctx={chat:{id:111,type:'private'},from:{id:111},message:{message_id:51,text:'/egrn_topup 2500,50'},reply:async text=>replies.push(text)};
+    await handler({...ctx,from:{id:222}});await handler({...ctx,chat:{id:-100123,type:'supergroup'}});assert.equal((await h.budget.snapshot()).recordedTopupsKopecks,0);
+    await handler(ctx);await handler(ctx);assert.equal((await h.budget.snapshot()).recordedTopupsKopecks,250050);assert.ok(replies.every(text=>/По учтённым пополнениям/.test(text)));assert.equal(h.calls.paid,0);
+  }finally{await h.close();}
+});
+
+test('order confirmations, ready native captions and free cache reuse expose the same current accounting without another charge', pg, async () => {
+  const h=await fixture();try{
+    await h.budget.topup('500',{sourceKey:'new-topup',actorId:111});const ordered=await h.attach();assert.match(ordered.budget_text,/осталось 2/);assert.ok(h.calls.messages.some(m=>/Заказано выписок: 1/.test(m.text)));
+    await h.poll();assert.ok(h.calls.documents.some(d=>/Заказано выписок: 1/.test(d.extra.caption)&&/осталось 2/.test(d.extra.caption)));
+    const cached=await h.attach(222);assert.equal(cached.result,'attached');assert.match(cached.budget_text,/осталось 2/);assert.equal(h.calls.paid,1);assert.equal((await h.budget.snapshot()).confirmedOrders,1);
+  }finally{await h.close();}
 });
 
 test('failed recipient delivery resumes from native receipts without refetching or reuploading the original', pg, async () => {

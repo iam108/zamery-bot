@@ -21,6 +21,7 @@ test('migration and session persistence, expiry, touch and logout in PostgreSQL'
       if (name === './pool') return pool;
       if (name === '../web/order-egrn-links') return { DDL: require('../src/web/order-egrn-links').DDL };
       if (name === '../bot/manual-order-attachments') return { DDL: require('../src/bot/manual-order-attachments').DDL };
+      if (name === '../bot/egrn-budget') return { DDL: require('../src/bot/egrn-budget').DDL };
       if (name === '../web/order-materials') return { DDL: require('../src/web/order-materials').DDL };
       if (name === '../web/workspace') return { SESSION_DDL: require('../src/web/workspace').SESSION_DDL };
       throw new Error('Unexpected require: ' + name);

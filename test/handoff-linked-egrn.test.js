@@ -21,7 +21,7 @@ async function fixture(run) {
     INSERT INTO orders VALUES(60,'Москва, Лесная, 5','ООО Проверка','Общепит','77:01:0004016:1064','Продление',50);
     CREATE TABLE audits(id INT PRIMARY KEY,order_id INT,text TEXT,report_data JSONB,chat_id BIGINT,msg_ids BIGINT[],created_at TIMESTAMPTZ DEFAULT NOW());
     CREATE TABLE cases(id SERIAL PRIMARY KEY,order_id INT,lawyer_tg_id BIGINT,lawyer_name TEXT,checklist_key TEXT,org TEXT,inn TEXT,client TEXT,phone TEXT,address TEXT,region TEXT,kind TEXT,service TEXT,priority TEXT,comment TEXT,audit_text TEXT,total INT,created_by BIGINT,contacts JSONB,request_id INT,data JSONB DEFAULT '{}');
-    CREATE TABLE egrn_orders(id INT PRIMARY KEY,file_msgs JSONB);
+    CREATE TABLE egrn_orders(id INT PRIMARY KEY,file_msgs JSONB,id_statement BIGINT,status TEXT,created_at TIMESTAMPTZ DEFAULT NOW());
     CREATE TABLE egrn_files(id UUID PRIMARY KEY,name TEXT,mime TEXT,bytes BIGINT,sha256 TEXT);`);
   await db.query('INSERT INTO audits(id,order_id,text,report_data,chat_id,msg_ids) VALUES(15,60,$1,$2,$3,$4)', ['Полный отчёт аудитора', { workflow: { conclusion_status: 'actions' } }, SOURCE, [101,102]]);
   const query = async (sql, params) => {
@@ -39,7 +39,7 @@ async function fixture(run) {
   const stored = { id: storedId, egrn_order_id: 9, name: 'Большая выписка.pdf', mime: 'application/pdf', bytes: 350 * 1024 * 1024, sha256: 'f'.repeat(64) };
   const native = { chat: SOURCE, id: 77, name: 'Оригинал Telegram.pdf', mime: 'application/pdf', bytes: 35 * 1024 * 1024, file_id: 'PRIVATE_NATIVE_FILE', key: 'exact-native-original' };
   const records = [{ kind: 'link', original_id: storedId, key: 'exact-stored-original', chat: SOURCE, id: 78 }, native];
-  await db.query('INSERT INTO egrn_orders VALUES(9,$1)', [JSON.stringify(records)]);
+  await db.query("INSERT INTO egrn_orders(id,file_msgs,id_statement,status) VALUES(9,$1,9009,'done')", [JSON.stringify(records)]);
   await db.query('INSERT INTO egrn_files VALUES($1,$2,$3,$4,$5)', [storedId, stored.name, stored.mime, stored.bytes, stored.sha256]);
   const links = createOrderEgrnLinks({ pool, files: { async ensure() {}, async get(id) { return id === storedId ? stored : null; }, chunks() { assert.fail('A large original must not be read or copied into a ZIP'); } }, makeUrl(id) { return 'https://bot.example/egrn-files/' + id + '/download?fresh=' + (++signed); } });
   await links.register({ id: 9, deliver: [{ order_id: 60, chat: Number(CLIENTS) }] }, records);
@@ -84,6 +84,12 @@ test('reviewed >200MB stored and medium Telegram originals join the complete pri
   assert.ok(state.linkedEgrn.confirmed[LAWYER][h.storedId].message_id > 0); assert.ok(state.linkedEgrn.confirmed[LAWYER][h.nativeId].message_id > 0);
   assert.doesNotMatch(JSON.stringify(state), /fresh=|PRIVATE_NATIVE_FILE/);
   const count = h.events.length; await h.submit(); assert.equal(h.events.length, count); assert.equal(h.packetCalls(), 1); assert.equal((await h.row()).length, 1);
+}));
+
+test('linked original handoff shows the existing shared budget without charging for the free private copies', pg, () => fixture(async h => {
+  const budget=require('../src/bot/egrn-budget').createEgrnBudget({pool:h.options.pool});await budget.topup('2500',{sourceKey:'handoff-test-credit',actorId:101});
+  const before=await budget.snapshot(),result=await h.submit(),after=await budget.snapshot();assert.equal(result.delivery_complete,true);assert.match(result.warn,/осталось 19/);assert.match(h.events.find(event=>event.type==='link').text,/осталось 19/);
+  assert.equal(before.confirmedOrders,1);assert.equal(after.confirmedOrders,1);assert.equal(after.trackedNetKopecks,250000);assert.equal(h.paidCalls(),0);
 }));
 
 test('explicit failure in the middle resumes only missing linked originals, with no new client or manager ZIP', pg, () => fixture(async h => {

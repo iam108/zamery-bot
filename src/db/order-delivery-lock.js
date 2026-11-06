@@ -37,7 +37,9 @@ function createOrderDeliveryLock(pool = defaultPool, options = {}) {
       // In-memory adapters use the same local queue. Real PostgreSQL workers
       // additionally share a session lock without occupying the SQL pool.
       if (pool instanceof Pool || options.lockPool) {
-        client = await getSessionLockPool(pool, options.lockPool).connect();
+        // Audit delivery already holds a draft lock. Its two outer sessions
+        // must not occupy every slot needed for this nested order lock.
+        client = await getSessionLockPool(pool, options.lockPool, 'order').connect();
         for (;;) {
           locked = !!(await client.query('SELECT pg_try_advisory_lock(119,$1) AS locked', [id])).rows[0]?.locked;
           if (locked) break;

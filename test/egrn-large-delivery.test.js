@@ -51,6 +51,17 @@ function streamedFile(overrides = {}) {
     open:async function*(){yield PDF.subarray(0,10);yield PDF.subarray(10);},...overrides };
 }
 
+test('ready large-link notices and free cached copies read current accounting without storing it in original receipts',async()=>{
+  let text='Заказано выписок: 1. По учтённым пополнениям: осталось 2 выписки.';const h=fixture({budgetText:async()=>text});
+  const record=await h.service.deliver(h.order,h.file,KEY,h.records);assert.ok(h.sends.every(call=>call.text.includes(text)));
+  text='Заказано выписок: 2. По учтённым пополнениям: осталось 1 выписка.';await h.service.copy(record,{chat:4444});assert.ok(h.sends.at(-1).text.includes(text));assert.equal(h.state.saveCount,1);assert.doesNotMatch(JSON.stringify(h.records),/Заказано|осталось/);
+});
+
+test('an unavailable accounting snapshot does not prevent the original large-link delivery or its receipt',async()=>{
+  const h=fixture({budgetText:async()=>{throw new Error('Synthetic counter read failure');}});await h.service.deliver(h.order,h.file,KEY,h.records);
+  assert.equal(h.records[0].deliveries.length,3);assert.ok(h.sends.every(call=>call.text.includes('Учёт заказов временно недоступен')));
+});
+
 test('original and descriptor are durable before a link is sent; every target receipt is persisted immediately',async()=>{
   const h=fixture(),record=await h.service.deliver(h.order,h.file,KEY,h.records);
   assert.equal(record,h.records[0]);assert.equal(h.records.length,1);assert.equal(h.state.saveCount,1);

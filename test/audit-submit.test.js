@@ -78,6 +78,36 @@ test('successful submission closes once and repeated request returns without red
   assert.equal(h.state.locked, false);
 });
 
+test('a missing original card returns a visible warning and retains it on a lost-response retry', async () => {
+  const h = harness(); let deliveries = 0;
+  const warning = 'Отчёт сохранён. Исходная карточка заявки удалена; кнопка перехода не добавлена.';
+  const submit = createAuditSubmitter(h.drafts, async ctx => {
+    deliveries++;
+    await ctx.auditDelivery.save({ saved: true, orderCardLinkSkipped: { code: 'ORDER_CARD_UNAVAILABLE', warning } });
+    return { warning };
+  });
+  assert.equal((await submit(108, h.id, 4, h.context)).warning, warning);
+  const retry = await submit(108, h.id, 4, h.context);
+  assert.equal(retry.already_submitted, true);
+  assert.equal(retry.warning, warning);
+  assert.equal(deliveries, 1);
+});
+
+test('a transient card link failure keeps the report resumable without another materials delivery', async () => {
+  const h = harness(); let materials = 0, links = 0;
+  const submit = createAuditSubmitter(h.drafts, async ctx => {
+    const progress = await ctx.auditDelivery.load();
+    if (!progress.saved) { materials++; progress.saved = true; await ctx.auditDelivery.save(progress); }
+    if (++links === 1) throw Object.assign(new Error('Retry original card markup'), { code: 'ORDER_CARD_LINK_RETRY' });
+    await ctx.auditDelivery.save({ ...progress, orderCardLinked: true });
+  });
+  await assert.rejects(submit(108, h.id, 4, h.context), e => e.code === 'ORDER_CARD_LINK_RETRY');
+  assert.equal(h.state.submitted, false);
+  assert.equal(h.state.frozen, true);
+  assert.equal((await submit(108, h.id, 4, h.context)).ok, true);
+  assert.equal(materials, 1); assert.equal(links, 2);
+});
+
 test('Telegram acknowledgement followed by checkpoint failure keeps the exact revision frozen', async () => {
   const h = harness();
   h.drafts.saveDraftDelivery = async () => { throw new Error('checkpoint unavailable'); };

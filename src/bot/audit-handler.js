@@ -5,6 +5,7 @@ const { buildInspectionReport, validateInspection } = require('./audit-inspectio
 const { splitTelegramHtml, photoCaption, deliveryMedia, presentationMedia } = require('./audit-delivery');
 const { createHash } = require('crypto');
 const { normalizeWorkflow, validateWorkflow, buildWorkflowReport } = require('./audit-workflow');
+const { syncOrderReportLink, telegramMessageUrl } = require('../web/order-report-link');
 
 // Отчёты, которые уже обрабатываются или отправлены (защита от дубля при повторной отправке)
 const seenSubmits = new Map();
@@ -60,7 +61,7 @@ async function handleAuditReport(ctx, data) {
     progress.signature = signature;
   }
   if (!progress) {
-    progress = { signature, ...(data.ui_version === 5 ? { deliveryVersion: 2 } : {}), textIds: [], photoIds: [], documentIds: [], saved: false, handoffSent: false, replied: false, job: null };
+    progress = { signature, ...(data.ui_version === 5 ? { deliveryVersion: 2 } : {}), textIds: [], photoIds: [], documentIds: [], saved: false, handoffSent: false, orderCardLinked: false, replied: false, job: null };
   }
   if (progress.deliveryVersion != null && ![1, 2].includes(progress.deliveryVersion)) throw new Error('Неизвестный формат доставки отчёта. Отправка остановлена, чтобы не потерять материалы.');
   if (key && !seenSubmits.has(key)) {
@@ -80,8 +81,8 @@ async function handleAuditReportInner(ctx, data, progress) {
   validateInspection(data);
   async function checkpoint() {
     if (ctx.auditDelivery) {
-      const { signature, deliveryVersion, textIds, photoIds, documentIds, saved, handoffSent, replied } = progress;
-      await ctx.auditDelivery.save({ signature, ...(deliveryVersion != null ? { deliveryVersion } : {}), textIds, photoIds, documentIds, saved, handoffSent, replied });
+      const { signature, deliveryVersion, textIds, photoIds, documentIds, saved, handoffSent, orderCardLinked, orderCardLinkSkipped, replied } = progress;
+      await ctx.auditDelivery.save({ signature, ...(deliveryVersion != null ? { deliveryVersion } : {}), textIds, photoIds, documentIds, saved, handoffSent, orderCardLinked, ...(orderCardLinkSkipped ? { orderCardLinkSkipped } : {}), replied });
     }
   }
   const GROUP_ID = process.env.GROUP_CHAT_ID;
@@ -341,20 +342,33 @@ async function handleAuditReportInner(ctx, data, progress) {
     await checkpoint();
   }
 
+  if (data.order_id && !progress.orderCardLinked && !progress.orderCardLinkSkipped) {
+    try {
+      const result = await tgRetry(() => syncOrderReportLink(data.order_id, { telegram: tg, groupId: GROUP_ID }));
+      if (result.state === 'linked') progress.orderCardLinked = true;
+      else if (result.state === 'skipped') progress.orderCardLinkSkipped = { code: result.code, warning: result.warning };
+      else throw new Error('Не подтверждено обновление карточки заявки.');
+      try { await checkpoint(); }
+      catch (error) {
+        // Markup is idempotent: retry its acknowledgement after a failed
+        // checkpoint, while all confirmed report receipts remain untouched.
+        progress.orderCardLinked = false; delete progress.orderCardLinkSkipped;
+        throw error;
+      }
+    } catch (error) {
+      throw Object.assign(new Error('Отчёт и материалы сохранены, но не удалось подтвердить кнопку «Перейти к отчёту» в заявке. Повторите отправку без изменений — отчёт не продублируется.'), { code: 'ORDER_CARD_LINK_RETRY' });
+    }
+  }
+
+  const warning = progress.orderCardLinkSkipped?.warning;
   if (ctx.reply && !progress.replied) {
-    await ctx.reply(presentation ? '✅ Отчёт и материалы отправлены в группу.' : '✅ Отчёт' + (photos.length ? ' и фото (' + photos.length + ')' : '') + ' отправлены в группу!');
+    const confirmation = presentation ? '✅ Отчёт и материалы отправлены в группу.' : '✅ Отчёт' + (photos.length ? ' и фото (' + photos.length + ')' : '') + ' отправлены в группу!';
+    await ctx.reply(confirmation + (warning ? '\n' + warning : ''));
     progress.replied = true;
     await checkpoint();
   }
 
-}
-
-function telegramMessageUrl(chatId, messageId) {
-  if (!Number.isSafeInteger(Number(messageId)) || Number(messageId) <= 0) return null;
-  const chat = String(chatId || '');
-  if (/^-100\d+$/.test(chat)) return 'https://t.me/c/' + chat.slice(4) + '/' + messageId;
-  if (/^@[a-zA-Z][a-zA-Z0-9_]{4,}$/.test(chat)) return 'https://t.me/' + chat.slice(1) + '/' + messageId;
-  return null;
+  return warning ? { warning } : {};
 }
 
 module.exports = { handleAuditReport };

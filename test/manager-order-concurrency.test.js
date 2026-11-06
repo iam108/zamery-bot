@@ -20,7 +20,8 @@ async function database(run) {
     async query(sql,values){const client=await pool.connect();try{return await client.query(sql,values);}finally{client.release();}}};
   try{
     await db.exec(`CREATE TABLE orders(id SERIAL PRIMARY KEY,created_at TIMESTAMPTZ DEFAULT NOW(),address TEXT,owner_name TEXT,object_type TEXT,object_name TEXT,has_video BOOLEAN,zones_info TEXT,deadline DATE,contacts TEXT,submitted_by BIGINT,submitted_name TEXT,status TEXT DEFAULT 'new',telegram_msg_id BIGINT);
-      CREATE TABLE logs(order_id INT,action TEXT,actor TEXT,details TEXT);`);
+      CREATE TABLE logs(order_id INT,action TEXT,actor TEXT,details TEXT);
+      CREATE TABLE audits(id INT PRIMARY KEY,order_id INT,chat_id BIGINT,msg_ids BIGINT[],created_at TIMESTAMPTZ DEFAULT NOW());`);
     const store=materialsModule.createMaterialsStore(pool),materials={...materialsModule,ensureOrderMaterials:store.ensure,saveOrderMaterials:store.save,saveOrderMaterialsInTransaction:store.saveInTransaction,listOrderMaterials:store.list,markOrderMaterialDelivered:store.delivered};
     function loadQueries(){const context=vm.createContext({module:{exports:{}},require(name){if(name==='./pool')return pool;if(name==='../web/order-materials')return materials;throw new Error('Unexpected dependency '+name);}});vm.runInContext(fs.readFileSync(require.resolve('../src/db/queries'),'utf8'),context);return context.module.exports;}
     const queries=loadQueries(),created=await queries.createOrderWithMaterials({...materialsModule.normalizeManagerOrder(initial(),[]),submitted_by:108},[]);
@@ -133,4 +134,13 @@ test('a late creation retry after a newer edit confirms the original revision wi
   const stale=request(h.order,108,'after-creation-replay',{...initial(),packet_revision:replayed.body.packet_revision}),rejected=response();
   await handlers().save(stale,rejected);assert.equal(rejected.statusCode,409);assert.equal(rejected.body.code,'ORDER_PACKET_CONFLICT');
   const latest=await h.queries.getOrderById(h.order.id);assert.equal(latest.address,latestData.address);assert.equal(latest.contacts,latestData.contacts);assert.equal(Number(latest.submitted_by),108);assert.equal(latest.submitted_name,'Исходный автор');assert.deepEqual(await h.counts(),counts);
+}));
+
+test('real manager publication keeps the latest persisted audit link after packet and status changes',pg,async()=>database(async h=>{
+  await h.pool.query('INSERT INTO audits(id,order_id,chat_id,msg_ids,created_at) VALUES(1,$1,$2,$3,$4),(2,$1,$2,$5,$6)',[h.order.id,'-1001111111111',[209,201],'2026-11-01T12:00:00Z',[0],'2026-11-02T12:00:00Z']);
+  const keyboards=[],handlers=createManagerHandlers({pool:h.pool,materials:h.materials,queries:h.loadQueries(),format:order=>order.address,attachOrOrder:()=>assert.fail('No provider call'),getTelegram:()=>({async editMessageText(chat,id,unused,text,options){keyboards.push(options.reply_markup.inline_keyboard.flat());}})});
+  const first=response();await handlers.save(request(h.order,108,'report-edit-1',{address:'Москва, Новый адрес'}),first);assert.equal(first.body.warning,undefined);assert.equal(keyboards[0].find(button=>button.url).url,'https://t.me/c/1111111111/209');
+  await h.pool.query("UPDATE orders SET status='cancelled' WHERE id=$1",[h.order.id]);await h.pool.query('INSERT INTO audits VALUES(3,$1,$2,$3,$4)',[h.order.id,'-1001111111111',[300],'2026-11-03T12:00:00Z']);
+  const current=await h.queries.getOrderById(h.order.id),second=response();await handlers.save(request(current,108,'report-edit-2',{address:'Москва, Финальный адрес'}),second);
+  assert.equal(second.body.warning,undefined);assert.deepEqual(keyboards[1],[{text:'Перейти к отчёту',url:'https://t.me/c/1111111111/300'}]);
 }));

@@ -62,6 +62,7 @@ function harness(options = {}) {
         if (options.saveFailure) await options.saveFailure();
         saved.push(args);
       } };
+      if (name === '../web/order-report-link') return { ...require('../src/web/order-report-link'), syncOrderReportLink: async () => ({ state: 'linked' }) };
       if (name === './formatter') return { esc };
       if (name === './audit-delivery') return require('../src/bot/audit-delivery');
       if (name === './audit-workflow') return require('../src/bot/audit-workflow');

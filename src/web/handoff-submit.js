@@ -121,6 +121,11 @@ function createHandoffSubmitter(options={}) {
   }
   const packetService=()=>options.packetService||require('./handoff-packet').createPacketService({pool});
   const telegram=()=>options.telegram||require('../bot/instance').telegram;
+  let budgetLedger;
+  const accountingText=async()=>{
+    try {const ledger=budgetLedger||=require('../bot/egrn-budget').createEgrnBudget({pool});return ledger.describe(await ledger.snapshot());}
+    catch(_){return 'Учёт заказов временно недоступен; остаток не сверён.';}
+  };
   const loadReport=(src,id)=>options.loadReport?options.loadReport(src,id):src==='a'?pool.query('SELECT * FROM audits WHERE id=$1',[id]).then(result=>result.rows[0]):Promise.reject(new Error('Legacy report loader is not configured'));
   const getExisting=(client,user,submitId)=>client.query('SELECT * FROM cases WHERE created_by=$1 AND handoff_submit_id=$2',[user,submitId]).then(result=>result.rows[0]);
   function compatible(c,signature) {
@@ -293,7 +298,7 @@ function createHandoffSubmitter(options={}) {
           const sent=await send({type:'linked-egrn',chat:target,original_id:file.id},async()=>{
             let receipt;
             if(url){
-              receipt=await tg.sendMessage(target,'📄 Выписка ЕГРН: '+file.name+'\nОригинал: '+file.bytes+' байт. Если срок ссылки истёк, обновите её кнопкой ниже.',{
+              receipt=await tg.sendMessage(target,'📄 Выписка ЕГРН: '+file.name+'\nОригинал: '+file.bytes+' байт. Если срок ссылки истёк, обновите её кнопкой ниже.\n'+await accountingText(),{
                 reply_to_message_id:state.cards[target],reply_markup:{inline_keyboard:[[{text:'Скачать оригинал',url}],[{text:'Обновить ссылку',callback_data:'egf:'+file.id}]]}});
             }else{
               try{receipt=await tg.callApi('copyMessage',{chat_id:target,from_chat_id:original.chat_id,message_id:Number(original.message_id),reply_parameters:{message_id:state.cards[target],allow_sending_without_reply:true}});}
@@ -307,7 +312,7 @@ function createHandoffSubmitter(options={}) {
           });
           links.confirmed[target][file.id]={message_id:Number(sent.message_id)};state.inflight=null;await save();receiptPending=false;
         }
-        links.completed=true;state.egrn.completed=true;state.egrn.result='included-links';state.egrn.note='Связанные выписки ЕГРН доставлены юристу.';await save();
+        links.completed=true;state.egrn.completed=true;state.egrn.result='included-links';state.egrn.note='Связанные выписки ЕГРН доставлены юристу.\n'+await accountingText();await save();
       }
       if(!state.egrn.completed){
         const egrn=state.egrn,cad=state.fields.cad_num;
@@ -328,6 +333,7 @@ function createHandoffSubmitter(options={}) {
             state.manual_review='Не удалось подтвердить результат ранее начатого заказа ЕГРН. Проверьте заказ вручную; повторный платный запрос не создан.';await save();return partial(c,state,state.manual_review,false);
           }
           egrn.note={attached:'Выписка ЕГРН приложена юристу.',ordered:'Выписка ЕГРН заказана и придёт юристу после готовности.',waiting:'Выписка ЕГРН уже в работе и придёт юристу после готовности.',unavailable:'ЕГРН не включена: доставка ранее заказанной выписки остановлена; новый заказ не создан.',none:'ЕГРН не включена: готовая выписка не найдена, новый заказ не создавался.',missing:'ЕГРН не включена: готовая выписка не найдена, новый заказ не создавался.'}[egrn.result]||'Готовность ЕГРН не подтверждена; выписка не включена в переданный комплект.';
+          if(result?.budget_text)egrn.note+='\n'+result.budget_text;
           egrn.completed=true;
         }
         await save();

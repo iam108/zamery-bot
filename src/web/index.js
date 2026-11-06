@@ -139,8 +139,8 @@ function setupWeb(app) {
       return res.json(await submit(req.tgUser.id, data.draft_id, data.revision, fakeCtx));
     }
     if (data.schema_version === 3) return res.status(400).json({ ok: false, error: 'Сначала сохраните черновик новой формы.' });
-    await handleAuditReport(fakeCtx, data);
-    res.json({ ok: true });
+    const delivered = await handleAuditReport(fakeCtx, data);
+    res.json({ ok: true, ...(delivered?.warning ? { warning: delivered.warning } : {}) });
   } catch (e) {
     console.error('api/audit error:', e);
     res.status(e.status || 400).json({ ok: false, error: e.message, ...(e.code==='AUDIT_PACKET_CHANGED'?{code:e.code}:{}) });

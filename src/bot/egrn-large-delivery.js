@@ -132,7 +132,10 @@ function createLargeDelivery(options = {}) {
       ] }
     };
     if (destination.reply) extra.reply_parameters = { message_id: destination.reply, allow_sending_without_reply: true };
-    return telegram.sendMessage(destination.chat, messageText(record), extra);
+    let accounting = '';
+    try { accounting = options.budgetText ? await options.budgetText() : ''; }
+    catch (_) { accounting = 'Учёт заказов временно недоступен; остаток не сверён.'; }
+    return telegram.sendMessage(destination.chat, messageText(record) + (accounting ? '\n' + accounting : ''), extra);
   }
   async function complete(order, record, records, descriptorSaved) {
     requireSender(); requirePersist();

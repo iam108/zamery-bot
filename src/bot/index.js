@@ -2,6 +2,7 @@ const { Telegraf, Markup } = require('telegraf');
 const { updateOrderStatus, getOrderById, getStats } = require('../db/queries');
 const { formatOrderMessage, STATUS_EMOJI } = require('./formatter');
 const { cardOptions } = require('../web/manager-orders');
+const { loadOrderReportLink } = require('../web/order-report-link');
 const { withOrderDeliveryLock } = require('../db/order-delivery-lock');
 
 function setupBot() {
@@ -11,6 +12,7 @@ function setupBot() {
   require('../web/handoff').setupReportsBot(bot);
   require('./egrn').setupEgrn(bot);
   const pool = require('../db/pool');
+  require('./report-link-admin').setupReportLinkAdmin(bot, { pool });
   const { ensureStaff, canManageCases } = require('../web/auth');
   const { parsePairing, approvePairing, canPair } = require('../web/workspace');
   const { esc } = require('./formatter');
@@ -210,7 +212,10 @@ function setupBot() {
   });
 
   async function refreshOrderCard(ctx, order) {
-    try { await ctx.editMessageText(formatOrderMessage(order), cardOptions(order)); }
+    try {
+      const report = await loadOrderReportLink(order.id, { pool });
+      await ctx.editMessageText(formatOrderMessage(order), cardOptions(order, report?.url));
+    }
     catch (error) {
       if (!/message is not modified/i.test(error.response?.description || error.message || '')) throw error;
     }

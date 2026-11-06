@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { createManagerHandlers } = require('../src/web/manager-orders');
+const { createManagerHandlers, cardOptions } = require('../src/web/manager-orders');
 const originalMaterials = require('../src/web/order-materials');
 const { Readable } = require('node:stream');
 
@@ -39,7 +39,7 @@ function fixture(options = {}) {
     sendDocument: async (chat, file) => { calls.push({ document: file.filename, content: file.source.toString() }); return { message_id: 901 }; },
     sendMessage: async () => { throw new Error('Existing order must not create another card'); },
   };
-  const handlers = createManagerHandlers({ materials, queries, pool: {}, getTelegram: () => telegram, format: item => 'order ' + item.id, attachOrOrder: async () => { throw new Error('No EGRN requested'); }, ...options });
+  const handlers = createManagerHandlers({ materials, queries, pool: {}, loadOrderReportLink: async () => null, getTelegram: () => telegram, format: item => 'order ' + item.id, attachOrOrder: async () => { throw new Error('No EGRN requested'); }, ...options });
   const request = (role = 'manager', uid = 109) => ({ params: { id: '58' }, tgUser: { id: uid }, staff: { name: 'Менеджер', role }, files: [], body: { address: 'Москва, новый адрес', owner_name: 'Клиент', object_type: 'Общепит алкоголь', service: 'Продление', archive_url: '', submit_id: 'edit-1', packet_revision: 1 } });
   const response = () => ({ statusCode: 200, headers: {}, status(n) { this.statusCode = n; return this; }, set(k,v) { this.headers[k] = v; return this; }, json(value) { this.body = value; return this; } });
   return { handlers, request, response, files, calls, telegram, order: () => order };
@@ -113,6 +113,7 @@ for (const edit of [false, true]) test('EGRN delivery failure remains retryable 
   let order = { id: 58, packet_revision: 1, submitted_by: 108, submitted_name: 'Автор', status: 'new', telegram_msg_id: edit ? 900 : null, cad_num: '', created_at: new Date() };
   let attempts = 0, creates = 0, cards = 0;
   const handlers = createManagerHandlers({
+    loadOrderReportLink: async () => null,
     materials: { ...originalMaterials, ensureOrderMaterials: async () => {}, listOrderMaterials: async () => [], saveOrderMaterials: async () => {} },
     queries: { getOrderById: async () => ({ ...order }), createOrderWithMaterials: async data => { creates++; order = { ...order, ...data }; return { ...order }; },
       updateOrderPacketWithMaterials: async (id, data) => { order = { ...order, ...data, packet_revision: 2 }; return { order: { ...order }, saved_revision: 2, replayed: false }; }, setTelegramMsgId: async (id, msg) => { order.telegram_msg_id = msg; }, addLog: async () => {} },
@@ -174,4 +175,31 @@ test('overlapping manager saves cannot replace the newest Telegram card with an 
   await Promise.all([savingFirst, savingSecond]);
   assert.equal(f.order().address, second.body.address);
   assert.equal(card, second.body.address);
+});
+
+test('canonical report buttons append to every status without changing its existing actions',()=>{
+  for(const status of ['new','in_progress','done','cancelled']){
+    const plain=cardOptions({id:58,status}).reply_markup.inline_keyboard;
+    for(const url of ['https://t.me/c/111111/101','https://t.me/public_audit/102']){
+      const linked=cardOptions({id:58,status},url).reply_markup.inline_keyboard;
+      assert.deepEqual(linked.slice(0,-1),plain);assert.deepEqual(linked.at(-1),[{text:'Перейти к отчёту',url}]);
+    }
+    for(const url of ['http://t.me/c/111/1','https://evil.test/c/111/1','https://t.me.evil.test/c/111/1','https://user@t.me/c/111/1','https://t.me:443/c/111/1','https://t.me/c/111/1?u=42&k=private','https://t.me/c/111/1#fragment','https://t.me/c/0/1','https://t.me/c/111/0','https://t.me/a/1','https://t.me/public_audit/1/extra',null,{}])assert.deepEqual(cardOptions({id:58,status},url).reply_markup.inline_keyboard,plain);
+  }
+});
+
+test('manager packet edits resolve the latest report under the order lock and preserve report plus current status actions',async()=>{
+  let locked=false,lookup=0;
+  const f=fixture({withOrderDeliveryLock:async(id,run)=>{assert.equal(id,58);locked=true;try{return await run();}finally{locked=false;}},loadOrderReportLink:async id=>{assert.equal(id,58);assert.equal(locked,true);lookup++;return{url:'https://t.me/c/111111/209'};}});
+  const req=f.request();req.body.service='Получение';const res=f.response();await f.handlers.save(req,res);
+  assert.equal(res.body.ok,true);assert.equal(res.body.warning,undefined);assert.equal(lookup,1);
+  const buttons=f.calls.find(call=>call.edit).options.reply_markup.inline_keyboard.flat();
+  assert.ok(buttons.some(button=>button.callback_data==='status:done:58'));assert.ok(buttons.some(button=>button.callback_data==='report:58'));assert.equal(buttons.find(button=>button.text==='Перейти к отчёту').url,'https://t.me/c/111111/209');
+});
+
+test('report lookup failure saves the packet with a visible warning and cannot overwrite the existing card keyboard',async()=>{
+  let failed=true;const f=fixture({loadOrderReportLink:async()=>{if(failed)throw new Error('Synthetic report lookup failure');return{url:'https://t.me/c/111111/210'};}}),req=f.request();req.body.service='Получение';
+  const first=f.response();await f.handlers.save(req,first);assert.equal(first.body.ok,true);assert.match(first.body.warning,/сохранены/);assert.equal(f.order().address,req.body.address);assert.equal(f.calls.filter(call=>call.edit).length,0);
+  failed=false;const retry=f.response();await f.handlers.save(req,retry);assert.equal(retry.body.warning,undefined);assert.equal(f.calls.filter(call=>call==='update-packet').length,1);
+  assert.equal(f.calls.find(call=>call.edit).options.reply_markup.inline_keyboard.flat().find(button=>button.url).url,'https://t.me/c/111111/210');
 });

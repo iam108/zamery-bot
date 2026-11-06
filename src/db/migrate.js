@@ -48,6 +48,7 @@ async function migrate() {
     await client.query(require('../web/order-materials').DDL);
     await client.query(require('../web/order-egrn-links').DDL);
     await client.query(require('../bot/manual-order-attachments').DDL);
+    await client.query(require('../bot/egrn-budget').DDL);
     await client.query(require('../web/workspace').SESSION_DDL);
 
     await client.query(`
