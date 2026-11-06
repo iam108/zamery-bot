@@ -54,6 +54,17 @@ function harness(options = {}) {
 }
 function lawyer(h) { h.node('lawyers').value = '108'; h.node('lawyers').onchange(); }
 
+test('the existing lawyer selector shows assigned workload including zero while review retains the plain recipient name',async()=>{
+  const h=harness({prefill:{ok:true,lawyers:[{tg_id:108,name:'Елена',active_cases:3},{tg_id:109,name:'Мария',active_cases:0}],report:{src:'a',id:15},order:{id:60}}});await pause();
+  assert.match(h.node('lawyers').innerHTML,/Елена · 3 в работе/);assert.match(h.node('lawyers').innerHTML,/Мария · 0 в работе/);
+  lawyer(h);assert.equal(h.node('go').textContent,'Передать · Елена');h.node('go').click();assert.equal(h.node('review-lawyer').textContent,'Елена');
+});
+
+test('a private readonly lawyer payload without workload does not invent a zero count',async()=>{
+  const h=harness({query:'?order_id=60&view=report',prefill:{ok:true,lawyers:[{tg_id:108,name:'Елена'}],report:{src:'a',id:15},order:{id:60}}});await pause();
+  assert.doesNotMatch(h.node('lawyers').innerHTML,/в работе/);assert.equal(h.node('assignment').hidden,true);
+});
+
 for(const contacts of [[],[{name:'',phone:'',tg:'',comment:'Контакт пока не предоставлен'}]])test('order-bound confirmation requires a usable client contact before opening review: '+JSON.stringify(contacts),async()=>{
   const p=packet();p.order.contacts=contacts;const h=harness({packet:p});await pause();lawyer(h);h.node('go').click();
   assert.equal(h.node('review').hidden,true);assert.match(h.node('form-error').textContent,/контакт/i);assert.equal(h.node('details').open,true);
@@ -363,6 +374,47 @@ test('a fresh resumable assignment button invokes only the existing case recover
   const bodies=[],p=packet();p.assignment={case_id:75,lawyer_name:'Мария',delivery_complete:false,can_resume:true,submit_id:'existing-job'};
   const h=harness({packet:p,post:async(_,body)=>{bodies.push(body);return h.response({ok:true,id:75,delivery_complete:true});}});await pause();
   assert.equal(h.node('retry-send').hidden,false);h.node('retry-send').click();await pause();assert.equal(bodies.length,1);assert.deepEqual(bodies[0],{resume_case_id:75});assert.match(h.node('delivery-title').textContent,/Передано/);
+});
+
+for(const status of ['pending','rejected','blocked'])test('reopening private-complete handoff with '+status+' group notice retries only the summary and keeps a later rejection visible',async()=>{
+  const bodies=[],p=packet();p.assignment={case_id:75,lawyer_name:'Мария',delivery_complete:true,can_resume:true,group_notice:{status,manual_review:false}};
+  const h=harness({packet:p,post:async(n,body)=>{bodies.push(body);return h.response({ok:true,id:75,delivery_complete:true,group_notice:{status:n===1?'rejected':'confirmed',manual_review:false}});}});await pause();
+  assert.match(h.node('delivery-text').textContent,/Личная доставка юристу: подтверждена/);assert.match(h.node('delivery-text').textContent,/Сводк/);
+  assert.equal(h.node('retry-send').hidden,false);assert.equal(h.node('retry-send').textContent,'Повторить сводку в чат');
+  h.node('retry-send').click();await pause();assert.deepEqual(bodies,[{resume_case_id:75}]);
+  assert.match(h.node('delivery-text').textContent,/Личная доставка полного комплекта юристу подтверждена/);assert.match(h.node('delivery-text').textContent,/Сводку не удалось отправить/);
+  assert.equal(h.node('retry-send').hidden,false);assert.equal(h.node('retry-send').textContent,'Повторить сводку в чат');
+  h.node('retry-send').click();await pause();assert.deepEqual(bodies,[{resume_case_id:75},{resume_case_id:75}]);assert.equal(h.node('retry-send').hidden,true);assert.match(h.node('delivery-text').textContent,/Сводка в чате клиентов опубликована/);
+  h.node('retry-send').click();await pause();assert.equal(bodies.length,2);
+});
+
+for(const notice of [{status:'unknown'},{status:'sending'},{status:'rejected',manual_review:true}])test('private-complete handoff with uncertain group receipt offers no resend: '+JSON.stringify(notice),async()=>{
+  const p=packet();p.assignment={case_id:75,lawyer_name:'Мария',delivery_complete:true,can_resume:true,group_notice:notice};
+  const h=harness({packet:p});await pause();assert.match(h.node('delivery-text').textContent,/Личная доставка юристу: подтверждена/);assert.match(h.node('delivery-text').textContent,/Сначала проверьте чат/);
+  assert.equal(h.node('retry-send').hidden,true);h.node('retry-send').click();await pause();assert.equal(h.postRequests(),0);
+});
+
+test('new private delivery with rejected group summary stays recoverable and an uncertain summary retry stops',async()=>{
+  const bodies=[],h=harness({post:async(n,body)=>{bodies.push(body);return h.response({ok:true,id:75,delivery_complete:true,egrn_note:'waiting',group_notice:{status:n===1?'rejected':'unknown',manual_review:n!==1}});}});
+  await pause();lawyer(h);h.node('go').click();h.node('confirm-send').click();await pause();
+  assert.equal(bodies[0].handoff_version,2);assert.equal(h.node('retry-send').hidden,false);assert.match(h.node('delivery-text').textContent,/Заказанная ЕГРН ещё ожидается/);
+  assert.match(h.node('delivery-text').textContent,/Личная доставка полного комплекта юристу подтверждена/);assert.equal(h.cached().completed.groupNotice.status,'rejected');
+  h.node('retry-send').click();await pause();assert.deepEqual(bodies[1],{resume_case_id:75});assert.equal(h.node('retry-send').hidden,true);assert.match(h.node('delivery-text').textContent,/Сначала проверьте чат/);assert.match(h.node('delivery-text').textContent,/Заказанная ЕГРН ещё ожидается/);
+  h.node('retry-send').click();h.node('confirm-send').click();await pause();assert.equal(bodies.length,2);
+});
+
+test('fresh group status and manager capability override a cached completed summary retry on reopen',async()=>{
+  for(const group of [{status:'unknown',manual_review:true},{status:'rejected',manual_review:false}]){
+    const p=packet(),source=M.profile(p.order);p.assignment={case_id:75,lawyer_name:'Мария',delivery_complete:true,can_resume:false,group_notice:group};
+    const h=harness({packet:p,stored:{'handoff-v2:staff:order-60':JSON.stringify({version:2,fingerprint:M.fingerprint(source),packetSignature:p.signature,completed:{id:75,name:'Мария',groupNotice:{status:'rejected'},canResumeNotice:true}})}});await pause();
+    assert.equal(h.node('retry-send').hidden,true);assert.match(h.node('delivery-text').textContent,group.status==='unknown'?/Сначала проверьте чат/:/Сводку не удалось отправить/);h.node('retry-send').click();await pause();assert.equal(h.postRequests(),0);
+  }
+});
+
+test('group notice presentation uses only normalized status and never exposes checkpoint metadata or raw warning',()=>{
+  assert.equal(M.groupNotice(null),null);
+  const notice=M.groupNotice({status:'rejected',target:'-100PRIVATE',message:'secret transport detail',cursors:{101:99},retry:false});
+  assert.equal(notice.retry,true);assert.doesNotMatch(JSON.stringify(notice),/PRIVATE|secret|cursors|target/);
 });
 
 test('an unconfirmed recovery response shows its warning in the visible delivery card and disables blind retry',async()=>{

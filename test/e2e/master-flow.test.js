@@ -24,10 +24,11 @@ async function unzip(buffer) {
   });
 }
 
-test('master: new manager originals become an annotated audit, complete private lawyer handoff and writable workspace case', {timeout:120000}, async t => {
+test('master: manager originals become an annotated audit, private lawyer package, one clients-group notice and writable workspace case', {timeout:120000}, async t => {
   let browser, service; const visits=[];
+  const clientsGroup='-1007777999911';
   try {
-    service=await createService({master:true});browser=await chromium.launch();
+    service=await createService({master:true,clientsGroup});browser=await chromium.launch();
     const manager=await openPage(browser,service,2001,{pathname:'/form',mobile:false});visits.push(manager);
     const p=manager.page,plan=multiPagePdf(),lease=Buffer.concat([multiPagePdf(),Buffer.from('\n% Distinct synthetic lease original\n')]);
     await p.locator('#address').fill('Москва, Сквозная улица, 7');await p.locator('#owner_name').fill('ООО «Сквозная проверка»');
@@ -77,7 +78,11 @@ test('master: new manager originals become an annotated audit, complete private 
     const before=service.messages.length;await h.locator('#go').click();await h.locator('#review').waitFor({state:'visible'});assert.match(await h.locator('#review-list').innerText(),/Отчёт аудитора/);
     const delivered=h.waitForResponse(r=>r.url().includes('/api/handoff')&&r.request().method()==='POST');await h.locator('#confirm-send').click();const handoffResponse=await delivered,result=await handoffResponse.json();assert.equal(handoffResponse.status(),200);assert.equal(result.delivery_complete,true);await h.locator('#delivery-title').getByText(/передан/i).waitFor();
     const cases=(await service.pool.query('SELECT * FROM cases WHERE order_id=$1',[orderId])).rows;assert.equal(cases.length,1);const assigned=cases[0];assert.equal(Number(assigned.lawyer_tg_id),LAWYER);assert.equal(Number(assigned.id),result.id);assert.equal(assigned.data._handoff.completed,true);
-    const sent=service.messages.slice(before);assert.ok(sent.length>2);for(const event of sent){const target=event.method.startsWith('copy')?event.args[0].chat_id:event.args[0];assert.equal(String(target),String(LAWYER));}
+    const sent=service.messages.slice(before);assert.ok(sent.length>2);
+    const notices=sent.filter(event=>event.method==='sendMessage'&&String(event.args[0])===clientsGroup);assert.equal(notices.length,1,'The manager receives one concise handoff record in the clients group');
+    const notice=notices[0];assert.match(notice.args[1],/Сквозное кафе/);assert.match(notice.args[1],/Сквозная улица/);assert.match(notice.args[1],/в работе/i);
+    const groupButtons=notice.args[2]?.reply_markup?.inline_keyboard?.flat()||[];assert.ok(groupButtons.some(button=>button.url==='https://t.me/LRSZamer_bot?start=case_'+assigned.id));assert.ok(groupButtons.every(button=>!button.web_app),'Group navigation must use the private bot and must not embed a staff credential');
+    for(const event of sent){const target=event.method.startsWith('copy')?event.args[0].chat_id:event.args[0];if(String(target)===clientsGroup){assert.equal(event,notice);assert.equal(event.item.bytes,null);}else assert.equal(String(target),String(LAWYER));}
     const privateOriginals=[...service.originals.values()].filter(item=>item.chat===String(LAWYER));
     const archives=privateOriginals.filter(item=>item.kind==='sendDocument'&&/\.zip$/i.test(item.filename||''));assert.equal(archives.length,2);
     const auditArchive=archives.find(item=>item.copied_from),managerArchive=archives.find(item=>!item.copied_from);assert.ok(auditArchive);assert.ok(managerArchive);
@@ -89,7 +94,7 @@ test('master: new manager originals become an annotated audit, complete private 
     assert.ok(managerEntries.some(item=>hash(item.bytes)===hash(lease)&&item.bytes.equals(lease)),'Private manager ZIP must contain the exact original lease PDF');
     assert.equal(managerEntries.some(item=>hash(item.bytes)===hash(plan)),false,'Manager ZIP must not duplicate the plan already copied inside the audit archive');
     const count=service.messages.length;await h.reload();await until(()=>h.locator('#delivery').isVisible(),'Completed handoff reopened');assert.equal(service.messages.length,count);assert.equal((await service.pool.query('SELECT id FROM cases WHERE order_id=$1',[orderId])).rows.length,1);
-    t.diagnostic('The real handoff UI delivered the complete package only to the selected lawyer; reopening sent no duplicates.');
+    t.diagnostic('The real handoff UI delivered files only to the selected lawyer and one short navigation notice to the clients group; reopening sent no duplicates.');
 
     const token=randomBytes(32).toString('base64url'),digest=createHash('sha256').update(token).digest('base64url');
     const workspace=require('../../src/web/workspace');await service.pool.query(workspace.SESSION_DDL);assert.equal(await workspace.approvePairing(service.pool,LAWYER,'mac_'+digest+'_'+(Math.floor(Date.now()/1000)+300).toString(36)),true);
@@ -97,7 +102,7 @@ test('master: new manager originals become an annotated audit, complete private 
     const snapshot=await api('GET','snapshot');assert.equal(snapshot.status(),200);const client=(await snapshot.json()).clients.find(row=>row.id===String(assigned.id));assert.ok(client);assert.equal(client.address,'Москва, Сквозная улица, 7');assert.equal(client.report,audit.text);assert.ok(client.total>0);assert.ok(client.checklistSections.length>0);
     const note='Юрист принял комплект: подготовить ТО и убрать алкоголь.';assert.equal((await api('PATCH','cases/'+assigned.id+'/note',{note,expectedNote:client.note})).status(),200);assert.equal((await (await api('GET','snapshot')).json()).clients.find(row=>row.id===client.id).note,note);
     assert.equal((await api('POST','logout')).status(),200);assert.equal((await api('GET','snapshot')).status(),401);
-    for(const visit of visits){assert.deepEqual(visit.errors,[]);assert.deepEqual(visit.blocked,[]);}assert.equal(service.egrnRequests.length,0,'No provider lookup or paid EGRN request is allowed in this journey');assert.ok(service.messages.filter(e=>!e.method.startsWith('copy')).every(e=>[GROUP,String(LAWYER)].includes(String(e.args[0]))));
+    for(const visit of visits){assert.deepEqual(visit.errors,[]);assert.deepEqual(visit.blocked,[]);}assert.equal(service.egrnRequests.length,0,'No provider lookup or paid EGRN request is allowed in this journey');assert.ok(service.messages.filter(e=>!e.method.startsWith('copy')).every(e=>[GROUP,String(LAWYER),clientsGroup].includes(String(e.args[0]))));assert.equal(service.messages.filter(e=>String(e.args[0])===clientsGroup).length,1,'Only the reviewed navigation notice goes to the clients group');
     t.diagnostic('Workspace actual HTTP snapshot contained the same assigned case and report; note save/read and logout passed.');
   } catch(error) {
     const directory=path.resolve(process.env.E2E_ARTIFACTS_DIR||'test-results/e2e');await fs.mkdir(directory,{recursive:true});let index=0;

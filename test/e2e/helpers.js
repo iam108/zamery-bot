@@ -42,9 +42,9 @@ function databasePool(db, { master = false } = {}) {
   return pool;
 }
 
-async function createService({ master = false } = {}) {
+async function createService({ master = false, clientsGroup = '' } = {}) {
   const db = new PGlite(), pool = databasePool(db, { master }), objects = new Map(), messages = [], originals = new Map(), egrnRequests = [], timers = [];
-  const env = { BOT_TOKEN: 'synthetic-e2e-token', GROUP_CHAT_ID: GROUP, WEBAPP_URL: 'https://example.invalid', DATABASE_URL: 'postgres://example.invalid/e2e' };
+  const env = { BOT_TOKEN: 'synthetic-e2e-token', GROUP_CHAT_ID: GROUP, CLIENTS_CHAT_ID: clientsGroup, WEBAPP_URL: 'https://example.invalid', DATABASE_URL: 'postgres://example.invalid/e2e' };
   const previousEnv = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]])); Object.assign(process.env, env);
   const caches = new Map();
   function replace(name, exports) { const file = require.resolve(path.join(root, name)); caches.set(file, require.cache[file]); require.cache[file] = { id: file, filename: file, loaded: true, exports }; }
@@ -58,7 +58,9 @@ async function createService({ master = false } = {}) {
   function recorded(chat, payload) { const item = { ...payload, chat: String(chat), message_id: ++nextMessage }; originals.set(item.chat + ':' + item.message_id, item); return item; }
   for (const method of ['sendMessage', 'sendPhoto', 'sendMediaGroup', 'sendDocument', 'editMessageText', 'editMessageReplyMarkup']) {
     telegram[method] = async (...args) => {
-      assert.ok(String(args[0]) === GROUP || master && String(args[0]) === String(LAWYER));
+      const clientNotice = clientsGroup && String(args[0]) === String(clientsGroup);
+      assert.ok(String(args[0]) === GROUP || master && String(args[0]) === String(LAWYER) || clientNotice);
+      if (clientNotice) assert.equal(method, 'sendMessage', 'The clients group may receive only a short handoff notice, never documents or photos');
       const event = { method, args }; messages.push(event);
       if (!master) return method === 'sendMediaGroup' ? args[1].map(() => ({ message_id: ++nextMessage })) : { message_id: ++nextMessage };
       if (method === 'sendMediaGroup') { event.items = []; for (const item of args[1]) event.items.push(recorded(args[0], { kind: item.type, bytes: await binary(item.media), caption: item.caption })); return event.items.map(item => ({ ...item, chat: { id: Number(args[0]) } })); }

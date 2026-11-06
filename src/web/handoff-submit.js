@@ -1,6 +1,7 @@
 const { createHash } = require('node:crypto');
 const { getSessionLockPool } = require('../db/session-lock-pool');
 const { canManageCases, canAccessCase } = require('./auth');
+const { createHandoffNoticePublisher, initialNotice, pendingNotice, noticeWarning, SAVE_CHECKPOINT_SQL } = require('./handoff-group-notice');
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DDL = `ALTER TABLE cases ADD COLUMN IF NOT EXISTS handoff_submit_id TEXT;
   ALTER TABLE cases ADD COLUMN IF NOT EXISTS handoff_signature TEXT;
@@ -112,7 +113,7 @@ function cardOptions(base,c,state) {
   return {parse_mode:'HTML',...(keyboard.length?{reply_markup:{inline_keyboard:keyboard}}:{})};
 }
 function partial(c,state,warn,retry=true) {return {ok:true,id:Number(c.id),delivery_complete:false,retry, ...(state.manual_review?{manual_review:true}:{}),warn};}
-function completed(c,state) {return {ok:true,id:Number(c.id),delivery_complete:true,...(state.egrn?.note?{warn:state.egrn.note}:{})};}
+function completed(c,state) {const warn=[state.egrn?.note,noticeWarning(state,c.id)].filter(Boolean).join('\n');return {ok:true,id:Number(c.id),delivery_complete:true,...(warn?{warn}:{}),...(state.groupNotice?{group_notice:{status:state.groupNotice.status,manual_review:state.groupNotice.status==='unknown'||!!state.groupNotice.intent}}:{})};}
 
 function createHandoffSubmitter(options={}) {
   const pool=options.pool||require('../db/pool');let initialized;
@@ -122,6 +123,14 @@ function createHandoffSubmitter(options={}) {
   }
   const packetService=()=>options.packetService||require('./handoff-packet').createPacketService({pool});
   const telegram=()=>options.telegram||require('../bot/instance').telegram;
+  let noticePublisher;
+  const finishNotice=async(c,state,client,actorId)=>{
+    if(pendingNotice(state)){
+      try {await (noticePublisher||=options.noticePublisher||createHandoffNoticePublisher({pool,lockPool:options.lockPool,telegram:telegram(),clientsChatId:options.clientsChatId,workingChatId:options.workingChatId})).publishLocked({client,c,state,actorId});}
+      catch(_){state.groupNotice.status=state.groupNotice.intent?'unknown':'blocked';state.groupNotice.warning='Не удалось подтвердить публикацию краткой карточки в чате клиентов. Личная доставка сохранена.';}
+    }
+    return completed(c,state);
+  };
   let budgetLedger;
   const accountingText=async()=>{
     try {const ledger=budgetLedger||=require('../bot/egrn-budget').createEgrnBudget({pool});return ledger.describe(await ledger.snapshot());}
@@ -161,12 +170,12 @@ function createHandoffSubmitter(options={}) {
     try {
       await ensure();
       c=await getExisting(pool,owner,submitId);
-      if(c){state=compatible(c,signature);if(state.completed&&!hasPendingLinkedEgrn(state,c.lawyer_tg_id))return completed(c,state);if(state.manual_review)return partial(c,state,state.manual_review,false);}
+      if(c){state=compatible(c,signature);if(state.completed&&!hasPendingLinkedEgrn(state,c.lawyer_tg_id)&&!pendingNotice(state))return completed(c,state);if(state.manual_review)return partial(c,state,state.manual_review,false);}
       client=await getSessionLockPool(pool,options.lockPool).connect();
       locked=!!(await client.query('SELECT pg_try_advisory_lock(111,hashtext($1)) AS locked',[owner+':'+submitId])).rows[0]?.locked;
-      if(!locked){if(c)return partial(c,state,'Передача уже выполняется. Повторите проверку результата.',true);const busy=new HandoffError(409,'HANDOFF_BUSY','Передача уже выполняется. Повторите проверку результата.');delete busy.case_created;throw busy;}
+      if(!locked){if(c)return state.completed&&!hasPendingLinkedEgrn(state,c.lawyer_tg_id)?completed(c,state):partial(c,state,'Передача уже выполняется. Повторите проверку результата.',true);const busy=new HandoffError(409,'HANDOFF_BUSY','Передача уже выполняется. Повторите проверку результата.');delete busy.case_created;throw busy;}
       c=await getExisting(client,owner,submitId);
-      if(c){state=compatible(c,signature);if(state.completed&&!hasPendingLinkedEgrn(state,c.lawyer_tg_id))return completed(c,state);if(state.inflight||state.materials?.inflight)state.manual_review='Не удалось сохранить подтверждение предыдущей отправки. Проверьте уже доставленные сообщения вручную; автоматический повтор остановлен, чтобы не создавать дубли.';if(state.manual_review)return partial(c,state,state.manual_review,false);}
+      if(c){state=compatible(c,signature);if(state.completed&&!hasPendingLinkedEgrn(state,c.lawyer_tg_id))return await finishNotice(c,state,client,user.id);if(state.inflight||state.materials?.inflight)state.manual_review='Не удалось сохранить подтверждение предыдущей отправки. Проверьте уже доставленные сообщения вручную; автоматический повтор остановлен, чтобы не создавать дубли.';if(state.manual_review)return partial(c,state,state.manual_review,false);}
       else {
         orderLocked=!!(await client.query('SELECT pg_try_advisory_lock(112,$1) AS locked',[orderId])).rows[0]?.locked;
         const assigned=(await client.query('SELECT * FROM cases WHERE order_id=$1 ORDER BY id DESC LIMIT 1',[orderId])).rows[0];
@@ -200,7 +209,8 @@ function createHandoffSubmitter(options={}) {
           request={id:requestId,...original,first_id:Number(row.first_id)||null,copy_ids:original.message_ids.filter(id=>!alreadyIncluded.has(id))};
         }
         const recipients=[{chat:String(lawyer.tg_id),role:'lawyer'}];
-        state={version:2,body:JSON.parse(serialized),fields:d,packet,source,request,manager_name:value(staff?.name),recipients,cards:{},auditCopies:{},requestCopies:{},materials:{confirmed:{},completed:false},linkedEgrn:{files:linkedOriginals(packet),confirmed:{},completed:false},egrn:{completed:false,order_started:false},completed:false};
+        const groupNotice=initialNotice(options.clientsChatId??process.env.CLIENTS_CHAT_ID);
+        state={version:2,body:JSON.parse(serialized),fields:d,packet,source,request,manager_name:value(staff?.name),recipients,cards:{},auditCopies:{},requestCopies:{},materials:{confirmed:{},completed:false},linkedEgrn:{files:linkedOriginals(packet),confirmed:{},completed:false},egrn:{completed:false,order_started:false},completed:false,...(groupNotice?{groupNotice}:{})};
         reportUrl(options.webappUrl||process.env.WEBAPP_URL,state);
         c=(await client.query(`INSERT INTO cases(order_id,lawyer_tg_id,lawyer_name,checklist_key,org,inn,client,phone,address,region,kind,service,priority,comment,audit_text,total,created_by,contacts,request_id,handoff_submit_id,handoff_signature,data)
           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,0,$16,$17,$18,$19,$20,$21)
@@ -220,7 +230,7 @@ function createHandoffSubmitter(options={}) {
         catch(_){throw recipientError('Не удалось проверить доступ назначенного юриста. Повторите передачу; подтверждённые материалы сохранены.');}
         if(!row||String(row.lawyer_tg_id)!==String(chat)||!canAccessCase(row,chat,row))throw recipientError('Получатель больше недоступен или назначение изменилось. Проверьте юриста и повторите передачу; подтверждённые материалы не отправятся повторно.');
       };
-      const save=async()=>{await client.query("UPDATE cases SET data=jsonb_set(COALESCE(data,'{}'::jsonb),'{_handoff}',$1::jsonb,true) WHERE id=$2",[JSON.stringify(state),c.id]);};
+      const save=async()=>{await client.query(SAVE_CHECKPOINT_SQL,[JSON.stringify(state),c.id]);};
       const send=async(operation,run)=>{
         await checkRecipient(operation.chat);
         state.inflight=operation;await save();let result;
@@ -366,7 +376,7 @@ function createHandoffSubmitter(options={}) {
         }
         await save();
       }
-      state.completed=true;await save();return completed(c,state);
+      state.completed=true;await save();return await finishNotice(c,state,client,user.id);
     } catch(error) {
       if(c&&state&&error?.code==='HANDOFF_RECIPIENT_UNAVAILABLE')return partial(c,state,error.message,true);
       if(c&&state&&receiptPending){state.manual_review='Сообщения отправлены, но подтверждение передачи не сохранилось. Проверьте комплект вручную; автоматический повтор остановлен.';return partial(c,state,state.manual_review,false);}

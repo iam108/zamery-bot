@@ -1349,7 +1349,8 @@ function setupHandoff(app) {
   app.get('/api/handoff/prefill', async function (req, res) {
     try {
       var orderId = parseInt(req.query.order_id) || 0;
-      if (!canManageCases(req.staff, req.tgUser.id)) {
+      var manager = canManageCases(req.staff, req.tgUser.id);
+      if (!manager) {
         var ownedCase = orderId && (await pool.query('SELECT * FROM cases WHERE order_id=$1 AND lawyer_tg_id=$2 ORDER BY id DESC LIMIT 1', [orderId, req.tgUser.id])).rows[0];
         if (!requireCase(req, res, ownedCase || null)) return;
       }
@@ -1358,9 +1359,14 @@ function setupHandoff(app) {
         order = (await pool.query('SELECT * FROM orders WHERE id=$1', [orderId])).rows[0] || null;
         audit = (await pool.query('SELECT * FROM audits WHERE order_id=$1 ORDER BY created_at DESC LIMIT 1', [orderId])).rows[0] || null;
       }
-      var lawyers = (await pool.query("SELECT tg_id, name FROM staff WHERE role='lawyer' AND approved = true ORDER BY name")).rows;
+      var lawyers = manager
+        ? (await pool.query(`SELECT s.tg_id, s.name, COUNT(c.id)::int AS active_cases
+            FROM staff s LEFT JOIN cases c ON c.lawyer_tg_id=s.tg_id AND COALESCE(c.data->>'_stage', '') <> 'Архив'
+            WHERE s.role='lawyer' AND s.approved IS TRUE
+            GROUP BY s.tg_id,s.name ORDER BY s.name,s.tg_id`)).rows
+        : (await pool.query("SELECT tg_id, name FROM staff WHERE tg_id=$1 AND role='lawyer' AND approved IS TRUE", [req.tgUser.id])).rows;
       var request = null, reqId = parseInt(req.query.request_id) || 0;
-      if (reqId && canManageCases(req.staff, req.tgUser.id)) {
+      if (reqId && manager) {
         var rq = (await pool.query('SELECT id, text, created_at FROM reports WHERE id=$1', [reqId])).rows[0];
         if (rq) request = { id: rq.id, text: rq.text, created_at: rq.created_at, f: parseRequest(rq.text) };
       }

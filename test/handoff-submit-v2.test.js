@@ -9,9 +9,11 @@ const tgFailure=message=>Object.assign(new Error(message),{response:{error_code:
 async function fixture(run,config={}){
   const {PGlite}=require(process.env.PGLITE_TEST_MODULE),db=new PGlite(),events=[],locks=new Map();let sequence=6000,packetCalls=0,reportCalls=0,egCalls=[],mutate=()=>{},fail=null;
   await db.exec(`CREATE TABLE staff(tg_id BIGINT PRIMARY KEY,name TEXT,role TEXT,approved BOOLEAN);
+    CREATE TABLE orders(id INT PRIMARY KEY,object_name TEXT,telegram_msg_id BIGINT);
     CREATE TABLE reports(id INT PRIMARY KEY,chat_id BIGINT,msg_ids BIGINT[],first_id BIGINT);
     CREATE TABLE cases(id SERIAL PRIMARY KEY,order_id INT,lawyer_tg_id BIGINT,lawyer_name TEXT,checklist_key TEXT,org TEXT,inn TEXT,client TEXT,phone TEXT,address TEXT,region TEXT,kind TEXT,service TEXT,priority TEXT,comment TEXT,audit_text TEXT,total INT,created_by BIGINT,contacts JSONB,request_id INT,data JSONB DEFAULT '{}');
-    INSERT INTO staff VALUES(808,'Юрист проверки','lawyer',true);`);
+    INSERT INTO orders VALUES(60,'Синтетический бренд',NULL);
+    INSERT INTO staff VALUES(808,'Юрист проверки','lawyer',true),(101,'Менеджер','manager',true);`);
   const pool={query:(query,params)=>params?db.query(query,params):db.exec(query),async connect(){const identity=randomUUID();return {async query(query,params){
     if(query.startsWith('SELECT pg_try_advisory_lock')){const key=params[0],available=!locks.has(key)||locks.get(key)===identity;if(available)locks.set(key,identity);return {rows:[{locked:available}]};}
     if(query.startsWith('SELECT pg_advisory_unlock')){if(locks.get(params[0])===identity)locks.delete(params[0]);return {rows:[{pg_advisory_unlock:true}]};}
@@ -26,7 +28,7 @@ async function fixture(run,config={}){
     org:'ООО «ЧООКДИ»',inn:'7701234567',address:'Москва, Лесная, 5',region:'МСК',kind:'Общепит',service:'Продление',priority:'срочно',cad_num:'77:01:0004016:1064',contacts:[{name:'Карина',phone:'+79991234567',comment:'Позвонить перед выездом'}],comment:'Сначала согласовать время',egrn_order:false};
   const pick={chat_id:SOURCE,msg_ids:Array.from({length:105},(_,i)=>100+i),text:packet.report.text,report_data:{evidence:[{sha256:files[0].sha256}]}};
   async function action(event){events.push(event);if(fail)await fail(event);await mutate(event);}
-  const telegram={async sendMessage(chat,text,opts){const event={type:'card',chat:String(chat),text,opts};await action(event);event.id=sequence++;return {message_id:event.id};},
+  const telegram={async sendMessage(chat,text,opts){const event={type:String(chat)===String(LAWYER)?'card':'notice',chat:String(chat),text,opts,noticeTarget:options.clientsChatId};await action(event);event.id=sequence++;return {message_id:event.id};},
     async callApi(method,payload){assert.equal(method,'copyMessages');const event={type:'copy',chat:String(payload.chat_id),payload};await action(event);const ids=payload.message_ids.map(()=>({message_id:sequence++}));return config.shortCopy&&event.chat===String(LAWYER)?ids.slice(1):ids;},
     async sendDocument(chat,file,opts){const event={type:'zip',chat:String(chat),name:file.filename,opts};await action(event);const chunks=[];for await(const chunk of file.source)chunks.push(Buffer.from(chunk));event.buffer=Buffer.concat(chunks);event.id=sequence++;return {message_id:event.id};}};
   const options={pool,ready:async()=>{},packetService:{async packet(query){packetCalls++;assert.deepEqual(query,{order_id:60,report_src:'a',report_id:15,request_id:body.request_id||null});return JSON.parse(JSON.stringify({...packet,request:config.requestMismatch?{id:999}:body.request_id?{id:body.request_id}:null}));}},telegram,
@@ -35,7 +37,7 @@ async function fixture(run,config={}){
   const context={body,user:{id:101},staff:{name:'Менеджер',role:'manager',approved:true}};
   try{await run({db,pool,events,packet,body,files,pick,context,options,submit:createHandoffSubmitter(options),restart:()=>createHandoffSubmitter(options),packetCalls:()=>packetCalls,reportCalls:()=>reportCalls,egCalls,
     setFail(fn){fail=fn;},setMutation(fn){mutate=fn;},async cases(){return(await db.query('SELECT * FROM cases ORDER BY id')).rows;}});
-    assert.ok(events.every(event=>event.chat===String(LAWYER)),'Handoff must never send to a shared chat, including after a failed delivery or retry');
+    assert.ok(events.every(event=>event.chat===String(LAWYER)||event.type==='notice'&&event.chat===String(event.noticeTarget)),'Only the short summary may go to the configured clients chat; package copies remain private');
   }finally{await db.close();}
 }
 test('V2 delivers the complete packet only to the assigned lawyer even when a shared chat is configured, and preserves completed idempotency',pg,async()=>fixture(async h=>{
@@ -43,9 +45,11 @@ test('V2 delivers the complete packet only to the assigned lawyer even when a sh
   const cases=await h.cases();assert.equal(cases.length,1);const c=cases[0],state=c.data._handoff;
   assert.equal(c.client,'Карина');assert.equal(c.priority,'🔥 горящий');assert.equal(c.audit_text,h.packet.report.text);assert.equal(c.address,'Москва, Лесная, 5');
   assert.deepEqual(h.events.slice(0,2).map(event=>event.type),['card','copy']);
-  assert.ok(h.events.every(event=>event.chat===String(LAWYER)));
+  assert.ok(h.events.every(event=>event.chat===String(LAWYER)||event.type==='notice'));
   assert.deepEqual(state.recipients,[{chat:String(LAWYER),role:'lawyer'}]);
   const cards=h.events.filter(event=>event.type==='card');assert.equal(cards.length,1);
+  const notices=h.events.filter(event=>event.type==='notice');assert.equal(notices.length,1);assert.equal(notices[0].chat,CLIENTS);assert.match(notices[0].text,/^Клиент передан юристу/);assert.match(notices[0].text,/В работе у юриста: 1 клиентов/);assert.doesNotMatch(notices[0].text,/Карина|7999|ПОЛНЫЙ ТЕКСТ|баланс/i);assert.ok(notices[0].opts.reply_markup.inline_keyboard.flat().every(button=>!button.web_app&&button.url==='https://t.me/LRSZamer_bot?start=case_'+c.id));
+  assert.equal(state.groupNotice.status,'confirmed');assert.equal(state.groupNotice.receipt.message_id,notices[0].id);
   for(const card of cards){assert.ok(card.text.length<2000);assert.doesNotMatch(card.text,/ПОЛНЫЙ ТЕКСТ АУДИТОРА|Контакт передала Ирина|Ответы и наблюдения/);assert.match(card.text,/Карина|Лесная/);}
   const lawyerButtons=cards[0].opts.reply_markup.inline_keyboard.flat();assert.ok(lawyerButtons.some(button=>button.web_app?.url.includes('/checklist?case_id='+c.id)));assert.ok(lawyerButtons.some(button=>button.web_app?.url.includes('view=report')));assert.ok(lawyerButtons.some(button=>button.url===h.packet.report.video_url));
   for(const target of [String(LAWYER)]){
@@ -60,7 +64,7 @@ test('V2 delivers the complete packet only to the assigned lawyer even when a sh
 
 test('handoff recipient revocation after a partial attempt stops delivery and reactivation resumes the same case',pg,async()=>fixture(async h=>{
   let first=true;h.setFail(event=>{if(first&&event.type==='card'){first=false;throw tgFailure('Synthetic temporary card rejection');}});
-  const initial=await h.submit(h.context);assert.equal(initial.delivery_complete,false);await h.db.query('UPDATE staff SET approved=false WHERE tg_id=808');
+  const initial=await h.submit(h.context);assert.equal(initial.delivery_complete,false);assert.equal(h.events.filter(event=>event.type==='notice').length,0);await h.db.query('UPDATE staff SET approved=false WHERE tg_id=808');
   const count=h.events.length,blocked=await h.restart()(h.context);assert.equal(blocked.delivery_complete,false);assert.equal(blocked.retry,true);assert.equal(blocked.manual_review,undefined);assert.equal(h.events.length,count);assert.match(blocked.warn,/получател|юрист|доступ/i);
   await h.db.query('UPDATE staff SET approved=true WHERE tg_id=808');const resumed=await h.restart()(h.context);assert.equal(resumed.delivery_complete,true);assert.equal(resumed.id,initial.id);assert.equal((await h.cases()).length,1);
 }));
@@ -101,7 +105,7 @@ test('handoff recipient revocation between ZIP parts preserves confirmed origina
   let revoked=false;h.setMutation(async event=>{if(event.type==='zip'&&!revoked){revoked=true;await h.db.query('UPDATE staff SET approved=false WHERE tg_id=808');}});
   const first=await h.restart()(h.context);assert.equal(first.delivery_complete,false);assert.equal(first.retry,true);assert.equal(first.manual_review,undefined);assert.equal(h.events.filter(event=>event.type==='zip').length,1);
   assert.equal((await h.cases())[0].data._handoff.materials.confirmed[String(LAWYER)].length,1);
-  await h.db.query('UPDATE staff SET approved=true WHERE tg_id=808');const count=h.events.length;assert.equal((await h.restart()(h.context)).delivery_complete,true);assert.deepEqual(h.events.slice(count).map(event=>event.type),['zip']);
+  await h.db.query('UPDATE staff SET approved=true WHERE tg_id=808');const count=h.events.length;assert.equal((await h.restart()(h.context)).delivery_complete,true);assert.deepEqual(h.events.slice(count).map(event=>event.type),['zip','notice']);
 }));
 test('failed lawyer card resumes frozen case, never reuses changed packet or creates a second client, and keeps checklist data',pg,async()=>fixture(async h=>{
   let failed=false;h.setFail(event=>{if(event.type==='card'&&event.chat===String(LAWYER)&&!failed){failed=true;throw tgFailure('temporary Telegram failure');}});
@@ -143,7 +147,7 @@ test('an older checkpoint with a failed first private card cannot restore copies
   state.recipients=[{chat:SOURCE,role:'lawyer'},{chat:CLIENTS,role:'clients'}];
   await h.db.query("UPDATE cases SET data=jsonb_set(data,'{_handoff}',$1::jsonb) WHERE id=$2",[JSON.stringify(state),c.id]);
   const result=await h.restart()(h.context);assert.equal(result.delivery_complete,true);assert.equal(result.id,first.id);
-  assert.ok(h.events.every(event=>event.chat===String(LAWYER)));assert.equal(h.events.filter(event=>event.type==='copy').length,2);
+  assert.ok(h.events.every(event=>event.chat===String(LAWYER)||event.type==='notice'&&event.chat===CLIENTS));assert.equal(h.events.filter(event=>event.type==='copy').length,2);
   assert.equal(h.egCalls.length,1);assert.equal(h.egCalls[0].order,false);assert.deepEqual(h.egCalls[0].targets,[{chat:LAWYER,reply:(await h.cases())[0].data._handoff.cards[String(LAWYER)],case_id:Number((await h.cases())[0].id)}]);
 },{withEgrn:false}));
 test('a historical group-only remainder does not repeat completed private files or EGRN when retried',pg,async()=>fixture(async h=>{

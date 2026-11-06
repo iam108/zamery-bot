@@ -17,6 +17,12 @@ function object(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 }
 function text(value) { return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : ''; }
+function groupNotice(state) {
+  const notice=object(state.groupNotice);if(notice.required!==true)return null;
+  const status=notice.intent||notice.status==='sending'||notice.status==='unknown'?'unknown':['pending','rejected','blocked','confirmed'].includes(notice.status)?notice.status:'unknown';
+  const messages={confirmed:'Сводка в чате клиентов опубликована.',pending:'Сводка в чат клиентов ещё не отправлена.',rejected:'Сводку не удалось отправить в чат клиентов. Можно повторить только сводку.',blocked:'Сводка в чат клиентов пока не опубликована. Повторите проверку публикации.',unknown:'Публикация сводки в чате клиентов не подтверждена. Сначала проверьте чат; автоматический повтор остановлен.'};
+  return {status,message:messages[status],manual_review:status==='unknown',retry:['pending','rejected','blocked'].includes(status)};
+}
 function https(value) {
   try { const url = new URL(text(value)); return url.protocol === 'https:' && !url.username && !url.password ? url.href : ''; } catch (_) { return ''; }
 }
@@ -220,6 +226,7 @@ function createPacketService(options = {}) {
           // before the first V2 submit adds its optional checkpoint columns.
           const row=(await pool.query("SELECT id,lawyer_name,lawyer_tg_id,data->'_handoff' AS checkpoint,data->'_handoff'->>'completed' AS delivery_complete,data->'_handoff'->>'manual_review' AS manual_review,to_jsonb(cases)->>'handoff_submit_id' AS submit_id FROM cases WHERE order_id=$1 ORDER BY id DESC LIMIT 1",[orderId])).rows[0];
           if(row)assignment={case_id:Number(row.id),lawyer_name:text(row.lawyer_name),submit_id:text(row.submit_id)||null,...(row.manual_review?{manual_review:true}:{}),
+            ...(groupNotice(object(row.checkpoint))?{group_notice:groupNotice(object(row.checkpoint))}:{}),
             ...(['true','false'].includes(String(row.delivery_complete))?{delivery_complete:String(row.delivery_complete)==='true'&&!require('./handoff-submit').hasPendingLinkedEgrn(object(row.checkpoint),row.lawyer_tg_id)}:{})};
         }catch(error){if(error.code!=='42P01')throw error;}
       }
@@ -274,7 +281,8 @@ function setupHandoffPacket(app, options = {}) {
   app.get('/api/handoff/packet', route(async (req,res) => {
     const packet = await service.packet(req.query);
     const manager = await authorize(req, packet.order && packet.order.id, packet.report);
-    if (packet.assignment) packet.assignment.can_resume = manager && packet.assignment.delivery_complete === false && !packet.assignment.manual_review;
+    if (packet.assignment) packet.assignment.can_resume = manager && !packet.assignment.manual_review &&
+      (packet.assignment.delivery_complete === false || packet.assignment.delivery_complete === true && packet.assignment.group_notice?.retry === true);
     if (!manager) delete packet.request;
     res.json(packet);
   }));

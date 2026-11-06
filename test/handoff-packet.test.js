@@ -187,6 +187,33 @@ test('packet exposes existing assignment and its resumable submit ID without cha
   assert.equal((await h.service.packet({order_id:60,report_id:15})).assignment.delivery_complete,true);
 }));
 
+test('required group notice projects only safe delivery state while private completion and source signature remain independent',pg,async()=>database(async h=>{
+  const first=await h.service.packet({order_id:60,report_id:15});
+  await h.db.query("INSERT INTO cases(id,order_id,lawyer_name) VALUES(800,60,'Мария')");
+  for(const [status,intent,expected] of [['pending',null,'pending'],['rejected',null,'rejected'],['blocked',null,'blocked'],['confirmed',null,'confirmed'],['unknown',null,'unknown'],['sending',null,'unknown'],['rejected',{key:'private-intent'},'unknown']]){
+    await h.db.query('UPDATE cases SET data=$1 WHERE id=800',[JSON.stringify({_handoff:{completed:true,groupNotice:{required:true,status,intent,target:'-100PRIVATE',warning:'private detail',cursors:{101:99}}}})]);
+    const p=await h.service.packet({order_id:60,report_id:15}),notice=p.assignment.group_notice;
+    assert.equal(p.assignment.delivery_complete,true);assert.equal(p.signature,first.signature);assert.equal(notice.status,expected);assert.equal(notice.manual_review,expected==='unknown');assert.equal(notice.retry,['pending','rejected','blocked'].includes(expected));assert.ok(notice.message);
+    assert.doesNotMatch(JSON.stringify(p.assignment),/PRIVATE|private|intent|cursors|target|warning/);
+  }
+  await h.db.query('UPDATE cases SET data=$1 WHERE id=800',[JSON.stringify({_handoff:{completed:true,groupNotice:{required:false,status:'pending'}}})]);
+  assert.equal((await h.service.packet({order_id:60,report_id:15})).assignment.group_notice,undefined);
+  assert.ok(h.sql.every(sql=>/^SELECT\b/.test(sql)));
+}));
+
+test('packet route grants group-only resume to managers for safe pending states and keeps private completion truthful',async()=>{
+  const routes=new Map();let assignment,role='manager';
+  setupHandoffPacket({get(path,run){routes.set(path,run);}},{pool:{async query(){return{rows:[{id:75,order_id:60,lawyer_tg_id:101,data:{}}]};}},service:{async packet(){return{order:{id:60},assignment:JSON.parse(JSON.stringify(assignment))};}}});
+  const read=async()=>{let result;const res={set(){return this;},status(){return this;},json(value){result=value;}};await routes.get('/api/handoff/packet')({staff:{approved:true,role},tgUser:{id:101},query:{}},res);return result.assignment;};
+  for(const status of ['pending','rejected','blocked','unknown','confirmed']){
+    assignment={case_id:75,delivery_complete:true,group_notice:{status,manual_review:status==='unknown',retry:['pending','rejected','blocked'].includes(status)}};
+    const result=await read();assert.equal(result.delivery_complete,true);assert.equal(result.can_resume,['pending','rejected','blocked'].includes(status));
+  }
+  assignment={case_id:75,delivery_complete:true};assert.equal((await read()).can_resume,false,'legacy completed handoffs do not acquire a retry');
+  assignment={case_id:75,delivery_complete:true,group_notice:{status:'rejected',retry:true}};role='lawyer';assert.equal((await read()).can_resume,false);
+  role='manager';assignment={case_id:75,delivery_complete:false};assert.equal((await read()).can_resume,true,'existing private partial recovery stays available');
+});
+
 test('HTTP files inherit the /api/handoff staff guard, preserve UTF-8 filenames and bytes, and hide unexpected storage errors', async () => {
   const express=require('express'),app=express(),calls=[],bytes=Buffer.from('exact original');
   app.use('/api/handoff',(req,res,next)=>{if(req.get('X-Test-Staff')!=='approved')return res.status(403).json({ok:false});req.staff={role:'manager',approved:true};req.tgUser={id:101};next();});

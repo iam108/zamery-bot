@@ -8,11 +8,12 @@ const { checklistCounts } = require('../src/web/handoff');
 function harness(staff = { tg_id: 42, role: 'auditor', approved: true }, options = {}) {
   const calls = [], actions = [], commands = new Map(), events = new Map();
   const order = { id: 17, status: 'new' };
-  const bot = { start() {}, action(pattern, handler) { actions.push([pattern, handler]); },
+  const bot = { start(handler) { this.startHandler=handler; }, action(pattern, handler) { actions.push([pattern, handler]); },
     command(name, handler) { commands.set(name, handler); }, hears() {},
     on(name, handler) { events.set(name, handler); }, catch(handler) { this.errorHandler = handler; } };
   const auth = { ensureStaff: async () => {}, keyQuery: id => 'u=' + id + '&k=synthetic',
-    canManageCases: (actor, id) => actor?.approved === true && (actor.role === 'manager' || id === 99) };
+    canManageCases: (actor, id) => actor?.approved === true && (actor.role === 'manager' || id === 99),
+    canAccessCase:(actor,id,row)=>actor?.approved===true&&(actor.role==='manager'||id===99||actor.role==='lawyer'&&String(row.lawyer_tg_id)===String(id)) };
   const queries = {
     getStats: async () => { calls.push('stats'); return {}; },
     getOrderById: async () => ({ ...order }),
@@ -30,6 +31,8 @@ function harness(staff = { tg_id: 42, role: 'auditor', approved: true }, options
       if (name === './report-link-admin') return require('../src/bot/report-link-admin');
       if (name === './order-delivery-admin') return require('../src/bot/order-delivery-admin');
       if (name === './handoff-status-admin') return require('../src/bot/handoff-status-admin');
+      if (name === './handoff-notice-admin') return require('../src/bot/handoff-notice-admin');
+      if (name === './case-open') return require('../src/bot/case-open');
       if (name === './staff-approval') return require('../src/bot/staff-approval');
       if (name === '../web/order-report-link') return { loadOrderReportLink: options.loadOrderReportLink || (async () => null) };
       if (name === '../db/order-delivery-lock') return { withOrderDeliveryLock: options.withOrderDeliveryLock || (async (id, run) => run()) };
@@ -206,9 +209,19 @@ test('the personal client list cannot disclose names through a group command',as
 
 test('manager delivery recovery commands are registered and ignore unauthorized chat users',async()=>{
   const h=harness();
-  for(const command of ['order_delivery','order_delivery_retry','handoff_status']){
+  for(const command of ['order_delivery','order_delivery_retry','handoff_status','handoff_notice','handoff_notice_apply']){
     assert.equal(typeof h.commands.get(command),'function');
     await h.commands.get(command)({...h.ctx(),callbackQuery:null,message:{message_id:301,text:'/'+command+' 17'}});
   }
   assert.deepEqual(h.calls,[]);
+});
+
+test('start case payload uses the read-only opener before the normal start staff initializer',async()=>{
+  const h=harness(undefined,{query:async(sql,args)=>{assert.match(sql,/^SELECT c.id/);assert.deepEqual(Array.from(args),[39,42]);return{rows:[{id:39,order_id:62,lawyer_tg_id:42,org:'Saved legal name',object_name:'Чанг',address:'Saved address',kind:'Общепит',service:'Продление',actor_id:42,actor_role:'lawyer',actor_approved:true,has_selection:false}]};}});
+  await h.bot.startHandler({...h.ctx(),chat:{id:42,type:'private'},callbackQuery:null,startPayload:'case_39'});
+  assert.match(h.calls.find(call=>Array.isArray(call)&&call[0]==='reply')[1],/Клиент #39/);assert.equal(h.calls.filter(call=>Array.isArray(call)&&call[0]==='query').length,1);assert.equal(typeof h.commands.get('case'),'function');
+});
+test('ordinary start still returns the existing keyboard, and group case starts disclose nothing',async()=>{
+  const h=harness({tg_id:42,name:'Current actor',role:'lawyer',approved:true});await h.bot.startHandler({...h.ctx(),chat:{id:42,type:'private'},callbackQuery:null,startPayload:''});assert.match(h.calls.find(call=>Array.isArray(call)&&call[0]==='reply')[1],/Выбери действие/);
+  h.calls.length=0;await h.bot.startHandler({...h.ctx(),startPayload:'case_39'});assert.deepEqual(h.calls,[]);
 });

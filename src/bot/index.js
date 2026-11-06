@@ -16,7 +16,10 @@ function setupBot() {
   require('./report-link-admin').setupReportLinkAdmin(bot, { pool });
   require('./order-delivery-admin').setupOrderDeliveryAdmin(bot, { pool });
   require('./handoff-status-admin').setupHandoffStatusAdmin(bot, { pool });
-  const { ensureStaff, canManageCases } = require('../web/auth');
+  require('./handoff-notice-admin').setupHandoffNoticeAdmin(bot, { pool });
+  const auth = require('../web/auth');
+  const { ensureStaff, canManageCases } = auth;
+  const openCase = require('./case-open').setupCaseOpen(bot, { pool, auth, webappUrl: WEBAPP_URL });
   const { parsePairing, approvePairing, canPair } = require('../web/workspace');
   const { esc } = require('./formatter');
   const ROLES = { manager: 'Менеджер', lawyer: 'Юрист', auditor: 'Аудитор' };
@@ -60,6 +63,7 @@ function setupBot() {
 
   bot.start(async (ctx) => {
     if (ctx.chat.type !== 'private') return;
+    if (String(ctx.startPayload || '').startsWith('case_')) return openCase(ctx, String(ctx.startPayload).slice(5));
     const me = await getMe(ctx.from.id);
     if (String(ctx.startPayload || '').startsWith('mac_')) {
       if (!canPair(me)) return ctx.reply('Подключение Мака доступно одобренным юристам и менеджерам.');

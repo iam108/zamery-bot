@@ -40,7 +40,13 @@ function handoffModel() {
   }
   function mediaLabel(file) { return text(file.caption) || ({ map: 'Схема прилегающей территории', plan: 'Размеченный план', entrance: 'Вход', zone: 'Проверенная организация', interior: 'Помещение', 'map-source': 'Исходный скриншот территории', 'plan-source': 'Исходный план' }[file.role] || 'Материал отчёта'); }
   function conflict(packet, p) { var report = packet && packet.report, old = text(report && (report.address || report.inspection && report.inspection.address)); return old && text(p.address) && old.toLowerCase() !== text(p.address).toLowerCase() ? 'В сохранённом отчёте указан прежний адрес: ' + old + '. В передаче используется адрес из заявки выше.' : ''; }
-  return { text: text, escape: escape, kind: kind, profile: profile, contacts: contacts, fingerprint: fingerprint, restore: restore, status: status, isSource: isSource, isImage: isImage, gallery: gallery, packageInfo: packageInfo, safeHttp: safeHttp, protectedUrl: protectedUrl, mediaLabel: mediaLabel, conflict: conflict };
+  function groupNotice(value) {
+    if(!value||typeof value!=='object')return null;
+    var state=value.manual_review===true||value.status==='sending'||value.status==='unknown'?'unknown':['pending','rejected','blocked','confirmed'].indexOf(value.status)>=0?value.status:'unknown';
+    var messages={confirmed:'Сводка в чате клиентов опубликована.',pending:'Сводка в чат клиентов ещё не отправлена.',rejected:'Сводку не удалось отправить в чат клиентов. Можно повторить только сводку.',blocked:'Сводка в чат клиентов пока не опубликована. Повторите проверку публикации.',unknown:'Публикация сводки в чате клиентов не подтверждена. Сначала проверьте чат; автоматический повтор остановлен.'};
+    return {status:state,message:messages[state],manual_review:state==='unknown',retry:['pending','rejected','blocked'].indexOf(state)>=0};
+  }
+  return { text: text, escape: escape, kind: kind, profile: profile, contacts: contacts, fingerprint: fingerprint, restore: restore, status: status, isSource: isSource, isImage: isImage, gallery: gallery, packageInfo: packageInfo, safeHttp: safeHttp, protectedUrl: protectedUrl, mediaLabel: mediaLabel, conflict: conflict, groupNotice:groupNotice };
 }
 
 function handoffClient() {
@@ -118,7 +124,7 @@ function handoffClient() {
     $('choose-report').textContent = report ? 'Выбрать другой отчёт' : 'Выбрать отчёт';
   }
   function renderAssignment() {
-    $('lawyers').innerHTML = '<option value="">Выберите юриста</option>' + S.lawyers.map(function (l) { return '<option value="' + M.escape(l.tg_id) + '"' + (String(l.tg_id) === String(S.lawyer) ? ' selected' : '') + '>' + M.escape(l.name) + '</option>'; }).join('');
+    $('lawyers').innerHTML = '<option value="">Выберите юриста</option>' + S.lawyers.map(function (l) { var known=(typeof l.active_cases==='number'||typeof l.active_cases==='string'&&/^\d+$/.test(l.active_cases))&&Number.isSafeInteger(Number(l.active_cases))&&Number(l.active_cases)>=0;return '<option value="' + M.escape(l.tg_id) + '"' + (String(l.tg_id) === String(S.lawyer) ? ' selected' : '') + '>' + M.escape(l.name) + (known?' · '+Number(l.active_cases)+' в работе':'') + '</option>'; }).join('');
     $('lawyer-empty').hidden = S.loading || S.lawyers.length > 0;
     $('priority').value = S.priority;
     $('comment').value = S.comment;
@@ -139,12 +145,13 @@ function handoffClient() {
     $('page-subtitle').textContent = readonly ? 'Материалы осмотра и оригиналы' : 'Объект, готовый комплект и ответственный';
     $('delivery').hidden = readonly || !locked;
     if (S.existingAssignment) {
-      var assignment = S.existingAssignment, confirmed = assignment.delivery_complete === true && assignment.manual_review !== true, incomplete = assignment.delivery_complete === false && assignment.manual_review !== true;
+      var assignment = S.existingAssignment, confirmed = assignment.delivery_complete === true && assignment.manual_review !== true, incomplete = assignment.delivery_complete === false && assignment.manual_review !== true, group=M.groupNotice(assignment.group_notice),groupRetry=confirmed&&group&&group.retry;
       $('delivery-title').textContent = (confirmed ? 'Уже передано: ' : 'Юрист назначен: ') + (assignment.lawyer_name || 'юристу');
       $('delivery-text').textContent = 'Клиент №' + assignment.case_id + '.' + (confirmed ? ' Доставка полного комплекта подтверждена. Материалы отчёта можно открыть выше.' : incomplete ? ' Доставка этого комплекта ещё не завершена. Повторное создание клиента недоступно.' : ' Подтверждение доставки не сохранено. Нужна проверка доставки.') + (assignment.message ? ' ' + assignment.message : '');
-      $('retry-send').hidden = assignment.can_resume !== true;
+      if(group)$('delivery-text').textContent+='\nЛичная доставка юристу: '+(confirmed?'подтверждена.':'ещё не подтверждена.')+'\n'+group.message;
+      $('retry-send').hidden = assignment.can_resume !== true || confirmed&&!groupRetry;
       $('retry-send').disabled = S.sending;
-      $('retry-send').textContent = S.sending ? 'Продолжаю доставку…' : 'Продолжить доставку';
+      $('retry-send').textContent = groupRetry ? (S.sending?'Отправляю сводку…':'Повторить сводку в чат') : S.sending ? 'Продолжаю доставку…' : 'Продолжить доставку';
     } else if (S.pending) {
       $('delivery-title').textContent = S.pending.manualReview ? 'Нужна проверка доставки' : 'Доставка не завершена';
       $('delivery-text').textContent = (S.pending.caseId ? 'Передача №' + S.pending.caseId + '. ' : '') + (S.pending.message || (orderId ? 'Подтверждение не получено. Повторите эту же передачу: новая заявка создана не будет.' : 'Подтверждение не получено. Проверьте личные сообщения юриста перед повторной отправкой.'));
@@ -152,9 +159,13 @@ function handoffClient() {
       $('retry-send').disabled = S.sending;
       $('retry-send').textContent = S.sending ? 'Продолжаю доставку…' : orderId ? 'Повторить доставку' : 'Повторить отправку';
     } else if (S.completed) {
+      var completedGroup=M.groupNotice(S.completed.groupNotice);
       $('delivery-title').textContent = 'Передано · ' + (S.completed.name || 'юристу');
       $('delivery-text').textContent = (S.completed.warn || 'Карточка и собранный комплект отправлены юристу в Telegram.') + (S.completed.egrnNote ? '\n' + S.completed.egrnNote : '');
-      $('retry-send').hidden = true;
+      if(completedGroup)$('delivery-text').textContent='Личная доставка полного комплекта юристу подтверждена.\n'+$('delivery-text').textContent+'\n'+completedGroup.message;
+      $('retry-send').hidden = !(completedGroup&&completedGroup.retry&&S.completed.canResumeNotice===true);
+      $('retry-send').disabled = S.sending;
+      $('retry-send').textContent = S.sending?'Отправляю сводку…':'Повторить сводку в чат';
     }
     $('details-editable').disabled = locked;
     $('lawyers').disabled = locked;
@@ -194,14 +205,22 @@ function handoffClient() {
     updateFooter(); $('review').scrollIntoView({ block: 'start', behavior: 'auto' }); $('confirm-send').focus();
   }
   async function send(savedPayload) {
-    if (S.sending || readonly || S.completed) return;
+    if (S.sending || readonly) return;
+    if(S.completed){
+      var completedNotice=M.groupNotice(S.completed.groupNotice);
+      if(!completedNotice||!completedNotice.retry||S.completed.canResumeNotice!==true)return;
+      S.existingAssignment={case_id:S.completed.id,lawyer_name:S.completed.name,delivery_complete:true,group_notice:completedNotice,can_resume:true,egrnNote:S.completed.egrnNote};S.completed=null;
+    }
     if (S.existingAssignment) {
       if (S.existingAssignment.can_resume !== true) return;
+      var existingNotice=M.groupNotice(S.existingAssignment.group_notice);
+      if(S.existingAssignment.delivery_complete===true&&(!existingNotice||!existingNotice.retry))return;
       S.sending = true; updateFooter();
       try {
         var resumed = await api('/api/handoff', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ resume_case_id: S.existingAssignment.case_id }) });
         if (resumed.delivery_complete) {
-          S.completed = { id: resumed.id, name: S.existingAssignment.lawyer_name, warn: resumed.warn || '' };
+          var resumedNotice=M.groupNotice(resumed.group_notice);
+          S.completed = { id: resumed.id, name: S.existingAssignment.lawyer_name, warn: resumed.warn || '',egrnNote:S.existingAssignment.egrnNote||'',groupNotice:resumedNotice,canResumeNotice:!!(resumedNotice&&resumedNotice.retry) };
           S.existingAssignment = null;
         } else {
           S.error = resumed.warn || 'Доставка ещё не завершена. Повторите попытку.';
@@ -226,7 +245,8 @@ function handoffClient() {
         S.pending.caseId = result.id || result.case_id; S.pending.manualReview = result.manual_review === true; S.pending.retry = result.retry;
       } else {
         var egrnNote = { attached: 'ЕГРН приложена.', waiting: 'Заказанная ЕГРН ещё ожидается; после получения бот доставит её отдельно.', none: 'Готовая выписка ЕГРН в комплекте отсутствует.' }[result.egrn_note] || (typeof result.egrn_note === 'string' ? result.egrn_note : '');
-        S.completed = { id: result.id, name: S.pending.name, warn: result.warn || '', egrnNote: egrnNote }; S.pending = null;
+        var resultNotice=M.groupNotice(result.group_notice);
+        S.completed = { id: result.id, name: S.pending.name, warn: result.warn || '', egrnNote: egrnNote,groupNotice:resultNotice,canResumeNotice:!!(resultNotice&&resultNotice.retry) }; S.pending = null;
         try { if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('success'); } catch (_) {}
       }
     } catch (error) {
@@ -265,6 +285,7 @@ function handoffClient() {
     if (assigned && assigned.case_id) {
       var samePending = assigned.delivery_complete === false && assigned.manual_review !== true && assigned.can_resume !== false && S.pending && S.pending.payload && S.pending.payload.handoff_version === 2 && assigned.submit_id && assigned.submit_id === S.pending.payload.submit_id;
       if (S.completed && (String(S.completed.id) !== String(assigned.case_id) || assigned.delivery_complete !== true || assigned.manual_review === true)) S.completed = null;
+      if(S.completed){S.completed.groupNotice=M.groupNotice(assigned.group_notice);S.completed.canResumeNotice=assigned.can_resume===true;}
       S.existingAssignment = samePending || S.completed ? null : assigned;
     } else S.existingAssignment = null;
   }
@@ -460,7 +481,7 @@ function handoffClient() {
   $('go').onclick = showReview;
   $('review-back').onclick = function () { S.review = false; updateFooter(); $('go').focus(); };
   $('confirm-send').onclick = function () { send(); };
-  $('retry-send').onclick = function () { if (S.existingAssignment) send(); else if (S.pending) send(S.pending.payload); };
+  $('retry-send').onclick = function () { if (S.existingAssignment||S.completed) send(); else if (S.pending) send(S.pending.payload); };
   $('retry-load').onclick = function () { if (S.lawyers.length && orderId) loadPacket(S.selectedReport || S.report, { profile: false }); else if (S.selectedReport) chooseReport(S.selectedReport, false); else load(); };
   $('open-report').onclick = openReport;
   $('choose-report').onclick = function () { openDialog('search-dialog', 'report-query'); layerHistory('search'); searchReports(); };
