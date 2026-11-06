@@ -135,14 +135,19 @@ function createLargeDelivery(options = {}) {
       ] }
     };
     if (destination.reply) extra.reply_parameters = { message_id: destination.reply, allow_sending_without_reply: true };
-    let accounting = '';
-    try { accounting = options.budgetText ? await options.budgetText() : ''; }
-    catch (_) { accounting = 'Учёт заказов временно недоступен; остаток не сверён.'; }
-    const dispatch = async () => {
+    const checkRecipient = async () => {
       if (typeof beforeSend === 'function') {
         try { await beforeSend(destination); }
         catch (error) { throw Object.assign(temporaryError(error, 'validation'), { uncertain: false }); }
       }
+    };
+    const dispatch = async recheck => {
+      await checkRecipient();
+      let accounting = '';
+      try { accounting = options.budgetText ? await options.budgetText() : ''; }
+      catch (_) { accounting = 'Учёт заказов временно недоступен; остаток не сверён.'; }
+      await checkRecipient();
+      if(typeof recheck==='function')await recheck();
       return telegram.sendMessage(destination.chat, messageText(record) + (accounting ? '\n' + accounting : ''), extra);
     };
     return options.sendOriginal ? options.sendOriginal(record,destination,dispatch) : dispatch();

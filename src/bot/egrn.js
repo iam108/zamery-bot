@@ -19,10 +19,15 @@ let budgetService;
 function budget() { return budgetService ||= require('./egrn-budget').createEgrnBudget({ pool }); }
 let telegramDeliveryService;
 function telegramDelivery() { return telegramDeliveryService ||= require('./egrn-telegram-delivery').createEgrnTelegramDelivery({ pool, env: process.env }); }
+async function readBudgetText() {
+  try { return budget().describe(await budget().snapshot()); }
+  catch (_) { return 'Учёт заказов временно недоступен; остаток не сверён.'; }
+}
+async function messageBudgetText() { return 'Учёт на момент сообщения: ' + await readBudgetText(); }
 async function budgetText(order) {
   try {
     if (order?.id_statement) await budget().accept(order.id, order.id_statement);
-    return budget().describe(await budget().snapshot());
+    return await readBudgetText();
   } catch (_) { return 'Учёт заказов временно недоступен; остаток не сверён.'; }
 }
 function budgetCaption(text, accounting) {
@@ -57,7 +62,7 @@ async function registerOriginal(targets, file) {
 
 function largeDelivery(order) {
   return require('./egrn-large-delivery').createLargeDelivery({ telegram: tgApi,
-    budgetText: () => budgetText(),
+    budgetText: messageBudgetText,
     sendOriginal: order ? (record, target, run) => telegramDelivery().send(order, { kind: 'large-link', key: record.key, target }, run) : undefined,
     persist: async function (order, records) {
       await persistFileRecords(order, records);
@@ -125,7 +130,14 @@ async function sendNativePrimary(order, file, key, extra) {
     delete configured.reply_parameters;
     if (target.reply) configured.reply_parameters = { message_id: Number(target.reply), allow_sending_without_reply: true };
   }
-  const message = await telegramDelivery().send(order, { kind: 'native-primary', key, target }, () => tgApi.sendDocument(target.chat, { source: file.buf, filename: file.name }, configured));
+  // Provider reads, downloads and original registration may take minutes.
+  // Read only the current counter after the protocol preflight, then retain
+  // its final recipient and lease checks immediately before the transport.
+  const message = await telegramDelivery().send(order, { kind: 'native-primary', key, target }, async recheck => {
+    configured.caption=budgetCaption(configured.caption,await messageBudgetText());
+    if(recheck)await recheck();
+    return tgApi.sendDocument(target.chat,{source:file.buf,filename:file.name},configured);
+  });
   return { message, chat: target.chat };
 }
 
@@ -888,7 +900,7 @@ function setupEgrn(bot) {
         if (st.done && !/выполн/i.test(st.text)) st.text = 'готова';
         Object.assign(o, { status: newStatus, status_text: st.text, polls: o.polls + 1 });
         if (changed && o.status_msg_id) {
-          try { await telegramDelivery().authorize(o,{chat:o.chat_id});await bot.telegram.editMessageText(o.chat_id, Number(o.status_msg_id), undefined, cardText(o), { parse_mode: 'HTML' }); } catch (e) {}
+          try { o.budget_text=await messageBudgetText();await telegramDelivery().authorize(o,{chat:o.chat_id});await bot.telegram.editMessageText(o.chat_id, Number(o.status_msg_id), undefined, cardText(o), { parse_mode: 'HTML' }); } catch (e) {}
         }
         if (newStatus === 'failed') {
           await pool.query('UPDATE egrn_orders SET files_sent = -1 WHERE id=$1 AND processing_token=$2', [o.id, o.processing_token]);
@@ -926,7 +938,7 @@ function setupEgrn(bot) {
           if (e.uncertain === true) throw e;
           if (e.code === 'EGRN_FILE_TOO_LARGE' || e.code === 'EGRN_FILE_TYPE') permanent = true;
         }
-        const caption = budgetCaption('📄 Выписка ЕГРН ' + o.cad_num + (o.label ? ' — ' + o.label : ''), o.budget_text);
+        const caption = '📄 Выписка ЕГРН ' + o.cad_num + (o.label ? ' — ' + o.label : '');
         // PDF — в чат; XML и архив — тоже в чат, но без звука, для архива и будущего разбора
         for (const [index, original] of embedded.entries()) {
           let d = original;
@@ -937,7 +949,7 @@ function setupEgrn(bot) {
             d = await smallDocument(d);
             checkDocumentSize(d.buf);
             await registerOriginal(o.deliver, d);
-            const extra = { caption: d.kind === 'pdf' ? caption : budgetCaption((d.kind === 'xml' ? 'XML ' : 'Архив ') + o.cad_num, o.budget_text), disable_notification: d.kind !== 'pdf' };
+            const extra = { caption: d.kind === 'pdf' ? caption : (d.kind === 'xml' ? 'XML ' : 'Архив ') + o.cad_num, disable_notification: d.kind !== 'pdf' };
             if (o.status_msg_id) extra.reply_parameters = { message_id: Number(o.status_msg_id), allow_sending_without_reply: true };
             await renewDelivery(o);
             let m, chat;
@@ -1043,11 +1055,14 @@ async function checkCopyTarget(options, destination) {
   }
 }
 async function copyNativeOriginal(record, destination, options) {
-  const copy = () => telegramDelivery().send(options.deliveryOrder, {kind:'native-copy',key:sourceKey(record),target:destination}, async () => {
+  const copy = () => telegramDelivery().send(options.deliveryOrder, {kind:'native-copy',key:sourceKey(record),target:destination}, async recheck => {
     await checkCopyTarget(options, destination);
+    const accounting=options.budgetText ? await messageBudgetText() : '';
+    await checkCopyTarget(options,destination);
+    if(recheck)await recheck();
     return tgApi.callApi('copyMessage', Object.assign({ chat_id: destination.chat, from_chat_id: record.chat, message_id: record.id },
-    options.budgetText ? { caption: budgetCaption('📄 ' + String(record.name || 'Выписка ЕГРН'), options.budgetText) } : {},
-    destination.reply ? { reply_parameters: { message_id: Number(destination.reply), allow_sending_without_reply: true } } : {}));
+      accounting ? { caption: budgetCaption('📄 ' + String(record.name || 'Выписка ЕГРН'), accounting) } : {},
+      destination.reply ? { reply_parameters: { message_id: Number(destination.reply), allow_sending_without_reply: true } } : {}));
   });
   try { return await copy(); }
   catch (error) {
@@ -1063,11 +1078,14 @@ async function copyNativeOriginal(record, destination, options) {
       repairChat=destination.chat;
     }
     const sameChat = String(repairChat) === String(destination.chat);
-    const extra = { disable_notification: true, caption: budgetCaption('📄 ' + String(record.name || 'Выписка ЕГРН').slice(0, 220), options.budgetText) };
+    const extra = { disable_notification: true };
     if (sameChat && destination.reply) extra.reply_parameters = { message_id: Number(destination.reply), allow_sending_without_reply: true };
-    const repaired = await telegramDelivery().send(options.deliveryOrder,{kind:'native-repair',key,target:{chat:repairChat,...(sameChat&&destination.case_id!=null?{case_id:destination.case_id}:{})}},async()=>{
-      await checkCopyTarget(options, destination);
-      return tgApi.sendDocument(repairChat, record.file_id, extra);
+    const repaired = await telegramDelivery().send(options.deliveryOrder,{kind:'native-repair',key,target:{chat:repairChat,...(sameChat&&destination.case_id!=null?{case_id:destination.case_id}:{})}},async recheck=>{
+      await checkCopyTarget(options,destination);
+      extra.caption=budgetCaption('📄 '+String(record.name||'Выписка ЕГРН').slice(0,220),options.budgetText?await messageBudgetText():'');
+      await checkCopyTarget(options,destination);
+      if(recheck)await recheck();
+      return tgApi.sendDocument(repairChat,record.file_id,extra);
     });
     if (!Number.isSafeInteger(Number(repaired?.message_id)) || Number(repaired.message_id) < 1)
       throw Object.assign(new Error('Telegram не подтвердил восстановление оригинала выписки.'), { code: 'EGRN_COPY_SOURCE_RECEIPT', uncertain: true });
@@ -1183,12 +1201,13 @@ async function attachOrOrder(opts) {
       order.budget_text = await budgetText(order);
       if (tgApi && order.chat_id) {
         try {
+          order.budget_text=await messageBudgetText();
           await telegramDelivery().authorize(order,{chat:order.chat_id});
           const message = await tgApi.sendMessage(order.chat_id, cardText(order, opts.note ? esc(opts.note) : ''), { parse_mode: 'HTML' });
           await pool.query('UPDATE egrn_orders SET status_msg_id=$1 WHERE id=$2', [message.message_id, order.id]);
         } catch (error) { console.error('egrn card:', error.message); }
       }
-      return { result: 'ordered', cad, id: order.id_statement, budget_text: order.budget_text };
+      return { result: 'ordered', cad, id: order.id_statement, budget_text: await readBudgetText() };
     }
   }
   if (prev.status === 'ordering' && Date.now() - new Date(prev.created_at).getTime() > 2 * 60 * 1000) {
@@ -1228,7 +1247,7 @@ async function attachOrOrder(opts) {
       // The cached order was already complete before these targets joined.
       // Only this generation may be acknowledged; another join leaves it open.
       if (wasComplete) await markDelivered(leased, records);
-      return { result: 'attached', cad, ...packet, budget_text: leased.budget_text };
+      return { result: 'attached', cad, ...packet, budget_text: await readBudgetText() };
     } finally { await lease.close(); }
   }
   if (prev.files_sent < 0) return budgetResult({ result: 'unavailable', cad, id: prev.id_statement }, prev);

@@ -55,6 +55,28 @@ test('intent write failure and revoked recipient after SQL wait perform no Teleg
   h.setFailure(null);await h.pool.query('UPDATE staff SET approved=false WHERE tg_id=222');await assert.rejects(p.send(o,op('native-copy',222),async()=>{sends++;}),e=>e.code==='EGRN_RECIPIENT_UNAVAILABLE');assert.equal(sends,0);assert.deepEqual((await h.row()).delivery_state,{});
 }));
 
+for(const change of ['approval','assignment','role'])test('dispatch preparation rechecks '+change+' after its readonly snapshot await and clears its own unsent intent',pg,()=>fixture(async h=>{
+  const protocol=h.make(),order=await h.row();let sends=0;
+  await assert.rejects(protocol.send(order,{...op('native-copy',222),target:{chat:222,case_id:9}},async recheck=>{
+    // The mutation occurs after the original preflight, as if another request
+    // changed access while this callback awaited its accounting snapshot.
+    if(change==='approval')await h.pool.query('UPDATE staff SET approved=false WHERE tg_id=222');
+    if(change==='assignment')await h.pool.query('UPDATE cases SET lawyer_tg_id=111 WHERE id=9');
+    if(change==='role')await h.pool.query("UPDATE staff SET role='auditor' WHERE tg_id=222");
+    await recheck();sends++;return{message_id:55};
+  }),e=>e.code==='EGRN_RECIPIENT_UNAVAILABLE'&&e.uncertain===false&&e.delivery_stage==='validation');
+  assert.equal(sends,0);assert.equal((await h.row()).delivery_state.inflight,undefined);
+}));
+
+test('dispatch preparation cannot clear another owners intent after losing its lease while reading accounting',pg,()=>fixture(async h=>{
+  const protocol=h.make(),order=await h.row();let sends=0;
+  await assert.rejects(protocol.send(order,op(),async recheck=>{
+    await h.pool.query('UPDATE egrn_orders SET processing_token=gen_random_uuid() WHERE id=1');
+    await recheck();sends++;return{message_id:55};
+  }),e=>e.uncertain===true);
+  assert.equal(sends,0);assert.ok((await h.row()).delivery_state.inflight);
+}));
+
 for(const code of [400,403,413,429])test('definite Telegram '+code+' rejection safely clears only its own intent',pg,()=>fixture(async h=>{
   const p=h.make(),o=await h.row();await assert.rejects(p.send(o,op(),async()=>{throw {response:{error_code:code}};}),e=>e.uncertain===false);
   assert.equal((await h.row()).delivery_state.inflight,undefined);await p.send(o,op(),async()=>({message_id:55}));await p.persist(o,[receipt()]);

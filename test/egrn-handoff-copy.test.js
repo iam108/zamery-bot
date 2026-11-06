@@ -64,8 +64,8 @@ test('a recipient guard runs immediately before a native copy and blocks it with
 
 test('native missing-source repair rechecks the recipient before sending its reusable original',async()=>{
   const h=harness({files:[{...native('exact'),file_id:'retained-original'}],fail:call=>call.kind==='native'?Object.assign(new Error('missing source'),{response:{error_code:400,description:'Bad Request: message to copy not found'}}):null});let checked=0;
-  await assert.rejects(h.attach({copyOptions:{beforeSend(){if(++checked===2)throw Object.assign(new Error('Recipient changed during source lookup'),{code:'HANDOFF_RECIPIENT_UNAVAILABLE'});}}}),error=>error.uncertain===false);
-  assert.equal(checked,2);assert.deepEqual(h.calls.map(call=>call.kind),['native']);assert.equal(h.order.file_msgs[0].id,5);h.noPaidOrder();
+  await assert.rejects(h.attach({copyOptions:{beforeSend(){checked++;if(h.calls.length)throw Object.assign(new Error('Recipient changed during source lookup'),{code:'HANDOFF_RECIPIENT_UNAVAILABLE'});}}}),error=>error.uncertain===false);
+  assert.equal(checked,3);assert.deepEqual(h.calls.map(call=>call.kind),['native']);assert.equal(h.order.file_msgs[0].id,5);h.noPaidOrder();
 });
 
 test('a native copy failure cannot claim a successful attachment when strict mode was omitted', async () => {

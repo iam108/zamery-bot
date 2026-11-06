@@ -64,8 +64,14 @@ test('an unavailable accounting snapshot does not prevent the original large-lin
 
 test('a free large-link copy rechecks its recipient after metadata, signing and accounting, immediately before Telegram',async()=>{
   let permitted=true,checked=0;const h=fixture({budgetText:async()=>{permitted=false;return 'Учёт без нового заказа';}}),record=lookupOnlyRecord({bytes:PDF.length});
-  await assert.rejects(h.service.copy(record,{chat:4444},{beforeSend(target){checked++;assert.equal(target.chat,4444);assert.equal(permitted,false);throw Object.assign(new Error('Recipient revoked'),{code:'HANDOFF_RECIPIENT_UNAVAILABLE'});}}),error=>error.uncertain===false&&error.delivery_stage==='validation');
-  assert.equal(checked,1);assert.equal(h.sends.length,0);assert.equal(h.state.saveCount,0);assert.equal(h.records.length,0);
+  await assert.rejects(h.service.copy(record,{chat:4444},{beforeSend(target){checked++;assert.equal(target.chat,4444);if(!permitted)throw Object.assign(new Error('Recipient revoked'),{code:'HANDOFF_RECIPIENT_UNAVAILABLE'});}}),error=>error.uncertain===false&&error.delivery_stage==='validation');
+  assert.equal(checked,2);assert.equal(h.sends.length,0);assert.equal(h.state.saveCount,0);assert.equal(h.records.length,0);
+});
+
+test('large-link accounting is read after delayed delivery preflight and caller validation',async()=>{
+  let text='old snapshot';const h=fixture({budgetText:async()=>text,sendOriginal:async(record,target,dispatch)=>{text='new snapshot after preflight';return dispatch(async()=>{});}});
+  await h.service.deliver(h.order,h.file,KEY,h.records);assert.ok(h.sends.every(call=>call.text.includes('new snapshot after preflight')));
+  text='old copy snapshot';await h.service.copy(h.records[0],{chat:4444},{beforeSend(){text='new snapshot after caller validation';}});assert.match(h.sends.at(-1).text,/new snapshot after caller validation/);
 });
 
 test('original and descriptor are durable before a link is sent; every target receipt is persisted immediately',async()=>{

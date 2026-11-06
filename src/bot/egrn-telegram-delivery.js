@@ -94,7 +94,13 @@ function createEgrnTelegramDelivery({ pool, env = process.env } = {}) {
       await authorize(order, operation.target);
       await retainOwnership(order,intent);
       requested = true;
-      const receipt = await run();
+      // Callers may prepare a readonly accounting snapshot after a slow
+      // preflight. Retain the final recipient/lease gate after that await.
+      const recheck = async () => {
+        try { await authorize(order,operation.target); await retainOwnership(order,intent); }
+        catch (error) { error.delivery_stage='validation';error.uncertain=false;throw error; }
+      };
+      const receipt = await run(recheck);
       if (!confirmsOriginal(order,operation,receipt)) throw unknown();
       order._deliveryAck = { attempt: intent.attempt, message_id: Number(receipt.message_id) };
       return receipt;

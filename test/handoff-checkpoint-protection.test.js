@@ -252,3 +252,138 @@ test('a stale checklist response freezes autosave and explicit recovery keeps a 
   assert.equal(storage.has('zamery_cl_17'), false);
   assert.equal(JSON.parse(storage.get('zamery_cl_17:recovery')).data.answer.s, 'ok');
 });
+
+function autosaveClient({ data = {}, revision = 0, storage = new Map() } = {}) {
+  const start = source.indexOf('function checklistClient()');
+  const end = source.indexOf('\n  render();\n  loadReminders();', start);
+  const elements = new Map(), events = new Map(), requests = [], timers = new Map(), alerts = [];
+  let serial = 0;
+  const location = { search: '', href: '' };
+  const client = vm.runInNewContext('(' + source.slice(start, end) + `
+    return { flush, edit(value) { D.answer = value; changed(); }, note(value) { D._comment = value; changed(); }, data() { return D; } };
+  })()`, {
+    window: { addEventListener: (name, fn) => events.set(name, fn), location,
+      __CFG: { data: structuredClone(data), list: { sections: [], passport: [] }, caseInfo: { id: 17, revision } } },
+    document: { documentElement: { dataset: {} }, addEventListener() {},
+      getElementById(id) { if (!elements.has(id)) elements.set(id, { style: {} }); return elements.get(id); } },
+    location, AbortController, alert: message => alerts.push(message),
+    localStorage: { getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key) },
+    setTimeout(fn, delay) { const id = ++serial; timers.set(id, { fn, delay }); return id; },
+    clearTimeout: id => timers.delete(id), setInterval() {}, clearInterval() {},
+    fetch(url, options) { return new Promise((resolve, reject) => requests.push({ url, body: JSON.parse(options.body), signal: options.signal, resolve, reject })); },
+  });
+  return { client, requests, storage, elements, events, location, alerts,
+    respond(index, body = { ok: true, note: '', revision: index + 1 }, status = 200) {
+      requests[index].resolve({ status, headers: { get() {} }, text: async () => JSON.stringify(body), json: async () => body });
+    },
+    async tick(delay) { for (const [id, timer] of [...timers]) if (timer.delay === delay) { timers.delete(id); timer.fn(); } await new Promise(setImmediate); },
+  };
+}
+
+test('a newer edit before the previous ACK keeps its backup and saves after the ACK without waiting for the old debounce', async () => {
+  const h = autosaveClient(); h.client.edit('A'); const first = h.client.flush();
+  h.client.edit('B'); h.respond(0); await first;
+  assert.equal(JSON.parse(h.storage.get('zamery_cl_17')).d.answer, 'B');
+  assert.notEqual(h.elements.get('st').textContent, 'Сохранено');
+  await h.tick(400); assert.equal(h.requests.length, 2); assert.equal(h.requests[1].body.data.answer, 'B');
+  assert.equal(h.requests[1].body.expectedRevision, 1);
+  h.respond(1); await new Promise(setImmediate);
+  assert.equal(h.elements.get('st').textContent, 'Сохранено'); assert.equal(h.storage.has('zamery_cl_17'), false);
+});
+
+test('pagehide during the second save and immediate reopen recover B from its current acknowledged revision', async () => {
+  const h = autosaveClient(); h.client.edit('A'); const first = h.client.flush();
+  h.client.edit('B'); h.respond(0); await first;
+  h.events.get('pagehide')(); assert.equal(h.requests[1].body.data.answer, 'B');
+  const reopened = autosaveClient({ data: { answer: 'A' }, revision: 1, storage: h.storage });
+  assert.equal(reopened.client.data().answer, 'B'); const save = reopened.client.flush();
+  assert.equal(reopened.requests[0].body.data.answer, 'B'); assert.equal(reopened.requests[0].body.expectedRevision, 1);
+  reopened.respond(0, { ok: true, note: '', revision: 2 }); await save;
+  assert.equal(h.storage.has('zamery_cl_17'), false);
+});
+
+for (const failure of ['network', 'forbidden', 'conflict']) test('printing after a '+failure+' save cannot discard the newer draft or open stale server answers', async () => {
+  const h = autosaveClient(); h.client.edit('A'); const printing = h.elements.get('printBtn').onclick();
+  h.client.edit('B');
+  if (failure === 'network') h.requests[0].reject(new Error('Offline'));
+  else h.respond(0, { ok: false, code: failure === 'conflict' ? 'checklist_conflict' : 'forbidden', error: 'Synthetic save refusal', revision: 4 }, failure === 'conflict' ? 409 : 403);
+  await printing; await new Promise(setImmediate);
+  assert.equal(h.requests.length, 1); assert.equal(h.location.href, '');
+  assert.equal(JSON.parse(h.storage.get('zamery_cl_17')).d.answer, 'B');
+  assert.notEqual(h.elements.get('st').textContent, 'Сохранено'); assert.equal(h.alerts.length, 1);
+});
+
+test('printing waits for edits during the save and the print-link request, sharing an existing save', async () => {
+  const h = autosaveClient(); h.client.edit('A'); const initial = h.client.flush();
+  const printing = h.elements.get('printBtn').onclick(); h.client.edit('B');
+  assert.equal(h.requests.length, 1); assert.equal(h.location.href, '');
+  h.respond(0); await initial; await new Promise(setImmediate);
+  assert.equal(h.requests[1].url, '/api/checklist/save'); assert.equal(h.requests[1].body.data.answer, 'B');
+  h.respond(1); await new Promise(setImmediate);
+  assert.equal(h.requests[2].url, '/api/checklist/printlink');
+  h.client.edit('C'); h.respond(2, { ok: true, url: 'https://bot.example/checklist?case_id=17&print=1' });
+  await new Promise(setImmediate);
+  assert.equal(h.requests[3].url, '/api/checklist/save'); assert.equal(h.requests[3].body.data.answer, 'C');
+  assert.equal(h.location.href, ''); h.respond(3, { ok: true, note: '', revision: 3 }); await printing;
+  assert.equal(h.location.href, 'https://bot.example/checklist?case_id=17&print=1');
+  assert.equal(h.storage.has('zamery_cl_17'), false);
+});
+
+for (const stage of ['fetch', 'body']) test('a stalled save '+stage+' releases printing and retains the draft for an online retry', async () => {
+  const h = autosaveClient(); h.client.edit('A'); const printing = h.elements.get('printBtn').onclick(); h.client.edit('B');
+  let lateBody;
+  if (stage === 'body') h.requests[0].resolve({ status: 200, headers: { get() {} }, text: () => new Promise(resolve => { lateBody = resolve; }) });
+  await new Promise(setImmediate); await h.tick(30000);
+  assert.equal(h.elements.get('printBtn').disabled, false); await printing;
+  assert.equal(h.location.href, ''); assert.equal(h.requests[0].signal.aborted, true);
+  assert.equal(JSON.parse(h.storage.get('zamery_cl_17')).d.answer, 'B');
+  assert.match(h.elements.get('st').textContent, /Не сохранено/);
+  if (lateBody) lateBody(JSON.stringify({ ok: true, note: '', revision: 99 })); else h.respond(0, { ok: true, note: '', revision: 99 });
+  await new Promise(setImmediate); assert.notEqual(h.elements.get('st').textContent, 'Сохранено');
+  h.events.get('online')(); assert.equal(h.requests[1].body.expectedRevision, 0); assert.equal(h.requests[1].body.data.answer, 'B');
+  h.respond(1, { ok: true, note: '', revision: 1 }); await new Promise(setImmediate);
+  assert.equal(h.elements.get('st').textContent, 'Сохранено'); assert.equal(h.storage.has('zamery_cl_17'), false);
+});
+
+for (const stage of ['fetch', 'body']) test('a stalled print-link '+stage+' times out without navigation or losing a newer edit', async () => {
+  const h = autosaveClient(); const printing = h.elements.get('printBtn').onclick(); await new Promise(setImmediate);
+  assert.equal(h.requests[0].url, '/api/checklist/printlink'); h.client.edit('B');
+  if (stage === 'body') h.requests[0].resolve({ json: () => new Promise(() => {}) });
+  await new Promise(setImmediate); await h.tick(30000);
+  assert.equal(h.elements.get('printBtn').disabled, false); await printing;
+  assert.equal(h.location.href, ''); assert.equal(h.requests[0].signal.aborted, true);
+  assert.equal(JSON.parse(h.storage.get('zamery_cl_17')).d.answer, 'B'); assert.equal(h.alerts.length, 1);
+});
+
+test('reopening after a note commit with lost ACK adopts the acknowledged current server baseline', pg, async () => fixture(async db => {
+  await db.seed({ _comment: 'B already committed' });
+  const storage = new Map([['zamery_cl_17', JSON.stringify({ t: Date.now(), d: { _comment: 'B already committed' }, noteBase: 'A previous baseline', revision: 0 })]]);
+  const h = autosaveClient({ data: { _comment: 'B already committed' }, storage });
+  await h.client.flush(); h.client.note('C next edit'); const pending = h.client.flush();
+  const request = h.requests[0].body;
+  const result = await db.rawSave(request.data, { expectedNote: request.expectedNote, expectedRevision: request.expectedRevision });
+  h.respond(0, result.result, result.status); await pending;
+  assert.equal(result.status, 200); assert.equal((await db.row()).data._comment, 'C next edit');
+}));
+
+test('a reopened already-committed checklist snapshot adopts the current revision without a false conflict', async () => {
+  const data = { answer: 'B already committed', detail: { a: 'one', z: { a: 1, b: 2 } } };
+  const reordered = { detail: { z: { b: 2, a: 1 }, a: 'one' }, answer: 'B already committed' };
+  const storage = new Map([['zamery_cl_17', JSON.stringify({ t: Date.now(), d: reordered, noteBase: '', revision: 0 })]]);
+  const h = autosaveClient({ data, revision: 1, storage });
+  assert.equal(await h.client.flush(), true); assert.equal(h.requests.length, 0);
+  h.client.edit('C next edit'); const pending = h.client.flush();
+  assert.equal(h.requests[0].body.expectedRevision, 1); h.respond(0, { ok: true, note: '', revision: 2 }); await pending;
+  assert.equal(h.storage.has('zamery_cl_17'), false);
+});
+
+test('matching notes never acknowledge different checklist answers or missing server-protected fields', async () => {
+  for (const data of [{ _comment: 'Same note', answer: 'New server answer' }, { _comment: 'Same note', answer: 'Old local answer', _workspaceNote: true }]) {
+    const local = { _comment: 'Same note', answer: 'Old local answer' };
+    const storage = new Map([['zamery_cl_17', JSON.stringify({ t: Date.now(), d: local, noteBase: 'Same note', revision: 0 })]]);
+    const h = autosaveClient({ data, revision: 1, storage });
+    assert.equal(await h.client.flush(), false); assert.equal(h.requests.length, 0);
+    assert.equal(JSON.parse(storage.get('zamery_cl_17')).d.answer, 'Old local answer');
+    assert.match(h.elements.get('st').textContent, /другом окне/);
+  }
+});

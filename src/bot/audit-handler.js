@@ -26,7 +26,10 @@ async function tgRetry(fn) {
     try { return await fn(); }
     catch (e) {
       const wait = e && e.response && e.response.parameters && e.response.parameters.retry_after;
-      if (!wait || attempt === 3) throw e;
+      // Only Telegram's explicit rate-limit refusal proves that no message
+      // was accepted. A retry hint on a 5xx/network error is still an unknown
+      // acknowledgement, and a long wait belongs to a deliberate later retry.
+      if (e?.response?.error_code !== 429 || !Number.isSafeInteger(wait) || wait < 1 || wait > 30 || attempt === 3) throw e;
       console.log('Telegram просит подождать ' + wait + ' с');
       await new Promise(function (r) { setTimeout(r, (wait + 1) * 1000); });
     }

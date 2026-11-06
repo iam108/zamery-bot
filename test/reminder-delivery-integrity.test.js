@@ -51,13 +51,23 @@ async function fixture(run) {
     await api.ensureTables(); await api.ensureDeadlines(); api.startDecisionReminders({ telegram });
     await db.exec("ALTER TABLE staff ADD COLUMN approved BOOLEAN; INSERT INTO staff(tg_id,name,role,approved) VALUES(808,'Synthetic lawyer','lawyer',true),(909,'Replacement lawyer','lawyer',true),(101,'Synthetic manager','manager',true),(102,'Other manager','manager',true); INSERT INTO cases(id,org,lawyer_tg_id,lawyer_name,created_by,data,submitted_on,decision_due) VALUES(17,'Synthetic client',808,'Synthetic lawyer',101,'{\"_stage\":\"Подано\"}','2026-10-15','2026-11-05')");
     const routes = new Map();
-    context.module.exports.setupHandoff({ get(path,...handlers) { routes.set('GET '+path,handlers.at(-1)); }, post() {} });
+    context.module.exports.setupHandoff({ get(path,...handlers) { routes.set('GET '+path,handlers.at(-1)); }, post(path,...handlers) { routes.set('POST '+path,handlers.at(-1)); } });
     const getReminders = async (actor = 808) => {
       let result;
       await routes.get('GET /api/checklist/reminders')({ query: { case_id: 17 }, tgUser: { id: actor }, staff: { role: actor === 808 ? 'lawyer' : 'manager', approved: true } }, { json(value) { result = value; }, status() { return this; } });
       return result;
     };
-    await run({ db, deliveries, getReminders, tick: () => scheduledTick(), reminders: () => api.sendCaseReminders({ telegram }), fail(chat) { failure = chat == null ? null : String(chat); }, mutate(fn) { mutation = fn; }, advance(ms) { currentNow += ms; }, rejectWrites(fn) { rejectWrite = fn; }, beforeQuery(fn) { beforeQuery = fn; }, restart() { reminderDelivery = { ...reminderModule, ...reminderModule.createReminderDelivery() }; }, row: async () => (await db.query('SELECT * FROM cases WHERE id=17')).rows[0] });
+    const complete = async(channel,actor=808) => {
+      if(channel==='callback'){
+        const actions=[],answers=[];context.module.exports.setupReportsBot({command(){},on(){},action(pattern,handler){actions.push({pattern,handler});}});
+        const handler=actions.find(item=>String(item.pattern).includes('rmd:')).handler;
+        await handler({from:{id:actor,first_name:'Synthetic staff'},match:['rmd:1','1'],answerCbQuery:async text=>answers.push(text),editMessageReplyMarkup:async()=>{}});
+        return {ok:answers.includes('Отмечено'),answers};
+      }
+      let body,status=200;await routes.get('POST /api/checklist/reminders/done')({body:{id:1},tgUser:{id:actor},staff:{role:'lawyer',approved:true}},
+        {json(value){body=value;},status(value){status=value;return this;}});return{...body,status};
+    };
+    await run({ db, deliveries, getReminders, complete, tick: () => scheduledTick(), reminders: () => api.sendCaseReminders({ telegram }), fail(chat) { failure = chat == null ? null : String(chat); }, mutate(fn) { mutation = fn; }, advance(ms) { currentNow += ms; }, rejectWrites(fn) { rejectWrite = fn; }, beforeQuery(fn) { beforeQuery = fn; }, restart() { reminderDelivery = { ...reminderModule, ...reminderModule.createReminderDelivery() }; }, row: async () => (await db.query('SELECT * FROM cases WHERE id=17')).rows[0] });
   } finally { await db.close(); }
 }
 
@@ -93,6 +103,27 @@ test('marking a case reminder done during its first delivery prevents sending it
   await h.db.exec("INSERT INTO case_reminders(id,case_id,remind_on,text,created_by) VALUES(1,17,'2026-11-05','Synthetic reminder',101)");
   h.mutate(async event => { if (event.chat === '808') await h.db.exec('UPDATE case_reminders SET done=true WHERE id=1'); });
   await h.reminders(); assert.deepEqual(h.deliveries.map(event => event.chat), ['808']);
+}));
+
+test('completing a case reminder while its final staff lookup waits prevents the first Telegram send',pg,async()=>fixture(async h=>{
+  await h.db.exec("INSERT INTO case_reminders(id,case_id,remind_on,text,created_by) VALUES(1,17,'2026-11-05','Synthetic reminder',101)");
+  let lookups=0;h.beforeQuery(async sql=>{if(isRecipientLookup(sql)&&++lookups===2)await h.db.exec('UPDATE case_reminders SET done=true WHERE id=1');});
+  await h.reminders();assert.deepEqual(h.deliveries,[]);const row=(await h.db.query('SELECT * FROM case_reminders WHERE id=1')).rows[0];assert.equal(row.done,true);assert.equal(row.sent_at,null);
+}));
+
+for(const channel of ['callback','http'])for(const change of ['approval','assignment','role'])test(channel+' reminder completion checks current '+change+' in the mutation snapshot',pg,async()=>fixture(async h=>{
+  await h.db.exec("INSERT INTO case_reminders(id,case_id,remind_on,text,created_by) VALUES(1,17,'2026-11-05','Synthetic reminder',101)");
+  let changed=false;h.beforeQuery(async sql=>{if(!changed&&/^UPDATE case_reminders.*SET done/.test(sql)){changed=true;await h.db.exec(change==='approval'?'UPDATE staff SET approved=false WHERE tg_id=808':change==='assignment'?'UPDATE cases SET lawyer_tg_id=909 WHERE id=17':"UPDATE staff SET role='auditor' WHERE tg_id=808");}});
+  const result=await h.complete(channel);assert.equal(changed,true);assert.equal(result.ok,false);assert.equal((await h.db.query('SELECT done FROM case_reminders WHERE id=1')).rows[0].done,false);
+  if(channel==='http')assert.equal(result.status,403);
+}));
+for(const channel of ['callback','http'])test(channel+' reminder completion preserves assigned-lawyer, manager and approved-admin access',pg,async()=>fixture(async h=>{
+  await h.db.exec("INSERT INTO case_reminders(id,case_id,remind_on,text,created_by) VALUES(1,17,'2026-11-05','Synthetic reminder',101)");
+  for(const actor of [808,101]){assert.equal((await h.complete(channel,actor)).ok,true);await h.db.exec('UPDATE case_reminders SET done=false WHERE id=1');}
+  assert.equal((await h.complete(channel,909)).ok,false);
+  const previous=process.env.ADMIN_TG_IDS;process.env.ADMIN_TG_IDS='808';
+  try{await h.db.exec("UPDATE staff SET role='auditor' WHERE tg_id=808");assert.equal((await h.complete(channel,808)).ok,true);await h.db.exec('UPDATE case_reminders SET done=false WHERE id=1; UPDATE staff SET approved=false WHERE tg_id=808');assert.equal((await h.complete(channel,808)).ok,false);}
+  finally{if(previous===undefined)delete process.env.ADMIN_TG_IDS;else process.env.ADMIN_TG_IDS=previous;}
 }));
 
 test('a received case-reminder ACK with failed DB receipts is persisted on the next tick without a second Telegram send', pg, async () => fixture(async h => {

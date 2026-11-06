@@ -16,7 +16,7 @@ function gate() {
 }
 async function fixture(options = {}) {
   const { PGlite } = require(process.env.PGLITE_TEST_MODULE);
-  const db = new PGlite(), calls = { paid: 0, status: [], documents: [], copies: [], messages: [] };
+  const db = new PGlite(), calls = { paid: 0, status: [], documents: [], copies: [], messages: [], edits: [] };
   let tail = Promise.resolve(), poll, clockOffset = 0;
   class Clock extends Date { static now() { return Date.now() + clockOffset; } }
   const pool = {
@@ -39,6 +39,10 @@ async function fixture(options = {}) {
       if (name === '../db/pool') return pool;
       if (name === './order-evidence') return { async registerOriginal() { return {}; }, async registerCached() { return {}; } };
       if (name === './egrn-large-delivery' && options.largeDelivery) return {createLargeDelivery: options.largeDelivery};
+      if (name === './egrn-telegram-delivery' && options.beforeDispatch) return {createEgrnTelegramDelivery(config){
+        const protocol=localRequire(name).createEgrnTelegramDelivery(config);
+        return {...protocol,send(order,operation,run){return protocol.send(order,operation,async(...args)=>{await options.beforeDispatch(operation);return run(...args);});}};
+      }};
       return localRequire(name);
     },
     async fetch(url, request = {}) {
@@ -52,7 +56,7 @@ async function fixture(options = {}) {
   const api = sandbox.module.exports;
   const telegram = {
     async sendMessage(chat, text) { calls.messages.push({ chat, text }); return { message_id: 100 + calls.messages.length }; },
-    async editMessageText() {},
+    async editMessageText(chat,id,inline,text) { calls.edits.push({chat,id,text}); },
     async sendDocument(chat, file, extra) { const call={chat,file,extra};calls.documents.push(call);await options.sendDocument?.(extra,call);call.delivered=true;return options.documentReceipt ? options.documentReceipt(call) : { message_id: 200 + calls.documents.length, document: { file_id: 'test-only-original-'+calls.documents.length, mime_type: 'application/pdf' } }; },
     async callApi(method, value) { calls.copies.push(value); await options.copy?.(value); return options.copyReceipt ? options.copyReceipt(value) : { message_id: 300 + calls.copies.length }; },
   };
@@ -296,6 +300,81 @@ test('order confirmations, ready native captions and free cache reuse expose the
     await h.poll();assert.ok(h.calls.documents.some(d=>/Заказано выписок: 1/.test(d.extra.caption)&&/осталось 2/.test(d.extra.caption)));
     const cached=await h.attach(222);assert.equal(cached.result,'attached');assert.match(cached.budget_text,/осталось 2/);assert.equal(h.calls.paid,1);assert.equal((await h.budget.snapshot()).confirmedOrders,1);
   }finally{await h.close();}
+});
+
+for(const waitingFor of ['provider-status','original-download'])test('native ready delivery reads the current counter after a slow '+waitingFor+' while another order is accepted',pg,async()=>{
+  const entered=gate(),release=gate(),h=await fixture();try{
+    await h.budget.syncBalance('1000',{sourceKey:'synthetic-opening'});await h.attach();
+    const original=Buffer.from('%PDF-1.7\n'+'A'.repeat(300)+'\n%%EOF');
+    h.api.qa.setStatus(async id=>{
+      if(waitingFor==='provider-status'){entered.open();await release.promise;}
+      return{id_req:id,status:[{type:'processed',statusDescription:'Выполнено',...(waitingFor==='provider-status'?{file:original.toString('base64')}:{download_url:'https://synthetic.invalid/original.pdf'})}]};
+    });
+    h.api.qa.setDownload(async()=>{entered.open();await release.promise;return{buf:original,name:'full-original.pdf',kind:'pdf'};});
+    const running=h.poll();await entered.promise;await h.attach(222,{cad:'77:17:0120316:998'});release.open();await running;
+    const snapshot=await h.budget.snapshot();assert.equal(snapshot.confirmedOrders,2);assert.equal(snapshot.balanceKopecks,74200);assert.equal(h.calls.paid,2);
+    assert.ok(h.calls.documents.length);for(const sent of h.calls.documents){assert.match(sent.extra.caption,/Учёт на момент сообщения: Заказано выписок: 2/);assert.match(sent.extra.caption,/осталось: 5/);}
+    if(waitingFor==='provider-status'){assert.ok(h.calls.edits.length);assert.match(h.calls.edits[0].text,/Заказано выписок: 2/);assert.match(h.calls.edits[0].text,/осталось: 5/);}
+    for(const copy of h.calls.copies){assert.match(copy.caption,/Заказано выписок: 2/);assert.match(copy.caption,/осталось: 5/);}
+  }finally{release.open();await h.close();}
+});
+
+for(const repair of [false,true])test('cached native '+(repair?'missing-source fallback':'copy')+' refreshes its counter after preflight waiting without a duplicate charge',pg,async()=>{
+  const entered=gate(),release=gate();let rejectMissing=false;
+  const h=await fixture({async copy(){if(rejectMissing){rejectMissing=false;entered.open();await release.promise;throw{response:{error_code:400,description:'Bad Request: message to copy not found'}};}}});try{
+    await h.budget.syncBalance('1000',{sourceKey:'synthetic-opening'});await h.attach();await h.poll();
+    rejectMissing=repair;
+    const running=h.attach(222,{copyOptions:repair?{}:{async beforeSend(){entered.open();await release.promise;}}});await entered.promise;
+    await h.attach(333,{cad:'77:17:0120316:998'});release.open();const result=await running;
+    assert.equal(result.result,'attached');assert.match(result.budget_text,/Заказано выписок: 2/);assert.match(result.budget_text,/осталось: 5/);
+    const copied=h.calls.copies.at(-1);assert.equal(Number(copied.chat_id),222);assert.match(copied.caption,/Заказано выписок: 2/);assert.match(copied.caption,/осталось: 5/);
+    if(repair){assert.equal(typeof h.calls.documents.at(-1).file,'string');assert.match(h.calls.documents.at(-1).extra.caption,/Заказано выписок: 2/);assert.match(h.calls.documents.at(-1).extra.caption,/осталось: 5/);}
+    assert.equal(h.calls.paid,2);const snapshot=await h.budget.snapshot();assert.equal(snapshot.confirmedOrders,2);assert.equal(snapshot.balanceKopecks,74200);assert.equal(snapshot.pendingOrders,0);
+  }finally{release.open();await h.close();}
+});
+
+test('an unavailable readonly counter cannot stop a confirmed original delivery or change its charge',pg,async()=>{
+  let failSnapshot=false;const h=await fixture({beforeQuery(sql){if(failSnapshot&&sql.startsWith('SELECT a.balance_kopecks'))throw new Error('Synthetic counter read failure');}});try{
+    await h.attach();h.api.qa.setStatus(async id=>{failSnapshot=true;return{id_req:id,status:[{type:'processed',file:Buffer.from('%PDF-1.7\n'+'A'.repeat(300)+'\n%%EOF').toString('base64')}]};});
+    await h.poll();assert.equal(h.calls.documents.length,1);assert.match(h.calls.documents[0].extra.caption,/Учёт заказов временно недоступен/);
+    assert.equal(Number((await h.pool.query('SELECT files_sent FROM egrn_orders')).rows[0].files_sent),1);failSnapshot=false;
+    assert.equal((await h.budget.snapshot()).confirmedOrders,1);assert.equal(h.calls.paid,1);
+  }finally{await h.close();}
+});
+
+for(const kind of ['native-primary','native-copy','native-repair'])test(kind+' reads its counter after a delayed delivery protocol preflight',pg,async()=>{
+  const entered=gate(),release=gate();let hold=false,missing=false;
+  const h=await fixture({async beforeDispatch(operation){if(hold&&operation.kind===kind){hold=false;entered.open();await release.promise;}},copy(){if(missing){missing=false;throw{response:{error_code:400,description:'Bad Request: message to copy not found'}};}}});try{
+    await h.budget.syncBalance('1000',{sourceKey:'synthetic-opening'});await h.attach();
+    if(kind!=='native-primary')await h.poll();
+    hold=true;missing=kind==='native-repair';const running=kind==='native-primary'?h.poll():h.attach(222);await entered.promise;
+    await h.attach(333,{cad:'77:17:0120316:998'});release.open();await running;
+    const caption=kind==='native-copy'?h.calls.copies.at(-1).caption:h.calls.documents.at(-1).extra.caption;
+    assert.match(caption,/Заказано выписок: 2/);assert.match(caption,/осталось: 5/);assert.equal(h.calls.paid,2);assert.equal((await h.budget.snapshot()).balanceKopecks,74200);
+  }finally{release.open();await h.close();}
+});
+
+test('source repair repeats the destination guard after accounting even when its safe upload target is the working group',pg,async()=>{
+  const entered=gate(),release=gate();let missing=true;
+  const h=await fixture({copy(value){if(missing&&Number(value.chat_id)===222){missing=false;throw{response:{error_code:400,description:'Bad Request: message to copy not found'}};}}});try{
+    await h.attach();await h.poll();const row=(await h.pool.query('SELECT * FROM egrn_orders ORDER BY id LIMIT 1')).rows[0];
+    await h.pool.query('CREATE TABLE cases(id INT PRIMARY KEY,lawyer_tg_id BIGINT)');await h.pool.query('INSERT INTO cases VALUES(39,222)');
+    const query=h.pool.query.bind(h.pool);let armed=true;
+    h.pool.query=async(sql,args)=>{
+      if(armed&&sql.startsWith('SELECT a.balance_kopecks')){
+        const current=(await h.db.query('SELECT delivery_state FROM egrn_orders WHERE id=$1',[row.id])).rows[0];
+        if(current.delivery_state?.inflight?.kind==='native-repair'){armed=false;entered.open();await release.promise;}
+      }
+      return query(sql,args);
+    };
+    const before=h.calls.documents.length,running=h.attach(222,{targets:[{chat:222,case_id:39}],copyOptions:{async beforeSend(){
+      const staff=(await h.pool.query('SELECT approved FROM staff WHERE tg_id=222')).rows[0];
+      if(!staff.approved)throw Object.assign(new Error('Revoked handoff recipient'),{code:'HANDOFF_RECIPIENT_UNAVAILABLE'});
+    }}});
+    await entered.promise;await h.pool.query('UPDATE staff SET approved=false WHERE tg_id=222');release.open();
+    await assert.rejects(running,error=>error.code==='HANDOFF_RECIPIENT_UNAVAILABLE'&&error.uncertain===false);
+    assert.equal(h.calls.documents.length,before);assert.equal(h.calls.copies.filter(value=>Number(value.chat_id)===222).length,1);assert.equal((await h.row(row.id)).delivery_state.inflight,undefined);assert.equal(h.calls.paid,1);
+  }finally{release.open();await h.close();}
 });
 
 test('failed recipient delivery resumes from native receipts without refetching or reuploading the original', pg, async () => {

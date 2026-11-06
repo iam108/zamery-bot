@@ -233,10 +233,7 @@ function setupReportsBot(bot) {
   bot.action('noop', function (ctx) { return ctx.answerCbQuery(); });
   bot.action(/^rmd:(\d+)$/, async function (ctx) {
     try {
-      var actor = (await pool.query('SELECT * FROM staff WHERE tg_id=$1', [ctx.from.id])).rows[0];
-      var client = (await pool.query('SELECT c.* FROM case_reminders r JOIN cases c ON c.id=r.case_id WHERE r.id=$1', [ctx.match[1]])).rows[0];
-      if (!client || !canAccessCase(actor, ctx.from.id, client)) return ctx.answerCbQuery('Этот клиент недоступен вашему аккаунту.', { show_alert: true });
-      await pool.query('UPDATE case_reminders SET done = true WHERE id=$1', [ctx.match[1]]);
+      if (!await require('./reminder-recipients').completeReminder(pool, ctx.match[1], ctx.from.id)) return ctx.answerCbQuery('Этот клиент недоступен вашему аккаунту.', { show_alert: true });
       var who = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ');
       try { await ctx.editMessageReplyMarkup({ inline_keyboard: [[{ text: '✅ Сделано · ' + who, callback_data: 'noop' }]] }); } catch (e) {}
       await ctx.answerCbQuery('Отмечено');
@@ -860,7 +857,7 @@ async function sendCaseReminders(bot) {
       var currentCase = null;
       var refreshAccess = async function () {
         currentCase = (await client.query('SELECT * FROM cases WHERE id=$1', [r.case_id])).rows[0];
-        var checked = await require('./reminder-recipients').loadRecipientAccess(client, currentCase, [r.created_by], Date.now());
+        var checked = await require('./reminder-recipients').loadRecipientAccess(client, currentCase, [r.created_by], Date.now(), { reminderId: r.id });
         currentCase = checked.client;
         var access = checked.access;
         access.next_at = reminderRetryAt(access.next_at,false);
@@ -881,9 +878,8 @@ async function sendCaseReminders(bot) {
             acknowledge: id => { receipts[chat] = id; },
             persist: () => client.query('UPDATE case_reminders SET delivery=$1 WHERE id=$2', [JSON.stringify(receipts), r.id]),
             beforeSend: async () => {
-              var latest = (await client.query('SELECT done FROM case_reminders WHERE id=$1', [r.id])).rows[0];
               var gate = await refreshAccess();
-              return !!latest && !latest.done && gate.checked && gate.allowed.includes(chat);
+              return gate.checked && gate.allowed.includes(chat);
             },
             send: () => bot.telegram.sendMessage(chat, text, { parse_mode: 'HTML', reply_markup: kb }),
           });
@@ -1668,9 +1664,7 @@ function setupHandoff(app) {
   app.post('/api/checklist/reminders/done', async function (req, res) {
     try {
       await ensureTables(); await ensureDeadlines();
-      var reminder = (await pool.query('SELECT c.* FROM case_reminders r JOIN cases c ON c.id=r.case_id WHERE r.id=$1', [parseInt(req.body.id) || 0])).rows[0];
-      if (!requireCase(req, res, reminder)) return;
-      await pool.query('UPDATE case_reminders SET done = true WHERE id=$1', [parseInt(req.body.id) || 0]);
+      if (!await require('./reminder-recipients').completeReminder(pool, parseInt(req.body.id) || 0, req.tgUser.id)) return res.status(403).json({ ok: false, code: 'CASE_FORBIDDEN', error: 'Этот клиент недоступен вашему аккаунту.' });
       res.json({ ok: true });
     }
     catch (e) { console.error(e); res.json({ ok: false, error: e.message }); }
@@ -2600,8 +2594,16 @@ function checklistClient() {
   var LKEY = 'zamery_cl_' + CASE.id;
   function backup() { try { localStorage.setItem(LKEY, JSON.stringify({ t: Date.now(), d: D, noteBase: noteBase, revision: checklistRevision })); } catch (e) {} }
   function dropBackup() { try { localStorage.removeItem(LKEY); } catch (e) {} }
+  function sameSnapshot(left, right) {
+    function ordered(key, value) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+      var result = {}; Object.keys(value).sort().forEach(function (name) { result[name] = value[name]; }); return result;
+    }
+    return JSON.stringify(left, ordered) === JSON.stringify(right, ordered);
+  }
   function changed() {
     try { updateEcp(); } catch (e) {}
+    if (inFlight) dirty = true;
     backup();
     setSt('saving', 'Сохраняю…');
     summary();
@@ -2628,34 +2630,58 @@ function checklistClient() {
 
   // Один запрос за раз; всё, что изменилось во время отправки, уйдёт следующим запросом.
   // При отказе сервера (лимит, обрыв связи) — повтор с паузой 3 → 6 → 12 → 24 → 30 с, пока не сохранится.
-  var inFlight = false, dirty = false, failCount = 0, retryTimer = null, countdown = null;
+  var inFlight = false, dirty = false, failCount = 0, retryTimer = null, countdown = null, pendingSave = null;
   var lastSaved = JSON.stringify(D), retryAfter = 0;
-  async function flush() {
+  async function checklistRequest(url, options, consume) {
+    var controller = typeof AbortController === 'function' ? new AbortController() : null, deadlineTimer;
+    var requestOptions = Object.assign({}, options);
+    if (controller) requestOptions.signal = controller.signal;
+    var deadline = new Promise(function (_, reject) {
+      deadlineTimer = setTimeout(function () {
+        var error = new Error('Сервер не ответил вовремя. Повторите попытку.'); error.code = 'CHECKLIST_TIMEOUT';
+        reject(error);
+        if (controller) try { controller.abort(); } catch (_) {}
+      }, 30000);
+    });
+    try { return await Promise.race([Promise.resolve(fetch(url, requestOptions)).then(consume), deadline]); }
+    finally { clearTimeout(deadlineTimer); }
+  }
+  function flush() {
     clearTimeout(timer);
-    if (inFlight) { dirty = true; return; }
+    if (pendingSave) { dirty = true; return pendingSave; }
+    var operation = saveChanges();
+    pendingSave = operation;
+    var finished = function () { if (pendingSave === operation) pendingSave = null; };
+    operation.then(finished, finished);
+    return operation;
+  }
+  async function saveChanges() {
     clearTimeout(retryTimer); clearInterval(countdown);
     if (checklistConflict) {
       setSt('err', 'Чек-лист изменился в другом окне. Нажмите, чтобы сохранить копию и открыть актуальные ответы.');
-      return;
+      return false;
     }
     if (noteConflict !== null) {
       setSt('err', 'Заметка изменилась в другом окне. Нажмите здесь, чтобы сохранить свой черновик.');
-      return;
+      return false;
     }
     var s = stats();
     var sentNote = D._comment || '';
     var body = JSON.stringify({ case_id: CASE.id, data: D, done: s.done, total: s.total, expectedNote: noteBase, expectedRevision: checklistRevision });
     var snapshot = JSON.stringify(D);
-    if (snapshot === lastSaved) { dropBackup(); setSt('ok', 'Сохранено'); return; } // ничего не изменилось — не нагружаем сервер
+    if (snapshot === lastSaved) { noteBase = sentNote; dropBackup(); setSt('ok', 'Сохранено'); return true; } // ничего не изменилось — не нагружаем сервер
     inFlight = true; dirty = false;
     var ok = false, why = '', savedNote = sentNote;
     try {
-      var r = await fetch('/api/checklist/save', {
+      var received = await checklistRequest('/api/checklist/save', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: body
+      }, async function (response) {
+        return { response: response, text: await response.text() };
       });
+      var r = received.response;
       retryAfter = parseInt(r.headers.get('Retry-After')) || 0;
-      var txt = await r.text(), j = null;
+      var txt = received.text, j = null;
       try { j = JSON.parse(txt); } catch (pe) {}
       ok = !!(j && j.ok);
       if (ok && typeof j.note === 'string') savedNote = j.note;
@@ -2671,12 +2697,12 @@ function checklistClient() {
           : (r.status === 429 || /^rate limited/i.test(snippet) ? 'сервер занят' : 'ошибка') + ' [' + r.status + (snippet ? ': ' + snippet : '') + ']';
         console.log('save failed', r.status, j && j.code || '');
       }
-    } catch (e) { why = 'нет связи'; }
+    } catch (e) { why = e.code === 'CHECKLIST_TIMEOUT' ? 'сервер не ответил вовремя' : 'нет связи'; }
     inFlight = false;
-    if (checklistConflict) { backup(); setSt('err', 'Чек-лист изменился в другом окне. Нажмите, чтобы сохранить копию и открыть актуальные ответы.'); return; }
+    if (checklistConflict) { backup(); setSt('err', 'Чек-лист изменился в другом окне. Нажмите, чтобы сохранить копию и открыть актуальные ответы.'); return false; }
     if (noteConflict !== null) {
       setSt('err', 'Заметка изменилась в другом окне. Нажмите здесь, чтобы сохранить свой черновик.');
-      return;
+      return false;
     }
     if (ok) {
       var draftNote = D._comment || '';
@@ -2684,7 +2710,7 @@ function checklistClient() {
         noteConflict = savedNote;
         backup();
         setSt('err', 'Заметка изменилась в другом окне. Нажмите здесь, чтобы сохранить свой черновик.');
-        return;
+        return false;
       }
       noteBase = savedNote;
       if (sentNote !== savedNote) {
@@ -2698,9 +2724,9 @@ function checklistClient() {
         snapshot = JSON.stringify(savedData);
       }
       failCount = 0; lastSaved = snapshot;
-      if (dirty) { backup(); setSt('saving', 'Сохраняю…'); timer = setTimeout(flush, 400); }
+      if (dirty || JSON.stringify(D) !== snapshot) { backup(); setSt('saving', 'Сохраняю…'); timer = setTimeout(flush, 400); }
       else { dropBackup(); setSt('ok', 'Сохранено'); }
-      return;
+      return true;
     }
     failCount++;
     var wait = Math.max(Math.min(retryAfter, 120), Math.min(40, 5 * Math.pow(2, failCount - 1)));
@@ -2711,10 +2737,12 @@ function checklistClient() {
       if (left > 0) setSt('err', 'Не сохранено (' + why + '), повтор через ' + left + ' с');
     }, 1000);
     retryTimer = setTimeout(function () { clearInterval(countdown); setSt('saving', 'Сохраняю…'); flush(); }, wait * 1000);
+    return false;
   }
   // Свернули Telegram или закрыли чек-лист — сохраняем сразу
   document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') flush(); });
   window.addEventListener('pagehide', function () { flush(); });
+  window.addEventListener('online', function () { failCount = 0; flush(); });
   // Тап по статусу — сохранить прямо сейчас
   document.getElementById('st').onclick = function () {
     if (checklistConflict) {
@@ -2739,16 +2767,26 @@ function checklistClient() {
     }
     failCount = 0; flush();
   };
-  document.getElementById('printBtn').onclick = function () {
+  document.getElementById('printBtn').onclick = async function () {
     // Внутри Telegram печать не работает — открываем версию для печати в браузере (там «Сохранить как PDF»)
-    failCount = 0; flush();
-    fetch('/api/checklist/printlink', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ case_id: CASE.id }) })
-      .then(function (r) { return r.json(); })
-      .then(function (j) {
-        if (!j.ok) throw new Error(j.error || 'нет доступа');
-        if (tg && tg.openLink && tg.initData) tg.openLink(j.url); else location.href = j.url;
-      })
-      .catch(function (e) { alertMsg('Не удалось открыть печать: ' + e.message); });
+    var button = document.getElementById('printBtn');
+    if (button.disabled) return;
+    button.disabled = true;
+    async function saveLatest() {
+      do {
+        if (!await flush()) throw new Error('Сначала сохраните актуальные ответы. Проверьте сообщение внизу чек-листа.');
+      } while (inFlight || JSON.stringify(D) !== lastSaved);
+    }
+    try {
+      failCount = 0;
+      await saveLatest();
+      var j = await checklistRequest('/api/checklist/printlink', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ case_id: CASE.id }) }, function (response) { return response.json(); });
+      if (!j.ok) throw new Error(j.error || 'нет доступа');
+      // The lawyer can keep typing while the navigation link is loading.
+      await saveLatest();
+      if (tg && tg.openLink && tg.initData) tg.openLink(j.url); else location.href = j.url;
+    } catch (e) { alertMsg('Не удалось открыть печать: ' + e.message); }
+    finally { button.disabled = false; }
   };
   if (/[?&]print=1/.test(location.search)) {
     Object.keys(OPEN).forEach(function (k) { OPEN[k] = true; });
@@ -2760,12 +2798,18 @@ function checklistClient() {
   try {
     var bk = JSON.parse(localStorage.getItem(LKEY) || 'null');
     if (bk && bk.d && Date.now() - bk.t < 7 * 24 * 3600 * 1000) {
-      var noteProtected = D._workspaceNote === true;
-      D = bk.d; restored = true;
-      if (Number.isSafeInteger(bk.revision)) { checklistConflict = bk.revision !== checklistRevision; checklistRevision = bk.revision; }
-      else checklistConflict = true;
-      if (typeof bk.noteBase === 'string') noteBase = bk.noteBase;
-      else if (noteProtected && (D._comment || '') !== noteBase) noteConflict = noteBase;
+      if (sameSnapshot(bk.d, D)) {
+        // The previous request committed before its ACK was lost. Keep the
+        // complete current server snapshot and its revision/note baseline.
+        dropBackup();
+      } else {
+        var noteProtected = D._workspaceNote === true;
+        D = bk.d; restored = true;
+        if (Number.isSafeInteger(bk.revision)) { checklistConflict = bk.revision !== checklistRevision; checklistRevision = bk.revision; }
+        else checklistConflict = true;
+        if (typeof bk.noteBase === 'string') noteBase = bk.noteBase;
+        else if (noteProtected && (D._comment || '') !== noteBase) noteConflict = noteBase;
+      }
     }
   } catch (e) {}
   render();

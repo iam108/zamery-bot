@@ -86,7 +86,7 @@ function harness(options = {}) {
     };
   }
   const context = { module: { exports: {} }, Buffer, URL, process: { env: { GROUP_CHAT_ID: options.group || GROUP, WEBAPP_URL: 'https://audit.example' } },
-    console: { log() {}, error() {} }, setTimeout: () => ({ unref() {} }), require(name) {
+    console: { log() {}, error() {} }, setTimeout: (fn,ms) => { options.timer?.(fn,ms);return { unref() {} }; }, require(name) {
       if (name === '../db/queries') return { getOrderById: async () => ({ telegram_msg_id: 77 }) };
       if (name === '../web/handoff') return { saveAudit: async (...args) => { if (options.saveFailure) await options.saveFailure(); saves.push(args); events.push({ method: 'saveAudit', args }); } };
       if (name === '../web/order-report-link') return { ...require('../src/web/order-report-link'), syncOrderReportLink: async (...args) => { events.push({ method: 'syncOrderReportLink', args }); return options.linkSync ? options.linkSync(...args) : { state: 'linked' }; } };
@@ -99,6 +99,32 @@ function harness(options = {}) {
 }
 function keyboard(h) { return h.events.filter(e => e.method === 'editMessageReplyMarkup').at(-1)?.args[3]?.inline_keyboard.flat() || []; }
 function onceFailure(target, detail = 'Telegram rejected ' + target) { let hit = false; return async method => { if (method === target && !hit) { hit = true; throw Object.assign(new Error(detail), { response: { error_code: 400, description: detail } }); } }; }
+
+for(const target of ['sendMessage','sendMediaGroup','sendDocument'])for(const code of [502,undefined,400])test(target+' does not automatically retry an ambiguous/ordinary error merely carrying retry_after: '+code,async()=>{
+  const holder={value:{}},data=report(),waits=[];let requests=0;
+  const h=harness({holder,timer(fn,ms){if(ms<=31000){waits.push(ms);queueMicrotask(fn);}},response(method){if(method===target&&++requests===1)throw Object.assign(new Error('Synthetic acknowledgement failure'),{response:{...(code==null?{}:{error_code:code}),parameters:{retry_after:1}}});}});
+  await assert.rejects(h.send(data),error=>code===400?error.code!=='AUDIT_DELIVERY_UNKNOWN':error.code==='AUDIT_DELIVERY_UNKNOWN');
+  assert.equal(requests,1);assert.deepEqual(waits,[]);assert.equal(!!holder.value.inflight,code!==400);assert.equal(h.saves.length,0);
+  const retry=harness({holder});if(code===400)await retry.send(data);else await assert.rejects(retry.send(data),error=>error.code==='AUDIT_DELIVERY_UNKNOWN');
+  if(code!==400)assert.equal(retry.delivered.length,0);
+});
+
+for(const target of ['sendMessage','sendMediaGroup','sendDocument'])test(target+' retries a confirmed short 429 refusal and delivers each report part once',async()=>{
+  const waits=[];let requests=0;
+  const h=harness({timer(fn,ms){if(ms<=31000){waits.push(ms);queueMicrotask(fn);}},response(method){if(method===target&&++requests===1)throw{response:{error_code:429,parameters:{retry_after:1}}};}});
+  await h.send(report());assert.equal(requests,2);assert.deepEqual(waits,[2000]);assert.equal(h.holder.value.inflight,undefined);assert.equal(h.saves.length,1);
+  assert.equal(h.delivered.filter(item=>item.kind==='text').length,1);assert.equal(h.delivered.filter(item=>item.kind==='photo').length,4);assert.equal(h.delivered.filter(item=>item.kind==='document').length,1);
+});
+
+for(const wait of ['1',true,0,-1,1.5,Infinity,31,Number.MAX_SAFE_INTEGER+1])test('an invalid or long 429 wait is returned as a known refusal without holding the submission: '+wait,async()=>{
+  let requests=0;const waits=[],h=harness({timer(fn,ms){if(ms<=31000){waits.push(ms);queueMicrotask(fn);}},response(method){if(method==='sendMessage'){requests++;throw{response:{error_code:429,parameters:{retry_after:wait}}};}}});
+  await assert.rejects(h.send(report()),error=>error.response?.error_code===429);assert.equal(requests,1);assert.deepEqual(waits,[]);assert.equal(h.holder.value.inflight,undefined);assert.equal(h.saves.length,0);
+});
+
+test('confirmed 429 retries have a finite total wait and leave an exhausted refusal safe for deliberate retry',async()=>{
+  let requests=0;const waits=[],h=harness({timer(fn,ms){if(ms<=31000){waits.push(ms);queueMicrotask(fn);}},response(method){if(method==='sendMessage'){requests++;throw{response:{error_code:429,parameters:{retry_after:30}}};}}});
+  await assert.rejects(h.send(report()),error=>error.response?.error_code===429);assert.equal(requests,4);assert.deepEqual(waits,[31000,31000,31000]);assert.equal(h.holder.value.inflight,undefined);
+});
 
 for (const target of ['sendMessage', 'sendMediaGroup', 'sendDocument']) test('lost ' + target + ' acknowledgement blocks automatic resend in the same process and after restart', async () => {
   const holder = { value: {} }, data = report(); let accepted = 0;
