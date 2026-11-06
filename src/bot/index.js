@@ -15,6 +15,7 @@ function setupBot() {
   const pool = require('../db/pool');
   require('./report-link-admin').setupReportLinkAdmin(bot, { pool });
   require('./order-delivery-admin').setupOrderDeliveryAdmin(bot, { pool });
+  require('./handoff-status-admin').setupHandoffStatusAdmin(bot, { pool });
   const { ensureStaff, canManageCases } = require('../web/auth');
   const { parsePairing, approvePairing, canPair } = require('../web/workspace');
   const { esc } = require('./formatter');

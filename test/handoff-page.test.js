@@ -34,7 +34,7 @@ function harness(options = {}) {
   async function fetch(url, init = {}) {
     calls.push(['fetch', url, init]);
     if (url.startsWith('/api/handoff/prefill')) return response(options.prefill || responses.prefill);
-    if (url.startsWith('/api/handoff/packet')) { packetRequests++; if (options.packetError && packetRequests === 1) throw new Error('Сеть недоступна'); return response(responses.packet); }
+    if (url.startsWith('/api/handoff/packet')) { packetRequests++; if (options.packetFetch) return options.packetFetch(url, packetRequests, response); if (options.packetError && packetRequests === 1) throw new Error('Сеть недоступна'); return response(responses.packet); }
     if (url === '/api/handoff' && init.method === 'POST') { postRequests++; if (options.post) return options.post(postRequests, JSON.parse(init.body)); return response({ ok: true, id: 75, delivery_complete: true }); }
     if (url.startsWith('/api/reports/search')) return response({ ok: true, items: options.searchItems || [] });
     if (url.startsWith('/api/reports/get')) return response({ ok: true, text: 'Аудитор: @only-auditor\nКомментарий: не превращать в контакт', metadata: { org: 'ООО Тест', address: 'Москва, Тестовая, 1', service: 'Получение' } });
@@ -53,6 +53,58 @@ function harness(options = {}) {
   return { context, node, nodes, calls, stored, events, revoked, created, responses, response, postRequests: () => postRequests, packetRequests: () => packetRequests, cached: () => JSON.parse(stored.get('handoff-v2:staff:order-60') || 'null') };
 }
 function lawyer(h) { h.node('lawyers').value = '108'; h.node('lawyers').onchange(); }
+
+for(const contacts of [[],[{name:'',phone:'',tg:'',comment:'Контакт пока не предоставлен'}]])test('order-bound confirmation requires a usable client contact before opening review: '+JSON.stringify(contacts),async()=>{
+  const p=packet();p.order.contacts=contacts;const h=harness({packet:p});await pause();lawyer(h);h.node('go').click();
+  assert.equal(h.node('review').hidden,true);assert.match(h.node('form-error').textContent,/контакт/i);assert.equal(h.node('details').open,true);
+  h.node('confirm-send').click();await pause();assert.equal(h.postRequests(),0);
+});
+
+test('phone-only and Telegram-only client contacts remain valid for an order-bound handoff',async()=>{
+  for(const contact of [{phone:'+79991234567'},{tg:'@synthetic_client'}]){
+    const p=packet();p.order.contacts=[contact];const h=harness({packet:p});await pause();lawyer(h);h.node('go').click();
+    assert.equal(h.node('review').hidden,false);assert.equal(h.node('form-error').textContent,'');
+  }
+});
+
+test('a failed known-order report packet stays blocked and retry retains V2 order and original-file identity',async()=>{
+  const bodies=[],h=harness({query:'?request_id=9',prefill:{ok:true,lawyers:[{tg_id:108,name:'Елена'}],request:{f:{org:'ООО Пример',address:'Москва, Тестовая, 1',kind:'Общепит',region:'МСК',service:'Получение',client:'Карина',phone:'+79991234567'}}},packetError:true,
+    searchItems:[{src:'a',id:15,order_id:60,text:'Saved report for source order'}],post:async(n,body)=>{bodies.push(body);return h.response({ok:true,id:75,delivery_complete:true});}});
+  await pause();h.node('choose-report').click();await pause();h.node('search-results').children[0].click();await pause();
+  assert.equal(h.node('packet-error').hidden,false);assert.equal(h.node('go').disabled,true);assert.equal(h.calls.some(call=>call[0]==='fetch'&&call[1].startsWith('/api/reports/get')),false);
+  h.node('confirm-send').click();await pause();assert.equal(h.postRequests(),0);
+  h.node('retry-load').click();await pause();assert.equal(h.node('packet-error').hidden,true);lawyer(h);h.node('go').click();h.node('confirm-send').click();await pause();
+  assert.equal(bodies.length,1);assert.equal(bodies[0].handoff_version,2);assert.equal(bodies[0].order_id,60);assert.equal(bodies[0].report_id,15);assert.equal(bodies[0].packet_signature,packet().signature);
+  const urls=h.calls.filter(call=>call[0]==='fetch'&&call[1].startsWith('/api/handoff/packet')).map(call=>new URL(call[1],'https://bot.example'));
+  assert.equal(urls.length,2);assert.ok(urls.every(url=>url.searchParams.get('order_id')==='60'&&url.searchParams.get('report_id')==='15'));
+});
+
+for (const failure of ['network', '500']) test('report search without an order hint never downgrades a '+failure+' packet failure to a legacy send', async () => {
+  const h=harness({query:'?request_id=9',prefill:{ok:true,lawyers:[{tg_id:108,name:'Елена'}],request:{f:{org:'ООО Пример',address:'Москва, Тестовая, 1',kind:'Общепит',region:'МСК',service:'Получение',client:'Карина'}}},searchItems:[{src:'a',id:15}],
+    packetFetch:async(url,n,response)=>{if(n===1){if(failure==='network')throw new Error('Сеть недоступна');return{ok:false,status:500,json:async()=>({ok:false,error:'Комплект временно недоступен'})};}return response(packet());}});
+  await pause();h.node('choose-report').click();await pause();h.node('search-results').children[0].click();await pause();
+  assert.equal(h.calls.some(call=>call[0]==='fetch'&&call[1].startsWith('/api/reports/get')),false);
+  assert.equal(h.node('packet-error').hidden,false);assert.equal(h.node('go').disabled,true);
+  h.node('retry-load').click();await pause();assert.equal(h.node('packet-error').hidden,true);lawyer(h);h.node('go').click();h.node('confirm-send').click();await pause();
+  const body=JSON.parse(h.calls.find(call=>call[1]==='/api/handoff')[2].body);assert.equal(body.order_id,60);assert.equal(body.report_id,15);assert.equal(body.handoff_version,2);
+  const urls=h.calls.filter(call=>call[0]==='fetch'&&call[1].startsWith('/api/handoff/packet')).map(call=>new URL(call[1],'https://bot.example'));
+  assert.equal(urls.length,2);assert.ok(urls.every(url=>url.searchParams.get('report_id')==='15'));
+});
+
+test('a successful packet explicitly without an order keeps a legacy report available', async () => {
+  const p=packet();p.order=null;p.report={...p.report,id:21,src:'r'};p.materials=[];
+  const h=harness({query:'?request_id=9',packet:p,prefill:{ok:true,lawyers:[{tg_id:108,name:'Елена'}],request:{f:{org:'ООО Пример',address:'Москва, Тестовая, 1',kind:'Общепит',region:'МСК',service:'Получение',client:'Карина'}}},searchItems:[{src:'r',id:21}]});
+  await pause();h.node('choose-report').click();await pause();h.node('search-results').children[0].click();await pause();lawyer(h);h.node('go').click();h.node('confirm-send').click();await pause();
+  const body=JSON.parse(h.calls.find(call=>call[1]==='/api/handoff')[2].body);assert.equal(body.order_id,null);assert.equal(body.report_id,21);assert.equal(body.report_src,'r');assert.equal(body.handoff_version,undefined);
+});
+
+for(const olderFails of [false,true]) test('a late '+(olderFails?'failed':'successful')+' packet cannot replace the latest chosen report',async()=>{
+  let release;const gate=new Promise(resolve=>{release=resolve;});const h=harness({searchItems:[{src:'a',id:16,order_id:60},{src:'a',id:17,order_id:60}],packetFetch:async(url,n,response)=>{const id=Number(new URL(url,'https://bot.example').searchParams.get('report_id'));if(id===16){await gate;if(olderFails)throw new Error('Older request failed');}const p=packet();if(id){p.report.id=id;p.report.text='Report '+id;p.signature='snapshot-'+id;}return response(p);}});
+  await pause();h.node('choose-report').click();await pause();h.node('search-results').children[0].click();await pause();h.node('search-results').children[1].click();await pause();
+  h.node('open-report').click();assert.equal(h.node('report-text').textContent,'Report 17');h.node('report-close').click();release();await pause();
+  h.node('open-report').click();assert.equal(h.node('report-text').textContent,'Report 17');h.node('report-close').click();assert.equal(h.node('packet-error').hidden,true);assert.equal(h.node('go').disabled,false);
+  lawyer(h);h.node('go').click();h.node('confirm-send').click();await pause();const body=JSON.parse(h.calls.find(call=>call[1]==='/api/handoff')[2].body);assert.equal(body.report_id,17);assert.equal(body.packet_signature,'snapshot-17');
+});
 
 test('package counts describe actual saved files, not source screenshots as extra plans', () => {
   const p = packet(), info = M.packageInfo(p);
@@ -292,11 +344,39 @@ test('legacy request selecting a verified audit binds the full V2 order package 
   assert.equal(body.packet_signature, 'immutable-snapshot'); assert.equal(body.report_src, 'a'); assert.equal(body.report_id, 15);
 });
 
+for(const cachedKind of ['none','completed','legacy-pending'])test('legacy assignment without delivery proof stays explicitly unknown despite '+cachedKind+' session state',async()=>{
+  const p=packet(),source=M.profile(p.order);p.assignment={case_id:75,lawyer_name:'Мария',submit_id:null};
+  const previous={version:2,fingerprint:M.fingerprint(source),packetSignature:p.signature,lawyer:'109'};
+  if(cachedKind==='completed')previous.completed={id:75,name:'Мария'};
+  if(cachedKind==='legacy-pending')previous.pending={caseId:75,payload:{order_id:60,report_src:'a',report_id:15},name:'Мария'};
+  const h=harness({packet:p,stored:cachedKind==='none'?{}:{'handoff-v2:staff:order-60':JSON.stringify(previous)}});await pause();
+  assert.equal(h.node('delivery-title').textContent,'Юрист назначен: Мария');assert.equal(h.node('delivery-text').textContent,'Клиент №75. Подтверждение доставки не сохранено. Нужна проверка доставки.');
+  assert.equal(h.node('retry-send').hidden,true);h.node('retry-send').click();h.node('confirm-send').click();await pause();assert.equal(h.postRequests(),0);assert.equal(h.node('open-report').disabled,false);
+});
+
+test('a confirmed saved delivery remains distinct from an assignment whose delivery is incomplete',async()=>{
+  const p=packet();p.assignment={case_id:75,lawyer_name:'Мария',delivery_complete:true};const h=harness({packet:p});await pause();
+  assert.equal(h.node('delivery-title').textContent,'Уже передано: Мария');assert.match(h.node('delivery-text').textContent,/Доставка полного комплекта подтверждена/);assert.equal(h.node('retry-send').hidden,true);
+});
+
+test('a fresh resumable assignment button invokes only the existing case recovery endpoint',async()=>{
+  const bodies=[],p=packet();p.assignment={case_id:75,lawyer_name:'Мария',delivery_complete:false,can_resume:true,submit_id:'existing-job'};
+  const h=harness({packet:p,post:async(_,body)=>{bodies.push(body);return h.response({ok:true,id:75,delivery_complete:true});}});await pause();
+  assert.equal(h.node('retry-send').hidden,false);h.node('retry-send').click();await pause();assert.equal(bodies.length,1);assert.deepEqual(bodies[0],{resume_case_id:75});assert.match(h.node('delivery-title').textContent,/Передано/);
+});
+
+test('an unconfirmed recovery response shows its warning in the visible delivery card and disables blind retry',async()=>{
+  const p=packet();p.assignment={case_id:75,lawyer_name:'Мария',delivery_complete:false,can_resume:true,submit_id:'existing-job'};
+  const h=harness({packet:p,post:async()=>h.response({ok:true,id:75,delivery_complete:false,manual_review:true,retry:false,warn:'Telegram мог принять часть комплекта. Проверьте личный чат.'})});await pause();
+  h.node('retry-send').click();await pause();assert.equal(h.postRequests(),1);assert.equal(h.node('delivery-title').textContent,'Юрист назначен: Мария');assert.match(h.node('delivery-text').textContent,/Подтверждение доставки не сохранено/);assert.match(h.node('delivery-text').textContent,/Telegram мог принять/);assert.equal(h.node('retry-send').hidden,true);
+  h.node('retry-send').click();await pause();assert.equal(h.postRequests(),1);
+});
+
 test('an assigned order reopened in a new session cannot create another client, while the full report stays accessible', async () => {
   const p = packet(); p.assignment = { case_id: 75, lawyer_name: 'Мария', delivery_complete: false, submit_id: 'existing-job' };
   const h = harness({ packet: p }); await pause();
   assert.equal(h.node('go').disabled, true); assert.equal(h.node('assignment').hidden, true);
-  assert.equal(h.node('delivery-title').textContent, 'Уже передано: Мария');
+  assert.equal(h.node('delivery-title').textContent, 'Юрист назначен: Мария');
   assert.match(h.node('delivery-text').textContent, /75/); assert.match(h.node('delivery-text').textContent, /не завершена/);
   assert.equal(h.node('retry-send').hidden, true); assert.equal(h.node('details-editable').disabled, true);
   h.node('open-report').click(); await pause(); assert.equal(h.node('report-dialog').open, true);
@@ -317,14 +397,14 @@ test('matching cached pending submit id resumes its partially assigned case even
 test('a cached pending attempt for another assignment is blocked instead of retrying the wrong lawyer', async () => {
   const p = packet(), source = M.profile(p.order); p.assignment = { case_id: 80, lawyer_name: 'Мария', delivery_complete: false, submit_id: 'actual-job' };
   const h = harness({ packet: p, stored: { 'handoff-v2:staff:order-60': JSON.stringify({ version: 2, fingerprint: M.fingerprint(source), lawyer: '108', pending: { payload: { submit_id: 'different-job', order_id: 60 }, name: 'Елена' } }) } }); await pause();
-  assert.equal(h.node('delivery-title').textContent, 'Уже передано: Мария'); assert.equal(h.node('retry-send').hidden, true); assert.equal(h.node('assignment').hidden, true);
+  assert.equal(h.node('delivery-title').textContent, 'Юрист назначен: Мария'); assert.equal(h.node('retry-send').hidden, true); assert.equal(h.node('assignment').hidden, true);
   h.node('retry-send').click(); await pause(); assert.equal(h.postRequests(), 0);
 });
 
 test('an already-assigned server rejection shows the actual recipient and case without offering another send', async () => {
   const h = harness({ post: () => ({ ok: false, status: 409, json: async () => ({ ok: false, code: 'HANDOFF_ALREADY_ASSIGNED', error: 'Клиент уже передан другому юристу.', case_created: true, manual_review: true, retry: false, case_id: 81, lawyer_name: 'Мария', delivery_complete: false }) }) });
   await pause(); lawyer(h); h.node('go').click(); h.node('confirm-send').click(); await pause();
-  assert.equal(h.node('delivery-title').textContent, 'Уже передано: Мария'); assert.match(h.node('delivery-text').textContent, /81/);
+  assert.equal(h.node('delivery-title').textContent, 'Юрист назначен: Мария'); assert.match(h.node('delivery-text').textContent, /81/);
   assert.equal(h.node('assignment').hidden, true); assert.equal(h.node('retry-send').hidden, true); assert.equal(h.node('open-report').disabled, false);
   h.node('retry-send').click(); await pause(); assert.equal(h.postRequests(), 1);
 });

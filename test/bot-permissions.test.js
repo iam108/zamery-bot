@@ -29,6 +29,7 @@ function harness(staff = { tg_id: 42, role: 'auditor', approved: true }, options
       if (name === '../web/manager-orders') return { cardOptions: require('../src/web/manager-orders').cardOptions };
       if (name === './report-link-admin') return require('../src/bot/report-link-admin');
       if (name === './order-delivery-admin') return require('../src/bot/order-delivery-admin');
+      if (name === './handoff-status-admin') return require('../src/bot/handoff-status-admin');
       if (name === './staff-approval') return require('../src/bot/staff-approval');
       if (name === '../web/order-report-link') return { loadOrderReportLink: options.loadOrderReportLink || (async () => null) };
       if (name === '../db/order-delivery-lock') return { withOrderDeliveryLock: options.withOrderDeliveryLock || (async (id, run) => run()) };
@@ -205,7 +206,7 @@ test('the personal client list cannot disclose names through a group command',as
 
 test('manager delivery recovery commands are registered and ignore unauthorized chat users',async()=>{
   const h=harness();
-  for(const command of ['order_delivery','order_delivery_retry']){
+  for(const command of ['order_delivery','order_delivery_retry','handoff_status']){
     assert.equal(typeof h.commands.get(command),'function');
     await h.commands.get(command)({...h.ctx(),callbackQuery:null,message:{message_id:301,text:'/'+command+' 17'}});
   }

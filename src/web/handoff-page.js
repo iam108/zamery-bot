@@ -51,7 +51,7 @@ function handoffClient() {
   var userId = tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id || query.get('u') || sessionValue('tg_u') || 'staff';
   var cacheKey = 'handoff-v2:' + userId + ':' + (orderId ? 'order-' + orderId : requestId ? 'request-' + requestId : 'new');
   var S = { profile: {}, source: {}, sourceLoaded: false, sourceContacts: [], contacts: [], lawyer: null, lawyers: [], priority: 'обычный', comment: '', packet: null, report: null, selectedReport: null, egrnOrder: false, submitId: uuid(), pending: null, completed: null, existingAssignment: null, loading: true, packetError: '', error: '', review: false, sending: false };
-  var layer = '', reportFocus = null, zoomFocus = null, imageEpoch = 0, imageUrls = [], imageControllers = [], zoomScale = 1, searchTimer, searchSequence = 0;
+  var layer = '', reportFocus = null, zoomFocus = null, imageEpoch = 0, imageUrls = [], imageControllers = [], zoomScale = 1, searchTimer, searchSequence = 0, packetSequence = 0;
   function sessionValue(key) { try { return sessionStorage.getItem(key); } catch (_) { return ''; } }
   function uuid() { return window.crypto && window.crypto.randomUUID ? window.crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) { var n = Math.floor(Math.random() * 16); return (c === 'x' ? n : (n & 3) | 8).toString(16); }); }
   function save() {
@@ -139,9 +139,9 @@ function handoffClient() {
     $('page-subtitle').textContent = readonly ? 'Материалы осмотра и оригиналы' : 'Объект, готовый комплект и ответственный';
     $('delivery').hidden = readonly || !locked;
     if (S.existingAssignment) {
-      var assignment = S.existingAssignment;
-      $('delivery-title').textContent = 'Уже передано: ' + (assignment.lawyer_name || 'юристу');
-      $('delivery-text').textContent = 'Клиент №' + assignment.case_id + '.' + (assignment.delivery_complete === false ? ' Доставка этого комплекта ещё не завершена. Повторное создание клиента недоступно.' : ' Материалы отчёта можно открыть выше.');
+      var assignment = S.existingAssignment, confirmed = assignment.delivery_complete === true && assignment.manual_review !== true, incomplete = assignment.delivery_complete === false && assignment.manual_review !== true;
+      $('delivery-title').textContent = (confirmed ? 'Уже передано: ' : 'Юрист назначен: ') + (assignment.lawyer_name || 'юристу');
+      $('delivery-text').textContent = 'Клиент №' + assignment.case_id + '.' + (confirmed ? ' Доставка полного комплекта подтверждена. Материалы отчёта можно открыть выше.' : incomplete ? ' Доставка этого комплекта ещё не завершена. Повторное создание клиента недоступно.' : ' Подтверждение доставки не сохранено. Нужна проверка доставки.') + (assignment.message ? ' ' + assignment.message : '');
       $('retry-send').hidden = assignment.can_resume !== true;
       $('retry-send').disabled = S.sending;
       $('retry-send').textContent = S.sending ? 'Продолжаю доставку…' : 'Продолжить доставку';
@@ -169,11 +169,13 @@ function handoffClient() {
     var p = S.profile, rep = S.packet && S.packet.report || S.report;
     return Object.assign({ order_id: orderId ? Number(orderId) : null, request_id: requestId ? Number(requestId) : null, lawyer_tg_id: S.lawyer, priority: S.priority, comment: S.comment.trim(), contacts: M.contacts(S.contacts), egrn_order: S.egrnOrder === true, report_src: rep ? rep.src : null, report_id: rep ? rep.id : null, audit_text: rep ? rep.text || '' : '', tg_user_id: tg && tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user.id : null }, p, orderId ? { handoff_version: 2, submit_id: S.submitId, packet_signature: S.packet && S.packet.signature } : {});
   }
+  function hasClientContact() { return S.contacts.some(function (contact) { return M.text(contact.name) || M.text(contact.phone) || M.text(contact.tg); }); }
   function validation() {
     if (!S.lawyer || !assignmentName()) return 'Выберите юриста, которому передать клиента.';
     if (!M.text(S.profile.org)) return 'Укажите организацию в карточке объекта.';
     if (!M.text(S.profile.address)) return 'Укажите адрес в карточке объекта.';
     if (!M.text(S.profile.kind) || !M.text(S.profile.service)) return 'Укажите тип объекта и услугу в карточке объекта.';
+    if (orderId && !hasClientContact()) return 'Добавьте контакт клиента: имя, телефон или Telegram.';
     if (orderId && !S.packet) return 'Комплект ещё не загружен. Повторите загрузку.';
     if (S.egrnOrder && !M.text(S.profile.cad_num)) return 'Для заказа ЕГРН нужен кадастровый номер.';
     return '';
@@ -181,7 +183,7 @@ function handoffClient() {
   function showReview() {
     if (S.existingAssignment || S.pending || S.completed || readonly) return;
     S.error = validation();
-    if (S.error) { updateFooter(); $('form-error').scrollIntoView({ block: 'center', behavior: 'auto' }); if (!S.lawyer) $('lawyers').focus(); else { $('details').open = true; $('org').focus(); } return; }
+    if (S.error) { updateFooter(); $('form-error').scrollIntoView({ block: 'center', behavior: 'auto' }); if (!S.lawyer) $('lawyers').focus(); else { $('details').open = true; if (orderId && !hasClientContact()) ($('contacts').querySelector('input[data-contact]') || $('add-contact')).focus(); else $('org').focus(); } return; }
     S.review = true; save();
     $('review-lawyer').textContent = assignmentName();
     $('review-org').textContent = S.profile.org;
@@ -203,9 +205,10 @@ function handoffClient() {
           S.existingAssignment = null;
         } else {
           S.error = resumed.warn || 'Доставка ещё не завершена. Повторите попытку.';
+          S.existingAssignment.message = S.error; S.existingAssignment.manual_review = resumed.manual_review === true;
           S.existingAssignment.can_resume = resumed.retry !== false && resumed.manual_review !== true;
         }
-      } catch (error) { S.error = error.message; }
+      } catch (error) { S.error = error.message; S.existingAssignment.message = S.error; }
       finally { S.sending = false; save(); updateFooter(); }
       return;
     }
@@ -260,18 +263,19 @@ function handoffClient() {
     }
     var assigned = packet.assignment;
     if (assigned && assigned.case_id) {
-      var samePending = S.pending && S.pending.payload && (assigned.submit_id && assigned.submit_id === S.pending.payload.submit_id || S.pending.caseId && String(S.pending.caseId) === String(assigned.case_id));
-      if (S.completed && String(S.completed.id) !== String(assigned.case_id)) S.completed = null;
+      var samePending = assigned.delivery_complete === false && assigned.manual_review !== true && assigned.can_resume !== false && S.pending && S.pending.payload && S.pending.payload.handoff_version === 2 && assigned.submit_id && assigned.submit_id === S.pending.payload.submit_id;
+      if (S.completed && (String(S.completed.id) !== String(assigned.case_id) || assigned.delivery_complete !== true || assigned.manual_review === true)) S.completed = null;
       S.existingAssignment = samePending || S.completed ? null : assigned;
     } else S.existingAssignment = null;
   }
   async function loadPacket(rep, options) {
+    var sequence = ++packetSequence;
     if (rep && rep.id) S.selectedReport = { id: rep.id, src: rep.src };
     var qs = new URLSearchParams(); if (orderId) qs.set('order_id', orderId); if (requestId) qs.set('request_id', requestId); if (rep && rep.id) { qs.set('report_src', rep.src); qs.set('report_id', rep.id); }
     S.loading = true; S.packetError = ''; renderPacket(); updateFooter();
-    try { applyPacket(await api('/api/handoff/packet?' + qs.toString()), options); }
-    catch (error) { S.packetError = error.message; }
-    finally { S.loading = false; render(); if (readonly && !S.packetError && S.packet && S.packet.report && S.packet.report.text) openReport(); }
+    try { var data = await api('/api/handoff/packet?' + qs.toString()); if (sequence !== packetSequence) return false; applyPacket(data, options); return true; }
+    catch (error) { if (sequence === packetSequence) S.packetError = error.message; return false; }
+    finally { if (sequence === packetSequence) { S.loading = false; render(); if (readonly && !S.packetError && S.packet && S.packet.report && S.packet.report.text) openReport(); } }
   }
   async function load() {
     S.loading = true; S.error = ''; render();
@@ -301,34 +305,38 @@ function handoffClient() {
   async function chooseReport(it, closeAfter) {
     if (!it || !it.id) return;
     if (orderId && it.order_id && String(it.order_id) !== String(orderId)) { $('search-error').textContent = 'Это отчёт другой заявки. Откройте передачу из нужной заявки.'; return; }
+    if (!orderId && it.order_id) {
+      // A source order already identified by the saved report must survive a
+      // temporary packet failure. Keep V2 and retry the complete original set.
+      orderId = String(it.order_id); cacheKey = 'handoff-v2:' + userId + ':order-' + orderId;
+    }
     if (orderId) {
-      await loadPacket(it, { profile: false });
+      if (!await loadPacket(it, { profile: false })) { if (S.packetError) $('search-error').textContent = S.packetError; return; }
       if (S.packetError) { $('search-error').textContent = S.packetError; return; }
     } else {
+      var sequence = ++packetSequence;
+      S.selectedReport = { id: it.id, src: it.src }; S.loading = true; S.packetError = ''; renderPacket(); updateFooter();
       try {
         var data, metadata = it.metadata || {};
-        try {
-          data = await api('/api/handoff/packet?report_src=' + encodeURIComponent(it.src) + '&report_id=' + encodeURIComponent(it.id));
-          S.packet = data.packet || data; S.report = S.packet.report;
-          if (S.packet.order) {
-            metadata = Object.assign({}, metadata, M.profile(S.packet.order));
-            if (S.packet.order.id && S.packet.signature) {
-              // A saved audit with a verified source order uses the complete V2
-              // package, even when the manager arrived through report search.
-              orderId = String(S.packet.order.id); cacheKey = 'handoff-v2:' + userId + ':order-' + orderId;
-              applyPacket(S.packet); metadata = S.profile;
-            }
+        // The packet endpoint also returns valid unlinked legacy reports. An
+        // error cannot prove that a saved report has no source order/materials.
+        data = await api('/api/handoff/packet?report_src=' + encodeURIComponent(it.src) + '&report_id=' + encodeURIComponent(it.id));
+        if (sequence !== packetSequence) return;
+        S.packet = data.packet || data; S.report = S.packet.report;
+        if (S.packet.order) {
+          metadata = Object.assign({}, metadata, M.profile(S.packet.order));
+          if (S.packet.order.id && S.packet.signature) {
+            // A saved audit with a verified source order uses the complete V2
+            // package, even when the manager arrived through report search.
+            orderId = String(S.packet.order.id); cacheKey = 'handoff-v2:' + userId + ':order-' + orderId;
+            applyPacket(S.packet); metadata = S.profile;
           }
-        } catch (_) {
-          data = await api('/api/reports/get?src=' + encodeURIComponent(it.src) + '&id=' + encodeURIComponent(it.id));
-          metadata = data.metadata || metadata;
-          S.report = { src: it.src, id: it.id, text: data.text || it.text || '', created_at: it.created_at, actor: it.author || '', media: [], status: '' };
-          S.packet = { order: S.profile, report: S.report, materials: [], files_known: false, egrn: { status: 'unknown' } };
         }
         // Only labelled structured metadata may fill an empty new-client card.
         ['org', 'address', 'service', 'inn', 'cad_num', 'kind', 'region'].forEach(function (key) { if (!S.profile[key] && metadata[key]) S.profile[key] = M.text(metadata[key]); });
         if (!S.contacts.length && S.packet.order) S.contacts = M.contacts(S.packet.order.contacts);
-      } catch (error) { $('search-error').textContent = error.message; return; }
+      } catch (error) { if (sequence === packetSequence) { S.packetError = error.message; $('search-error').textContent = error.message; } return; }
+      finally { if (sequence === packetSequence) { S.loading = false; render(); } }
     }
     save(); render(); if (closeAfter !== false) closeSearch();
   }
@@ -452,8 +460,8 @@ function handoffClient() {
   $('go').onclick = showReview;
   $('review-back').onclick = function () { S.review = false; updateFooter(); $('go').focus(); };
   $('confirm-send').onclick = function () { send(); };
-  $('retry-send').onclick = function () { if (S.pending) send(S.pending.payload); };
-  $('retry-load').onclick = function () { if (S.lawyers.length && orderId) loadPacket(S.selectedReport || S.report, { profile: false }); else load(); };
+  $('retry-send').onclick = function () { if (S.existingAssignment) send(); else if (S.pending) send(S.pending.payload); };
+  $('retry-load').onclick = function () { if (S.lawyers.length && orderId) loadPacket(S.selectedReport || S.report, { profile: false }); else if (S.selectedReport) chooseReport(S.selectedReport, false); else load(); };
   $('open-report').onclick = openReport;
   $('choose-report').onclick = function () { openDialog('search-dialog', 'report-query'); layerHistory('search'); searchReports(); };
   $('report-query').oninput = function () { clearTimeout(searchTimer); searchTimer = setTimeout(searchReports, 250); };
