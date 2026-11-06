@@ -25,7 +25,7 @@ function createReportLinkAdmin(options = {}) {
   }
   function cleanup() { for (const [actor, entry] of previews) if (entry !== active && now() >= entry.expiresAt) previews.delete(actor); }
   const keyboard = (entry, retry = false) => ({ reply_markup: { inline_keyboard: [[{ text: retry ? 'Повторить оставшиеся' : 'Добавить переходы', callback_data: 'report_links_apply:' + entry.token }]] } });
-  const answer = (ctx, text) => Promise.resolve().then(() => ctx.answerCbQuery(text)).catch(() => {});
+  const answer = (ctx, text) => Promise.resolve().then(() => ctx.callbackQuery ? ctx.answerCbQuery(text) : ctx.reply(text)).catch(() => {});
   const nextPage = entry => entry.nextAfterId == null ? '' : '\nСледующая порция: /report_links ' + entry.nextAfterId;
   function summary(entry) {
     let text = 'Переходы к отчётам: готово ' + entry.linked + ', пропущено ' + entry.skipped.length + ', осталось ' + entry.remaining.length + '.';
@@ -56,15 +56,17 @@ function createReportLinkAdmin(options = {}) {
       if (!result.items.length) return ctx.reply('Заявок с сохранёнными отчётами больше нет.');
       let text = 'Предварительный просмотр · ' + result.items.length + ' заявок.\n';
       text += result.items.map(item => '#' + item.order_id + ' — ' + (item.code ? REASONS[item.code] || 'карточка недоступна' : 'добавить переход к готовому отчёту')).join('\n');
-      text += '\n\nДо нажатия кнопки карточки не меняются. Просмотр действует десять минут.' + nextPage(entry);
+      text += '\n\nДо подтверждения карточки не меняются. Просмотр действует десять минут.';
+      if (remaining.length) text += '\nИли /report_links_apply — применить последний просмотренный список.';
+      text += nextPage(entry);
       if (remaining.length) previews.set(actor, entry);
       return ctx.reply(text, remaining.length ? keyboard(entry) : undefined);
     } catch (_) { return ctx.reply('Не удалось подготовить список. Карточки не менялись; повторите /report_links позднее.'); }
   }
 
-  async function apply(ctx) {
+  async function runApply(ctx, commandToken) {
     if (!allowed(ctx)) return answer(ctx, 'Команда доступна администратору в личном чате.');
-    cleanup(); const actor = String(ctx.from.id), entry = previews.get(actor), match = String(ctx.callbackQuery?.data || '').match(APPLY);
+    cleanup(); const actor = String(ctx.from.id), entry = previews.get(actor), match = commandToken ? [null, commandToken] : String(ctx.callbackQuery?.data || '').match(APPLY);
     if (!match || !entry || entry.token !== match[1] || entry.chat !== String(ctx.chat.id) || entry.group !== group()) return answer(ctx, 'Просмотр устарел. Выполните /report_links заново.');
     if (active) return answer(ctx, 'Обновление уже выполняется. Дождитесь результата.');
     if (entry.phase === 'done') return answer(ctx, 'Эти карточки уже обработаны. Готово: ' + entry.linked + ', пропущено: ' + entry.skipped.length + '.');
@@ -89,12 +91,24 @@ function createReportLinkAdmin(options = {}) {
     return ctx.reply((failed ? 'Обновление остановлено. ' : '') + summary(entry), entry.remaining.length ? keyboard(entry, true) : undefined);
   }
 
-  return { preview, apply };
+  const apply = ctx => runApply(ctx);
+
+  async function applyCommand(ctx) {
+    if (!allowed(ctx)) return;
+    if (!/^\/report_links_apply(?:@[a-z\d_]+)?\s*$/i.test(String(ctx.message?.text || ''))) return ctx.reply('Команда /report_links_apply применяет последний просмотренный список без дополнительных аргументов. Сначала выполните /report_links.');
+    cleanup();
+    const entry = previews.get(String(ctx.from.id));
+    if (!entry) return ctx.reply('Нет действующего просмотренного списка. Карточки не менялись. Сначала выполните /report_links.');
+    return runApply(ctx, entry.token);
+  }
+
+  return { preview, apply, applyCommand };
 }
 
 function setupReportLinkAdmin(bot, options = {}) {
   const commands = createReportLinkAdmin(options);
   bot.command('report_links', commands.preview);
+  bot.command('report_links_apply', commands.applyCommand);
   bot.action(APPLY, commands.apply);
   return commands;
 }

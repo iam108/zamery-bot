@@ -33,12 +33,12 @@ function fixture() {
   };
 }
 
-test('setup only registers the private preview command and explicit apply button; it performs no startup work', () => {
+test('setup only registers private preview and apply commands plus the explicit apply button; it performs no startup work', () => {
   const commands = [], actions = [];
   setupReportLinkAdmin({ command(name, run) { commands.push({ name, run }); }, action(pattern, run) { actions.push({ pattern, run }); } }, {
     previewOrderReportLinks: () => assert.fail('No startup reads'), applyOrderReportLinks: () => assert.fail('No startup writes'),
   });
-  assert.deepEqual(commands.map(item => item.name), ['report_links']); assert.equal(actions.length, 1);
+  assert.deepEqual(commands.map(item => item.name), ['report_links', 'report_links_apply']); assert.equal(actions.length, 1);
   assert.ok(actions[0].pattern.test('report_links_apply:abcdefghijklmnop')); assert.equal(BATCH_SIZE, 20);
 });
 
@@ -154,4 +154,47 @@ test('a failed callback acknowledgement never strands the active admission flag'
   const h = fixture(), data = h.data(await h.preview());
   await h.apply(data, 108, { answerCbQuery() { throw new Error('Synthetic callback expired'); } });
   const next = h.data(await h.preview()); await h.apply(next); assert.equal(h.writes.length, 2);
+});
+
+test('text apply requires a private configured administrator and a reviewed list, never IDs supplied as arguments', async () => {
+  const h = fixture();
+  const run = context => h.commands.applyCommand(context);
+  for (const context of [h.ctx(109, { message: { text: '/report_links_apply' } }), h.ctx(108, { chat: { id: -1001, type: 'supergroup' }, message: { text: '/report_links_apply' } })]) await run(context);
+  assert.equal(h.replies.length, 0);
+  const missing = h.ctx(108, { message: { text: '/report_links_apply' } }); await run(missing);
+  assert.match(missing.replies[0].text, /Нет действующего просмотренного списка.*Карточки не менялись/);
+  await h.preview();
+  const arbitrary = h.ctx(108, { message: { text: '/report_links_apply 999' } }); await run(arbitrary);
+  assert.match(arbitrary.replies[0].text, /без дополнительных аргументов/); assert.equal(h.writes.length, 0);
+});
+
+test('text apply refuses an expired preview or a changed working group without changing cards', async () => {
+  const h = fixture(); await h.preview(); h.advance(PREVIEW_TTL);
+  const expired = h.ctx(108, { message: { text: '/report_links_apply' } }); await h.commands.applyCommand(expired);
+  assert.match(expired.replies[0].text, /Нет действующего просмотренного списка/);
+  await h.preview(); h.options.groupId = '-1009999999999';
+  const changed = h.ctx(108, { message: { text: '/report_links_apply' } }); await h.commands.applyCommand(changed);
+  assert.match(changed.replies[0].text, /Просмотр устарел/); assert.equal(h.writes.length, 0);
+});
+
+test('text apply uses only the most recently reviewed list and a completed duplicate returns its cached receipt', async () => {
+  const h = fixture(), old = h.data(await h.preview());
+  h.setPreview(() => ({ items: [{ order_id: 99 }], nextAfterId: null }));
+  const latest = await h.preview(); assert.match(latest.replies[0].text, /\/report_links_apply — применить последний просмотренный список/);
+  assert.match((await h.apply(old)).answers[0], /устарел/);
+  const context = h.ctx(108, { message: { text: '/report_links_apply@audit_bot' } }); await h.commands.applyCommand(context);
+  assert.deepEqual(h.writes.map(item => item.ids), [[99]]); assert.match(context.replies.at(-1).text, /готово 1, пропущено 0, осталось 0/);
+  const repeated = h.ctx(108, { message: { text: '/report_links_apply' } }); await h.commands.applyCommand(repeated);
+  assert.match(repeated.replies[0].text, /уже обработаны/); assert.equal(h.writes.length, 1);
+});
+
+test('text and button retries share the same remaining batch without repeating confirmed cards', async () => {
+  const h = fixture(); let first = true;
+  h.setApply(ids => { if (!first) return complete(ids); first = false; return { complete: false, results: [{ order_id: 58, state: 'linked' }], failed_order_id: 60 }; });
+  const data = h.data(await h.preview()), command = h.ctx(108, { message: { text: '/report_links_apply' } });
+  await h.commands.applyCommand(command); assert.match(command.replies.at(-1).text, /готово 1, пропущено 1, осталось 1/);
+  await h.commands.apply(h.ctx(108, { callbackQuery: { data } }), () => assert.fail('Matched button does not delegate middleware'));
+  assert.deepEqual(h.writes.map(item => item.ids), [[58, 60], [60]]);
+  const repeated = h.ctx(108, { message: { text: '/report_links_apply' } }); await h.commands.applyCommand(repeated);
+  assert.equal(h.writes.length, 2); assert.match(repeated.replies[0].text, /уже обработаны/);
 });
