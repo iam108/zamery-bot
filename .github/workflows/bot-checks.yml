@@ -1,0 +1,105 @@
+name: Bot checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Monday 10:00 Moscow / Istanbul (UTC+3), independently of any local Mac.
+    - cron: '0 7 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bot-checks-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Unit and browser tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CI: 'true'
+      NODE_ENV: test
+      FORCE_COLOR: '0'
+      E2E_ARTIFACTS_DIR: test-results/e2e
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up supported Node.js LTS
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Prepare synthetic test logs
+        run: mkdir -p test-results/logs
+
+      - name: Install locked dependencies, including test tools
+        timeout-minutes: 10
+        run: npm ci --include=dev 2>&1 | tee test-results/logs/npm-ci.log
+
+      - name: Require the installed pinned SQL and browser test tools
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const lock = require('./package-lock.json');
+          for (const name of ['@electric-sql/pglite', 'playwright']) {
+            const installed = JSON.parse(fs.readFileSync('node_modules/' + name + '/package.json', 'utf8')).version;
+            const pinned = lock.packages['node_modules/' + name].version;
+            if (installed !== pinned) throw new Error(name + ' does not match package-lock.json');
+            console.log(name + ': ' + installed);
+          }
+          fs.appendFileSync(process.env.GITHUB_ENV,
+            'PGLITE_TEST_MODULE=' + require.resolve('@electric-sql/pglite') + '\n');
+          NODE
+
+      - name: Run all unit and local integration tests
+        timeout-minutes: 15
+        run: npm test 2>&1 | tee test-results/logs/unit.log
+
+      - name: Install Chromium and Linux browser dependencies
+        timeout-minutes: 10
+        run: npx --no-install playwright install --with-deps chromium 2>&1 | tee test-results/logs/chromium-install.log
+
+      - name: Run real browser journeys against local fixtures
+        timeout-minutes: 10
+        run: npm run test:e2e 2>&1 | tee test-results/logs/e2e.log
+
+      - name: Verify both suites ran without skipped tests
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const summaries = [];
+          for (const suite of ['unit', 'e2e']) {
+            const log = fs.readFileSync('test-results/logs/' + suite + '.log', 'utf8');
+            const count = key => [...log.matchAll(new RegExp('^(?:#|ℹ)\\s+' + key + '\\s+(\\d+)\\s*$', 'gm'))].at(-1)?.[1];
+            const tests = Number(count('tests'));
+            if (!Number.isSafeInteger(tests) || tests < 1 || count('skipped') !== '0' || count('fail') !== '0') {
+              throw new Error(suite + ': missing test summary, failed tests, or skipped tests');
+            }
+            summaries.push(suite + ': ' + tests + ' tests passed; none skipped.');
+          }
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summaries.join('\n\n') + '\n');
+          NODE
+
+      - name: Preserve failure logs and synthetic browser screenshots
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bot-checks-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            test-results/logs/
+            test-results/e2e/
+          if-no-files-found: ignore
+          retention-days: 7
