@@ -26,7 +26,7 @@ async function fixture(run, options = {}) {
     async row(){return (await db.query('SELECT * FROM manual_order_attachments WHERE source_chat_id=108 AND source_message_id=321')).rows[0];},
     async extraOrder(){await db.exec("INSERT INTO orders(id,submitted_by,status,address,object_name,telegram_msg_id) VALUES(61,108,'in_progress','Москва, Мясницкая, 15','Вторая заявка',904)");},
     set approved(value){approved=value;},set sendError(value){sendError=value;},set replyError(value){replyError=value;},set downloadError(value){downloadError=value;},set saveError(value){saveError=value;},set downloadWait(value){downloadWait=value;},set delivered(value){delivered=value;},
-    callback(data){const ctx=context({message:undefined,callbackQuery:{data}});return ctx;},
+    async callback(data){if(/^manual_retry:\d+$/.test(data)){const row=await h.row();if(row?.retry_generation)data+=':'+row.retry_generation;}const ctx=context({message:undefined,callbackQuery:{data}});return ctx;},
   };
   try { await run(h); } finally { await db.close(); }
 }
@@ -43,10 +43,10 @@ test('multiple open orders require explicit selection and cannot attach to anoth
   await h.extraOrder();const handler=h.create();await handler.receive(h.context());
   assert.equal(h.downloads.length,0);assert.equal(h.sends.length,0);assert.equal((await h.row()).order_id,null);
   const buttons=h.replies[0].extra.reply_markup.inline_keyboard.flat();assert.equal(buttons.length,2);assert.ok(buttons.every(button=>/:(58|61)$/.test(button.callback_data)));
-  for(const id of [59,60])await handler.select(h.callback('manual_attach:321:'+id));
-  assert.equal(h.saves.length,0);await handler.select(h.callback('manual_attach:321:61'));
+  for(const id of [59,60])await handler.select(await h.callback('manual_attach:321:'+id));
+  assert.equal(h.saves.length,0);await handler.select(await h.callback('manual_attach:321:61'));
   assert.equal((await h.row()).order_id,61);assert.equal((await h.store.list(61)).length,1);assert.equal((await h.store.list(58)).length,0);
-  await handler.select(h.callback('manual_attach:321:58'));assert.equal((await h.store.list(58)).length,0);assert.equal(h.sends.length,1);
+  await handler.select(await h.callback('manual_attach:321:58'));assert.equal((await h.store.list(58)).length,0);assert.equal(h.sends.length,1);
 }));
 
 test('unapproved or non-private actors cannot create receipts, download files or post to the group',pg,async()=>fixture(async h=>{
@@ -63,21 +63,21 @@ test('oversized originals remain in Telegram without false packet success or a d
 for(const stage of ['download','save'])test(stage+' failure keeps the original and retries the same order without group success',pg,async()=>fixture(async h=>{
   const handler=h.create();if(stage==='download')h.downloadError=new Error('synthetic');else h.saveError=new Error('synthetic');
   await handler.receive(h.context());assert.equal(h.sends.length,0);assert.match(h.replies.at(-1).text,/Не удалось сохранить/);assert.equal((await h.row()).order_id,58);
-  h.downloadError=null;h.saveError=null;await handler.retry(h.callback('manual_retry:321'));
+  h.downloadError=null;h.saveError=null;await handler.retry(await h.callback('manual_retry:321'));
   assert.equal(h.sends.length,1);assert.equal((await h.store.list(58)).length,1);assert.equal((await h.row()).stage,'sent');
 }));
 
 test('a confirmed Telegram rejection keeps saved packet bytes and retries publication without downloading again',pg,async()=>fixture(async h=>{
   const handler=h.create();h.sendError=Object.assign(new Error('rejected'),{response:{error_code:400}});await handler.receive(h.context());
   assert.equal((await h.row()).stage,'saved');assert.equal((await h.store.list(58)).length,1);assert.match(h.replies.at(-1).text,/сохранён.*отправить не удалось/);
-  h.sendError=null;await handler.retry(h.callback('manual_retry:321'));
+  h.sendError=null;await handler.retry(await h.callback('manual_retry:321'));
   assert.equal(h.downloads.length,1);assert.equal(h.saves.length,1);assert.equal(h.sends.length,2);assert.equal((await h.row()).stage,'sent');
 }));
 
 test('an unknown Telegram acknowledgement does not auto-duplicate and an explicit retry reuses the saved original',pg,async()=>fixture(async h=>{
   const handler=h.create();h.sendError=new Error('network acknowledgement lost');await handler.receive(h.context());
   assert.equal((await h.row()).stage,'sending');assert.match(h.replies.at(-1).text,/могло дойти/);await handler.receive(h.context());assert.equal(h.sends.length,1);
-  h.sendError=null;await h.create().retry(h.callback('manual_retry:321'));
+  h.sendError=null;await h.create().retry(await h.callback('manual_retry:321'));
   assert.equal(h.sends.length,2);assert.equal(h.downloads.length,1);assert.equal(h.saves.length,1);assert.equal((await h.row()).stage,'sent');
 }));
 
@@ -108,9 +108,9 @@ test('simultaneous repeated updates never download or publish the same source tw
 test('a crash during active sending requires an expired lease and explicit retry, preserving the original',pg,async()=>fixture(async h=>{
   const handler=h.create();h.sendError=new Error('unknown');await handler.receive(h.context());h.sendError=null;
   await h.db.exec("UPDATE manual_order_attachments SET lease_until=NOW()+INTERVAL '1 minute'");
-  await handler.retry(h.callback('manual_retry:321'));assert.equal(h.sends.length,1);
+  await handler.retry(await h.callback('manual_retry:321'));assert.equal(h.sends.length,1);
   await h.db.exec("UPDATE manual_order_attachments SET lease_until=NOW()-INTERVAL '1 second'");
-  await h.create().retry(h.callback('manual_retry:321'));assert.equal(h.sends.length,2);assert.equal(h.downloads.length,1);
+  await h.create().retry(await h.callback('manual_retry:321'));assert.equal(h.sends.length,2);assert.equal(h.downloads.length,1);
 }));
 
 test('photo selection uses the largest Telegram original, while image documents with missing MIME remain accepted',pg,async()=>fixture(async h=>{
@@ -130,7 +130,7 @@ async function managerSave(h) {
   const context=vm.createContext({module:{exports:{}},require(name){if(name==='./pool')return h.pool;if(name==='../web/order-materials')return materials;throw new Error(name);}});
   vm.runInContext(fs.readFileSync(require.resolve('../src/db/queries'),'utf8'),context);
   const telegram=h.context().telegram;telegram.editMessageText=async()=>{};
-  const handlers=require('../src/web/manager-orders').createManagerHandlers({pool:h.pool,materials,queries:context.module.exports,getTelegram:()=>telegram,format:()=> 'order',attachOrOrder:()=>assert.fail('No paid API')});
+  const handlers=require('../src/web/manager-orders').createManagerHandlers({groupId:'-100321',pool:h.pool,materials,queries:context.module.exports,getTelegram:()=>telegram,format:()=> 'order',attachOrOrder:()=>assert.fail('No paid API')});
   const row=(await h.pool.query('SELECT * FROM orders WHERE id=58')).rows[0],response={statusCode:200,status(code){this.statusCode=code;return this;},json(body){this.body=body;return this;}};
   await handlers.save({params:{id:'58'},tgUser:{id:108},staff:{name:'Author',role:'manager'},files:[],body:{address:row.address,owner_name:'Client',object_type:'Общепит алкоголь',service:'Получение',submit_id:'manager-save',packet_revision:row.packet_revision}},response);
   return response;
@@ -151,6 +151,44 @@ test('a lost manual publication checkpoint stays unknown to manager delivery and
 test('a manual retry adopts a confirmed manager publication rather than forwarding the same file again',pg,async()=>fixture(async h=>{
   h.sendError=Object.assign(new Error('Telegram rejected'),{response:{error_code:400}});await h.create().receive(h.context());assert.equal((await h.row()).stage,'saved');
   h.sendError=null;const saved=await managerSave(h);assert.equal(saved.body.ok,true);assert.equal(h.sends.length,2);
-  await h.create().retry(h.callback('manual_retry:321'));assert.equal(h.sends.length,2);assert.equal((await h.row()).stage,'sent');
+  await h.create().retry(await h.callback('manual_retry:321'));assert.equal(h.sends.length,2);assert.equal((await h.row()).stage,'sent');
   assert.equal(Number((await h.row()).group_message_id),Number((await h.store.list(58))[0].telegram_msg_id));
+}));
+
+test('a manual attachment cannot bypass an unknown manager publication of the identical saved original',pg,async()=>fixture(async h=>{
+  h.sendError=Object.assign(new Error('Telegram rejected'),{response:{error_code:400}});await h.create().receive(h.context());
+  h.sendError=new Error('Manager send accepted but ACK lost');const saved=await managerSave(h);assert.match(saved.body.warning,/могло дойти/);assert.equal(h.sends.length,2);
+  h.sendError=null;await h.create().retry(await h.callback('manual_retry:321'));
+  assert.equal(h.sends.length,2,'A manual retry must not reopen the manager delivery generation');assert.match(h.replies.at(-1).text,/order_delivery 58/);assert.equal((await h.store.list(58))[0].telegram_msg_id,null);
+}));
+
+test('a Telegram 5xx response is an unknown manual delivery, and redelivered source updates cannot repeat it automatically',pg,async()=>fixture(async h=>{
+  h.sendError=Object.assign(new Error('upstream ACK unknown'),{response:{error_code:502}});await h.create().receive(h.context());
+  assert.equal((await h.row()).stage,'sending');h.sendError=null;await h.create().receive(h.context());assert.equal(h.sends.length,1);assert.match(h.replies.at(-1).text,/могло дойти/);
+}));
+
+for(const ack of [{message_id:true},{message_id:[777]},{message_id:901},{message_id:1000,chat:{id:-100999}}])test('manual original rejects malformed, card-reused or wrong-chat ACK '+JSON.stringify(ack),pg,async()=>fixture(async h=>{
+  h.delivered=ack;await h.create().receive(h.context());assert.equal((await h.row()).stage,'sending');assert.equal((await h.store.list(58))[0].telegram_msg_id,null);
+  h.delivered={};await h.create().receive(h.context());assert.equal(h.sends.length,1);
+  const manager=await managerSave(h);assert.match(manager.body.warning,/не подтверждена/);assert.equal(h.sends.length,1);
+}));
+test('a manual original cannot reuse another document receipt in the same order chat',pg,async()=>fixture(async h=>{
+  const other=prepareMaterials([{originalname:'Другой.pdf',mimetype:'application/pdf',buffer:Buffer.from('%PDF other original')}]);await h.store.save(58,other);await h.store.delivered(58,other[0].id,777);
+  h.delivered={message_id:777};await h.create().receive(h.context());assert.equal((await h.row()).stage,'sending');assert.equal((await h.store.list(58)).filter(file=>Number(file.telegram_msg_id)===777).length,1);
+}));
+test('the same explicit manual retry callback cannot authorize a later unknown attempt after restart',pg,async()=>fixture(async h=>{
+  h.sendError=new Error('ACK lost');await h.create().receive(h.context());const confirmation=await h.callback('manual_retry:321');
+  await h.create().retry(confirmation);assert.equal(h.sends.length,2);await h.create().retry(confirmation);assert.equal(h.sends.length,2);assert.equal((await h.row()).stage,'sending');
+  h.sendError=null;await h.create().retry(await h.callback('manual_retry:321'));assert.equal(h.sends.length,3);assert.equal((await h.row()).stage,'sent');assert.equal(h.downloads.length,1);assert.equal((await h.store.list(58)).length,1);
+}));
+test('concurrent clicks of one reviewed manual retry generation dispatch only one native attempt',pg,async()=>fixture(async h=>{
+  h.sendError=new Error('ACK lost');await h.create().receive(h.context());const confirmation=await h.callback('manual_retry:321');
+  const send=confirmation.telegram.sendDocument;let enter,release;const entered=new Promise(resolve=>{enter=resolve;}),gate=new Promise(resolve=>{release=resolve;});
+  confirmation.telegram.sendDocument=async(...args)=>{enter();await gate;return send(...args);};
+  const a=h.create().retry(confirmation);await entered;const b=h.create().retry(confirmation);release();await Promise.all([a,b]);assert.equal(h.sends.length,2);assert.equal((await h.row()).stage,'sending');
+}));
+test('a legacy manual retry button only refreshes the currently reviewed attempt instead of sending an original',pg,async()=>fixture(async h=>{
+  h.sendError=new Error('ACK lost');await h.create().receive(h.context());
+  await h.create().retry(h.context({message:undefined,callbackQuery:{data:'manual_retry:321'}}));assert.equal(h.sends.length,1);
+  assert.match(h.replies.at(-1).extra.reply_markup.inline_keyboard[0][0].callback_data,/^manual_retry:321:[a-f\d-]{36}$/i);
 }));

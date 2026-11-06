@@ -9,8 +9,16 @@ const nativeBridge = () => ({ TelegramWebviewProxy: { postEvent() {} } });
 
 test('contact numbers normalize Russian country and local formats', () => {
   for (const value of formats) assert.equal(actions.normalizePhone(value), phone, value);
-  for (const value of ['', null, '12345', 'номер 79995554433', '05.11.2026 10']) {
+  for (const value of ['', null, '12345', 'номер 79995554433', '05.11.2026 10', '+799955544330']) {
     assert.equal(actions.normalizePhone(value), '', String(value));
+  }
+});
+
+test('an explicitly supplied international contact remains callable in raw fields objects arrays and saved JSON', () => {
+  for (const value of ['+44 20 7946 0958', '+90 (555) 123-45-67', '+1 202 555 0123', '+372 5123 456']) {
+    const wanted = actions.normalizePhone(value); assert.ok(wanted);
+    assert.equal(wanted, '+' + value.replace(/\D/g, ''), 'An explicit international prefix must not become a local Russian number');
+    for (const contact of [value, { name: 'Contact', phone: value }, [{ name: 'Contact', phone: value }], JSON.stringify({ contact_phone: value })]) assert.equal(actions.findPhone(contact), wanted);
   }
 });
 

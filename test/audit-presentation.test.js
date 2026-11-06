@@ -60,17 +60,18 @@ async function unzip(buffer) {
 }
 function harness(options = {}) {
   const events = [], delivered = [], saves = options.saves || [], holder = options.holder || { value: {} };
-  let sequence = options.sequence || 1000;
+  let sequence = options.sequence || Math.max(999, ...(holder.value.textIds || []), ...(holder.value.photoIds || []), ...(holder.value.documentIds || [])) + 1;
   const ctx = { from: { id: 90001, username: 'qa_auditor' }, telegram: {},
     auditDelivery: {
       load: async () => clone(holder.value),
-      save: async value => { if (options.checkpointFailure) await options.checkpointFailure(value); holder.value = clone(value); events.push({ method: 'checkpoint', value: clone(value) }); }
+      save: async value => { if (options.checkpointFailure) await options.checkpointFailure(value); holder.value = clone(value); events.push({ method: 'checkpoint', value: clone(value) }); if (options.afterCheckpointFailure) await options.afterCheckpointFailure(value); }
     },
     reply: async text => { if (options.fail) await options.fail('reply', [text]); events.push({ method: 'reply', args: [text] }); }
   };
   for (const method of ['sendMessage', 'sendPhoto', 'sendMediaGroup', 'sendDocument', 'editMessageReplyMarkup']) {
     ctx.telegram[method] = async (...args) => {
       events.push({ method, args }); if (options.fail) await options.fail(method, args);
+      if (options.response) { const result = await options.response(method, args); if (result !== undefined) return result; }
       if (method === 'editMessageReplyMarkup') return true;
       const count = method === 'sendMediaGroup' ? args[1].length : 1, result = [];
       for (let i = 0; i < count; i++) {
@@ -97,7 +98,75 @@ function harness(options = {}) {
   return { events, delivered, saves, holder, ctx, send: data => context.module.exports.handleAuditReport(ctx, data) };
 }
 function keyboard(h) { return h.events.filter(e => e.method === 'editMessageReplyMarkup').at(-1)?.args[3]?.inline_keyboard.flat() || []; }
-function onceFailure(target, detail = 'temporary ' + target + ' failure') { let hit = false; return async method => { if (method === target && !hit) { hit = true; throw new Error(detail); } }; }
+function onceFailure(target, detail = 'Telegram rejected ' + target) { let hit = false; return async method => { if (method === target && !hit) { hit = true; throw Object.assign(new Error(detail), { response: { error_code: 400, description: detail } }); } }; }
+
+for (const target of ['sendMessage', 'sendMediaGroup', 'sendDocument']) test('lost ' + target + ' acknowledgement blocks automatic resend in the same process and after restart', async () => {
+  const holder = { value: {} }, data = report(); let accepted = 0;
+  const first = harness({ holder, response(method) {
+    if (method === target) { accepted++; throw new Error('Network lost after Telegram accepted the request'); }
+  } });
+  await assert.rejects(first.send(data));
+  await assert.rejects(first.send(data), error => error.code === 'AUDIT_DELIVERY_UNKNOWN');
+  const second = harness({ holder, response(method) { if (method === target) accepted++; } });
+  await assert.rejects(second.send(data), error => error.code === 'AUDIT_DELIVERY_UNKNOWN');
+  assert.equal(accepted, 1, 'An ordinary HTTP retry must not repeat an unconfirmed Telegram send');
+  assert.ok(holder.value.inflight.id); assert.equal(second.delivered.length, 0);
+});
+
+test('a lost receipt checkpoint leaves the already sent summary unknown instead of silently sending it again', async () => {
+  const holder = { value: {} }, data = report(); let failed = false;
+  const first = harness({ holder, checkpointFailure(value) {
+    if (value.textIds.length && !failed) { failed = true; throw new Error('Receipt checkpoint failed before commit'); }
+  } });
+  await assert.rejects(first.send(data)); assert.equal(first.delivered.filter(item => item.kind === 'text').length, 1);
+  const second = harness({ holder });
+  await assert.rejects(second.send(data), error => error.code === 'AUDIT_DELIVERY_UNKNOWN');
+  assert.equal(second.delivered.length, 0); assert.ok(holder.value.inflight.id);
+});
+
+test('a malformed album receipt remains unknown after restart and cannot repeat its accepted photos', async () => {
+  const holder = { value: {} }, data = report(), first = harness({ holder, response(method) { if (method === 'sendMediaGroup') return []; } });
+  await assert.rejects(first.send(data));
+  const second = harness({ holder });
+  await assert.rejects(second.send(data), error => error.code === 'AUDIT_DELIVERY_UNKNOWN');
+  assert.equal(second.delivered.length, 0); assert.equal(holder.value.inflight.stage, 'photos');
+});
+
+for (const target of ['sendMessage', 'sendMediaGroup']) test('an explicitly wrong chat in the ' + target + ' receipt cannot complete a report', async () => {
+  const holder={value:{}},data=report(),first=harness({holder,response(method,args){
+    if(method!==target)return;
+    const receipt={message_id:8000,chat:{id:-1009999999999}};
+    return method==='sendMediaGroup'?args[1].map((_,index)=>({...receipt,message_id:8000+index})):receipt;
+  }});
+  await assert.rejects(first.send(data),error=>error.code==='AUDIT_DELIVERY_UNKNOWN');
+  assert.equal(first.saves.length,0);assert.ok(holder.value.inflight);
+  const retry=harness({holder});await assert.rejects(retry.send(data),error=>error.code==='AUDIT_DELIVERY_UNKNOWN');assert.equal(retry.delivered.length,0);
+});
+
+test('a receipt COMMIT with a lost acknowledgement is reread before the same process resumes its remaining parts', async () => {
+  const holder = { value: {} }, data = report(); let failed = false;
+  const h = harness({ holder, afterCheckpointFailure(value) { if (value.textIds.length && !failed) { failed = true; throw new Error('COMMIT acknowledged only by database'); } } });
+  await assert.rejects(h.send(data)); assert.equal(holder.value.inflight, undefined); assert.equal(holder.value.textIds.length, 1);
+  await h.send(data);
+  assert.equal(h.delivered.filter(item => item.kind === 'text').length, 1); assert.equal(h.saves.length, 1);
+});
+
+test('failure to save the pre-send intent contacts no Telegram destination', async () => {
+  const h = harness({ checkpointFailure(value) { if (value.inflight) throw new Error('Intent did not commit'); } });
+  await assert.rejects(h.send(report()), /Intent did not commit/);
+  assert.equal(h.events.some(event => event.method.startsWith('send')), false);
+});
+
+test('a known Telegram rejection whose cleanup checkpoint fails remains unknown until checked', async () => {
+  let sent = false;
+  const holder = { value: {} }, data = report(), first = harness({ holder,
+    fail(method) { if (method === 'sendMessage') { sent = true; throw Object.assign(new Error('Rejected'), { response: { error_code: 400 } }); } },
+    checkpointFailure(value) { if (sent && !value.inflight) throw new Error('Cannot clear rejected intent'); }
+  });
+  await assert.rejects(first.send(data), error => error.code === 'AUDIT_DELIVERY_UNKNOWN');
+  const second = harness({ holder }); await assert.rejects(second.send(data), error => error.code === 'AUDIT_DELIVERY_UNKNOWN');
+  assert.equal(second.delivered.length, 0);
+});
 
 test('new UI5 delivery is summary, one photo album and original ZIP, with all actions on the summary', async () => {
   const data = report(), h = harness(); await h.send(data);
@@ -184,8 +253,37 @@ test('a missing original card records an explicit durable warning without claimi
   const repeated = await second.send(data); assert.equal(repeated.warning, warning); assert.equal(second.delivered.length, 0);
 });
 
+test('an empty photo album acknowledgement stops immediately instead of resending the same album inside one attempt', async () => {
+  let albums = 0;
+  const h = harness({ response(method, args) {
+    if (method !== 'sendMediaGroup' || args[1][0].type !== 'photo') return;
+    if (++albums > 1) throw new Error('Bound the legacy repeating loop in this repro');
+    return [];
+  } });
+  await assert.rejects(h.send(report())); assert.equal(albums, 1); assert.equal(h.saves.length, 0);
+  assert.equal(h.events.some(event => event.method === 'sendDocument'), false);
+});
+
+test('missing summary and duplicate album message IDs cannot be saved as a completed report', async () => {
+  for (const mode of ['missing-summary', 'duplicate-album']) {
+    const h = harness({ response(method, args) {
+      if (mode === 'missing-summary' && method === 'sendMessage') return {};
+      if (mode === 'duplicate-album' && method === 'sendMediaGroup') return args[1].map(() => ({ message_id: 999 }));
+    } });
+    await assert.rejects(h.send(report()), undefined, mode); assert.equal(h.saves.length, 0, mode);
+    assert.equal(h.events.some(event => event.method === 'syncOrderReportLink'), false, mode);
+  }
+});
+
+test('invalid durable message receipts cannot be silently accepted after a restart', async () => {
+  const holder = { value: {} }, data = report(), first = harness({ holder }); await first.send(data);
+  holder.value.photoIds[0] = holder.value.textIds[0];
+  const second = harness({ holder }); await assert.rejects(second.send(data));
+  assert.equal(second.delivered.length, 0); assert.equal(second.saves.length, 0);
+});
+
 for (const method of ['sendMessage', 'sendMediaGroup', 'sendDocument', 'editMessageReplyMarkup']) {
-  test(method + ' failure resumes after restart without repeating confirmed summary, photos or ZIP', async () => {
+  test(method + ' rejection resumes after restart without repeating confirmed summary, photos or ZIP', async () => {
     const data = report(), holder = { value: {} }, saves = [];
     const first = harness({ holder, saves, fail: onceFailure(method) });
     await assert.rejects(first.send(data));

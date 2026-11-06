@@ -161,7 +161,9 @@ function createDraftStore(pool = defaultPool, configuredLimits = LIMITS, options
   }
   async function snapshot(client, row, includeOriginals = false) {
     const files = (await client.query('SELECT ' + (includeOriginals ? '*' : 'id,name,mime,role,subject_id,kind,bytes,sha256,created_at') + ' FROM audit_evidence WHERE draft_id=$1 AND deleted_at IS NULL ORDER BY created_at,id', [row.id])).rows;
+    const pending = row.delivery?.inflight;
     return { id: row.id, order_id: row.order_id, revision: Number(row.revision), data: row.data, updated_at: row.updated_at, submitted_at: row.submitted_at, submitting: row.submitting_revision != null,
+      ...(pending ? { delivery_unknown: { cursor: pending.id, stage: pending.stage, count: pending.count } } : {}),
       evidence: files.map(file => includeOriginals ? Object.assign(evidenceMetadata(file), { draft_id: row.id, content: file.content, storage: file.storage, object_key: file.object_key }) : evidenceMetadata(file)) };
   }
   async function hydrate(value) {
@@ -203,7 +205,7 @@ function createDraftStore(pool = defaultPool, configuredLimits = LIMITS, options
       [row.id, file.id, file.name, file.mime, file.role, file.subject_id, file.kind, file.bytes, file.sha256, objectKey ? null : file.content, objectKey ? 's3' : 'postgres', objectKey || null, Number(row.revision) + 1])).rows[0];
     return { evidence: evidenceMetadata(saved), revision: Number(await bump(client, row.id)) };
   }
-  return {
+  const api = {
     ensureTables,
     async withDraftDeliveryLock(owner, id, run) {
       const draftId = uuid(id);
@@ -368,6 +370,21 @@ function createDraftStore(pool = defaultPool, configuredLimits = LIMITS, options
         await client.query('UPDATE audit_drafts SET delivery=$1,updated_at=NOW() WHERE id=$2', [JSON.stringify(safe), row.id]);
       });
     },
+    async retryDraftDelivery(owner, id, input) {
+      if (input?.acknowledge_duplicate_risk !== true) fail(400, 'DELIVERY_RETRY_CONFIRMATION_REQUIRED', 'Сначала проверьте чат и подтвердите риск повторной отправки.');
+      const cursor = uuid(input.cursor);
+      return api.withDraftDeliveryLock(owner, id, () => transaction(async client => {
+        const row = await find(client, owner, id, true); checkRevision(row, input.revision);
+        if (row.submitted_at) return { ok: true, already_submitted: true };
+        if (Number(row.submitting_revision) !== Number(row.revision)) fail(409, 'NOT_SUBMITTING', 'Отчёт не подготовлен к отправке.');
+        const delivery = row.delivery || {};
+        if (!delivery.inflight && delivery.lastRiskRetryCursor === cursor) return { ok: true, already_confirmed: true };
+        if (delivery.inflight?.id !== cursor) fail(409, 'DELIVERY_RETRY_STALE', 'Состояние отправки изменилось. Обновите отчёт и снова проверьте чат.');
+        delete delivery.inflight; delivery.lastRiskRetryCursor = cursor;
+        await client.query('UPDATE audit_drafts SET delivery=$1,updated_at=NOW() WHERE id=$2', [JSON.stringify(delivery), row.id]);
+        return { ok: true };
+      }));
+    },
     async markDraftSubmitted(owner, id, expected) {
       return transaction(async client => {
         const row = await find(client, owner, id, true); checkRevision(row, expected);
@@ -378,6 +395,7 @@ function createDraftStore(pool = defaultPool, configuredLimits = LIMITS, options
       });
     },
   };
+  return api;
 }
 
 const store = createDraftStore();
@@ -401,6 +419,7 @@ function setupAuditDrafts(app, draftStore = store) {
     res.json({ ok: true, draft, revision: draft.revision });
   }));
   app.post('/api/audit/drafts/:id/evidence', route(async (req, res) => res.json(Object.assign({ ok: true }, await draftStore.addEvidence(req.tgUser.id, req.params.id, req.body)))));
+  app.post('/api/audit/drafts/:id/retry-delivery', route(async (req, res) => res.json(await draftStore.retryDraftDelivery(req.tgUser.id, req.params.id, req.body))));
   app.delete('/api/audit/drafts/:id/evidence/:fileId', route(async (req, res) => res.json(Object.assign({ ok: true }, await draftStore.removeEvidence(req.tgUser.id, req.params.id, req.params.fileId, req.body?.revision)))));
   app.get('/api/audit/drafts/:id/evidence/:fileId', route(async (req, res) => {
     const file = await draftStore.downloadEvidence(req.tgUser.id, req.params.id, req.params.fileId);

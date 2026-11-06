@@ -35,10 +35,10 @@ function auditWizard() {
   <footer class="bottom-bar glass"><div class="bottom-inner"><button type="button" class="button secondary" id="previous-step">← Назад</button><span id="step-counter">1 из 3</span><button type="button" class="button primary" id="next-step">Далее →</button></div></footer>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   <script src="/audit-editor-geometry.js"><\/script>
-  <script src="/audit-plan-editor.js?v=20261106-sheet-atomic"><\/script>
-  <script src="/audit-actions.js?v=20261030-actions5"><\/script>
+  <script src="/audit-plan-editor.js?v=20261106-touch-ownership"><\/script>
+  <script src="/audit-actions.js?v=20261106-explicit-phone"><\/script>
   <script src="/audit-route.js?v=20261030-actions5"><\/script>
-  <script src="/audit-wizard-client.js?v=20261106-report-link"><\/script>
+  <script src="/audit-wizard-client.js?v=20261106-generic-audit"><\/script>
 </body>
 </html>`;
 }

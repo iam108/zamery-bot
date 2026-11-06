@@ -131,6 +131,13 @@ test('live capture groups consecutive messages using the latest message time and
   assert.deepEqual(rows[0].msg_ids.map(Number), [100, 101, 102]); assert.equal(rows[2].text, 'A new report');
 }));
 
+test('live capture follows the same stable Telegram author after a display-name change, matching exported history grouping',pg,async()=>fixture(async h=>{
+  const time=Date.parse('2026-11-05T10:00:00Z');
+  await h.addToReports(-100100,100,'Начало отчёта','Саша',808,null,new Date(time));
+  await h.addToReports(-100100,101,'Продолжение отчёта','Саша Я.',808,null,new Date(time+60000));
+  const rows=await h.rows();assert.equal(rows.length,1);assert.deepEqual(rows[0].msg_ids.map(Number),[100,101]);assert.equal(rows[0].text,'Начало отчёта\nПродолжение отчёта');assert.equal(Number(rows[0].author_id),808);
+}));
+
 test('Telegram export timestamps prefer epoch data and preserve the HTML UTC offset', () => {
   const h = load({});
   const json = h.parseExport(Buffer.from(JSON.stringify({ messages: [msg(1, 'Epoch', { date: 'invalid', date_unixtime: '1793862000', from_id: 'user808', media_group_id: 'album-1' })] })), 'result.json');

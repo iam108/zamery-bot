@@ -41,10 +41,11 @@ test('plan and map attachments have descriptive short captions', () => {
   assert.ok(photoCaption({}, 58).length < 1024);
 });
 
+let nextMockMessageId = 1000;
 function harness(options = {}) {
   const calls = [];
   const saved = [];
-  let sequence = 1;
+  let sequence = nextMockMessageId; nextMockMessageId += 1000;
   const esc = text => String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const ctx = { from: { id: 10, username: 'auditor' }, telegram: {}, reply: async text => { calls.push({ method: 'reply', text }); } };
   for (const method of ['sendMessage', 'sendPhoto', 'sendMediaGroup', 'sendDocument', 'editMessageReplyMarkup']) {
@@ -113,13 +114,13 @@ test('one photo uses sendPhoto with a short caption, full text sent separately',
   assert.ok(h.saved[0][3].length >= 4);
 });
 
-test('album failure is an error and retry does not resend report text', async () => {
+test('a Telegram-rejected album can retry without resending confirmed report text', async () => {
   let failed = false;
   const h = harness({ fail: async method => {
-    if (method === 'sendMediaGroup' && !failed) { failed = true; throw new Error('temporary upload failure'); }
+    if (method === 'sendMediaGroup' && !failed) { failed = true; throw Object.assign(new Error('Telegram rejected album'), { response: { error_code: 400 } }); }
   } });
   const report = data({ photos: [photo('plan'), photo('map')] });
-  await assert.rejects(h.send(report), /фотографии не доставлены/);
+  await assert.rejects(h.send(report), /доставка фотографий не подтверждена/);
   assert.equal(h.saved.length, 0);
   assert.equal(h.calls.filter(c => c.method === 'sendMessage').length, 1);
   await h.send(report);
@@ -160,7 +161,7 @@ test('legacy and tobacco submissions remain accepted and legacy zones remain vis
 
 test('changed payload cannot be mixed with partially delivered report', async () => {
   const h = harness({ fail: async method => { if (method === 'sendPhoto') throw new Error('failure'); } });
-  await assert.rejects(h.send(data({ photos: [photo('photo')] })), /фотографии/);
+  await assert.rejects(h.send(data({ photos: [photo('photo')] })), error => error.code === 'AUDIT_DELIVERY_UNKNOWN');
   await assert.rejects(h.send(data({ photos: [photo('photo')], conclusion: 'Изменено' })), /без изменений/);
 });
 
@@ -168,9 +169,9 @@ test('original documents are batched beyond ten and resume durable checkpoints a
   let stored = {}, albums = 0;
   const files = Array.from({ length: 23 }, (_, i) => ({ name: 'file-' + i + '.pdf', mime: 'application/pdf', role: 'document', source: Buffer.from('original-' + i) }));
   const report = data({ schema_version: 3, workflow: { conclusion_status: 'insufficient' }, entrances: [], zones: [], documents: files });
-  const first = harness({ fail: async method => { if (method === 'sendMediaGroup' && ++albums === 2) throw new Error('temporary failure'); } });
+  const first = harness({ fail: async method => { if (method === 'sendMediaGroup' && ++albums === 2) throw Object.assign(new Error('Telegram rejected batch'), { response: { error_code: 400 } }); } });
   first.ctx.auditDelivery = { load: async () => stored, save: async progress => { stored = JSON.parse(JSON.stringify(progress)); } };
-  await assert.rejects(first.send(report), /не все оригиналы/);
+  await assert.rejects(first.send(report), /подтвердить доставку оригиналов/);
   assert.equal(stored.documentIds.length, 10);
   const second = harness();
   second.ctx.auditDelivery = first.ctx.auditDelivery;

@@ -131,6 +131,7 @@ async function migrate() {
           ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS request_key TEXT;
           ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS processing_token UUID;
           ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS processing_until TIMESTAMPTZ;
+          ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS delivery_state JSONB NOT NULL DEFAULT '{}';
           CREATE UNIQUE INDEX IF NOT EXISTS egrn_orders_request_key ON egrn_orders(request_key) WHERE request_key IS NOT NULL;
         END IF;
         IF to_regclass('reports') IS NOT NULL THEN

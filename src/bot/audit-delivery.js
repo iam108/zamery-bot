@@ -194,7 +194,8 @@ function presentationMedia(data, options = {}) {
     return { source, mime: 'application/zip', name: 'Отчёт-' + order + '-оригиналы' + (groups.length > 1 ? '-' + (index + 1) + '-из-' + groups.length : '') + '.zip',
       caption: 'Оригиналы выезда' + (data.order_id ? ' · заявка #' + data.order_id : '') + (groups.length > 1 ? '\nЧасть ' + (index + 1) + ' из ' + groups.length : '') + '\n' + part.length + ' файлов · исходники и полная графика без изменения качества.', bytes: source.length };
   });
-  const inline = files.filter(item => /^(image\/(jpeg|png))$/.test(item.file.mime) && ['map', 'plan', 'entrance', 'zone', 'interior'].includes(item.file.role) && !['source', 'original'].includes(item.file.subject_id) && item.buffer.length <= 10 * 1024 * 1024);
+  const previewRoles=['map','plan','entrance','zone','interior'].concat(data.object_category==='other'?['photo','exterior']:[]);
+  const inline = files.filter(item => /^(image\/(jpeg|png))$/.test(item.file.mime) && previewRoles.includes(item.file.role) && !['source', 'original'].includes(item.file.subject_id) && item.buffer.length <= 10 * 1024 * 1024);
   const photos = inline.map(item => {
     const peers = inline.filter(other => other.file.role === item.file.role && other.file.subject_id === item.file.subject_id);
     const { data: encoded, ...metadata } = item.file;

@@ -95,13 +95,19 @@ function setupEgrnDownloads(app, options = {}) {
       const controller = new AbortController(), abort = () => controller.abort();
       req.once('aborted', abort); res.once('close', abort);
       async function* body() {
-        let sent = 0;
+        let sent = 0, tail;
         for await (const chunk of store.chunks(id, { signal: controller.signal })) {
           if (!(Buffer.isBuffer(chunk) || chunk instanceof Uint8Array) || sent + chunk.byteLength > info.bytes) throw new Error('Invalid stored file content');
           sent += chunk.byteLength;
-          yield chunk;
+          if (!chunk.byteLength) continue;
+          if (tail) yield tail;
+          tail = chunk;
         }
         if (sent !== info.bytes) throw new Error('Incomplete stored file content');
+        // Store iterators validate their final checksum at EOF. Retain one
+        // bounded chunk so Content-Length cannot make a client accept all
+        // bytes before that validation (or a last metadata query) succeeds.
+        if (tail) yield tail;
       }
       // pipeline destroys the source/async iterator on a disconnected client,
       // and waits for response drain instead of collecting the file in RAM.

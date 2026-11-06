@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const { createOrderDeliveryLock } = require('../src/db/order-delivery-lock');
+const { checklistCounts } = require('../src/web/handoff');
 
 function harness(staff = { tg_id: 42, role: 'auditor', approved: true }, options = {}) {
   const calls = [], actions = [], commands = new Map(), events = new Map();
@@ -27,13 +28,15 @@ function harness(staff = { tg_id: 42, role: 'auditor', approved: true }, options
       if (name === './formatter') return { formatOrderMessage: options.format || (() => 'Synthetic order'), STATUS_EMOJI: {}, esc: x => x };
       if (name === '../web/manager-orders') return { cardOptions: require('../src/web/manager-orders').cardOptions };
       if (name === './report-link-admin') return require('../src/bot/report-link-admin');
+      if (name === './order-delivery-admin') return require('../src/bot/order-delivery-admin');
+      if (name === './staff-approval') return require('../src/bot/staff-approval');
       if (name === '../web/order-report-link') return { loadOrderReportLink: options.loadOrderReportLink || (async () => null) };
       if (name === '../db/order-delivery-lock') return { withOrderDeliveryLock: options.withOrderDeliveryLock || (async (id, run) => run()) };
       if (name === './audit-handler') return { handleAuditReport: async () => calls.push('audit') };
-      if (name === '../web/handoff') return { setupReportsBot() {} };
+      if (name === '../web/handoff') return { setupReportsBot() {}, checklistCounts };
       if (name === './egrn') return { setupEgrn() {} };
       if (name === './manual-order-attachments') return { setupManualOrderAttachments() {} };
-      if (name === '../db/pool') return { query: async (sql, params) => { calls.push(['query', sql, params]); return { rows: staff ? [staff] : [] }; } };
+      if (name === '../db/pool') return { query: async (sql, params) => { calls.push(['query', sql, params]); return options.query ? options.query(sql, params) : { rows: staff ? [staff] : [] }; } };
       if (name === '../web/auth') return auth;
       if (name === '../web/workspace') return {};
       throw new Error('Unexpected import: ' + name);
@@ -44,7 +47,7 @@ function harness(staff = { tg_id: 42, role: 'auditor', approved: true }, options
     return { from: { id: 42 }, chat: { id: -10042, type: 'supergroup' }, callbackQuery: { data },
       telegram: { sendMessage: async () => { calls.push('message'); return { message_id: 7 }; } },
       editMessageText: async (text,opts) => { calls.push('edit'); calls.push(['card', text,opts]); }, answerCbQuery: async text => calls.push(['answer', text]),
-      reply: async text => calls.push(['reply', text]) };
+      reply: async (text, opts) => calls.push(['reply', text, opts]) };
   }
   async function action(data, overrides) {
     const [pattern, handler] = actions.find(([pattern]) => pattern.test(data));
@@ -158,4 +161,53 @@ test('bot report lookup failure preserves the existing keyboard and saved status
   await h.action('status:done:17');assert.equal(h.order.status,'done');assert.equal(h.calls.includes('edit'),false);assert.ok(h.calls.some(call=>Array.isArray(call)&&call[0]==='answer'&&/Ошибка|сохран/iu.test(call[1])));
   failed=false;await h.action('status:done:17');assert.equal(h.calls.filter(call=>Array.isArray(call)&&call[0]==='status').length,1);
   assert.equal(h.calls.find(call=>Array.isArray(call)&&call[0]==='card')[2].reply_markup.inline_keyboard.flat().find(button=>button.url).url,'https://t.me/c/111111/210');
+});
+
+
+test('the client list computes current conditional checklist progress instead of cached zero totals',async()=>{
+  const {LISTS:lists}=require('../src/checklists');
+  const key=Object.keys(lists).find(key=>lists[key]?.passport?.length);
+  assert.ok(key);
+  const c={id:72,org:'Синтетический клиент',done:0,total:0,checklist_key:key,service:'Получение',data:{},stage:'Сбор документов'};
+  const counts=checklistCounts(c,c.data);assert.ok(counts.total>0);
+  const staff={tg_id:42,role:'lawyer',approved:true};
+  const h=harness(staff,{query:async sql=>({rows:/FROM cases/.test(sql)?[c]:[staff]})});
+  await h.commands.get('cases')({...h.ctx(),callbackQuery:null,chat:{id:42,type:'private'}});
+  const reply=h.calls.find(call=>Array.isArray(call)&&call[0]==='reply');
+  const button=reply[2].reply_markup.inline_keyboard[0][0];
+  assert.ok(button.text.endsWith(counts.done+'/'+counts.total));
+  assert.ok(!button.text.endsWith('0/0'));
+  assert.match(button.web_app.url,/case_id=72&u=42/);
+  assert.ok(h.calls.some(call=>Array.isArray(call)&&call[0]==='query'&&/FROM cases/.test(call[1])&&/checklist_key/.test(call[1])));
+});
+
+test('an unknown checklist is labelled explicitly instead of showing false zero progress',async()=>{
+  const staff={tg_id:42,role:'lawyer',approved:true},c={id:73,org:'Без чек-листа',done:0,total:0,checklist_key:'missing',service:'Получение',data:{}};
+  const h=harness(staff,{query:async sql=>({rows:/FROM cases/.test(sql)?[c]:[staff]})});
+  await h.commands.get('cases')({...h.ctx(),callbackQuery:null,chat:{id:42,type:'private'}});
+  const reply=h.calls.find(call=>Array.isArray(call)&&call[0]==='reply');
+  assert.match(reply[2].reply_markup.inline_keyboard[0][0].text,/Чек-лист не выбран/);
+});
+
+test('a former lawyer now approved as auditor cannot list old assigned clients',async()=>{
+  const h=harness({tg_id:42,role:'auditor',approved:true});
+  await h.commands.get('cases')({...h.ctx(),callbackQuery:null,chat:{id:42,type:'private'}});
+  assert.equal(h.calls.some(call=>Array.isArray(call)&&call[0]==='query'&&/FROM cases/.test(call[1])),false);
+  assert.match(h.calls.find(call=>Array.isArray(call)&&call[0]==='reply')[1],/Нет доступа/);
+});
+
+test('the personal client list cannot disclose names through a group command',async()=>{
+  const h=harness({tg_id:42,role:'lawyer',approved:true});
+  await h.commands.get('cases')({...h.ctx(),callbackQuery:null});
+  assert.equal(h.calls.some(call=>Array.isArray(call)&&call[0]==='query'),false);
+  assert.equal(h.calls.some(call=>Array.isArray(call)&&call[0]==='reply'),false);
+});
+
+test('manager delivery recovery commands are registered and ignore unauthorized chat users',async()=>{
+  const h=harness();
+  for(const command of ['order_delivery','order_delivery_retry']){
+    assert.equal(typeof h.commands.get(command),'function');
+    await h.commands.get(command)({...h.ctx(),callbackQuery:null,message:{message_id:301,text:'/'+command+' 17'}});
+  }
+  assert.deepEqual(h.calls,[]);
 });

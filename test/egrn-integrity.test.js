@@ -38,6 +38,7 @@ async function fixture(options = {}) {
     require(name) {
       if (name === '../db/pool') return pool;
       if (name === './order-evidence') return { async registerOriginal() { return {}; }, async registerCached() { return {}; } };
+      if (name === './egrn-large-delivery' && options.largeDelivery) return {createLargeDelivery: options.largeDelivery};
       return localRequire(name);
     },
     async fetch(url, request = {}) {
@@ -47,17 +48,19 @@ async function fixture(options = {}) {
     },
   };
   vm.createContext(sandbox);
-  vm.runInContext(source + '\nmodule.exports.qa={ensureTables,reserveOrder,setStatus(fn){apiStatus=fn;}};', sandbox, { filename });
+  vm.runInContext(source + '\nmodule.exports.qa={ensureTables,reserveOrder,setStatus(fn){apiStatus=fn;},setDownload(fn){download=fn;}};', sandbox, { filename });
   const api = sandbox.module.exports;
   const telegram = {
     async sendMessage(chat, text) { calls.messages.push({ chat, text }); return { message_id: 100 + calls.messages.length }; },
     async editMessageText() {},
-    async sendDocument(chat, file, extra) { calls.documents.push({ chat, file, extra }); await options.sendDocument?.(extra); return { message_id: 200 + calls.documents.length, document: { file_id: 'test-only-original', mime_type: 'application/pdf' } }; },
-    async callApi(method, value) { calls.copies.push(value); await options.copy?.(value); return { message_id: 300 + calls.copies.length }; },
+    async sendDocument(chat, file, extra) { const call={chat,file,extra};calls.documents.push(call);await options.sendDocument?.(extra,call);call.delivered=true;return options.documentReceipt ? options.documentReceipt(call) : { message_id: 200 + calls.documents.length, document: { file_id: 'test-only-original-'+calls.documents.length, mime_type: 'application/pdf' } }; },
+    async callApi(method, value) { calls.copies.push(value); await options.copy?.(value); return options.copyReceipt ? options.copyReceipt(value) : { message_id: 300 + calls.copies.length }; },
   };
   const bot = { on() {}, hears() {}, action(pattern, handler) { actions.push({ pattern, handler }); }, command(name, handler) { commands.push({ name, handler }); }, telegram };
   api.setupEgrn(bot);
   await api.qa.ensureTables();
+  await pool.query('CREATE TABLE staff(tg_id BIGINT PRIMARY KEY,approved BOOLEAN,role TEXT)');
+  await pool.query("INSERT INTO staff(tg_id,approved,role) VALUES(111,true,'manager'),(222,true,'lawyer'),(333,true,'lawyer')");
   api.qa.setStatus(async id => {
     calls.status.push(Number(id));
     const done = options.ready ? options.ready(Number(id)) : true;
@@ -73,6 +76,83 @@ async function fixture(options = {}) {
     attach: (chat = 111, extra = {}) => api.attachOrOrder({ cad: CAD, order: true, orderedBy: chat, targets: [{ chat }], ...extra }),
     close: () => db.close() };
 }
+
+function retryContext(id, message_id, replies=[],actor=111) { return {from:{id:actor},chat:{type:'private',id:actor},message:{text:'/egrn_retry '+id,message_id},async reply(text){replies.push(text);}}; }
+
+for(const busyStage of ['native-send','provider-status'])test('runtime busy retry consumes its actor cursor during '+busyStage+' and cannot reopen a later unknown attempt',pg,async()=>{
+  const entered=gate(),release=gate();let first=true;
+  const h=await fixture({adminIDs:'111,222',async sendDocument(){if(first&&busyStage==='native-send'){first=false;entered.open();await release.promise;}throw new Error('Synthetic accepted original ACK lost');}});try{
+    const order=await h.add();
+    if(busyStage==='provider-status')h.api.qa.setStatus(async()=>{if(first){first=false;entered.open();await release.promise;}return{id_req:7001,status:[{type:'processed',file:Buffer.from('%PDF-1.7\n'+'A'.repeat(300)+'\n%%EOF').toString('base64')}]};});
+    const command=h.commands.find(c=>c.name==='egrn_retry').handler,running=h.poll();await entered.promise;await command(retryContext(7001,101));release.open();await running;
+    assert.equal(h.calls.documents.length,1);assert.equal((await h.row(order.id)).delivery_state.retry_cursors?.['111'],101);
+    await command(retryContext(7001,201,[],222));assert.equal(h.calls.documents.length,2);const current=await h.row(order.id),attempt=current.delivery_state.inflight.attempt;
+    await command(retryContext(7001,101));assert.equal(h.calls.documents.length,2);assert.equal((await h.row(order.id)).delivery_state.inflight.attempt,attempt);assert.equal(h.calls.paid,0);
+  }finally{release.open();await h.close();}
+});
+
+test('cached large-link copy into a case thread checkpoints its exact reply target without an unknown state',pg,async()=>{
+  const id='11111111-1111-4111-8111-111111111111',meta={id,name:'full.pdf',mime:'application/pdf',bytes:100*1024*1024},h=await fixture({largeDelivery:options=>require('../src/bot/egrn-large-delivery').createLargeDelivery({...options,store:{get:async()=>meta},makeUrl:()=> 'https://fixture.invalid/full.pdf'})});try{
+    const order=await h.add({status:'done',filesSent:1,files:[{key:'exact-large',kind:'link',original_id:id,name:meta.name,mime:meta.mime,bytes:meta.bytes,chat:-100123,deliveries:[{chat:-100123,id:99}]}]});
+    assert.equal((await h.attach(222,{targets:[{chat:222,reply:91}]})).result,'attached');const saved=await h.row(order.id);assert.equal(saved.delivery_state.inflight,undefined);assert.ok(saved.file_msgs[0].deliveries.some(r=>Number(r.chat)===222&&r.reply===91));assert.equal(h.calls.paid,0);
+  }finally{await h.close();}
+});
+
+test('lost native primary ACK stops automatic restart delivery until a new explicit admin event, without another paid POST',pg,async()=>{
+  let lose=true;const h=await fixture({sendDocument(){if(lose)throw new Error('Network ACK lost after physical acceptance');}});try{
+    const order=await h.add();await h.poll();let saved=await h.row(order.id);assert.equal(saved.files_sent,-1);assert.ok(saved.delivery_state.inflight);assert.equal(h.calls.documents.length,1);assert.equal(saved.file_msgs.length,0);
+    await h.anotherPoller()();await assert.rejects(h.attach(222),e=>e.code==='EGRN_DELIVERY_UNCONFIRMED');assert.equal(h.calls.documents.length,1);assert.equal(h.calls.paid,0);
+    let command=h.restartCommands().find(c=>c.name==='egrn_retry').handler;await command(retryContext(7001,101));assert.equal(h.calls.documents.length,2);saved=await h.row(order.id);assert.equal(saved.files_sent,-1);const attempt=saved.delivery_state.inflight.attempt;
+    command=h.restartCommands().find(c=>c.name==='egrn_retry').handler;await command(retryContext(7001,101));assert.equal(h.calls.documents.length,2);assert.equal((await h.row(order.id)).delivery_state.inflight.attempt,attempt);
+    lose=false;await command(retryContext(7001,102));saved=await h.row(order.id);assert.equal(saved.files_sent,1);assert.equal(saved.delivery_state.inflight,undefined);assert.equal(h.calls.documents.length,3);assert.equal(h.calls.paid,0);
+  }finally{await h.close();}
+});
+
+test('a lost extra-recipient copy ACK keeps original receipts and does not copy again automatically after restart',pg,async()=>{
+  let lose=true;const h=await fixture({copy(value){if(lose&&Number(value.chat_id)===222)throw new Error('Lost copy ACK');}});try{
+    const order=await h.add({targets:[{chat:222}]});await h.poll();let saved=await h.row(order.id);assert.equal(saved.files_sent,-1);assert.equal(saved.file_msgs.length,1);assert.ok(saved.delivery_state.inflight);assert.equal(saved.file_msgs[0].deliveries?.some(r=>Number(r.chat)===222)||false,false);
+    await h.anotherPoller()();assert.equal(h.calls.copies.filter(v=>Number(v.chat_id)===222).length,1);assert.equal(h.calls.documents.length,1);
+    lose=false;await h.commands.find(c=>c.name==='egrn_retry').handler(retryContext(7001,201));saved=await h.row(order.id);assert.equal(saved.files_sent,1);assert.equal(h.calls.documents.length,1);assert.equal(h.calls.copies.filter(v=>Number(v.chat_id)===222).length,2);assert.equal(h.calls.paid,0);
+  }finally{await h.close();}
+});
+
+test('deleted-source repair ACK loss persists its own unknown intent and cannot silently resend the retained file_id',pg,async()=>{
+  let lose=true;const h=await fixture({copy(value){if(Number(value.message_id)===501)throw {response:{error_code:400,description:'Bad Request: message to copy not found'}};},sendDocument(){if(lose)throw new Error('Lost retained-file send ACK');}});try{
+    const order=await h.add({status:'done',filesSent:1,files:[{key:'exact-original',chat:-100123,id:501,file_id:'retained-id',name:'full.pdf',bytes:35*1024*1024,mime:'application/pdf'}]});
+    await assert.rejects(h.attach(222),e=>e.uncertain===true);let saved=await h.row(order.id);assert.equal(saved.delivery_state.inflight.kind,'native-repair');assert.equal(h.calls.documents.length,1);
+    await h.anotherPoller()();await assert.rejects(h.attach(222),e=>e.code==='EGRN_DELIVERY_UNCONFIRMED');assert.equal(h.calls.documents.length,1);assert.equal(h.calls.paid,0);
+    lose=false;await h.commands.find(c=>c.name==='egrn_retry').handler(retryContext(7001,250));saved=await h.row(order.id);assert.equal(saved.files_sent,1);assert.equal(saved.delivery_state.inflight,undefined);assert.equal(h.calls.documents.length,2,'only the newly authorized source repair is needed');assert.equal(h.calls.paid,0);
+  }finally{await h.close();}
+});
+
+test('postACK native checkpoint failure leaves an unknown marker and a salvaged receipt, so explicit retry does not resend the original',pg,async()=>{
+  let fail=true;const h=await fixture({beforeQuery(sql){if(fail&&sql.startsWith('UPDATE egrn_orders SET file_msgs=')){fail=false;throw new Error('Lost checkpoint before write');}}});try{
+    const order=await h.add();await h.poll();let saved=await h.row(order.id);assert.equal(saved.files_sent,-1);assert.ok(saved.delivery_state.inflight);assert.equal(saved.file_msgs.length,1);assert.equal(h.calls.documents.length,1);
+    await h.anotherPoller()();assert.equal(h.calls.documents.length,1);await h.commands.find(c=>c.name==='egrn_retry').handler(retryContext(7001,301));saved=await h.row(order.id);assert.equal(saved.files_sent,1);assert.equal(saved.delivery_state.inflight,undefined);assert.equal(h.calls.documents.length,1);assert.equal(h.calls.paid,0);
+  }finally{await h.close();}
+});
+
+test('a durable intent SQL failure prevents Telegram send, and a later safe retry delivers only once',pg,async()=>{
+  let fail=true;const h=await fixture({beforeQuery(sql){if(fail&&sql.includes('jsonb_set(COALESCE(delivery_state')){fail=false;throw new Error('Intent storage unavailable');}}});try{
+    const order=await h.add();await h.poll();let saved=await h.row(order.id);assert.equal(saved.files_sent,0);assert.equal(saved.delivery_state.inflight,undefined);assert.equal(h.calls.documents.length,0);
+    await h.pool.query('UPDATE egrn_orders SET retry_at=NULL WHERE id=$1',[order.id]);await h.poll();saved=await h.row(order.id);assert.equal(saved.files_sent,1);assert.equal(h.calls.documents.length,1);assert.equal(h.calls.paid,0);
+  }finally{await h.close();}
+});
+
+test('revoked or reassigned private recipients stay pending without physical copies, while approved recipients retain their receipts',pg,async()=>{
+  const h=await fixture();try{
+    await h.pool.query('CREATE TABLE cases(id INT PRIMARY KEY,lawyer_tg_id BIGINT)');await h.pool.query('INSERT INTO cases VALUES(9,333)');await h.pool.query('UPDATE staff SET approved=false WHERE tg_id=333');
+    const order=await h.add({targets:[{chat:222,case_id:9},{chat:333}]});await h.poll();let saved=await h.row(order.id);assert.equal(saved.files_sent,0);assert.equal(h.calls.documents.length,1);assert.equal(h.calls.copies.some(v=>[222,333].includes(Number(v.chat_id))),false);assert.ok(saved.file_msgs[0].deliveries.some(r=>Number(r.chat)===111));assert.equal(saved.delivery_state.inflight,undefined);
+    await h.pool.query('UPDATE cases SET lawyer_tg_id=222 WHERE id=9');await h.pool.query('UPDATE staff SET approved=true WHERE tg_id=333');await h.pool.query('UPDATE egrn_orders SET retry_at=NULL WHERE id=$1',[order.id]);await h.poll();saved=await h.row(order.id);assert.equal(saved.files_sent,1);assert.equal(h.calls.documents.length,1);assert.equal(h.calls.paid,0);
+  }finally{await h.close();}
+});
+
+test('revoked private primary is never sent a document or stopped notification; the configured group retains a safe original source',pg,async()=>{
+  const h=await fixture({adminIDs:'111'});try{
+    await h.pool.query('UPDATE staff SET approved=false WHERE tg_id=222');const order=await h.add({targets:[{chat:-100123}]});await h.pool.query('UPDATE egrn_orders SET chat_id=222,ordered_by=222 WHERE id=$1',[order.id]);await h.poll();
+    const saved=await h.row(order.id);assert.equal(saved.files_sent,0);assert.equal(h.calls.documents.length,1);assert.equal(h.calls.documents[0].chat,-100123);assert.equal(h.calls.copies.some(v=>Number(v.chat_id)===222),false);assert.equal(h.calls.messages.some(v=>Number(v.chat)===222),false);assert.ok(h.calls.messages.some(v=>Number(v.chat)===111&&/доступа получателя/.test(v.text)));assert.equal(h.calls.paid,0);
+  }finally{await h.close();}
+});
 
 test('concurrent requests reserve one paid order and keep both recipients', pg, async () => {
   const started = gate(), release = gate();
@@ -230,6 +310,34 @@ test('failed recipient delivery resumes from native receipts without refetching 
     assert.equal(h.calls.copies.filter(c => Number(c.chat_id) === 111).length, 1);
     assert.equal(h.calls.copies.filter(c => Number(c.chat_id) === 222).length, 2);
   } finally { await h.close(); }
+});
+
+for(const sourceKind of ['embedded','url'])test('partial '+sourceKind+' delivery matches exact originals after provider order changes, rather than reusing the previous array position', pg, async()=>{
+  let attempt=0,phase=0;const h=await fixture({sendDocument(){if(++attempt===2)throw Object.assign(new Error('Synthetic rejected second document'),{response:{error_code:400,description:'Bad Request: rejected second file'}});}});
+  const a=Buffer.from('%PDF-1.7\nORIGINAL-A\n'+'A'.repeat(300)+'\n%%EOF'),b=Buffer.from('%PDF-1.7\nORIGINAL-B\n'+'B'.repeat(300)+'\n%%EOF');
+  try{
+    const order=await h.add();
+    h.api.qa.setStatus(async()=>({id_req:7001,status:(phase++===0?[a,b]:[b,a]).map(buf=>({type:'processed',statusDescription:'Выполнено',...(sourceKind==='embedded'?{file:buf.toString('base64')}:{download:'https://provider.invalid/'+(buf===a?'original-A':'original-B')+'.pdf'})}))}));
+    h.api.qa.setDownload(async url=>({name:'provider-original.pdf',kind:'pdf',buf:url.includes('original-A')?a:b}));
+    await h.poll();assert.equal((await h.row(order.id)).file_msgs.length,1);await h.pool.query('UPDATE egrn_orders SET retry_at=NULL WHERE id=$1',[order.id]);await h.poll();
+    const row=await h.row(order.id),delivered=h.calls.documents.filter(call=>call.delivered);assert.equal(row.files_sent,2);assert.equal(delivered.filter(call=>call.file.source.equals(a)).length,1);assert.equal(delivered.filter(call=>call.file.source.equals(b)).length,1);assert.equal(h.calls.paid,0);assert.equal(new Set(row.file_msgs.map(record=>record.sha256)).size,2);
+  }finally{await h.close();}
+});
+
+test('an incomplete legacy native packet without a content identity is explicitly stopped before any guessed replacement or resend',pg,async()=>{
+  const h=await fixture(),a=Buffer.from('%PDF-1.7\nA'+'A'.repeat(300)+'\n%%EOF');try{
+    const row=await h.add({status:'done',files:[{key:'embedded:0:old.pdf',chat:-100123,id:501,file_id:'legacy-original',name:'old.pdf',mime:'application/pdf',bytes:a.length}]});
+    h.api.qa.setStatus(async()=>({id_req:7001,status:[{type:'processed',statusDescription:'Выполнено',file:a.toString('base64')}]}));await h.poll();
+    const saved=await h.row(row.id);assert.equal(saved.files_sent,-1);assert.match(saved.error,/Старый частичный комплект/);assert.equal(h.calls.documents.length,0);assert.equal(h.calls.copies.length,0);assert.ok(h.calls.messages.some(call=>/вручную/.test(call.text)));assert.equal(h.calls.paid,0);
+  }finally{await h.close();}
+});
+
+test('a verified legacy content identity keeps its original receipt key when the provider reorders the partial packet',pg,async()=>{
+  const h=await fixture(),a=Buffer.from('%PDF-1.7\nA'+'A'.repeat(300)+'\n%%EOF'),b=Buffer.from('%PDF-1.7\nB'+'B'.repeat(300)+'\n%%EOF'),sha=require('node:crypto').createHash('sha256').update(a).digest('hex');try{
+    const row=await h.add({status:'done',files:[{key:'legacy-original-A',sha256:sha,chat:-100123,id:501,file_id:'legacy-original',name:'old.pdf',mime:'application/pdf',bytes:a.length}]});
+    h.api.qa.setStatus(async()=>({id_req:7001,status:[b,a].map(buf=>({type:'processed',statusDescription:'Выполнено',file:buf.toString('base64')}))}));await h.poll();
+    const saved=await h.row(row.id);assert.equal(saved.files_sent,2);assert.equal(h.calls.documents.length,1);assert.ok(h.calls.documents[0].file.source.equals(b));assert.ok(saved.file_msgs.some(record=>record.key==='legacy-original-A'&&record.id===501));assert.equal(h.calls.paid,0);
+  }finally{await h.close();}
 });
 
 test('waiting orders rotate out of a full polling batch so a newer ready order is checked', pg, async () => {

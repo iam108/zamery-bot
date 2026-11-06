@@ -49,7 +49,7 @@ test('packet fields, revision, new originals, log and edit receipt roll back tog
 
 for(const restart of [false,true])test('stale manager inputs and a new original cannot overwrite a later packet or cause delivery, restarted='+restart,pg,async()=>database(async h=>{
   const deliveries=[];let rejectFirstCard=true;
-  function handlers(isA=false){return createManagerHandlers({pool:h.pool,materials:h.materials,queries:h.loadQueries(),format:order=>JSON.stringify({address:order.address,contacts:order.contacts}),
+  function handlers(isA=false){return createManagerHandlers({groupId:'-100321',pool:h.pool,materials:h.materials,queries:h.loadQueries(),format:order=>JSON.stringify({address:order.address,contacts:order.contacts}),
     attachOrOrder:()=>assert.fail('No paid EGRN request'),getTelegram:()=>({
       async editMessageText(_chat,_id,_unused,text){deliveries.push({kind:'card',...JSON.parse(text)});if(isA&&rejectFirstCard){rejectFirstCard=false;throw new Error('Synthetic Telegram rejection');}},
       async sendMessage(){assert.fail('Reuse the existing card');},async sendDocument(_chat,file){deliveries.push({kind:'document',name:file.filename});return {message_id:901};},
@@ -84,7 +84,7 @@ test('an exact edit receipt replays after restart against the current row withou
 
 test('a restarted handler replays exact saved intent using the current card and never applies an older EGRN order to a newer cadastral number',pg,async()=>database(async h=>{
   const cards=[],egrn=[];
-  function handlers(){return createManagerHandlers({pool:h.pool,materials:h.materials,queries:h.loadQueries(),format:order=>JSON.stringify({address:order.address,cad:order.cad_num}),
+  function handlers(){return createManagerHandlers({groupId:'-100321',pool:h.pool,materials:h.materials,queries:h.loadQueries(),format:order=>JSON.stringify({address:order.address,cad:order.cad_num}),
     attachOrOrder:async intent=>{egrn.push(intent);return {result:'none'};},getTelegram:()=>({async editMessageText(_chat,_id,_unused,text){cards.push(JSON.parse(text));},async sendMessage(){assert.fail('Reuse the existing card');},async sendDocument(){assert.fail('No new original is allowed');}})});}
   const first=handlers(),intentA=request(h.order,108,'durable-a',{address:'Москва, Адрес A, 2',cad_num:'77:01:0000001:1',egrn_order:'1'}),savedA=response();
   await first.save(intentA,savedA);assert.equal(savedA.body.ok,true);assert.match(savedA.body.warning,/ЕГРН/);
@@ -123,7 +123,7 @@ test('a late creation retry after a newer edit confirms the original revision wi
   const latestData=materialsModule.normalizeManagerOrder({...initial(),address:'Москва, Позднее изменение B, 2',contacts:'Новый контакт B'},[]);
   const changed=await h.queries.updateOrderPacketWithMaterials(h.order.id,latestData,[],{actorId:109,actorName:'B',submitId:'later-edit',signature:'b'.repeat(64),expectedRevision:h.order.packet_revision});
   const counts=await h.counts(),cards=[];
-  function handlers(){return createManagerHandlers({pool:h.pool,materials:h.materials,queries:h.loadQueries(),format:order=>order.address,attachOrOrder:()=>assert.fail('No paid EGRN call'),
+  function handlers(){return createManagerHandlers({groupId:'-100321',pool:h.pool,materials:h.materials,queries:h.loadQueries(),format:order=>order.address,attachOrOrder:()=>assert.fail('No paid EGRN call'),
     getTelegram:()=>({sendMessage:()=>assert.fail('No duplicate card'),editMessageText:async(chat,id,unused,text)=>cards.push(text),sendDocument:()=>assert.fail('No new original')})});}
   const createRetry={params:{},tgUser:{id:108},staff:{name:'Переименованный автор',role:'manager'},files:[],body:initial()},replayed=response();
   await handlers().save(createRetry,replayed);
@@ -138,7 +138,7 @@ test('a late creation retry after a newer edit confirms the original revision wi
 
 test('real manager publication keeps the latest persisted audit link after packet and status changes',pg,async()=>database(async h=>{
   await h.pool.query('INSERT INTO audits(id,order_id,chat_id,msg_ids,created_at) VALUES(1,$1,$2,$3,$4),(2,$1,$2,$5,$6)',[h.order.id,'-1001111111111',[209,201],'2026-11-01T12:00:00Z',[0],'2026-11-02T12:00:00Z']);
-  const keyboards=[],handlers=createManagerHandlers({pool:h.pool,materials:h.materials,queries:h.loadQueries(),format:order=>order.address,attachOrOrder:()=>assert.fail('No provider call'),getTelegram:()=>({async editMessageText(chat,id,unused,text,options){keyboards.push(options.reply_markup.inline_keyboard.flat());}})});
+  const keyboards=[],handlers=createManagerHandlers({groupId:'-100321',pool:h.pool,materials:h.materials,queries:h.loadQueries(),format:order=>order.address,attachOrOrder:()=>assert.fail('No provider call'),getTelegram:()=>({async editMessageText(chat,id,unused,text,options){keyboards.push(options.reply_markup.inline_keyboard.flat());}})});
   const first=response();await handlers.save(request(h.order,108,'report-edit-1',{address:'Москва, Новый адрес'}),first);assert.equal(first.body.warning,undefined);assert.equal(keyboards[0].find(button=>button.url).url,'https://t.me/c/1111111111/209');
   await h.pool.query("UPDATE orders SET status='cancelled' WHERE id=$1",[h.order.id]);await h.pool.query('INSERT INTO audits VALUES(3,$1,$2,$3,$4)',[h.order.id,'-1001111111111',[300],'2026-11-03T12:00:00Z']);
   const current=await h.queries.getOrderById(h.order.id),second=response();await handlers.save(request(current,108,'report-edit-2',{address:'Москва, Финальный адрес'}),second);

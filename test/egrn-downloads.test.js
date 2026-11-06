@@ -100,6 +100,18 @@ test('GET downloads the exact bytes using only the signed URL and private attach
   assert.deepEqual(h.calls, ['ensure', ['get', ID], ['chunks', ID]]);
 });
 
+for(const emptyTail of [false,true])test('a late stored-original integrity failure cannot become a completed HTTP download, empty tail='+emptyTail,async t=>{
+  const data=Buffer.from('%PDF-1.7\ncorrupted same-size original\n');
+  const h=await fixture(t,{async get(){return{name:'original.pdf',mime:'application/pdf',bytes:data.length};},async *chunks(){yield data.subarray(0,8);yield data.subarray(8);if(emptyTail)yield Buffer.alloc(0);await new Promise(resolve=>setTimeout(resolve,25));throw Object.assign(new Error('Stored checksum mismatch'),{code:'EGRN_FILE_CORRUPT'});}});
+  await assert.rejects(request(h.port,routePath(url())),/aborted|reset|socket|closed/i);
+});
+
+test('the final original bytes reach the client only after successful iterator integrity completion',async t=>{
+  const data=Buffer.from('%PDF-1.7\nverified original\n');let verified=false;
+  const h=await fixture(t,{async get(){return{name:'original.pdf',mime:'application/pdf',bytes:data.length};},async *chunks(){yield data;await new Promise(resolve=>setTimeout(resolve,25));verified=true;}});
+  const result=await request(h.port,routePath(url()));assert.equal(result.status,200);assert.ok(result.body.equals(data));assert.equal(verified,true);
+});
+
 test('HEAD exposes the same size and filename without opening or buffering the body', async t => {
   const h = await fixture(t), result = await request(h.port, routePath(url()), 'HEAD');
   assert.equal(result.status, 200); assert.equal(result.body.length, 0);

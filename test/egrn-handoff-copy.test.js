@@ -27,6 +27,7 @@ function harness({ files = [native('small')], fail, receipt, sender = true, pers
     process: { env: {} }, console: { error(...args) { errors.push(args); } },
     fetch() { apiCalls++; throw new Error('Paid API and external requests are forbidden in this test.'); },
     require(name) {
+      if (name === './egrn-telegram-delivery') return require('./fixtures/egrn-telegram-delivery.cjs');
       if (name === '../db/pool') return { async query(sql, params) {
         queries.push({ sql, params });
         if(sql.startsWith('UPDATE egrn_orders SET processing_token=gen_random_uuid()')) {order.processing_token='11111111-1111-4111-8111-111111111111';return {rows:[order]};}
@@ -54,6 +55,18 @@ function harness({ files = [native('small')], fail, receipt, sender = true, pers
 }
 
 const copyKey = (chat, file) => JSON.stringify([String(chat), file.key || String(file.chat) + ':' + String(file.id)]);
+
+test('a recipient guard runs immediately before a native copy and blocks it without an unknown acknowledgement',async()=>{
+  const h=harness(),blocked=Object.assign(new Error('Recipient was revoked'),{code:'HANDOFF_RECIPIENT_UNAVAILABLE'});let checked=0;
+  await assert.rejects(h.attach({copyOptions:{beforeSend(target){checked++;assert.equal(target.chat,20);throw blocked;}}}),error=>error===blocked&&error.uncertain===false);
+  assert.equal(checked,1);assert.equal(h.calls.length,0);h.noPaidOrder();
+});
+
+test('native missing-source repair rechecks the recipient before sending its reusable original',async()=>{
+  const h=harness({files:[{...native('exact'),file_id:'retained-original'}],fail:call=>call.kind==='native'?Object.assign(new Error('missing source'),{response:{error_code:400,description:'Bad Request: message to copy not found'}}):null});let checked=0;
+  await assert.rejects(h.attach({copyOptions:{beforeSend(){if(++checked===2)throw Object.assign(new Error('Recipient changed during source lookup'),{code:'HANDOFF_RECIPIENT_UNAVAILABLE'});}}}),error=>error.uncertain===false);
+  assert.equal(checked,2);assert.deepEqual(h.calls.map(call=>call.kind),['native']);assert.equal(h.order.file_msgs[0].id,5);h.noPaidOrder();
+});
 
 test('a native copy failure cannot claim a successful attachment when strict mode was omitted', async () => {
   const h = harness({ fail: () => new Error('Temporary Telegram failure') });

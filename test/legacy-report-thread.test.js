@@ -21,12 +21,12 @@ async function fixture(run) {
     console: { error() {}, log() {} }, process: { env: { CLIENTS_CHAT_ID: CLIENTS, GROUP_CHAT_ID: AUDITS } },
     require(name) { if (name === '../db/pool') return pool; return require(name.startsWith('.') ? '../src/web/' + name : name); },
   });
-  vm.runInContext(source + '\nmodule.exports.qa={ensureTables,ensureReports,ensureRequests,getReport};', context);
+  vm.runInContext(source + '\nmodule.exports.qa={ensureTables,ensureReports,ensureRequests,getReport,searchReports};', context);
   const api = context.module.exports.qa;
   try {
     await api.ensureTables(); await api.ensureReports(); await api.ensureRequests();
-    await db.exec(`CREATE TABLE orders(id INT PRIMARY KEY,address TEXT,object_name TEXT,telegram_msg_id BIGINT);
-      INSERT INTO orders VALUES(60,'Москва, Synthetic, 5','ООО Synthetic',50),(61,'Москва, Other object','ООО Other',51);
+    await db.exec(`CREATE TABLE orders(id INT PRIMARY KEY,address TEXT,object_name TEXT,telegram_msg_id BIGINT,owner_name TEXT);
+      INSERT INTO orders(id,address,object_name,telegram_msg_id) VALUES(60,'Москва, Synthetic, 5','ООО Synthetic',50),(61,'Москва, Other object','ООО Other',51);
       INSERT INTO reports(id,chat_id,first_id,msg_ids,text,author,reply_to) VALUES
       (100,-100200,1000,'{1000,1001}','Заявка #60','manager',NULL),
       (110,-100200,1100,'{1100,1101}','Direct auditor report','auditor',1001),
@@ -39,7 +39,8 @@ async function fixture(run) {
       (180,-100200,1800,'{1100}','Cycle back to ancestor','auditor',1800),
       (200,-100100,2200,'{2200}','','auditor',2101),
       (210,-100100,2300,'{2300}','GROUP correction','auditor',2200),
-      (400,-100200,4000,'{4000}','Bound to another order','auditor',51),
+      (400,-100100,4000,'{4000}','Bound to another order','auditor',51),
+      (401,-100200,4010,'{4010}','Unrelated clients-chat reply','client',51),
       (500,-100200,5000,'{5000}','Unlinked legacy report','auditor',NULL),
       (510,-100200,5100,'{5100}','Unlinked descendant','auditor',5000),
       (999,-100999,1100,'{9990}','Foreign-chat coincidental message IDs','other',1101);
@@ -47,7 +48,7 @@ async function fixture(run) {
       (15,60,-100100,'{2100,2101}','Saved cross-chat audit','{"inspection":{"service":"Продление"}}'),
       (16,61,-100100,'{2500}','Other order audit','{"inspection":{"service":"Получение"}}');
       INSERT INTO cases(id,order_id,lawyer_tg_id,created_by,data) VALUES(60,60,808,101,'{"_handoff":{"body":{"report_src":"r","report_id":500}}}');`);
-    const options = { pool, evidenceStore: {}, listMaterials: async () => [], listEgrnLinks: async () => [], lookupEgrn: async () => ({ status: 'missing' }) };
+    const options = { pool, workingChatId: AUDITS, evidenceStore: {}, listMaterials: async () => [], listEgrnLinks: async () => [], lookupEgrn: async () => ({ status: 'missing' }) };
     const service = createPacketService(options), routes = new Map();
     setupHandoffPacket({ get(path, handler) { routes.set(path, handler); } }, { pool, service });
     async function packetRoute(query) {
@@ -101,13 +102,31 @@ test('a requested order cannot seed audits for an unlinked legacy root and its e
 }));
 
 test('server-side legacy order binding rejects a conflicting requested order before case authorization', pg, async () => fixture(async h => {
-  const bound = await loadReportAggregate(h.pool,400); assert.equal(bound.order_id,61);
+  const bound = await loadReportAggregate(h.pool,400,{workingChatId:AUDITS}); assert.equal(bound.order_id,61);
   const before = h.queries.length;
   const result = await h.packetRoute({ order_id: 60, report_src: 'r', report_id: 400 });
   assert.equal(result.status,409); assert.equal(result.result.code,'REPORT_ORDER_MISMATCH');
   assert.ok(h.queries.slice(before).some(call => call.sql.startsWith('SELECT id FROM orders WHERE telegram_msg_id=')));
   assert.ok(!h.queries.slice(before).some(call => call.sql.startsWith('SELECT * FROM cases WHERE order_id=')));
   assert.equal((await h.packetRoute({ report_src: 'r', report_id: 400 })).status,403);
+}));
+
+test('a coincidental reply message ID in the clients chat cannot bind a legacy report to an order card in the working chat',pg,async()=>fixture(async h=>{
+  const before=h.queries.length,aggregate=await loadReportAggregate(h.pool,401,{workingChatId:AUDITS});assert.equal(aggregate.order_id,null);assert.equal(aggregate.text,'Unrelated clients-chat reply');
+  assert.ok(!h.queries.slice(before).some(call=>call.sql.startsWith('SELECT id FROM orders WHERE telegram_msg_id=')));
+  const report=await h.api.getReport('r',401);assert.equal(report.order_id,null);assert.equal(report.linked,0);
+  const packet=await h.service.packet({order_id:60,report_src:'r',report_id:401});assert.equal(packet.report.order_id,null);assert.equal(packet.report.text,'Unrelated clients-chat reply');assert.equal((await h.packetRoute({order_id:60,report_src:'r',report_id:401})).status,403);
+}));
+
+test('reply-based legacy binding requires a configured working chat rather than guessing across all chats',pg,async()=>fixture(async h=>{
+  assert.equal((await loadReportAggregate(h.pool,400,{workingChatId:''})).order_id,null);
+  assert.equal((await loadReportAggregate(h.pool,400,{workingChatId:AUDITS})).order_id,61);
+  assert.equal((await loadReportAggregate(h.pool,100,{workingChatId:''})).order_id,60,'An explicit persisted card number retains its existing server relation');
+}));
+
+test('legacy report search does not borrow another chat order address or inferred order ID from a coincidental reply number',pg,async()=>fixture(async h=>{
+  const results=await h.api.searchReports('Other object');assert.ok(results.some(item=>item.src==='r'&&item.id===400));assert.ok(!results.some(item=>item.src==='r'&&item.id===401));
+  const ownText=await h.api.searchReports('Unrelated clients-chat reply');assert.equal(ownText.find(item=>item.src==='r'&&item.id===401).order_id,null);
 }));
 
 test('live Telegram capture retains captionless audio, voice, video notes and animation replies for the recursive packet', pg, async () => fixture(async h => {

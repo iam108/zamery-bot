@@ -33,7 +33,7 @@ function harness(files, options = {}) {
       attempts.push({ chat, filename: file.filename }); if (options.fail) await options.fail(chat, file, config);
       const buffer = await collect(file.source), id = ++sequence;
       sent.push({ chat, filename: file.filename, config, buffer, id });
-      return options.badAck ? {} : { message_id: id };
+      return options.ack ? options.ack(id,chat) : options.badAck ? {} : { message_id: id };
     } }
   });
   return { deliver, sent, attempts, loads };
@@ -182,4 +182,15 @@ test('an upload response without a receipt is uncertain even when transport reso
   const h = harness([material('Документ.pdf', 'ORIGINAL')], { badAck: true });
   const result = await h.deliver(58, [targets[0]]);
   assert.equal(result.failed[0].code, 'MATERIAL_TELEGRAM_RECEIPT'); assert.equal(result.failed[0].uncertain, true);
+});
+
+for(const ack of [{message_id:true},{message_id:15},{message_id:900,chat:{id:808}}])test('ZIP rejects malformed, reply-card or wrong-chat ACK '+JSON.stringify(ack),async()=>{
+  const h=harness([material('Документ.pdf','ORIGINAL')],{ack:()=>ack}),saved=[];
+  const result=await h.deliver(58,[targets[0]],null,{onPart:async(...receipt)=>saved.push(receipt)});
+  assert.equal(result.ok,false);assert.equal(result.failed[0].uncertain,true);assert.equal(saved.length,0);
+});
+test('separate ZIP parts cannot reuse an already confirmed message id in the same recipient chat',async()=>{
+  const h=harness([material('А.pdf',Buffer.alloc(200)),material('Б.pdf',Buffer.alloc(200))],{maximum:400,ack:()=>({message_id:901})}),saved=[];
+  const result=await h.deliver(58,[targets[0]],null,{onPart:async(...receipt)=>saved.push(receipt)});
+  assert.equal(result.parts,2);assert.equal(result.ok,false);assert.equal(result.failed[0].uncertain,true);assert.equal(saved.length,1);
 });

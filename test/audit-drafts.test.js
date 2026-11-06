@@ -211,6 +211,37 @@ test('submission freezes a revision, resumes durable delivery after restart, and
   assert.equal((await db.query('SELECT COUNT(*)::int AS count FROM audit_evidence')).rows[0].count, 1);
 }));
 
+test('explicit delivery retry is owner-scoped, frozen, acknowledged and bound to exactly one unknown attempt', { skip: !process.env.PGLITE_TEST_MODULE }, async () => database(async (store, db, pool) => {
+  const locks = [], lockPool = { async connect() { return { async query(sql, params) {
+    if (sql.includes('pg_try_advisory_lock')) { locks.push(params[0]); return { rows: [{ locked: true }] }; }
+    if (sql.includes('pg_advisory_unlock')) return { rows: [] };
+    return db.query(sql, params);
+  }, release() {} }; } };
+  const retryStore = createDraftStore(pool, undefined, { lockPool });
+  const draft = await store.create(108, 58, { observation: 'Frozen original' }), first = randomUUID(), next = randomUUID();
+  const input = { revision: 1, cursor: first, acknowledge_duplicate_risk: true };
+  await assert.rejects(retryStore.retryDraftDelivery(108, draft.id, input), error(409, 'NOT_SUBMITTING'));
+  await store.loadDraftForSubmit(108, draft.id, 1);
+  await store.saveDraftDelivery(108, draft.id, 1, { signature: 'unchanged', textIds: [100], photoIds: [], documentIds: [], inflight: { id: first, stage: 'photos', index: 0, count: 2 } });
+  assert.deepEqual((await store.current(108, 58)).delivery_unknown, { cursor: first, stage: 'photos', count: 2 });
+  await assert.rejects(retryStore.retryDraftDelivery(109, draft.id, input), error(404, 'NOT_FOUND'));
+  await assert.rejects(retryStore.retryDraftDelivery(108, draft.id, { ...input, acknowledge_duplicate_risk: false }), error(400, 'DELIVERY_RETRY_CONFIRMATION_REQUIRED'));
+  await assert.rejects(retryStore.retryDraftDelivery(108, draft.id, { ...input, revision: 2 }), error(409, 'REVISION_CONFLICT'));
+  assert.deepEqual(await retryStore.retryDraftDelivery(108, draft.id, input), { ok: true });
+  assert.deepEqual(await retryStore.retryDraftDelivery(108, draft.id, input), { ok: true, already_confirmed: true });
+  const cleared = await store.loadDraftDelivery(108, draft.id);
+  assert.equal(cleared.inflight, undefined); assert.equal(cleared.lastRiskRetryCursor, first); assert.deepEqual(cleared.textIds, [100]);
+  assert.equal((await store.current(108, 58)).data.observation, 'Frozen original');
+  await store.saveDraftDelivery(108, draft.id, 1, { ...cleared, inflight: { id: next, stage: 'photos', index: 0, count: 2 } });
+  await assert.rejects(retryStore.retryDraftDelivery(108, draft.id, input), error(409, 'DELIVERY_RETRY_STALE'));
+  assert.equal((await store.loadDraftDelivery(108, draft.id)).inflight.id, next, 'Repeated old HTTP cannot reset a later unknown attempt');
+  assert.equal((await store.current(108, 58)).submitting, true); assert.equal(locks.length, 5);
+  await store.saveDraftDelivery(108, draft.id, 1, { ...cleared, saved: true });await store.markDraftSubmitted(108, draft.id, 1);
+  const finished = await store.loadDraftDelivery(108, draft.id);
+  assert.deepEqual(await retryStore.retryDraftDelivery(108, draft.id, input), { ok: true, already_submitted: true }, 'A stale window must be able to discover that another window already completed the report');
+  assert.deepEqual(await store.loadDraftDelivery(108, draft.id), finished, 'Late consent never edits the completed report');
+}));
+
 test('stale evidence mutations cannot bypass draft metadata concurrency and exact retries remain idempotent', { skip: !process.env.PGLITE_TEST_MODULE }, async () => database(async (store) => {
   const draft = await store.create(108, 58, { conclusion: 'First' });
   const original = file('first image');

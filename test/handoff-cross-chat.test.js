@@ -25,7 +25,7 @@ async function fixture(run) {
       return query(sql, values);
     }, release() { for (const [key, value] of locks) if (value === owner) locks.delete(key); } };
   } };
-  const context = vm.createContext({ module: { exports: {} }, URL, Date, Buffer,
+  const context = vm.createContext({ module: { exports: {} }, URL, Date, Buffer,process:{env:{GROUP_CHAT_ID:AUDITS,CLIENTS_CHAT_ID:CLIENTS}},
     require(name) { if (name === '../db/pool') return pool; return require(name.startsWith('.') ? '../src/web/' + name : name); },
   });
   vm.runInContext(source + '\nmodule.exports.qa={ensureReports,ensureTables,ensureRequests,getReport};', context);
@@ -46,7 +46,7 @@ async function fixture(run) {
       async callApi(method, payload) { assert.equal(method, 'copyMessages'); const event = { type: 'copy', chat: String(payload.chat_id), source: String(payload.from_chat_id), ids: payload.message_ids }; events.push(event); const override = await intercept(event); if (override) return override; event.receipts = payload.message_ids.map(() => ({ message_id: sequence++ })); return event.receipts; },
       async sendDocument() { throw new Error('No manager originals in this synthetic packet'); },
     };
-    const packetService = createPacketService({ pool, listMaterials: async () => [], egrnLinks: async () => [], lookupEgrn: async () => ({ status: 'missing' }) });
+    const packetService = createPacketService({ pool,workingChatId:AUDITS, listMaterials: async () => [], egrnLinks: async () => [], lookupEgrn: async () => ({ status: 'missing' }) });
     const packet = await packetService.packet({ order_id: 60, report_src: 'r', report_id: 9, request_id: 9 });
     const body = { handoff_version: 2, submit_id: randomUUID(), packet_signature: packet.signature, order_id: 60, report_src: 'r', report_id: 9, request_id: 9,
       lawyer_tg_id: 808, org: 'ООО Synthetic', address: 'Москва, Synthetic, 5', region: 'МСК', kind: 'Общепит', service: 'Продление', priority: 'обычный', contacts: [{ name: 'Synthetic client', phone: '+79990000000' }] };

@@ -3,7 +3,7 @@
 const LEASE_MS = 2 * 60 * 1000;
 const RETRY_MS = 10 * 60 * 1000;
 const MAX_RETRY_MS = 60 * 60 * 1000;
-const validReceipt = value => Number.isSafeInteger(Number(value)) && Number(value) > 0;
+const validReceipt = value => (typeof value === 'number' || typeof value === 'string' && /^[1-9]\d*$/.test(value)) && Number.isSafeInteger(Number(value)) && Number(value) > 0;
 const { calendarDate: dateOnly } = require('../calendar-date');
 const retryDelay = attempt => Math.min(MAX_RETRY_MS, RETRY_MS * 2 ** Math.min(6, Math.max(0, attempt-1)));
 
@@ -61,7 +61,8 @@ function createReminderDelivery(options = {}) {
       message = await send();
       if (!validReceipt(message && message.message_id)) throw new Error('Missing Telegram receipt');
     } catch (error) {
-      const rejected = !!error?.response;
+      const code = Number(error?.response?.error_code);
+      const rejected = code >= 400 && code < 500;
       attempt = { ...attempt, state: rejected ? 'retrying' : 'unknown', lease_until: null,
         next_at: nextRetryAt(now+retryDelay(attempt.count)), duplicate_possible: attempt.duplicate_possible || !rejected };
       delivery._attempts[slot] = attempt;

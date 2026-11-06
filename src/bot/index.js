@@ -4,6 +4,7 @@ const { formatOrderMessage, STATUS_EMOJI } = require('./formatter');
 const { cardOptions } = require('../web/manager-orders');
 const { loadOrderReportLink } = require('../web/order-report-link');
 const { withOrderDeliveryLock } = require('../db/order-delivery-lock');
+const { approvalKeyboard, createStaffApprovalHandler } = require('./staff-approval');
 
 function setupBot() {
   const bot = new Telegraf(process.env.BOT_TOKEN);
@@ -13,6 +14,7 @@ function setupBot() {
   require('./egrn').setupEgrn(bot);
   const pool = require('../db/pool');
   require('./report-link-admin').setupReportLinkAdmin(bot, { pool });
+  require('./order-delivery-admin').setupOrderDeliveryAdmin(bot, { pool });
   const { ensureStaff, canManageCases } = require('../web/auth');
   const { parsePairing, approvePairing, canPair } = require('../web/workspace');
   const { esc } = require('./formatter');
@@ -113,7 +115,7 @@ function setupBot() {
 
     const text = '🙋 <b>' + (me && me.approved ? 'Смена роли' : 'Новый сотрудник') + '</b>\n' + esc(name) + (ctx.from.username ? ' (@' + esc(ctx.from.username) + ')' : '') +
       (me && me.approved ? '\nСейчас: ' + ROLES[me.role] : '') + '\nПросит роль: <b>' + ROLES[role] + '</b>';
-    const kb = { inline_keyboard: [[{ text: '✅ Одобрить', callback_data: 'ap:' + uid }, { text: '❌ Отклонить', callback_data: 'rj:' + uid }]] };
+    const kb = approvalKeyboard(uid, role);
     let sent = 0;
     for (const id of list) {
       if (id === uid) continue;
@@ -125,29 +127,7 @@ function setupBot() {
     await ctx.answerCbQuery();
   });
 
-  bot.action(/^(ap|rj):(\d+)$/, async (ctx) => {
-    const list = await approvers();
-    if (list.indexOf(String(ctx.from.id)) === -1) return ctx.answerCbQuery('Одобрять может только администратор', { show_alert: true });
-    const uid = ctx.match[2];
-    const u = (await pool.query('SELECT * FROM staff WHERE tg_id=$1', [uid])).rows[0];
-    if (!u || !u.requested_role) {
-      await ctx.editMessageText('Запрос уже обработан.');
-      return ctx.answerCbQuery();
-    }
-    const who = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ');
-    const wanted = ROLES[u.requested_role];
-    if (ctx.match[1] === 'ap') {
-      await pool.query('UPDATE staff SET role=requested_role, approved=true, requested_role=NULL WHERE tg_id=$1', [uid]);
-      await ctx.editMessageText('✅ ' + u.name + ' — ' + wanted + '. Одобрил(а): ' + who);
-      try { await ctx.telegram.sendMessage(uid, '✅ Доступ открыт: ' + wanted + '. Нажмите /start'); } catch (e) {}
-    } else {
-      if (u.approved) await pool.query('UPDATE staff SET requested_role=NULL WHERE tg_id=$1', [uid]);
-      else await pool.query('DELETE FROM staff WHERE tg_id=$1', [uid]);
-      await ctx.editMessageText('❌ ' + u.name + ' — запрос на роль «' + wanted + '» отклонён. ' + who);
-      try { await ctx.telegram.sendMessage(uid, '❌ Запрос на роль «' + wanted + '» отклонён.'); } catch (e) {}
-    }
-    await ctx.answerCbQuery();
-  });
+  bot.action(/^(ap|rj):(\d+)(?::(manager|lawyer|auditor))?$/, createStaffApprovalHandler({ pool, approvers, adminIds }));
 
   bot.command('role', async (ctx) => {
     if (ctx.chat.type !== 'private') return;
@@ -282,16 +262,19 @@ function setupBot() {
   bot.hears('📂 Мои клиенты', (ctx) => showCases(ctx));
   bot.command('cases', (ctx) => showCases(ctx));
   async function showCases(ctx) {
+    if (ctx.chat.type !== 'private') return;
     const me = await getMe(ctx.from.id);
-    if (!me || !me.approved) return ctx.reply('Нет доступа. Нажмите /start.');
+    if (!me || me.approved !== true || me.role !== 'lawyer' && !canManageCases(me, ctx.from.id)) return ctx.reply('Нет доступа. Нажмите /start.');
     const { rows } = await pool.query(
-           "SELECT id, org, done, total, data->>'_stage' AS stage FROM cases WHERE lawyer_tg_id=$1 AND COALESCE(data->>'_stage', '') <> 'Архив' ORDER BY created_at DESC LIMIT 30",
+      "SELECT id, org, checklist_key, service, data, data->>'_stage' AS stage FROM cases WHERE lawyer_tg_id=$1 AND COALESCE(data->>'_stage', '') <> 'Архив' ORDER BY created_at DESC LIMIT 30",
       [ctx.from.id]
     );
     if (!rows.length) return ctx.reply('У вас нет открытых клиентов 🎉');
     await ctx.reply('📂 Ваши клиенты в работе:', {
       reply_markup: { inline_keyboard: rows.map(function(c) {
-                return [{ text: c.org + ' · ' + (c.stage || 'Сбор документов') + ' · ' + c.done + '/' + c.total, web_app: { url: WEBAPP_URL + '/checklist?case_id=' + c.id + '&' + require('../web/auth').keyQuery(ctx.from.id) } }];
+        const counts = require('../web/handoff').checklistCounts(c, c.data || {});
+        const progress = counts ? counts.done + '/' + counts.total : 'Чек-лист не выбран';
+        return [{ text: c.org + ' · ' + (c.stage || 'Сбор документов') + ' · ' + progress, web_app: { url: WEBAPP_URL + '/checklist?case_id=' + c.id + '&' + require('../web/auth').keyQuery(ctx.from.id) } }];
       }) },
     });
   }

@@ -17,6 +17,8 @@ const MAX_FAILURES = 5;
 const REQUEST_TIMEOUT_MS = 20 * 60 * 1000;
 let budgetService;
 function budget() { return budgetService ||= require('./egrn-budget').createEgrnBudget({ pool }); }
+let telegramDeliveryService;
+function telegramDelivery() { return telegramDeliveryService ||= require('./egrn-telegram-delivery').createEgrnTelegramDelivery({ pool, env: process.env }); }
 async function budgetText(order) {
   try {
     if (order?.id_statement) await budget().accept(order.id, order.id_statement);
@@ -53,9 +55,10 @@ async function registerOriginal(targets, file) {
   catch (e) { console.error('egrn packet: original unavailable'); }
 }
 
-function largeDelivery() {
+function largeDelivery(order) {
   return require('./egrn-large-delivery').createLargeDelivery({ telegram: tgApi,
     budgetText: () => budgetText(),
+    sendOriginal: order ? (record, target, run) => telegramDelivery().send(order, { kind: 'large-link', key: record.key, target }, run) : undefined,
     persist: async function (order, records) {
       await persistFileRecords(order, records);
     }
@@ -94,9 +97,7 @@ function keepDeliveryAlive(order) {
   };
 }
 async function persistFileRecords(order, records) {
-  const result = await pool.query('UPDATE egrn_orders SET file_msgs=$1,updated_at=NOW() WHERE id=$2 AND processing_token=$3', [JSON.stringify(records), order.id, order.processing_token]);
-  if (result.rowCount === 0) throw lostLease();
-  order.file_msgs = records;
+  await telegramDelivery().persist(order, records);
   if ((order.deliver || []).some(target => target?.order_id) && records.some(file => file.kind==='link' || Number(file.bytes) > 12 * 1024 * 1024)) await require('../web/order-egrn-links').registerOrderLinks(order, records);
 }
 
@@ -111,6 +112,22 @@ function nativeDeliveryTargets(order, record) {
   }
   return [...unique.values()];
 }
+async function nativePrimaryTarget(order) {
+  for (const target of nativeDeliveryTargets(order, {})) {
+    try { await telegramDelivery().authorize(order, target); return target; }
+    catch (error) { if (error.code !== 'EGRN_RECIPIENT_UNAVAILABLE') throw error; }
+  }
+  throw Object.assign(new Error('Нет доступного получателя оригинала выписки. Проверьте доступ сотрудника и назначение; новый платный заказ не создавался.'), { code: 'EGRN_RECIPIENT_UNAVAILABLE', uncertain: false });
+}
+async function sendNativePrimary(order, file, key, extra) {
+  const target = await nativePrimaryTarget(order), configured = { ...extra };
+  if (String(target.chat) !== String(order.chat_id)) {
+    delete configured.reply_parameters;
+    if (target.reply) configured.reply_parameters = { message_id: Number(target.reply), allow_sending_without_reply: true };
+  }
+  const message = await telegramDelivery().send(order, { kind: 'native-primary', key, target }, () => tgApi.sendDocument(target.chat, { source: file.buf, filename: file.name }, configured));
+  return { message, chat: target.chat };
+}
 
 async function deliverNativeRecord(order, record, records) {
   await renewDelivery(order);
@@ -122,8 +139,10 @@ async function deliverNativeRecord(order, record, records) {
   for (const receipt of deliveries) {
     if (receipt && receipt.id) confirmed[JSON.stringify([String(receipt.chat), record.key || String(record.chat) + ':' + String(record.id)])] = true;
   }
-  await copyFiles([record], nativeDeliveryTargets(order, record), { strict: true, confirmed,
+  let blocked;
+  for (const target of nativeDeliveryTargets(order, record)) try { await copyFiles([record], [target], { strict: true, confirmed,
     budgetText: order.budget_text,
+    deliveryOrder: order,
     onSourceRepaired: () => persistFileRecords(order, records),
     async onCopied(key, message) {
       const chat = JSON.parse(key)[0];
@@ -131,14 +150,19 @@ async function deliverNativeRecord(order, record, records) {
       deliveries.push({ chat, id: Number(message.message_id) });
       await persistFileRecords(order, records);
     }
-  });
+  }); } catch (error) {
+    if (error.code === 'EGRN_RECIPIENT_UNAVAILABLE' || error.failure_code === 'EGRN_RECIPIENT_UNAVAILABLE') blocked ||= error;
+    else throw error;
+  }
+  if (blocked) throw blocked;
 }
 
 async function markDelivered(order, records) {
+  telegramDelivery().assertAvailable(order);
   if ((order.deliver || []).some(target => target?.order_id) && records.some(file => file.kind==='link' || Number(file.bytes)>12*1024*1024)) await require('../web/order-egrn-links').registerOrderLinks(order, records);
   // A new recipient registered while delivery was running keeps the row
   // pending, so the next round sends only their missing originals.
-  await pool.query('UPDATE egrn_orders SET files_sent=$1,file_msgs=$2,error=$3,failures=0,retry_at=NULL,updated_at=NOW() WHERE id=$4 AND delivery_revision=$5 AND processing_token=$6',
+  await pool.query("UPDATE egrn_orders SET files_sent=$1,file_msgs=$2,error=$3,failures=0,retry_at=NULL,updated_at=NOW() WHERE id=$4 AND delivery_revision=$5 AND processing_token=$6 AND NOT (COALESCE(delivery_state,'{}'::jsonb) ? 'inflight')",
     [records.length, JSON.stringify(records), null, order.id, Number(order.delivery_revision || 0), order.processing_token]);
 }
 
@@ -149,7 +173,7 @@ async function resumeLargeDelivery(order) {
   const manifest = Array.isArray(order.delivery_manifest) ? order.delivery_manifest : [];
   if (order.status !== 'done' || !manifest.length || !manifest.every(key => records.some(file => sourceKey(file) === key))) return false;
   for (const record of records) {
-    if (record.kind === 'link') await largeDelivery().retry(order, record, records);
+    if (record.kind === 'link') await largeDelivery(order).retry(order, record, records);
     else await deliverNativeRecord(order, record, records);
   }
   await markDelivered(order, records);
@@ -158,9 +182,42 @@ async function resumeLargeDelivery(order) {
 
 function documentRecord(message, chat, key, file) {
   const mime = message.document?.mime_type || (/\.pdf$/i.test(file.name) ? 'application/pdf' : /\.zip$/i.test(file.name) ? 'application/zip' : 'application/octet-stream');
-  const record = { chat: Number(chat), id: message.message_id, key, document_kind: file.kind || '', name: file.name, mime, bytes: file.buf.length };
+  const record = { chat: Number(chat), id: message.message_id, key, document_kind: file.kind || '', name: file.name, mime, bytes: file.buf.length, sha256: originalHash(file) };
   if (message.document?.file_id) record.file_id = message.document.file_id;
   return record;
+}
+
+function originalHash(file) {
+  if (Buffer.isBuffer(file?.buf)) {
+    const actual = require('node:crypto').createHash('sha256').update(file.buf).digest('hex');
+    if (file.sha256 && file.sha256.toLowerCase() !== actual) throw Object.assign(new Error('Оригинал выписки изменился после получения.'), { code: 'EGRN_FILE_CHANGED' });
+    return actual;
+  }
+  if (/^[a-f\d]{64}$/i.test(file?.sha256 || '')) return file.sha256.toLowerCase();
+  throw Object.assign(new Error('Не удалось подтвердить содержимое оригинала выписки.'), { code: 'EGRN_FILE_IDENTITY' });
+}
+function recordHash(record) {
+  if (/^[a-f\d]{64}$/i.test(record?.sha256 || '')) return record.sha256.toLowerCase();
+  return /^sha256:([a-f\d]{64})$/.exec(record?.key || '')?.[1] || null;
+}
+function matchingOriginal(file, records) {
+  const hash = originalHash(file), existing = records.find(record => recordHash(record) === hash);
+  if (existing && Number(existing.bytes) !== documentBytes(file)) throw Object.assign(new Error('Размер ранее доставленного оригинала не совпадает.'), { code: 'EGRN_FILE_IDENTITY' });
+  return { hash, existing, key: existing?.key || 'sha256:' + hash };
+}
+async function verifyPartialRecords(order, records) {
+  let changed = false;
+  for (const record of records) {
+    if (recordHash(record)) continue;
+    if (record.kind === 'link') {
+      const file = await require('./egrn-files').get(record.original_id);
+      if (file && Number(file.egrn_order_id) === Number(order.id) && file.name === record.name && file.mime === record.mime && Number(file.bytes) === Number(record.bytes) && /^[a-f\d]{64}$/i.test(file.sha256 || '')) {
+        record.sha256 = file.sha256.toLowerCase(); changed = true; continue;
+      }
+    }
+    throw Object.assign(new Error('Старый частичный комплект не содержит подтверждения содержимого оригиналов. Проверьте уже доставленные файлы вручную; новая платная выписка не заказывалась.'), { code: 'EGRN_LEGACY_FILE_IDENTITY' });
+  }
+  if (changed) await persistFileRecords(order, records);
 }
 
 const TYPE_DOC = 'kvarmrusxmlpdf'; // выписка об объекте
@@ -198,6 +255,7 @@ function ensureTables() {
       ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS request_key TEXT;
       ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS processing_token UUID;
       ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS processing_until TIMESTAMPTZ;
+      ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS delivery_state JSONB NOT NULL DEFAULT '{}';
       CREATE UNIQUE INDEX IF NOT EXISTS egrn_orders_request_key ON egrn_orders(request_key) WHERE request_key IS NOT NULL;
       UPDATE egrn_orders SET status='order_unknown',status_text='Заказ требует проверки у поставщика',
         error='Не подтверждён результат первоначального заказа',updated_at=NOW()
@@ -531,7 +589,9 @@ async function smallDocument(file) {
     chunks.push(chunk);
   }
   if (size !== file.bytes) throw new Error('Файл выписки получен не полностью.');
-  return Object.assign({}, file, { buf: Buffer.concat(chunks, size) });
+  const complete = Object.assign({}, file, { buf: Buffer.concat(chunks, size) });
+  originalHash(complete);
+  return complete;
 }
 
 function cardText(o, extra) {
@@ -763,19 +823,19 @@ function setupEgrn(bot) {
 
   // ── Опрос статусов
   async function notifyStopped(o, tooLarge) {
-    const text = o.status === 'done'
+    const text = o.delivery_unknown ? '⚠️ Результат отправки оригинала не подтверждён. Проверьте сообщения в чате. После проверки администратор может разрешить повтор: /egrn_retry ' + o.id_statement + '. Новый платный заказ не создавался.' : o.recipient_unavailable ? '⚠️ Доставка выписки ожидает проверки доступа получателя или назначения юриста. Подтверждённые файлы сохранены; новый платный заказ не создавался.' : o.identity_unconfirmed ? '⚠️ Не удалось подтвердить оригиналы в старом частичном комплекте. Проверьте ранее доставленные файлы вручную; автоматическая пересылка остановлена и новый платный заказ не создан.' : o.status === 'done'
       ? '⚠️ Выписка готова, но ' + (tooLarge ? 'не удалось подготовить файл для скачивания.' : 'не все файлы удалось доставить после нескольких попыток.')
       : '⚠️ Не удалось проверить готовность выписки после нескольких попыток.';
     const fallback = '\nСкачайте выписку или проверьте заявку №' + o.id_statement + ' в личном кабинете: https://armrus.org';
     if (o.status_msg_id) {
-      try { await bot.telegram.editMessageText(o.chat_id, Number(o.status_msg_id), undefined, cardText(o, text + fallback), { parse_mode: 'HTML' }); }
+      try { await telegramDelivery().authorize(o, {chat:o.chat_id});await bot.telegram.editMessageText(o.chat_id, Number(o.status_msg_id), undefined, cardText(o, text + fallback), { parse_mode: 'HTML' }); }
       catch (e) { console.error('egrn notification:', o.id_statement, e.message); }
     }
     // Личное уведомление — только заказавшему сотруднику, без технических ошибок и ссылок с токенами.
-    const target = o.ordered_by || o.chat_id;
-    if (target) {
-      try { await bot.telegram.sendMessage(target, text + '\nКадастровый номер: ' + o.cad_num + fallback); }
-      catch (e) { console.error('egrn notification:', o.id_statement, e.message); }
+    const targets=[o.ordered_by||o.chat_id,...String(process.env.ADMIN_TG_IDS||'').split(/[\s,;]+/),process.env.EGRN_CHAT_ID,process.env.GROUP_CHAT_ID].filter(Boolean);
+    for (const target of [...new Set(targets.map(String))]) {
+      try { await telegramDelivery().authorize(o,{chat:target});await bot.telegram.sendMessage(target, text + '\nКадастровый номер: ' + o.cad_num + fallback);break; }
+      catch (e) { console.error('egrn notification:', o.id_statement, e.code || 'unavailable'); }
     }
   }
 
@@ -785,7 +845,7 @@ function setupEgrn(bot) {
     const retryAt = stopped ? null : new Date(Date.now() + 3 * 60 * 1000 * Math.pow(2, failures - 1));
     await pool.query('UPDATE egrn_orders SET files_sent=$1, file_msgs=$2, error=$3, failures=$4, retry_at=$5, updated_at=NOW() WHERE id=$6 AND processing_token=$7',
       [stopped ? -1 : 0, JSON.stringify(fileMsgs), errors.join('; ').slice(0, 300), failures, retryAt, o.id, o.processing_token]);
-    if (stopped) await notifyStopped(o, permanent);
+    if (stopped || o.recipient_unavailable && o.error !== errors.join('; ').slice(0,300)) await notifyStopped(o, permanent);
   }
 
   let polling = false;
@@ -812,6 +872,7 @@ function setupEgrn(bot) {
       const lease = keepDeliveryAlive(o);
       let source;
       try {
+        telegramDelivery().assertAvailable(o);
         o.budget_text = await budgetText(o);
         if (await resumeLargeDelivery(o)) continue;
         const j = await apiStatus(o.id_statement);
@@ -827,11 +888,11 @@ function setupEgrn(bot) {
         if (st.done && !/выполн/i.test(st.text)) st.text = 'готова';
         Object.assign(o, { status: newStatus, status_text: st.text, polls: o.polls + 1 });
         if (changed && o.status_msg_id) {
-          try { await bot.telegram.editMessageText(o.chat_id, Number(o.status_msg_id), undefined, cardText(o), { parse_mode: 'HTML' }); } catch (e) {}
+          try { await telegramDelivery().authorize(o,{chat:o.chat_id});await bot.telegram.editMessageText(o.chat_id, Number(o.status_msg_id), undefined, cardText(o), { parse_mode: 'HTML' }); } catch (e) {}
         }
         if (newStatus === 'failed') {
           await pool.query('UPDATE egrn_orders SET files_sent = -1 WHERE id=$1 AND processing_token=$2', [o.id, o.processing_token]);
-          try { await bot.telegram.sendMessage(o.ordered_by, '❌ Выписка по ' + o.cad_num + ' не выполнена: ' + st.text); } catch (e) {}
+          try { await telegramDelivery().authorize(o,{chat:o.ordered_by});await bot.telegram.sendMessage(o.ordered_by, '❌ Выписка по ' + o.cad_num + ' не выполнена: ' + st.text); } catch (e) {}
           continue;
         }
         if (newStatus !== 'done') {
@@ -845,40 +906,45 @@ function setupEgrn(bot) {
           await saveFailure(o, ['файлы не найдены в ответе API'], false, o.file_msgs || []);
           continue;
         }
-        const manifest = embedded.length ? embedded.map((file, index) => 'embedded:' + index + ':' + file.name) : urls.slice(0, 6).map((_, index) => 'url:' + index);
+        const fileMsgs = Array.isArray(o.file_msgs) ? o.file_msgs.slice() : [];
+        // Retain confirmed ACKs for the failure checkpoint as well. The
+        // inflight marker still requires explicit review if that write fails.
+        o.file_msgs = fileMsgs;
+        await verifyPartialRecords(o, fileMsgs);
+        const manifest = embedded.length ? [...new Set(embedded.map(file => matchingOriginal(file, fileMsgs).key))] : urls.slice(0, 6).map((_, index) => 'pending-url:' + index);
         await pool.query('UPDATE egrn_orders SET delivery_manifest=$1 WHERE id=$2 AND processing_token=$3', [JSON.stringify(manifest), o.id, o.processing_token]);
         o.delivery_manifest = manifest;
         const deliveryErrors = [];
         let permanent = false;
-        const fileMsgs = Array.isArray(o.file_msgs) ? o.file_msgs.slice() : [];
         function fileError(e, name, size) {
           console.error('egrn file:', JSON.stringify({ order_id: o.id, id_statement: o.id_statement,
             filename: name, bytes: size, error: e.message,
             delivery_stage: e.delivery_stage, failure_code: e.failure_code, constraint: e.constraint,
             provider_code: e.provider_code, provider_status: e.provider_status }));
           deliveryErrors.push(String(e.message || 'ошибка доставки'));
+          if (e.code === 'EGRN_RECIPIENT_UNAVAILABLE' || e.failure_code === 'EGRN_RECIPIENT_UNAVAILABLE') o.recipient_unavailable = true;
+          if (e.uncertain === true) throw e;
           if (e.code === 'EGRN_FILE_TOO_LARGE' || e.code === 'EGRN_FILE_TYPE') permanent = true;
         }
         const caption = budgetCaption('📄 Выписка ЕГРН ' + o.cad_num + (o.label ? ' — ' + o.label : ''), o.budget_text);
         // PDF — в чат; XML и архив — тоже в чат, но без звука, для архива и будущего разбора
         for (const [index, original] of embedded.entries()) {
           let d = original;
-          const key = 'embedded:' + index + ':' + d.name;
           try {
-            const existing = fileMsgs.find(file => file.key === key);
-            if (existing) { if (existing.kind === 'link') await largeDelivery().retry(o, existing, fileMsgs); continue; }
-            if (documentBytes(d) > MAX_DOCUMENT_BYTES) { await largeDelivery().deliver(o, d, key, fileMsgs); continue; }
+            const { existing, key, hash } = matchingOriginal(d, fileMsgs); d.sha256 = hash;
+            if (existing) { if (existing.kind === 'link') await largeDelivery(o).retry(o, existing, fileMsgs); continue; }
+            if (documentBytes(d) > MAX_DOCUMENT_BYTES) { await largeDelivery(o).deliver(o, d, key, fileMsgs); continue; }
             d = await smallDocument(d);
             checkDocumentSize(d.buf);
             await registerOriginal(o.deliver, d);
             const extra = { caption: d.kind === 'pdf' ? caption : budgetCaption((d.kind === 'xml' ? 'XML ' : 'Архив ') + o.cad_num, o.budget_text), disable_notification: d.kind !== 'pdf' };
             if (o.status_msg_id) extra.reply_parameters = { message_id: Number(o.status_msg_id), allow_sending_without_reply: true };
             await renewDelivery(o);
-            let m;
-            try { m = await bot.telegram.sendDocument(o.chat_id, { source: d.buf, filename: d.name }, extra); }
-            catch (error) { if (!documentTooLarge(error)) throw error; await largeDelivery().deliver(o, d, key, fileMsgs); continue; }
+            let m, chat;
+            try { const sent=await sendNativePrimary(o,d,key,extra);m=sent.message;chat=sent.chat; }
+            catch (error) { if (!documentTooLarge(error)) throw error; await largeDelivery(o).deliver(o, d, key, fileMsgs); continue; }
             if (m && m.message_id) {
-              const record = documentRecord(m, o.chat_id, key, d);
+              const record = documentRecord(m, chat, key, d);
               fileMsgs.push(record);
               await persistFileRecords(o, fileMsgs);
             }
@@ -887,24 +953,26 @@ function setupEgrn(bot) {
           }
         }
         for (const [index, u] of urls.slice(0, 6).entries()) {
-          const key = 'url:' + index;
           let f;
           try {
-            const existing = fileMsgs.find(file => file.key === key);
-            if (existing) { if (existing.kind === 'link') await largeDelivery().retry(o, existing, fileMsgs); continue; }
             f = await download(u);
-            if (documentBytes(f) > MAX_DOCUMENT_BYTES) { await largeDelivery().deliver(o, f, key, fileMsgs); continue; }
+            const { existing, key, hash } = matchingOriginal(f, fileMsgs); f.sha256 = hash;
+            manifest[index] = key;
+            await pool.query('UPDATE egrn_orders SET delivery_manifest=$1 WHERE id=$2 AND processing_token=$3', [JSON.stringify([...new Set(manifest)]), o.id, o.processing_token]);
+            o.delivery_manifest = [...new Set(manifest)];
+            if (existing) { if (existing.kind === 'link') await largeDelivery(o).retry(o, existing, fileMsgs); continue; }
+            if (documentBytes(f) > MAX_DOCUMENT_BYTES) { await largeDelivery(o).deliver(o, f, key, fileMsgs); continue; }
             f = await smallDocument(f);
             checkDocumentSize(f.buf);
             await registerOriginal(o.deliver, f);
             const extra = { caption: caption.slice(0, 1000) };
             if (o.status_msg_id) extra.reply_parameters = { message_id: Number(o.status_msg_id), allow_sending_without_reply: true };
             await renewDelivery(o);
-            let m;
-            try { m = await bot.telegram.sendDocument(o.chat_id, { source: f.buf, filename: f.name }, extra); }
-            catch (error) { if (!documentTooLarge(error)) throw error; await largeDelivery().deliver(o, f, key, fileMsgs); continue; }
+            let m, chat;
+            try { const sent=await sendNativePrimary(o,f,key,extra);m=sent.message;chat=sent.chat; }
+            catch (error) { if (!documentTooLarge(error)) throw error; await largeDelivery(o).deliver(o, f, key, fileMsgs); continue; }
             if (m && m.message_id) {
-              const record = documentRecord(m, o.chat_id, key, f);
+              const record = documentRecord(m, chat, key, f);
               fileMsgs.push(record);
               await persistFileRecords(o, fileMsgs);
             }
@@ -924,7 +992,10 @@ function setupEgrn(bot) {
       } catch (e) {
         console.error('egrn status', o.id_statement, e.message,
           JSON.stringify({ source_code: e.source_code, source_name: e.source_name, source_bytes: e.source_bytes }));
-        if (e.code !== 'EGRN_LEASE_LOST') await saveFailure(o, [String(e.message || 'ошибка проверки статуса')], e.code === 'EGRN_FILE_TOO_LARGE', o.file_msgs || []);
+        if (e.code === 'EGRN_LEGACY_FILE_IDENTITY') o.identity_unconfirmed = true;
+        if(e.uncertain===true)o.delivery_unknown=true;
+        if(e.code==='EGRN_RECIPIENT_UNAVAILABLE'||e.failure_code==='EGRN_RECIPIENT_UNAVAILABLE')o.recipient_unavailable=true;
+        if (e.code !== 'EGRN_LEASE_LOST') await saveFailure(o, [String(e.message || 'ошибка проверки статуса')], e.uncertain===true||['EGRN_FILE_TOO_LARGE', 'EGRN_LEGACY_FILE_IDENTITY'].includes(e.code), o.file_msgs || []);
       } finally {
         try { if (source) await source.cleanup(); } finally { await lease.close(); }
       }
@@ -937,29 +1008,47 @@ function setupEgrn(bot) {
     if (!(await canOrder(ctx.from.id, ctx.chat.id))) return ctx.reply('Нет доступа. Нажмите /start.');
     const match = String(ctx.message?.text || '').match(/^\/egrn_retry(?:@[a-z\d_]+)?\s+([1-9]\d{0,14})\s*$/i);
     if (!match) return ctx.reply('Укажите номер уже готового заказа: /egrn_retry номер. Новый заказ не создаётся.');
-    if (polling) return ctx.reply('Доставка выписок уже выполняется. Повторите команду после её завершения.');
-    polling = true;
+    const ownsPollGuard = !polling;
+    if (ownsPollGuard) polling = true;
     try {
       await ensureTables();
-      const order = (await pool.query("UPDATE egrn_orders SET files_sent=0, failures=0, retry_at=NULL, error=NULL, updated_at=NOW() WHERE id_statement=$1 AND status='done' AND files_sent<=0 AND created_at > NOW()-INTERVAL '30 days' RETURNING id", [match[1]])).rows[0];
-      if (!order) return ctx.reply('Нет готовой недоставленной выписки с таким номером за последние 30 дней.');
-      await ctx.reply('Повторно доставляю готовую выписку. Новый платный заказ не создаётся.');
+      // Even a command received while another delivery is busy must consume
+      // its cursor. Replaying it later cannot authorize a newer unknown send.
+      const decision = await telegramDelivery().retry(match[1],ctx.from.id,ctx.message?.message_id,{consumeOnly:!ownsPollGuard});
+      if (decision.state==='replayed') return ctx.reply('Эта команда уже обработана. Проверьте сообщения в чате; для нового разрешения повтора отправьте новую команду.');
+      if (decision.state==='busy') return ctx.reply('Доставка этой выписки уже выполняется. Повторите команду после её завершения.');
+      if (decision.state==='admin_required') return ctx.reply('Результат прошлой отправки не подтверждён. Проверьте сообщения в чате; повтор может разрешить администратор новой командой /egrn_retry.');
+      if (decision.state==='invalid') return ctx.reply('Не удалось подтвердить сообщение команды. Отправьте новую команду /egrn_retry.');
+      if (decision.state!=='ready') return ctx.reply('Нет готовой недоставленной выписки с таким номером за последние 30 дней.');
+      const order = decision.order;
+      await ctx.reply('Разрешён повтор доставки готовой выписки. Проверьте ранее полученные сообщения: при потерянном ответе Telegram возможен повтор файла. Новый платный заказ не создаётся.');
       await pollOrders(order.id);
       const latest = (await pool.query('SELECT files_sent FROM egrn_orders WHERE id=$1', [order.id])).rows[0];
-      await ctx.reply(latest?.files_sent > 0 ? 'Выписка доставлена.' : 'Доставка пока не завершена. Проверю причину и повторю по сохранённому заказу.');
+      await ctx.reply(latest?.files_sent > 0 ? 'Выписка доставлена.' : 'Доставка пока не завершена. Проверьте сообщения в чате и причину в уведомлении; новый платный заказ не создавался.');
     } catch (error) {
       console.error('egrn retry:', /^[a-z\d_]{1,80}$/i.test(String(error.code || '')) ? error.code : 'unavailable');
       await ctx.reply('Не удалось повторить доставку. Новый платный заказ не создавался.');
-    } finally { polling = false; }
+    } finally { if (ownsPollGuard) polling = false; }
   });
   setTimeout(poll, 30 * 1000);
   setInterval(poll, 3 * 60 * 1000);
 }
 
+async function checkCopyTarget(options, destination) {
+  if (typeof options.beforeSend !== 'function') return;
+  try { await options.beforeSend(destination); }
+  catch (error) {
+    const blocked = error && typeof error === 'object' ? error : new Error('Получатель выписки сейчас недоступен.');
+    blocked.uncertain = false; blocked.delivery_stage = 'validation'; throw blocked;
+  }
+}
 async function copyNativeOriginal(record, destination, options) {
-  const copy = () => tgApi.callApi('copyMessage', Object.assign({ chat_id: destination.chat, from_chat_id: record.chat, message_id: record.id },
+  const copy = () => telegramDelivery().send(options.deliveryOrder, {kind:'native-copy',key:sourceKey(record),target:destination}, async () => {
+    await checkCopyTarget(options, destination);
+    return tgApi.callApi('copyMessage', Object.assign({ chat_id: destination.chat, from_chat_id: record.chat, message_id: record.id },
     options.budgetText ? { caption: budgetCaption('📄 ' + String(record.name || 'Выписка ЕГРН'), options.budgetText) } : {},
     destination.reply ? { reply_parameters: { message_id: Number(destination.reply), allow_sending_without_reply: true } } : {}));
+  });
   try { return await copy(); }
   catch (error) {
     const missing = Number(error.response?.error_code) === 400 && /message to copy not found/i.test(error.response?.description || error.message || '');
@@ -967,11 +1056,19 @@ async function copyNativeOriginal(record, destination, options) {
     // A deleted message does not delete Telegram's reusable original. Repair
     // only this exact file and retain its original reference identity.
     const originChat = record.chat, originId = record.id, key = sourceKey(record);
-    const repairChat = /^-100[1-9]\d+$/.test(String(destination.chat)) ? destination.chat : originChat;
+    let repairChat = /^-100[1-9]\d+$/.test(String(destination.chat)) ? destination.chat : originChat;
+    if (options.deliveryOrder) try { await telegramDelivery().authorize(options.deliveryOrder,{chat:repairChat}); }
+    catch (failure) {
+      if(failure.code!=='EGRN_RECIPIENT_UNAVAILABLE')throw failure;
+      repairChat=destination.chat;
+    }
     const sameChat = String(repairChat) === String(destination.chat);
     const extra = { disable_notification: true, caption: budgetCaption('📄 ' + String(record.name || 'Выписка ЕГРН').slice(0, 220), options.budgetText) };
     if (sameChat && destination.reply) extra.reply_parameters = { message_id: Number(destination.reply), allow_sending_without_reply: true };
-    const repaired = await tgApi.sendDocument(repairChat, record.file_id, extra);
+    const repaired = await telegramDelivery().send(options.deliveryOrder,{kind:'native-repair',key,target:{chat:repairChat,...(sameChat&&destination.case_id!=null?{case_id:destination.case_id}:{})}},async()=>{
+      await checkCopyTarget(options, destination);
+      return tgApi.sendDocument(repairChat, record.file_id, extra);
+    });
     if (!Number.isSafeInteger(Number(repaired?.message_id)) || Number(repaired.message_id) < 1)
       throw Object.assign(new Error('Telegram не подтвердил восстановление оригинала выписки.'), { code: 'EGRN_COPY_SOURCE_RECEIPT', uncertain: true });
     record.reference_chat ??= originChat; record.reference_id ??= originId;
@@ -999,7 +1096,7 @@ async function copyFiles(fileMsgs, targets, options = {}) {
       if (confirmed[key] === true) continue;
       let stage = 'telegram';
       try {
-        const message = fm.kind === 'link' ? await largeDelivery().copy(fm, t) : await copyNativeOriginal(fm, t, options);
+        const message = fm.kind === 'link' ? await largeDelivery(options.deliveryOrder).copy(fm, t, { beforeSend: destination => checkCopyTarget(options, destination) }) : await copyNativeOriginal(fm, t, options);
         if (options.strict && !(fm.kind === 'link' && message === true) && (!Number.isSafeInteger(Number(message?.message_id)) || Number(message.message_id) < 1)) {
           throw Object.assign(new Error('Telegram не подтвердил доставку выписки.'), { code: 'EGRN_COPY_RECEIPT', uncertain: true });
         }
@@ -1045,13 +1142,14 @@ async function deliverCachedCopy(order, targets, copyOptions = {}) {
   }
   for (const target of targets) for (const record of records) {
     await renewDelivery(order);
-    await copyFiles([record], [target], { ...copyOptions, budgetText: order.budget_text, strict: true, confirmed,
+    await copyFiles([record], [target], { ...copyOptions, deliveryOrder:order, budgetText: order.budget_text, strict: true, confirmed,
       onSourceRepaired: () => persistFileRecords(order, records),
       async onCopied(key, message) {
         if (message?.message_id) {
           const chat = JSON.parse(key)[0];
           record.deliveries ||= [];
-          record.deliveries.push({ chat, id: Number(message.message_id) });
+          record.deliveries.push({ chat, id: Number(message.message_id),
+            ...(record.kind==='link'&&Number.isSafeInteger(Number(target.reply))&&Number(target.reply)>0 ? {reply:Number(target.reply)} : {}) });
           await persistFileRecords(order, records);
         }
         if (copyOptions.onCopied) await copyOptions.onCopied(key, message);
@@ -1085,6 +1183,7 @@ async function attachOrOrder(opts) {
       order.budget_text = await budgetText(order);
       if (tgApi && order.chat_id) {
         try {
+          await telegramDelivery().authorize(order,{chat:order.chat_id});
           const message = await tgApi.sendMessage(order.chat_id, cardText(order, opts.note ? esc(opts.note) : ''), { parse_mode: 'HTML' });
           await pool.query('UPDATE egrn_orders SET status_msg_id=$1 WHERE id=$2', [message.message_id, order.id]);
         } catch (error) { console.error('egrn card:', error.message); }
@@ -1098,6 +1197,11 @@ async function attachOrOrder(opts) {
   if (prev.status === 'order_unknown') return budgetResult(uncertainOrder(await mergeTargets(prev, opts.targets), cad), prev);
   if (prev.status === 'ordering') { await mergeTargets(prev, opts.targets); return budgetResult({ result: 'waiting', cad }, prev); }
   if (prev.status === 'failed') return budgetResult({ result: 'unavailable', cad, id: prev.id_statement }, prev);
+  if (prev.delivery_state?.inflight && new Date(prev.processing_until).getTime()>Date.now()) {
+    await mergeTargets(prev,opts.targets);
+    return budgetResult({result:'waiting',cad},prev);
+  }
+  telegramDelivery().assertAvailable(prev);
   if ((prev.files_sent > 0 || hasReusableFiles(prev)) && Array.isArray(prev.file_msgs) && prev.file_msgs.length) {
     const wasComplete = prev.files_sent > 0;
     prev = await mergeTargets(prev, opts.targets);
@@ -1105,6 +1209,7 @@ async function attachOrOrder(opts) {
     if (!leased) return budgetResult({ result: 'waiting', cad }, prev);
     const lease = keepDeliveryAlive(leased);
     try {
+      telegramDelivery().assertAvailable(leased);
       leased.budget_text = await budgetText(leased);
       if (!Array.isArray(leased.delivery_manifest) || !leased.delivery_manifest.length) {
         leased.delivery_manifest = [...new Set(leased.file_msgs.map(sourceKey))];

@@ -198,7 +198,7 @@ async function addToReports(chatId, msgId, text, author, authorId, mgid, date, r
     var r = null;
     if (mgid) r = (await db.query('SELECT id FROM reports WHERE chat_id=$1 AND mgid=$2 ORDER BY id DESC LIMIT 1', [chatId, mgid])).rows[0];
     if (!r && !startsReport(text)) r = (await db.query(
-      "SELECT id FROM reports WHERE chat_id=$1 AND author=$2 AND author_id IS NOT DISTINCT FROM $5::bigint AND COALESCE(last_message_at,created_at) >= $3::timestamptz - INTERVAL '" + MERGE_SEC + " seconds' AND COALESCE(last_message_at,created_at) <= $3::timestamptz + INTERVAL '5 seconds' AND reply_to IS NOT DISTINCT FROM $4::bigint AND id=(SELECT id FROM reports WHERE chat_id=$1 ORDER BY first_id DESC LIMIT 1)",
+      "SELECT id FROM reports WHERE chat_id=$1 AND (($5::bigint IS NOT NULL AND author_id=$5::bigint) OR ($5::bigint IS NULL AND author_id IS NULL AND author=$2)) AND COALESCE(last_message_at,created_at) >= $3::timestamptz - INTERVAL '" + MERGE_SEC + " seconds' AND COALESCE(last_message_at,created_at) <= $3::timestamptz + INTERVAL '5 seconds' AND reply_to IS NOT DISTINCT FROM $4::bigint AND id=(SELECT id FROM reports WHERE chat_id=$1 ORDER BY first_id DESC LIMIT 1)",
       [chatId, author, when, replyTo || null, authorId || null])).rows[0];
     if (r) {
       await db.query(
@@ -289,12 +289,15 @@ async function searchReports(q) {
     condA.push("replace(lower(concat_ws(' ', a.text, o.address, o.object_name, o.owner_name, '#' || a.order_id)), 'ё', 'е') LIKE " + n);
     condR.push("replace(lower(concat_ws(' ', r.text, o2.address, o2.object_name, o2.owner_name, '#' || o2.id)), 'ё', 'е') LIKE " + n);
   });
+  var workingChat = String(process.env.GROUP_CHAT_ID || '');
+  params.push(/^-?[1-9]\d*$/.test(workingChat) ? workingChat : null);
+  var replyChat = '$' + params.length + '::bigint';
   var sql =
     "SELECT 'a' AS src, a.id, a.text, a.created_at, a.order_id, o.address, NULL::text AS author " +
     "FROM audits a LEFT JOIN orders o ON o.id = a.order_id " + (condA.length ? 'WHERE ' + condA.join(' AND ') : '') +
     " UNION ALL " +
     "SELECT 'r', r.id, r.text, r.created_at, o2.id, o2.address, r.author FROM reports r " +
-    "LEFT JOIN orders o2 ON o2.telegram_msg_id = r.reply_to " +
+    "LEFT JOIN orders o2 ON o2.telegram_msg_id = r.reply_to AND r.chat_id = " + replyChat + " " +
     "WHERE r.text <> '' " + (condR.length ? 'AND ' + condR.join(' AND ') : '') +
     " ORDER BY created_at DESC LIMIT 20";
   var rows = (await pool.query(sql, params)).rows;
@@ -316,7 +319,7 @@ async function getReport(src, id) {
     var a = (await pool.query('SELECT * FROM audits WHERE id=$1', [id])).rows[0];
     return a ? { chat_id: a.chat_id, msg_ids: a.msg_ids, sources: [{ chat_id: a.chat_id, msg_ids: a.msg_ids || [] }], text: a.text, linked: 0, metadata: auditMetadata(a), report_data: a.report_data } : null;
   }
-  var aggregate = await require('./legacy-report').loadReportAggregate(pool, id);
+  var aggregate = await require('./legacy-report').loadReportAggregate(pool, id, { workingChatId: process.env.GROUP_CHAT_ID });
   if (!aggregate) return null;
   var { metadata_source, ...report } = aggregate;
   return Object.assign(report, { metadata: auditMetadata(metadata_source) });
@@ -1448,7 +1451,7 @@ function setupHandoff(app) {
       if (d.cad_num) {
         try {
           var targets = [];
-          if (lawyerMsg) targets.push({ chat: Number(lawyer.tg_id), reply: lawyerMsg.message_id });
+          if (lawyerMsg) targets.push({ chat: Number(lawyer.tg_id), reply: lawyerMsg.message_id, case_id: Number(c.id) });
           // в «Заявки по клиенту» выписку не копируем — она живёт в чате выписок
           var eg = await require('../bot/egrn').attachOrOrder({
             cad: d.cad_num, label: d.org, order: !!d.egrn_order, orderedBy: req.tgUser.id, orderedName: req.staff.name,
@@ -2921,4 +2924,4 @@ function checklistPage(c, L) {
     '</body></html>';
 }
 
-module.exports = { setupHandoff: setupHandoff, saveAudit: saveAudit, setupReportsBot: setupReportsBot, setupReportsWeb: setupReportsWeb, setupRequestsWeb: setupRequestsWeb };
+module.exports = { setupHandoff: setupHandoff, saveAudit: saveAudit, setupReportsBot: setupReportsBot, setupReportsWeb: setupReportsWeb, setupRequestsWeb: setupRequestsWeb, checklistCounts };

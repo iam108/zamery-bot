@@ -11,13 +11,13 @@ function actualFunction(name) {
   const rest = source.slice(start), next = rest.slice(1).search(/\n  (?:(?:async )?function |var )/);
   return next < 0 ? rest : rest.slice(0, next + 1);
 }
-function load(c, ...names) { if(names.includes('fetchAuditFile')||names.includes('request'))names=['requestWithDeadline',...names];vm.runInContext(names.map(actualFunction).join('\n'), c); }
+function load(c, ...names) { if(names.includes('fetchAuditFile')||names.includes('request'))names=['requestWithDeadline',...names];if(names.includes('postEvidence')&&source.includes('async function recoverEvidenceUpload('))names=['recoverEvidenceUpload',...names];vm.runInContext(names.map(actualFunction).join('\n'), c); }
 function harness() {
   const calls=[],nodes=new Map();
   const node=key=>{if(!nodes.has(key))nodes.set(key,{textContent:'',innerHTML:'',dataset:{},style:{},disabled:false,hidden:false,querySelector:()=>null,querySelectorAll:()=>[],remove(){calls.push(['host-removed']);}});return nodes.get(key);};
   const c={
     state:{data:{schema_version:3,ui_version:5,object_category:'catering',inspection:{org:'Тест',address:'Москва',service:'Получение',visit_date:'2026-10-30'},workflow:{step:2,conclusion_status:'actions',territory_result:'findings'},conclusion:'Есть замечания',entrances:[],zones:[],plan:{evidence_id:'plan-original',page:6,annotations:[{id:'p1',tool:'boundary'}]},map:{evidence_id:'map-original',page:1,annotations:[{id:'e1',tool:'entrance'}]},additional_plans:[]},draft:{id:'draft-test',revision:10},evidence:[],dirty:false,serverError:'',version:0,frozen:false,submitting:false,completed:false,packet:{materials:[]}},
-    $:node,root:node('#root'),calls,tail:Promise.resolve(),timer:null,pendingSave:null,queuedJobs:0,closingConfirmation:false,saveRetries:0,editor:null,activePlanId:'main',orderId:'123',localKey:'test-only',tg:null,
+    $:node,root:node('#root'),calls,tail:Promise.resolve(),timer:null,pendingSave:null,queuedJobs:0,closingConfirmation:false,saveRetries:0,editor:null,activePlanId:'main',managerPlanIntents:new Map(),orderId:'123',localKey:'test-only',tg:null,
     clone:copy,clearTimeout,setTimeout,console,TextEncoder,URL,OUTCOME_LABELS:{ready:'Соответствует по проверенным пунктам',actions:'Нужны действия'},
     document:{body:{classList:{add(){},remove(){}},appendChild(){calls.push(['host-added']);}},createElement:()=>node('export-host')},
     window:{},localStorage:{setItem(){},removeItem(){}},
@@ -33,6 +33,39 @@ function harness() {
   };
   vm.createContext(c);load(c,'requiredIssues','stable','sameData','draftWriteOptions','updateClosingConfirmation','recoverUnconfirmedWrite','setOutcome','queue','step','isRenewal','evidenceFor','mapMode','adoptRevision','removeGeneratedEvidence','submit','currentPlan','setCurrentPlan');return c;
 }
+
+test('unknown delivery disables ordinary submit and offers an explicit checked-chat retry', async () => {
+  const c=harness();c.state.frozen=true;c.state.draft.delivery_unknown={cursor:'attempt-1',stage:'photos',count:2};
+  load(c,'freezeControls');c.freezeControls();
+  assert.equal(c.$('#submit-audit').disabled,true);assert.equal(c.$('#retry-unknown-delivery').hidden,false);
+  assert.match(c.$('#submit-status').textContent,/проверьте чат.*дубликаты/i);
+  await c.submit('');assert.equal(c.calls.some(call=>call[0]==='request'),false);
+});
+
+test('cancelling the explicit duplicate-risk confirmation contacts no retry or submit endpoint', async () => {
+  const c=harness();c.state.frozen=true;c.state.draft.delivery_unknown={cursor:'attempt-1',stage:'summary',count:1};
+  c.window.confirm=()=>false;c.freezeControls=()=>{};load(c,'retryUnconfirmedDelivery');
+  await c.retryUnconfirmedDelivery();assert.equal(c.calls.some(call=>call[0]==='request'),false);
+  assert.equal(c.state.draft.delivery_unknown.cursor,'attempt-1');
+});
+
+test('explicit retry confirms only the displayed frozen attempt before resuming the report', async () => {
+  const c=harness();c.state.frozen=true;c.state.draft.delivery_unknown={cursor:'attempt-1',stage:'originals',count:1};
+  c.window.confirm=message=>{assert.match(message,/дубликатов/);return true;};c.freezeControls=()=>{};
+  c.submit=async()=>{assert.equal(c.state.draft.delivery_unknown,undefined);assert.equal(c.state.retryingDelivery,false);c.calls.push(['resume']);};
+  load(c,'retryUnconfirmedDelivery');await c.retryUnconfirmedDelivery();
+  const sent=c.calls.find(call=>call[0]==='request');assert.match(sent[1],/draft-test\/retry-delivery$/);
+  assert.deepEqual(JSON.parse(sent[2].body),{revision:10,cursor:'attempt-1',acknowledge_duplicate_risk:true});
+  assert.equal(c.calls.filter(call=>call[0]==='resume').length,1);
+});
+
+test('a stale retry cursor reloads the current unknown attempt without sending any report part', async () => {
+  const c=harness();c.state.frozen=true;c.state.draft.delivery_unknown={cursor:'attempt-1',stage:'photos',count:2};
+  c.window.confirm=()=>true;c.freezeControls=()=>{};c.request=async()=>{throw Object.assign(new Error('Retry cursor changed'),{status:409});};
+  c.checkSubmissionState=async()=>{c.state.draft.delivery_unknown={cursor:'attempt-2',stage:'photos',count:2};};
+  c.submit=async()=>assert.fail('The stale HTTP retry cannot start delivery');load(c,'retryUnconfirmedDelivery');
+  await c.retryUnconfirmedDelivery();assert.equal(c.state.draft.delivery_unknown.cursor,'attempt-2');assert.equal(c.state.retryingDelivery,false);
+});
 
 test('the first Call click dispatches the one-shot dial URL without opening a contact dialog',()=>{
   const c=harness(),button={},events=[];
@@ -580,3 +613,103 @@ test('a Telegram-only EGRN original opens its message with Telegram native navig
   await c.openLargeEgrn(id,{disabled:false});
   assert.deepEqual(opened,['https://t.me/c/123456/789']);
 });
+
+for (const newer of ['source', 'geometry']) test('a late manager document preserves a newer ' + newer + ' choice on the same plan', async () => {
+  const c = harness(); let started, release;
+  const opened = new Promise(resolve => { started = resolve; }), delayed = new Promise(resolve => { release = resolve; });
+  c.packetFiles = () => [{ id: 'manager-delayed', name: 'Delayed.pdf', mime: 'application/pdf', role: 'plan', url: '/api/audit/orders/123/materials/manager-delayed' }];
+  c.fetchAuditFile = async () => { started(); await delayed; return { blob: { type: 'application/pdf' } }; };
+  c.readBase64 = async () => Buffer.from('Original manager PDF').toString('base64'); load(c, 'useManagerPlan');
+  c.useManagerPlan('manager-delayed'); await opened;
+  c.state.data.plan = newer === 'source'
+    ? { evidence_id: 'newer-original', page: 3, annotations: [{ id: 'newer-mark', tool: 'boundary' }] }
+    : { ...copy(c.state.data.plan), annotations: [{ id: 'newer-mark', tool: 'boundary', label: 'Drawn during the download' }] };
+  const wanted = copy(c.state.data.plan); c.changed(); release(); await c.tail;
+  assert.deepEqual(c.state.data.plan, wanted, 'Completing an older document download must not replace newer inspection work');
+  assert.equal(c.calls.filter(item => item[0] === 'upload').length, 1, 'The downloaded manager original remains available independently');
+});
+
+test('a newer manager-document request supersedes an older pending import even when the newer download fails', async () => {
+  const c = harness(); let started, release;
+  const opened = new Promise(resolve => { started = resolve; }), delayed = new Promise(resolve => { release = resolve; });
+  const files = ['first', 'second'].map(id => ({ id, name: id + '.pdf', mime: 'application/pdf', role: 'plan', url: '/api/audit/orders/123/materials/' + id }));
+  c.packetFiles = () => files;
+  c.fetchAuditFile = async url => { if (url.endsWith('/second')) throw new Error('Synthetic newer document unavailable'); started(); await delayed; return { blob: { type: 'application/pdf' } }; };
+  c.readBase64 = async () => Buffer.from('Original first manager PDF').toString('base64'); load(c, 'useManagerPlan');
+  const wanted = copy(c.state.data.plan); c.useManagerPlan('first'); await opened; c.useManagerPlan('second'); release(); await c.tail;
+  assert.deepEqual(c.state.data.plan, wanted, 'A failed newer choice must not silently activate an older request');
+  assert.ok(c.calls.some(item => item[0] === 'notify' && /newer document unavailable/.test(item[1])));
+});
+
+test('a confirmed scheme deletion is immediately reflected in the UI even when its follow-up draft save fails', async () => {
+  const c = harness(), renders = []; let saves = 0;
+  c.window.confirm = () => true; c.blobUrls = new Map();
+  c.state.data.map = { mode: 'attached', evidence_id: 'attached-scheme', page: 1, annotations: [] };
+  c.state.evidence = [{ id: 'attached-scheme', role: 'map', subject_id: 'attached', mime: 'image/png', name: 'Scheme.png' }];
+  c.flush = async () => { if (++saves === 2) throw new Error('Synthetic follow-up PUT failed'); };
+  c.render = () => renders.push({ source: c.state.data.map.evidence_id, files: c.state.evidence.map(file => file.id) });
+  load(c, 'deleteEvidence'); await c.deleteEvidence('attached-scheme'); await c.tail;
+  assert.equal(c.state.data.map.evidence_id, ''); assert.equal(c.state.dirty, true);
+  assert.deepEqual(renders, [{ source: '', files: [] }], 'The server-confirmed deletion must remove its stale visible card before retrying metadata');
+  assert.ok(c.calls.some(item => item[0] === 'notify' && /follow-up PUT failed/.test(item[1])));
+});
+
+async function evidenceDatabase(run) {
+  const { PGlite } = require(process.env.PGLITE_TEST_MODULE), db = new PGlite();
+  const query = (sql, params) => params ? db.query(sql, params) : db.exec(sql);
+  const pool = { query, async connect() { return { query, release() {} }; } };
+  const store = require('../src/web/audit-drafts').createDraftStore(pool, undefined, { objectStore: { configured: () => false } });
+  try { await db.exec('CREATE TABLE orders(id INT PRIMARY KEY); INSERT INTO orders VALUES(123);'); await run(store, db); }
+  finally { await db.close(); }
+}
+
+test('a committed evidence upload with a lost ACK does not turn the next observation into a false draft conflict', { skip: !process.env.PGLITE_TEST_MODULE }, () => evidenceDatabase(async (store, db) => {
+  const c = harness(), fileId = require('node:crypto').randomUUID(), original = Buffer.from('Original phone image');
+  c.state.draft = await store.create(108, 123, c.state.data); c.evidenceId = async () => fileId;
+  c.crypto = require('node:crypto').webcrypto; c.window.crypto = c.crypto; c.atob = value => Buffer.from(value, 'base64').toString('binary');
+  c.request = async (url, options) => {
+    if (!options) return { draft: await store.current(108, 123) };
+    const input = JSON.parse(options.body);
+    if (url.endsWith('/evidence')) { await store.addEvidence(108, c.state.draft.id, input); c.state.data.conclusion = 'Typed while the original upload was in flight'; c.changed(); throw Object.assign(new Error('Synthetic lost evidence ACK'), { retryable: true }); }
+    return { draft: await store.update(108, c.state.draft.id, input.revision, input.data) };
+  };
+  load(c, 'postEvidence', 'flush', 'saveNow');
+  let uploadError; try { await c.postEvidence({ name: 'Phone.png', type: 'image/png' }, 'entrance', 'door-1', original.toString('base64')); } catch (error) { uploadError = error; }
+  assert.equal(c.state.data.conclusion, 'Typed while the original upload was in flight');
+  c.state.data.conclusion = 'A new observation after the selected photo'; c.changed();
+  await c.saveNow();
+  assert.equal(uploadError, undefined, 'A matching committed original is recovered through its owned server snapshot');
+  assert.equal(!!c.state.conflict, false); assert.equal((await store.current(108, 123)).data.conclusion, c.state.data.conclusion);
+  const files = (await db.query('SELECT content FROM audit_evidence')).rows; assert.equal(files.length, 1); assert.ok(Buffer.from(files[0].content).equals(original));
+}));
+
+test('uncertain evidence recovery cannot adopt another window newer draft revision', { skip: !process.env.PGLITE_TEST_MODULE }, () => evidenceDatabase(async store => {
+  const c = harness(), fileId = require('node:crypto').randomUUID();
+  c.state.draft = await store.create(108, 123, c.state.data); const baseline = c.state.draft.revision;
+  c.evidenceId = async () => fileId; c.crypto = require('node:crypto').webcrypto; c.window.crypto = c.crypto; c.atob = value => Buffer.from(value, 'base64').toString('binary');
+  c.request = async (url, options) => {
+    if (!options) return { draft: await store.current(108, 123) };
+    const result = await store.addEvidence(108, c.state.draft.id, JSON.parse(options.body));
+    await store.update(108, c.state.draft.id, result.revision, { ...copy(c.state.data), conclusion: 'Another window newer observation' });
+    throw Object.assign(new Error('Synthetic lost evidence ACK'), { retryable: true });
+  };
+  load(c, 'postEvidence');
+  await assert.rejects(c.postEvidence({ name: 'Phone.png', type: 'image/png' }, 'entrance', 'door-1', Buffer.from('Original').toString('base64')), /lost evidence ACK/);
+  assert.equal(c.state.draft.revision, baseline); assert.equal(c.state.evidence.length, 0);
+  assert.equal((await store.current(108, 123)).data.conclusion, 'Another window newer observation');
+}));
+
+test('uncertain evidence recovery verifies original bytes rather than trusting only file ID and size', { skip: !process.env.PGLITE_TEST_MODULE }, () => evidenceDatabase(async (store, db) => {
+  const c = harness(), fileId = require('node:crypto').randomUUID();
+  c.state.draft = await store.create(108, 123, c.state.data); const baseline = c.state.draft.revision;
+  c.evidenceId = async () => fileId; c.crypto = require('node:crypto').webcrypto; c.window.crypto = c.crypto; c.atob = value => Buffer.from(value, 'base64').toString('binary');
+  c.request = async (url, options) => {
+    if (!options) return { draft: await store.current(108, 123) };
+    await store.addEvidence(108, c.state.draft.id, JSON.parse(options.body));
+    await db.query('UPDATE audit_evidence SET sha256=$1 WHERE id=$2', ['0'.repeat(64), fileId]);
+    throw Object.assign(new Error('Synthetic lost evidence ACK'), { retryable: true });
+  };
+  load(c, 'postEvidence');
+  await assert.rejects(c.postEvidence({ name: 'Phone.png', type: 'image/png' }, 'entrance', 'door-1', Buffer.from('Original').toString('base64')), /lost evidence ACK/);
+  assert.equal(c.state.draft.revision, baseline); assert.equal(c.state.evidence.length, 0);
+}));

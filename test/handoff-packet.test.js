@@ -73,7 +73,7 @@ async function database(run) {
       await db.query('INSERT INTO audit_evidence VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)', [draftId,file.id,file.name,file.mime,file.role,file.subject_id,file.content.length,sha(file.content),key?null:file.content,file.storage,key,new Date()]);
     }
     const store = createAuditEvidenceStore({ objectStore:{ configured:()=>true, async get(input) { gets.push(input.key); assert.ok(originals.has(input.key)); return Readable.from([originals.get(input.key)]); } } });
-    const service = createPacketService({pool,evidenceStore:store});
+    const service = createPacketService({pool,evidenceStore:store,workingChatId:'-1001234567890'});
     await run({db,pool,sql,gets,files,metadata,data,draftId,service,store,completeText});
   } finally { await db.close(); }
 }

@@ -42,6 +42,7 @@ function createManagerHandlers(options = {}) {
   const attachOrOrder = options.attachOrOrder || (data => require('../bot/egrn').attachOrOrder(data));
   const withOrderLock = options.withOrderDeliveryLock || require('../db/order-delivery-lock').createOrderDeliveryLock(pool, options.orderLockOptions);
   const loadReportLink = options.loadOrderReportLink || (id => require('./order-report-link').loadOrderReportLink(id, { pool }));
+  const delivery = options.telegramDelivery || require('./order-telegram-delivery').createOrderTelegramDelivery({ pool, telegram: getTelegram, groupId: options.groupId, ready: materials.ensureOrderMaterials });
   const recent = new Map();
 
   async function read(req, res) {
@@ -104,23 +105,18 @@ function createManagerHandlers(options = {}) {
       const telegram = getTelegram();
       const warnings = [];
       if (replayed && savedRevision !== Number(order.packet_revision)) warnings.push('Ваше сохранение подтверждено. После него заявку изменил другой менеджер; доставка использует актуальные данные.');
-      const newCard = !order.telegram_msg_id;
-      if (newCard) {
-        try {
-          const report = await loadReportLink(order.id);
-          const msg = await telegram.sendMessage(process.env.GROUP_CHAT_ID, format(order), cardOptions(order, report?.url));
-          await queries.setTelegramMsgId(order.id, msg.message_id);
-          order.telegram_msg_id = msg.message_id;
-          await queries.addLog(order.id, 'created', req.staff.name, 'Заявка и материалы сохранены; карточка отправлена в чат');
-        } catch (e) { console.error('order card delivery:', e.message); warnings.push('Карточка не доставлена в чат.'); }
-      } else {
-        try {
-          const report = await loadReportLink(order.id);
-          await telegram.editMessageText(process.env.GROUP_CHAT_ID, Number(order.telegram_msg_id), undefined, format(order), cardOptions(order, report?.url));
+      let card;
+      try {
+        const report = await loadReportLink(order.id);
+        card = await delivery.publishCard(order, format(order), cardOptions(order, report?.url));
+        if (card.message_id) order.telegram_msg_id = card.message_id;
+        if (!card.ok) warnings.push(card.warning);
+        if (card.created) {
+          try { await queries.addLog(order.id, 'created', req.staff.name, 'Заявка и материалы сохранены; карточка отправлена в чат'); }
+          catch (error) { console.error('order card log:', error.message); }
         }
-        catch (e) { if (!/message is not modified/i.test(e.message)) { console.error('order card update:', e.message); warnings.push('Не удалось обновить карточку в чате.'); } }
-      }
-      if (order.telegram_msg_id) {
+      } catch (e) { console.error('order card delivery:', e.message); warnings.push('Не удалось проверить или обновить доставку карточки. Повторите проверку позднее.'); }
+      if (order.telegram_msg_id && card?.usable !== false) {
         for (const file of await materials.listOrderMaterials(order.id, true)) {
           if (file.telegram_msg_id) continue;
           try {
@@ -131,9 +127,9 @@ function createManagerHandlers(options = {}) {
               else warnings.push('Не удалось подтвердить прежнюю отправку файла «' + file.name + '». Проверьте исходное вложение в боте.');
               continue;
             }
-            const sent = await telegram.sendDocument(process.env.GROUP_CHAT_ID, { source: file.buffer, filename: file.name }, { caption: '📎 Заявка #' + order.id + ' · ' + file.name, reply_to_message_id: order.telegram_msg_id });
-            await materials.markOrderMaterialDelivered(order.id, file.id, sent.message_id);
-          } catch (e) { console.error('order document delivery:', e.message); warnings.push('Не доставлен в чат файл «' + file.name + '».'); }
+            const sent = await delivery.publishMaterial(order, file);
+            if (!sent.ok) warnings.push('Файл «' + file.name + '»: ' + sent.warning);
+          } catch (e) { console.error('order document delivery:', e.message); warnings.push('Не удалось проверить доставку файла «' + file.name + '». Повторите проверку позднее.'); }
         }
         const orderEgrn = data.egrn_order === true || data.egrn_order === '1' || data.egrn_order === 'true';
         const sameCad = data.cad_num === String(order.cad_num || '');
@@ -155,7 +151,7 @@ function createManagerHandlers(options = {}) {
           } catch (e) { console.error('egrn for order:', e.message); warnings.push('Не удалось проверить доставку выписки ЕГРН.'); }
         }
       }
-      finish({ ok: true, id: order.id, packet_revision: savedRevision, current_revision: Number(order.packet_revision), replayed, warning: warnings.length ? 'Заявка #' + order.id + ' и документы сохранены. ' + warnings.join(' ') + ' Повторите доставку — новая заявка не создастся.' : undefined });
+      finish({ ok: true, id: order.id, packet_revision: savedRevision, current_revision: Number(order.packet_revision), replayed, warning: warnings.length ? 'Заявка #' + order.id + ' и документы сохранены. ' + warnings.join(' ') + ' Новая заявка при повторе не создастся.' : undefined });
       };
       return edit ? await publish() : await withOrderLock(order.id, publish);
     } catch (e) {

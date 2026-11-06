@@ -39,7 +39,7 @@ function createAuditSubmitter(drafts, deliver, options = {}) {
         if (snapshot.data.ui_version === 5 && !trustedPacket) throw new Error('Не удалось проверить заявку менеджера. Обновите форму и повторите отправку.');
         if (trustedPacket) snapshot.data = { ...snapshot.data, request_packet: trustedPacket };
         const packet = snapshot.data.request_packet;
-        if (!packet || !packet.org || !packet.address || (packet.object_category !== 'tobacco' && !packet.service)) throw new Error('В заявке не хватает данных объекта или услуги. Менеджеру нужно дополнить заявку.');
+        if (!packet || !packet.org || !packet.address || (!['tobacco','other'].includes(packet.object_category) && !packet.service)) throw new Error('В заявке не хватает данных объекта или услуги. Менеджеру нужно дополнить заявку.');
       }
       data = hydrateDraftReport(snapshot);
       validateInspection(data);

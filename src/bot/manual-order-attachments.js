@@ -2,6 +2,7 @@ const defaultPool = require('../db/pool');
 const defaultMaterials = require('../web/order-materials');
 const { telegramOriginal } = require('./order-evidence');
 const { createOrderDeliveryLock } = require('../db/order-delivery-lock');
+const { messageId, hasUnknownMaterialDelivery } = require('../web/order-telegram-delivery');
 
 // Receipts contain Telegram identifiers only. File bytes use order_materials and
 // its existing size limits; no second original or large-file store is created.
@@ -13,7 +14,8 @@ const DDL = `CREATE TABLE IF NOT EXISTS manual_order_attachments (
   group_message_id BIGINT, reply_kind TEXT,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY(source_chat_id,source_message_id)
-);`;
+);
+ALTER TABLE manual_order_attachments ADD COLUMN IF NOT EXISTS retry_generation UUID NOT NULL DEFAULT gen_random_uuid();`;
 const OPEN = "status NOT IN ('done','cancelled')";
 const materialStateReady = new WeakMap();
 async function manualMaterialDeliveryState(pool, orderId, materialId) {
@@ -63,7 +65,7 @@ function createManualOrderAttachments(options = {}) {
     await ctx.reply(text, extra);
     await pool.query('UPDATE manual_order_attachments SET reply_kind=$3 WHERE source_chat_id=$1 AND source_message_id=$2', [row.source_chat_id, row.source_message_id, kind]);
   }
-  const retryKeyboard = row => ({ reply_markup: { inline_keyboard: [[{ text: 'Повторить отправку в рабочий чат', callback_data: 'manual_retry:' + row.source_message_id }]] } });
+  const retryKeyboard = row => ({ reply_markup: { inline_keyboard: [[{ text: 'Проверил чат — повторить отправку', callback_data: 'manual_retry:' + row.source_message_id + ':' + row.retry_generation }]] } });
   async function publicationWarning(ctx, row, unknown) {
     await notify(ctx, row, unknown ? 'unknown' : 'group-error', 'Файл сохранён в документах заявки #' + row.order_id + '. ' + (unknown
       ? 'Подтверждение отправки в рабочий чат не получено. Перед повтором проверьте чат: исходное сообщение могло дойти.'
@@ -87,21 +89,23 @@ function createManualOrderAttachments(options = {}) {
     } catch (error) { await client.query('ROLLBACK').catch(() => {}); throw error; }
     finally { client.release(); }
   }
-  async function process(ctx, initial, orderId, explicitRetry = false) {
-    return withOrderLock(orderId, () => processLocked(ctx, initial, orderId, explicitRetry));
+  async function process(ctx, initial, orderId, explicitRetry = false, expectedGeneration = null) {
+    return withOrderLock(orderId, () => processLocked(ctx, initial, orderId, explicitRetry, expectedGeneration));
   }
-  async function processLocked(ctx, initial, orderId, explicitRetry = false) {
+  async function processLocked(ctx, initial, orderId, explicitRetry = false, expectedGeneration = null) {
     let row = await receipt(initial.source_chat_id, initial.source_message_id);
     if (!row || String(row.actor_tg_id) !== String(ctx.from.id)) return;
     if (row.order_id && Number(row.order_id) !== Number(orderId)) return ctx.reply('Этот файл уже относится к заявке #' + row.order_id + '. Для другой заявки отправьте его отдельным сообщением.');
     if (row.stage === 'sent') return notify(ctx, row, 'sent', '✅ Файл сохранён в документах заявки #' + row.order_id + ' и отправлен в рабочий чат.');
+    if (explicitRetry && row.retry_generation !== expectedGeneration) return ctx.reply('Кнопка относится к прошлой попытке. Сначала проверьте чат: сообщение могло дойти. Для повтора текущей попытки используйте обновлённую кнопку; возможен дубликат.', retryKeyboard(row));
     if (row.stage === 'sending' && !explicitRetry) return publicationWarning(ctx, row, true);
     const order = (await pool.query('SELECT * FROM orders WHERE id=$1 AND submitted_by=$2 AND ' + OPEN, [orderId, ctx.from.id])).rows[0];
     if (!order) return ctx.reply('Заявка закрыта или недоступна. Файл к ней не прикреплён.');
     if (Number(row.file.bytes) > materials.LIMITS.fileBytes) return notify(ctx, row, 'oversize', 'Файл «' + row.file.name + '» больше 12 МБ. В документы заявки он не добавлен. Оригинал остаётся в вашем сообщении Telegram. Для большого файла используйте ссылку на Яндекс Диск в форме заявки.');
-    const claimed = (await pool.query(`UPDATE manual_order_attachments SET order_id=$3,stage='processing',lease_until=NOW()+INTERVAL '60 seconds',updated_at=NOW(),reply_kind=NULL
+    const claimed = (await pool.query(`UPDATE manual_order_attachments SET order_id=$3,stage='processing',lease_until=NOW()+INTERVAL '60 seconds',updated_at=NOW(),reply_kind=NULL,retry_generation=gen_random_uuid()
       WHERE source_chat_id=$1 AND source_message_id=$2 AND (order_id IS NULL OR order_id=$3)
-      AND (stage IN ('pending','saved') OR stage='processing' AND lease_until<NOW() OR $4::boolean AND stage='sending' AND (lease_until IS NULL OR lease_until<NOW())) RETURNING *`, [row.source_chat_id, row.source_message_id, order.id, explicitRetry])).rows[0];
+      AND (NOT $4::boolean OR retry_generation=$5::uuid)
+      AND (stage IN ('pending','saved') OR stage='processing' AND lease_until<NOW() OR $4::boolean AND stage='sending' AND (lease_until IS NULL OR lease_until<NOW())) RETURNING *`, [row.source_chat_id, row.source_message_id, order.id, explicitRetry, expectedGeneration])).rows[0];
     if (!claimed) return ctx.reply('Этот файл уже обрабатывается. Повторите проверку чуть позже; повторно отправлять сам файл не нужно.');
     row = claimed;
     let sending = false, published = false;
@@ -120,10 +124,18 @@ function createManualOrderAttachments(options = {}) {
         await confirmDelivery(row, Number(publishedOriginal.telegram_msg_id)); published = true;
         return notify(ctx, row, 'sent', '✅ Файл сохранён в документах заявки #' + order.id + ' и отправлен в рабочий чат.');
       }
+      const deliveryRow = (await pool.query('SELECT telegram_delivery FROM orders WHERE id=$1', [order.id])).rows[0];
+      if (!deliveryRow) throw new Error('Order no longer available');
+      if (hasUnknownMaterialDelivery(deliveryRow, row.material_id)) {
+        await pool.query("UPDATE manual_order_attachments SET stage='saved',lease_until=NULL WHERE source_chat_id=$1 AND source_message_id=$2", [row.source_chat_id, row.source_message_id]);
+        return notify(ctx, row, 'manager-unknown', 'Файл сохранён в документах заявки #' + order.id + '. Отправка этого оригинала из формы заявки не подтверждена: сообщение могло дойти. Автоматический повтор остановлен. Проверьте чат; администратор может открыть /order_delivery ' + order.id + '. Повтор может создать дубликат.');
+      }
       if (!groupId) {
         await pool.query("UPDATE manual_order_attachments SET stage='saved',lease_until=NULL WHERE source_chat_id=$1 AND source_message_id=$2", [row.source_chat_id, row.source_message_id]);
         return publicationWarning(ctx, row, false);
       }
+      const previous = (await pool.query('SELECT telegram_msg_id FROM order_materials WHERE order_id=$1 AND telegram_msg_id IS NOT NULL', [order.id])).rows;
+      const known = new Set([order.telegram_msg_id,...previous.map(file => file.telegram_msg_id)].map(messageId).filter(Boolean));
       // Durable intent precedes the Telegram call. A crash or unknown network
       // acknowledgement requires an explicit retry instead of duplicate posts.
       await pool.query("UPDATE manual_order_attachments SET stage='sending',lease_until=NOW()+INTERVAL '60 seconds',updated_at=NOW() WHERE source_chat_id=$1 AND source_message_id=$2", [row.source_chat_id, row.source_message_id]);
@@ -131,14 +143,16 @@ function createManualOrderAttachments(options = {}) {
       const extra = { caption: '📎 Файл к заявке #' + order.id };
       if (sourceNumber(order.telegram_msg_id)) Object.assign(extra, { reply_to_message_id: Number(order.telegram_msg_id), allow_sending_without_reply: true });
       const delivered = row.file.photo ? await ctx.telegram.sendPhoto(groupId, row.file.file_id, extra) : await ctx.telegram.sendDocument(groupId, row.file.file_id, extra);
-      if (!sourceNumber(delivered?.message_id)) throw new Error('Telegram acknowledgement unavailable');
-      await confirmDelivery(row, Number(delivered.message_id));
+      const receipt = messageId(delivered?.message_id), chat = String(groupId);
+      const matchingChat = delivered?.chat == null || (chat.startsWith('@') ? String(delivered.chat.username || '').toLowerCase() === chat.slice(1).toLowerCase() : String(delivered.chat.id) === chat);
+      if (!receipt || known.has(receipt) || !matchingChat) throw new Error('Telegram acknowledgement unavailable');
+      await confirmDelivery(row, receipt);
       published = true;
       await notify(ctx, row, 'sent', '✅ Файл сохранён в документах заявки #' + order.id + ' и отправлен в рабочий чат.');
     } catch (error) {
       log();
       if (published) return; // A failed private acknowledgement must never resend the group post.
-      const rejected = sending && Number(error.response?.error_code) >= 400;
+      const rejected = sending && Number(error.response?.error_code) >= 400 && Number(error.response?.error_code) < 500;
       if (sending) {
         await pool.query("UPDATE manual_order_attachments SET stage=CASE WHEN $3::boolean THEN 'saved' ELSE stage END,lease_until=NULL,updated_at=NOW() WHERE source_chat_id=$1 AND source_message_id=$2", [row.source_chat_id, row.source_message_id, rejected]).catch(log);
         return publicationWarning(ctx, row, !rejected);
@@ -174,11 +188,11 @@ function createManualOrderAttachments(options = {}) {
   async function retry(ctx) {
     return safe(ctx, async () => {
       await ctx.answerCbQuery();
-      const match = /^manual_retry:(\d+)$/.exec(ctx.callbackQuery?.data || '');
+      const match = /^manual_retry:(\d+)(?::([a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}))?$/i.exec(ctx.callbackQuery?.data || '');
       if (!match) return;
       const row = await receipt(ctx.chat.id, Number(match[1]));
       if (!row || String(row.actor_tg_id) !== String(ctx.from.id) || !row.order_id) return ctx.reply('Вложение не найдено. Отправьте файл ещё раз.');
-      return process(ctx, row, row.order_id, true);
+      return process(ctx, row, row.order_id, true, match[2] || null);
     });
   }
   return { receive, select, retry, ensure };
@@ -187,7 +201,7 @@ function setupManualOrderAttachments(bot, options) {
   const handler = createManualOrderAttachments(options);
   bot.on(['photo', 'document'], handler.receive);
   bot.action(/^manual_attach:\d+:\d+$/, handler.select);
-  bot.action(/^manual_retry:\d+$/, handler.retry);
+  bot.action(/^manual_retry:\d+(?::[a-f\d-]{36})?$/i, handler.retry);
   return handler;
 }
 module.exports = { DDL, sourceFile, createManualOrderAttachments, setupManualOrderAttachments, manualMaterialDeliveryState };

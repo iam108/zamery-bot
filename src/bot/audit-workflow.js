@@ -1,5 +1,6 @@
 const { esc } = require('./formatter');
 const { validateInspection, compactInspectionIssues } = require('./audit-inspection');
+const { isGenericAudit, validateGenericAudit, buildGenericAuditSummary } = require('./audit-generic');
 
 const CONCLUSIONS = { ready: 'Соответствует по проверенным пунктам', actions: 'Нужны действия', insufficient: 'Недостаточно данных', obstacle: 'Выявлено препятствие' };
 const ZONE_STATUS = { pending: 'Требует уточнения', confirmed: 'Ограничение подтверждено аудитором', excluded: 'Ограничение исключено с основанием' };
@@ -79,6 +80,7 @@ function simpleFollowupTasks(data) {
 }
 
 function followupTasks(data) {
+  if (isGenericAudit(data)) return [];
   if (data.ui_version === 5) return compactFollowupTasks(data);
   if (data.ui_version === 4) return simpleFollowupTasks(data);
   const p = data.inspection || {}, w = data.workflow || {}, evidence = data.evidence || [];
@@ -114,6 +116,7 @@ function followupTasks(data) {
 
 function validateWorkflow(data) {
   if (data.schema_version !== 3) return;
+  if (isGenericAudit(data)) return validateGenericAudit(data);
   if (data.ui_version === 5) return validateCompactWorkflow(data);
   const w = data.workflow || {}, p = data.inspection || {};
   if (!CONCLUSIONS[w.conclusion_status]) throw new Error('Выберите итог проверки: соответствует, нужны действия, недостаточно данных или препятствие.');
@@ -156,6 +159,7 @@ function validateWorkflow(data) {
 function buildWorkflowReport(data) {
   if (data.schema_version !== 3) return { plain: [], html: [] };
   validateWorkflow(data);
+  if (isGenericAudit(data)) { const summary=buildGenericAuditSummary(data);return {plain:summary.plain.split('\n'),html:summary.html.split('\n')}; }
   if (data.ui_version === 5) return buildCompactWorkflowReport(data);
   if (data.ui_version === 4) return buildSimpleReport(data);
   const w = data.workflow || {}, p = data.inspection || {}, plain = [];
@@ -243,6 +247,7 @@ function buildSimpleReport(data) {
 
 function activeDraftEvidence(draft) {
   const input = draft.data;
+  if (isGenericAudit(input)) return draft.evidence || [];
   const territoryResult = input?.ui_version === 5 && input.workflow?.territory_result;
   const explicitTerritory = territoryResult === 'clear' || territoryResult === 'findings';
   let files = draft.evidence || [];

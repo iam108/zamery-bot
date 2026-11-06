@@ -51,6 +51,7 @@ test('migration and session persistence, expiry, touch and logout in PostgreSQL'
       assert.deepEqual((await db.query('SELECT delivery FROM case_reminders WHERE id=1')).rows[0].delivery, {});
       assert.deepEqual((await db.query('SELECT delivery_revision,request_key,processing_token,processing_until FROM egrn_orders WHERE id=1')).rows[0],
         { delivery_revision: 0, request_key: null, processing_token: null, processing_until: null });
+      assert.deepEqual((await db.query('SELECT delivery_state FROM egrn_orders WHERE id=1')).rows[0].delivery_state, {});
       assert.equal((await db.query('SELECT incoming_key FROM reports WHERE id=1')).rows[0].incoming_key, null);
       assert.equal((await db.query('SELECT last_message_at FROM reports WHERE id=1')).rows[0].last_message_at, null);
       await db.exec("INSERT INTO egrn_orders(id,request_key) VALUES(2,'same-intent')");

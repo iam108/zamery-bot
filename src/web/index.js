@@ -51,6 +51,7 @@ function setupWeb(app) {
 
   const requireAuth = (req, res, next) => {
     if (req.session.auth) return next();
+    if (req.path.startsWith('/admin/api/')) return res.status(401).json({ ok: false, code: 'ADMIN_LOGIN_REQUIRED', error: 'Сессия завершилась. Нужно снова войти в панель.' });
     res.redirect('/admin/login');
   };
 
@@ -126,6 +127,7 @@ function setupWeb(app) {
   app.post('/api/audit', async (req, res) => {
   try {
     const data = req.body;
+    if (!data || typeof data !== 'object' || !data.draft_id) return res.status(409).json({ ok: false, code: 'AUDIT_DRAFT_REQUIRED', error: 'Эта форма отчёта устарела. Откройте актуальную проверку из заявки в боте: она сохраняет черновик и подтверждения доставки.' });
     const { handleAuditReport } = require('../bot/audit-handler');
     const botInstance = require('../bot/instance');
     const fakeCtx = {
@@ -133,17 +135,16 @@ function setupWeb(app) {
       telegram: botInstance.telegram,
       reply: async () => {},
     };
-    if (data.draft_id) {
-      const drafts = require('./audit-drafts');
-      const submit = require('./audit-submit').createAuditSubmitter(drafts, handleAuditReport, { loadPacket: require('./audit-packet').loadAuditPacket });
-      return res.json(await submit(req.tgUser.id, data.draft_id, data.revision, fakeCtx));
-    }
-    if (data.schema_version === 3) return res.status(400).json({ ok: false, error: 'Сначала сохраните черновик новой формы.' });
-    const delivered = await handleAuditReport(fakeCtx, data);
-    res.json({ ok: true, ...(delivered?.warning ? { warning: delivered.warning } : {}) });
+    const drafts = require('./audit-drafts');
+    const submit = require('./audit-submit').createAuditSubmitter(drafts, handleAuditReport, { loadPacket: require('./audit-packet').loadAuditPacket });
+    return res.json(await submit(req.tgUser.id, data.draft_id, data.revision, fakeCtx));
   } catch (e) {
     console.error('api/audit error:', e);
-    res.status(e.status || 400).json({ ok: false, error: e.message, ...(e.code==='AUDIT_PACKET_CHANGED'?{code:e.code}:{}) });
+    const expose = ['AUDIT_PACKET_CHANGED', 'AUDIT_DELIVERY_UNKNOWN'].includes(e.code);
+    const pending = e.code === 'AUDIT_DELIVERY_UNKNOWN' && e.delivery_unknown;
+    const unknown = pending && typeof pending.cursor === 'string' && /^[a-f\d-]{36}$/i.test(pending.cursor)
+      ? { cursor: pending.cursor, stage: String(pending.stage || '').slice(0, 40), index: pending.index, count: pending.count } : null;
+    res.status(e.status || 400).json({ ok: false, error: e.message, ...(expose ? { code: e.code } : {}), ...(unknown ? { delivery_unknown: unknown } : {}) });
   }
 });
   // ── Stats page ───────────────────────────────────────────
@@ -170,10 +171,9 @@ function setupWeb(app) {
   }));
   app.get('/form', (req, res) => res.send(miniAppForm()));
 
-  const { auditForm } = require('./audit-form');
   const auditWizard = require('./audit-wizard');
   app.get('/audit', (req, res) => res.set('Cache-Control', 'no-store').send(auditWizard()));
-  app.get('/audit/legacy', (req, res) => res.send(auditForm()));
+  app.get('/audit/legacy', (req, res) => res.redirect('/audit' + (req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '')));
   app.get('/audit-wizard.css', (req, res) => res.type('text/css').send(auditWizard.css()));
   app.get('/audit-wizard-client.js', (req, res) => res.type('application/javascript').send(auditWizard.client()));
   app.get('/audit-plan-editor.js', (req, res) => res.sendFile(require('path').join(__dirname, 'audit-plan-editor.js')));
@@ -361,6 +361,7 @@ async function setStatus(status) {
   try {
     const r = await fetch('/admin/api/status', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id: ${parseInt(order.id)}, status }) });
     const result = await r.json();
+    if (r.status === 401) { alert(result.error || 'Войдите в панель заново.'); location.href='/admin/login'; return; }
     if (!r.ok || !result.ok) return alert(result.error || 'Не удалось изменить статус. Повторите попытку.');
     if (result.warning) alert(result.warning);
     location.reload();

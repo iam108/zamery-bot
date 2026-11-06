@@ -55,3 +55,19 @@ test('map marker deletion and undo restore the same IDs, not another entrance nu
  h.find(n=>n.getAttribute('aria-label')==='Отменить действие').emit('click');await h.api.flush();assert.deepEqual(h.state.annotations[0],first);
  h.button('+ Вход').emit('click');h.tap(200,120);await h.api.flush();assert.equal(h.state.annotations[1].code,'В2');h.api.destroy();
 });
+
+test('a second touch cannot steal an active marker drag and leave visible geometry unsaved',async t=>{
+ const h=domHarness(t);await h.api.refresh();h.button('+ Вход').emit('click');h.tap(100,100);await h.api.flush();const mark=h.state.annotations[0];
+ h.canvas().emit('pointerdown',h.event(100,100,{pointerId:1}));h.canvas().emit('pointermove',h.event(160,120,{pointerId:1}));
+ h.canvas().emit('pointerdown',h.event(400,250,{pointerId:2,isPrimary:false}));h.canvas().emit('pointerup',h.event(400,250,{pointerId:2,isPrimary:false}));
+ h.canvas().emit('pointerup',h.event(160,120,{pointerId:1}));await h.api.flush();
+ assert.equal(h.state.annotations[0].id,mark.id);assert.equal(h.state.annotations[0].points[0].x,160/600);assert.equal(h.state.annotations[0].points[0].y,120/400);
+ h.api.destroy();
+});
+
+test('cancelling the active touch after another finger restores the original marker without a new write',async t=>{
+ const h=domHarness(t);await h.api.refresh();h.button('+ Вход').emit('click');h.tap(100,100);await h.api.flush();const before=structuredClone(h.state),writes=h.writes;
+ h.canvas().emit('pointerdown',h.event(100,100,{pointerId:1}));h.canvas().emit('pointermove',h.event(160,120,{pointerId:1}));
+ h.canvas().emit('pointerdown',h.event(400,250,{pointerId:2,isPrimary:false}));h.canvas().emit('pointercancel',h.event(400,250,{pointerId:2,isPrimary:false}));
+ h.canvas().emit('pointercancel',h.event(160,120,{pointerId:1}));await h.api.flush();assert.deepEqual(h.state,before);assert.equal(h.writes,writes);h.api.destroy();
+});

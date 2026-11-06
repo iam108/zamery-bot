@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const { createManagerHandlers, cardOptions } = require('../src/web/manager-orders');
 const originalMaterials = require('../src/web/order-materials');
 const { Readable } = require('node:stream');
+const { orderDeliveryDouble } = require('./helpers/order-delivery');
 
 function fixture(options = {}) {
   let order = { id: 58, packet_revision: 1, submitted_by: 108, submitted_name: 'Автор', status: 'in_progress', telegram_msg_id: 900, address: 'Москва, старый адрес', owner_name: 'Клиент', object_type: 'Общепит алкоголь', service: null, cad_num: '', created_at: new Date(), request_submit_id: 'original', request_signature: 'original-signature' };
@@ -39,7 +40,7 @@ function fixture(options = {}) {
     sendDocument: async (chat, file) => { calls.push({ document: file.filename, content: file.source.toString() }); return { message_id: 901 }; },
     sendMessage: async () => { throw new Error('Existing order must not create another card'); },
   };
-  const handlers = createManagerHandlers({ materials, queries, pool: {}, loadOrderReportLink: async () => null, getTelegram: () => telegram, format: item => 'order ' + item.id, attachOrOrder: async () => { throw new Error('No EGRN requested'); }, ...options });
+  const handlers = createManagerHandlers({ materials, queries, pool: {}, telegramDelivery: orderDeliveryDouble({ materials, queries, getTelegram: () => telegram }), loadOrderReportLink: async () => null, getTelegram: () => telegram, format: item => 'order ' + item.id, attachOrOrder: async () => { throw new Error('No EGRN requested'); }, ...options });
   const request = (role = 'manager', uid = 109) => ({ params: { id: '58' }, tgUser: { id: uid }, staff: { name: 'Менеджер', role }, files: [], body: { address: 'Москва, новый адрес', owner_name: 'Клиент', object_type: 'Общепит алкоголь', service: 'Продление', archive_url: '', submit_id: 'edit-1', packet_revision: 1 } });
   const response = () => ({ statusCode: 200, headers: {}, status(n) { this.statusCode = n; return this; }, set(k,v) { this.headers[k] = v; return this; }, json(value) { this.body = value; return this; } });
   return { handlers, request, response, files, calls, telegram, order: () => order };
@@ -112,14 +113,16 @@ for (const result of ['none', 'unavailable', 'failed', 'unknown', 'uncertain']) 
 for (const edit of [false, true]) test('EGRN delivery failure remains retryable after the card and cadastral number are saved, edit=' + edit, async () => {
   let order = { id: 58, packet_revision: 1, submitted_by: 108, submitted_name: 'Автор', status: 'new', telegram_msg_id: edit ? 900 : null, cad_num: '', created_at: new Date() };
   let attempts = 0, creates = 0, cards = 0;
-  const handlers = createManagerHandlers({
+  const options = {
     loadOrderReportLink: async () => null,
     materials: { ...originalMaterials, ensureOrderMaterials: async () => {}, listOrderMaterials: async () => [], saveOrderMaterials: async () => {} },
     queries: { getOrderById: async () => ({ ...order }), createOrderWithMaterials: async data => { creates++; order = { ...order, ...data }; return { ...order }; },
       updateOrderPacketWithMaterials: async (id, data) => { order = { ...order, ...data, packet_revision: 2 }; return { order: { ...order }, saved_revision: 2, replayed: false }; }, setTelegramMsgId: async (id, msg) => { order.telegram_msg_id = msg; }, addLog: async () => {} },
     pool: {}, format: () => 'order', getTelegram: () => ({ sendMessage: async () => { cards++; return { message_id: 900 }; }, editMessageText: async () => {} }),
     attachOrOrder: async options => { assert.equal(options.requestKey, 'manager-order:58:77:01:0000001:12'); attempts++; if (attempts === 1) throw new Error('Synthetic EGRN connection failure'); return { result: 'none' }; },
-  });
+  };
+  options.telegramDelivery = orderDeliveryDouble(options);
+  const handlers = createManagerHandlers(options);
   const req = { params: edit ? { id: '58' } : {}, tgUser: { id: 108 }, staff: { name: 'Автор', role: 'manager' }, files: [],
     body: { address: 'Москва, адрес', owner_name: 'Клиент', object_type: 'Общепит алкоголь', service: 'Получение', cad_num: '77:01:0000001:12', submit_id: 'egrn-retry', packet_revision: 1 } };
   const response = fixture().response;

@@ -5,6 +5,7 @@ const SERVICES = ['Получение', 'Продление', 'Переофор�
 const ALCOHOL_CATEGORIES = ['catering', 'retail'];
 
 function usesInspection(data) {
+  if (data.ui_version === 5 && data.object_category === 'other') return false;
   return data.ui_version === 5 || ALCOHOL_CATEGORIES.includes(data.object_category) &&
     (data.schema_version === 2 || data.inspection != null);
 }

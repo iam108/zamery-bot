@@ -52,7 +52,7 @@ async function fixture(run) {
   async function action(event) { events.push(event); if (beforeSend) await beforeSend(event); event.receipt = sequence++; return { message_id: event.receipt }; }
   const telegram = {
     sendMessage(chat, text, opts) { return action({ type: opts.reply_to_message_id ? 'link' : 'card', chat: String(chat), text, opts }); },
-    async callApi(method, payload) { if (method === 'copyMessages') { const result = await action({ type: 'audit', chat: String(payload.chat_id), payload }); return payload.message_ids.map((_, i) => ({ message_id: result.message_id + i })); } assert.equal(method, 'copyMessage'); return action({ type: 'native', chat: String(payload.chat_id), payload }); },
+    async callApi(method, payload) { if (method === 'copyMessages') { const result = await action({ type: 'audit', chat: String(payload.chat_id), payload }); sequence += Math.max(0,payload.message_ids.length-1); return payload.message_ids.map((_, i) => ({ message_id: result.message_id + i })); } assert.equal(method, 'copyMessage'); return action({ type: 'native', chat: String(payload.chat_id), payload }); },
     async sendDocument(chat, file, opts) { if (typeof file === 'string') return action({ type: 'native-fallback', chat: String(chat), file, opts }); const chunks = []; for await (const chunk of file.source) chunks.push(Buffer.from(chunk)); return action({ type: 'zip', chat: String(chat), bytes: Buffer.concat(chunks), opts }); },
   };
   const options = { pool, ready: async () => {}, packetService: { async packet() { packetCalls++; return structuredClone(packet); } }, telegram, webappUrl: 'https://bot.example', pickChecklist: () => 'QA', clientsChatId: CLIENTS,
@@ -84,6 +84,18 @@ test('reviewed >200MB stored and medium Telegram originals join the complete pri
   assert.ok(state.linkedEgrn.confirmed[LAWYER][h.storedId].message_id > 0); assert.ok(state.linkedEgrn.confirmed[LAWYER][h.nativeId].message_id > 0);
   assert.doesNotMatch(JSON.stringify(state), /fresh=|PRIVATE_NATIVE_FILE/);
   const count = h.events.length; await h.submit(); assert.equal(h.events.length, count); assert.equal(h.packetCalls(), 1); assert.equal((await h.row()).length, 1);
+}));
+
+test('linked original handoff checks the current recipient again after resolving original metadata and signing',pg,()=>fixture(async h=>{
+  let revoked=false;h.onResolve(async()=>{if(!revoked){revoked=true;await h.db.query('UPDATE staff SET approved=false WHERE tg_id=808');}});
+  const first=await h.submit();assert.equal(first.delivery_complete,false);assert.equal(first.retry,true);assert.equal(first.manual_review,undefined);assert.equal(h.events.filter(event=>['link','native'].includes(event.type)).length,0);
+  await h.db.query('UPDATE staff SET approved=true WHERE tg_id=808');const count=h.events.length;assert.equal((await h.submit()).delivery_complete,true);assert.deepEqual(h.events.slice(count).map(event=>event.type),['link','native']);assert.equal(h.paidCalls(),0);
+}));
+
+test('a missing native source cannot fall back to file ID after the recipient was revoked during the first Telegram rejection',pg,()=>fixture(async h=>{
+  let revoked=false;h.failSend(async event=>{if(event.type==='native'&&!revoked){revoked=true;await h.db.query('UPDATE staff SET approved=false WHERE tg_id=808');throw explicit('Bad Request: message to copy not found');}});
+  const first=await h.submit();assert.equal(first.delivery_complete,false);assert.equal(first.retry,true);assert.equal(first.manual_review,undefined);assert.equal(h.events.filter(event=>event.type==='native-fallback').length,0);assert.equal((await h.row())[0].data._handoff.inflight,null);
+  await h.db.query('UPDATE staff SET approved=true WHERE tg_id=808');const count=h.events.length;assert.equal((await h.submit()).delivery_complete,true);assert.deepEqual(h.events.slice(count).map(event=>event.type),['native']);assert.equal(h.paidCalls(),0);
 }));
 
 test('linked original handoff shows the existing shared budget without charging for the free private copies', pg, () => fixture(async h => {

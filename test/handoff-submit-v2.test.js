@@ -57,6 +57,52 @@ test('V2 delivers the complete packet only to the assigned lawyer even when a sh
   const before=h.events.length;h.packet.signature='b'.repeat(64);
   const replay=await h.restart()(h.context);assert.deepEqual(replay,result);assert.equal(h.events.length,before);assert.equal(h.packetCalls(),1);assert.equal((await h.cases()).length,1);
 }));
+
+test('handoff recipient revocation after a partial attempt stops delivery and reactivation resumes the same case',pg,async()=>fixture(async h=>{
+  let first=true;h.setFail(event=>{if(first&&event.type==='card'){first=false;throw tgFailure('Synthetic temporary card rejection');}});
+  const initial=await h.submit(h.context);assert.equal(initial.delivery_complete,false);await h.db.query('UPDATE staff SET approved=false WHERE tg_id=808');
+  const count=h.events.length,blocked=await h.restart()(h.context);assert.equal(blocked.delivery_complete,false);assert.equal(blocked.retry,true);assert.equal(blocked.manual_review,undefined);assert.equal(h.events.length,count);assert.match(blocked.warn,/получател|юрист|доступ/i);
+  await h.db.query('UPDATE staff SET approved=true WHERE tg_id=808');const resumed=await h.restart()(h.context);assert.equal(resumed.delivery_complete,true);assert.equal(resumed.id,initial.id);assert.equal((await h.cases()).length,1);
+}));
+
+test('handoff recipient gate runs after its durable send intent so a revoked lawyer receives no Telegram call',pg,async()=>fixture(async h=>{
+  const query=h.db.query.bind(h.db);let revoked=false;
+  h.db.query=async(sql,params)=>{const result=await query(sql,params);if(!revoked&&sql.startsWith('UPDATE cases SET data=jsonb_set')&&JSON.parse(params[0]).inflight?.type==='card'){revoked=true;await query('UPDATE staff SET approved=false WHERE tg_id=808');}return result;};
+  const result=await h.submit(h.context);assert.equal(result.delivery_complete,false);assert.equal(result.retry,true);assert.equal(h.events.length,0);
+  const state=(await h.cases())[0].data._handoff;assert.equal(state.inflight,null);assert.equal(state.manual_review,undefined);
+  await query('UPDATE staff SET approved=true WHERE tg_id=808');assert.equal((await h.restart()(h.context)).delivery_complete,true);
+}));
+
+test('handoff recipient revocation during an acknowledged audit batch preserves its receipt and stops the next batch',pg,async()=>fixture(async h=>{
+  let revoked=false;h.setMutation(async event=>{if(event.type==='copy'&&!revoked){revoked=true;await h.db.query('UPDATE staff SET approved=false WHERE tg_id=808');}});
+  const first=await h.submit(h.context);assert.equal(first.delivery_complete,false);assert.equal(first.retry,true);assert.equal(h.events.filter(event=>event.type==='copy').length,1);assert.equal(h.events.filter(event=>event.type==='zip').length,0);
+  assert.equal((await h.cases())[0].data._handoff.auditCopies[String(LAWYER)].offset,100);
+  await h.db.query('UPDATE staff SET approved=true WHERE tg_id=808');const count=h.events.length;assert.equal((await h.restart()(h.context)).delivery_complete,true);
+  assert.deepEqual(h.events.slice(count).filter(event=>event.type==='copy').map(event=>event.payload.message_ids),[[200,201,202,203,204]]);assert.equal(h.events.filter(event=>event.type==='card').length,1);
+}));
+
+test('handoff recipient lookup failure stays retryable and a changed staff role cannot receive the saved package',pg,async()=>fixture(async h=>{
+  const query=h.db.query.bind(h.db);let unavailable=true;
+  h.db.query=async(sql,params)=>{if(unavailable&&sql.startsWith('SELECT c.lawyer_tg_id'))throw new Error('Synthetic staff lookup failure');return query(sql,params);};
+  const first=await h.submit(h.context);assert.equal(first.delivery_complete,false);assert.equal(first.retry,true);assert.equal(h.events.length,0);
+  unavailable=false;await query("UPDATE staff SET role='auditor' WHERE tg_id=808");assert.equal((await h.restart()(h.context)).delivery_complete,false);assert.equal(h.events.length,0);
+  await query("UPDATE staff SET role='lawyer' WHERE tg_id=808");assert.equal((await h.restart()(h.context)).delivery_complete,true);assert.equal((await h.cases()).length,1);
+}));
+
+test('handoff recipient gate observes reassignment after the earlier case read and does not send its former owner',pg,async()=>fixture(async h=>{
+  const query=h.db.query.bind(h.db);let reassigned=false;
+  h.db.query=async(sql,params)=>{if(!reassigned&&sql.startsWith('SELECT c.lawyer_tg_id')){reassigned=true;await query("INSERT INTO staff VALUES(909,'Другой юрист','lawyer',true)");await query("UPDATE cases SET lawyer_tg_id=909,lawyer_name='Другой юрист' WHERE id=1");}return query(sql,params);};
+  const result=await h.submit(h.context);assert.equal(result.delivery_complete,false);assert.equal(result.retry,true);assert.equal(h.events.length,0);
+}));
+
+test('handoff recipient revocation between ZIP parts preserves confirmed originals and retries only the missing part',pg,async()=>fixture(async h=>{
+  const third={id:randomUUID(),name:'Third.pdf',mime:'application/pdf',role:'document',buffer:Buffer.alloc(300,65)};third.bytes=third.buffer.length;third.sha256=sha(third.buffer);h.files.push(third);const {buffer,...metadata}=third;h.packet.materials.push(metadata);
+  h.options.materialDelivery=createHandoffMaterialsDelivery({telegram:h.options.telegram,loadMaterials:async()=>h.files,maxPartBytes:512});
+  let revoked=false;h.setMutation(async event=>{if(event.type==='zip'&&!revoked){revoked=true;await h.db.query('UPDATE staff SET approved=false WHERE tg_id=808');}});
+  const first=await h.restart()(h.context);assert.equal(first.delivery_complete,false);assert.equal(first.retry,true);assert.equal(first.manual_review,undefined);assert.equal(h.events.filter(event=>event.type==='zip').length,1);
+  assert.equal((await h.cases())[0].data._handoff.materials.confirmed[String(LAWYER)].length,1);
+  await h.db.query('UPDATE staff SET approved=true WHERE tg_id=808');const count=h.events.length;assert.equal((await h.restart()(h.context)).delivery_complete,true);assert.deepEqual(h.events.slice(count).map(event=>event.type),['zip']);
+}));
 test('failed lawyer card resumes frozen case, never reuses changed packet or creates a second client, and keeps checklist data',pg,async()=>fixture(async h=>{
   let failed=false;h.setFail(event=>{if(event.type==='card'&&event.chat===String(LAWYER)&&!failed){failed=true;throw tgFailure('temporary Telegram failure');}});
   const first=await h.submit(h.context);assert.equal(first.delivery_complete,false);assert.equal(first.retry,true);assert.equal((await h.cases()).length,1);
@@ -98,7 +144,7 @@ test('an older checkpoint with a failed first private card cannot restore copies
   await h.db.query("UPDATE cases SET data=jsonb_set(data,'{_handoff}',$1::jsonb) WHERE id=$2",[JSON.stringify(state),c.id]);
   const result=await h.restart()(h.context);assert.equal(result.delivery_complete,true);assert.equal(result.id,first.id);
   assert.ok(h.events.every(event=>event.chat===String(LAWYER)));assert.equal(h.events.filter(event=>event.type==='copy').length,2);
-  assert.equal(h.egCalls.length,1);assert.equal(h.egCalls[0].order,false);assert.deepEqual(h.egCalls[0].targets,[{chat:LAWYER,reply:(await h.cases())[0].data._handoff.cards[String(LAWYER)]}]);
+  assert.equal(h.egCalls.length,1);assert.equal(h.egCalls[0].order,false);assert.deepEqual(h.egCalls[0].targets,[{chat:LAWYER,reply:(await h.cases())[0].data._handoff.cards[String(LAWYER)],case_id:Number((await h.cases())[0].id)}]);
 },{withEgrn:false}));
 test('a historical group-only remainder does not repeat completed private files or EGRN when retried',pg,async()=>fixture(async h=>{
   const first=await h.submit(h.context);assert.equal(first.delivery_complete,true);assert.equal(h.egCalls.length,1);
@@ -150,6 +196,26 @@ test('unknown Telegram network outcome stops automatic retry, whereas a still-ru
   h.setFail(event=>{if(event.type==='card')throw new Error('Unknown network result');});
   const first=await h.submit(h.context);assert.equal(first.delivery_complete,false);assert.equal(first.retry,false);assert.equal(first.manual_review,true);
   const before=h.events.length,result=await h.restart()(h.context);assert.equal(result.manual_review,true);assert.equal(result.retry,false);assert.equal(h.events.length,before);
+}));
+for(const type of ['card','copy','zip'])test('Telegram502 after accepting handoff '+type+' keeps the attempt unknown across restart instead of silently repeating it',pg,async()=>fixture(async h=>{
+  h.setFail(event=>{if(event.type===type)throw Object.assign(new Error('Synthetic accepted send with upstream502'),{response:{error_code:502}});});
+  const first=await h.submit(h.context);assert.equal(first.delivery_complete,false);assert.equal(first.retry,false);assert.equal(first.manual_review,true);
+  const before=h.events.length;h.setFail(null);const retry=await h.restart()(h.context);assert.equal(retry.delivery_complete,false);assert.equal(retry.retry,false);assert.equal(retry.manual_review,true);assert.equal(h.events.length,before);
+}));
+for(const receipt of [{message_id:true},{message_id:6000,chat:{id:909}}])test('handoff card rejects a malformed or wrong-chat ACK without claiming a complete private packet: '+JSON.stringify(receipt),pg,async()=>fixture(async h=>{
+  h.options.telegram.sendMessage=async()=>receipt;
+  const first=await h.restart()(h.context);assert.equal(first.delivery_complete,false);assert.equal(first.manual_review,true);assert.equal(first.retry,false);
+  assert.equal((await h.cases())[0].data._handoff.cards[String(LAWYER)],undefined);
+}));
+for(const duplicate of ['within-batch','card'])test('handoff audit-copy receipt cannot reuse message IDs '+duplicate,pg,async()=>fixture(async h=>{
+  const copy=h.options.telegram.callApi;h.options.telegram.callApi=async(...args)=>{const result=await copy(...args);if(duplicate==='within-batch')result[1]=result[0];else result[0]={message_id:6000};return result;};
+  const first=await h.restart()(h.context);assert.equal(first.delivery_complete,false);assert.equal(first.manual_review,true);assert.equal(first.retry,false);
+  const before=h.events.length;await h.restart()(h.context);assert.equal(h.events.length,before);
+}));
+for(const receipt of [{message_id:true},{message_id:6000},{message_id:9000,chat:{id:909}}])test('handoff ZIP rejects malformed, reused card or wrong-chat acknowledgement: '+JSON.stringify(receipt),pg,async()=>fixture(async h=>{
+  const send=h.options.telegram.sendDocument;h.options.telegram.sendDocument=async(...args)=>{await send(...args);return receipt;};
+  const first=await h.restart()(h.context);assert.equal(first.delivery_complete,false);assert.equal(first.manual_review,true);assert.equal(first.retry,false);
+  assert.equal((await h.cases())[0].data._handoff.materials.confirmed[String(LAWYER)],undefined);
 }));
 test('a received Telegram ack with failed PostgreSQL receipt stays durably inflight and cannot duplicate on retry',pg,async()=>fixture(async h=>{
   const connect=h.pool.connect;let failed=false;

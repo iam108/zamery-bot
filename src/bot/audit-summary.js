@@ -23,6 +23,8 @@ function sourceLink(source) {
 // A projection of the auditor's recorded facts. It never changes answers,
 // guesses an action from free text or checks an address inside an image.
 function buildAuditSummary(data, actor) {
+  const {isGenericAudit,buildGenericAuditSummary}=require('./audit-generic');
+  if(isGenericAudit(data))return buildGenericAuditSummary(data,actor);
   const p = data.inspection || {}, w = data.workflow || {}, packet = data.request_packet || {};
   const html = [], plain = [];
   const pair = (formatted, text) => { html.push(formatted); plain.push(text); };

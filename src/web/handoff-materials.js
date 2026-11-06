@@ -7,6 +7,7 @@ const MAX_PART_BYTES = 45 * 1024 * 1024;
 
 function problem(code) { return Object.assign(new Error('Не удалось подтвердить полный комплект документов заявки.'), { code }); }
 function digest(buffer) { return createHash('sha256').update(buffer).digest('hex'); }
+const messageId=value=>(typeof value==='number'||typeof value==='string'&&/^[1-9]\d*$/.test(value))&&Number.isSafeInteger(Number(value))&&Number(value)>0?Number(value):null;
 function recipient(target) {
   if (!target || !['string', 'number'].includes(typeof target.chat)) throw problem('MATERIAL_TARGET_INVALID');
   const chat = String(target.chat);
@@ -80,6 +81,7 @@ function createHandoffMaterialsDelivery(options = {}) {
       if (!recipients.length) throw problem('MATERIAL_TARGET_MISSING');
       if (deliveryOptions.onPart != null && typeof deliveryOptions.onPart !== 'function') throw problem('MATERIAL_RECEIPT_INVALID');
       if (deliveryOptions.onPrepared != null && typeof deliveryOptions.onPrepared !== 'function') throw problem('MATERIAL_RECEIPT_INVALID');
+      if (deliveryOptions.beforeSend != null && typeof deliveryOptions.beforeSend !== 'function') throw problem('MATERIAL_RECEIPT_INVALID');
       const loaded = await load(orderId), frozen = frozenSelection(loaded, deliveryOptions.expectedFiles);
       const all = originals(frozen); result.ignored = loaded.length - frozen.length;
       const excluded = new Set(excludeHashes instanceof Set || Array.isArray(excludeHashes)
@@ -95,7 +97,7 @@ function createHandoffMaterialsDelivery(options = {}) {
       // Validate every recipient's checkpoint before publishing any part.
       for (const target of recipients) {
         const ids = Object.hasOwn(confirmed, String(target.chat)) ? confirmed[String(target.chat)] : [];
-        if (!Array.isArray(ids) || ids.length > packets.length || ids.some(id => !Number.isSafeInteger(Number(id)) || Number(id) <= 0) || new Set(ids.map(Number)).size !== ids.length) throw problem('MATERIAL_RECEIPT_INVALID');
+        if (!Array.isArray(ids) || ids.length > packets.length || ids.some(id => !messageId(id)) || new Set(ids.map(Number)).size !== ids.length) throw problem('MATERIAL_RECEIPT_INVALID');
         result.delivered.push({ ...target, messageIds: ids.map(Number), complete: false });
       }
       if (deliveryOptions.onPrepared) {
@@ -120,23 +122,29 @@ function createHandoffMaterialsDelivery(options = {}) {
       for (let index = target.messageIds.length; index < packets.length; index++) {
         const part = packets[index], suffix = packets.length > 1 ? '-' + String(index + 1).padStart(2, '0') + '-из-' + String(packets.length).padStart(2, '0') : '';
         const filename = 'Заявка-' + orderId + '-документы' + suffix + '.zip';
-        const source = Readable.from(part.chunks, { objectMode: false }); let stage = 'telegram';
+        const source = Readable.from(part.chunks, { objectMode: false }); let stage = 'recipient';
         try {
+          if (deliveryOptions.beforeSend && await deliveryOptions.beforeSend(target.chat,index) === false) throw problem('MATERIAL_RECIPIENT_UNAVAILABLE');
+          stage = 'telegram';
           const message = await telegram.sendDocument(target.chat, { source, filename }, {
             caption: '📎 Документы заявки #' + orderId + (packets.length > 1 ? ' · часть ' + (index + 1) + ' из ' + packets.length : '') + '\nОригиналы документов менеджера.',
             ...(target.reply != null ? { reply_to_message_id: target.reply } : {})
           });
-          if (!Number.isSafeInteger(Number(message?.message_id)) || Number(message.message_id) <= 0) throw problem('MATERIAL_TELEGRAM_RECEIPT');
+          const id=messageId(message?.message_id),chat=String(target.chat);
+          const matchingChat=message?.chat==null||(chat.startsWith('@')?String(message.chat.username||'').toLowerCase()===chat.slice(1).toLowerCase():String(message.chat.id)===chat);
+          if (!id || id===target.reply || target.messageIds.includes(id) || !matchingChat) throw problem('MATERIAL_TELEGRAM_RECEIPT');
           target.messageIds.push(Number(message.message_id)); stage = 'receipt';
           if (deliveryOptions.onPart) await deliveryOptions.onPart(target.chat, index, Number(message.message_id), { packetHash: result.packetHash, files: result.files, parts: result.parts });
         } catch (failure) {
+          const unavailable = stage === 'recipient' || ['MATERIAL_RECIPIENT_UNAVAILABLE','HANDOFF_RECIPIENT_UNAVAILABLE'].includes(failure?.code);
+          if (unavailable) stage = 'recipient';
           result.failed.push({ chat: target.chat, ...(target.reply != null ? { reply: target.reply } : {}), part: index + 1, partIndex: index, stage,
-            uncertain: stage === 'telegram' && !failure?.response,
-            code: stage === 'receipt' ? 'MATERIAL_CHECKPOINT_FAILED' : failure?.code === 'MATERIAL_TELEGRAM_RECEIPT' ? failure.code : 'MATERIAL_TELEGRAM_FAILED' });
+            uncertain: stage === 'telegram' && !(Number(failure?.response?.error_code)>=400&&Number(failure?.response?.error_code)<500),
+            code: unavailable ? 'MATERIAL_RECIPIENT_UNAVAILABLE' : stage === 'receipt' ? 'MATERIAL_CHECKPOINT_FAILED' : failure?.code === 'MATERIAL_TELEGRAM_RECEIPT' ? failure.code : 'MATERIAL_TELEGRAM_FAILED' });
           if (stage === 'receipt') {
             stop = true;
             warn(null, 'Часть документов доставлена, но квитанция передачи не сохранилась. Проверьте доставку перед повтором: новый клиент не требуется.');
-          } else warn(null, 'Не все документы заявки #' + orderId + ' доставлены одному из получателей (часть ' + (index + 1) + ' из ' + packets.length + '). Повторите доставку материалов без создания нового клиента.');
+          } else warn(null, unavailable ? 'Получатель документов больше недоступен или назначение изменилось. Проверьте юриста и повторите доставку; подтверждённые части сохранены.' : 'Не все документы заявки #' + orderId + ' доставлены одному из получателей (часть ' + (index + 1) + ' из ' + packets.length + '). Повторите доставку материалов без создания нового клиента.');
           break;
         } finally { source.destroy(); }
       }

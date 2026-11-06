@@ -22,6 +22,7 @@ test('ten simultaneous handoffs keep nested packet, material and EGRN queries mo
       else if (sql.startsWith('SELECT * FROM cases WHERE created_by=')) rows=[...cases.values()].filter(c=>c.created_by===params[0]&&c.handoff_submit_id===params[1]);
       else if (sql.startsWith('SELECT * FROM cases WHERE order_id=')) rows=[...cases.values()].filter(c=>c.order_id===params[0]);
       else if (sql.startsWith('SELECT tg_id,name FROM staff')) rows=[{tg_id:808,name:'Юрист проверки'}];
+      else if (sql.startsWith('SELECT c.lawyer_tg_id')) { const c=cases.get(params[0]);if(c)rows=[{lawyer_tg_id:c.lawyer_tg_id,tg_id:808,role:'lawyer',approved:true}]; }
       else if (sql.startsWith('INSERT INTO cases(')) {
         const state=JSON.parse(params[20])._handoff, c={id:sequence++,order_id:params[0],lawyer_tg_id:params[1],lawyer_name:params[2],checklist_key:params[3],
           ...state.fields,created_by:params[15],contacts:JSON.parse(params[16]),handoff_submit_id:params[18],handoff_signature:params[19],data:{_handoff:state}};

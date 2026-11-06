@@ -39,7 +39,9 @@ function harness({ docs = [], urls = [], downloadedSize = 10, sendError, orderFi
   const context = {
     module: { exports: {} },
     require: (name) => {
+      if (name === 'node:crypto') return require('node:crypto');
       if (name === '../db/pool') return pool;
+      if (name === './egrn-telegram-delivery') return require('./fixtures/egrn-telegram-delivery.cjs');
       if (name === './formatter') return { esc: String };
       if(name === '../web/order-egrn-links')return {async registerOrderLinks(){}};
       if(name === './egrn-files')return{async get(id){renewed.push(id);if(renewError)throw renewError;return renewFile||null;}};
@@ -69,7 +71,7 @@ function harness({ docs = [], urls = [], downloadedSize = 10, sendError, orderFi
     ' apiStatus = async function() { return {}; };' +
     ' readStatus = function() { return { done: true, failed: false, text: "готова" }; };' +
     ' extractDocs = function() { return docs; }; findFileUrls = function() { return urls; };' +
-    ' download = async function() { return { buf: { length: size }, name: "download.pdf" }; };' +
+      ' download = async function() { return { buf: { length: size }, name: "download.pdf", sha256: "' + require('node:crypto').createHash('sha256').update('download').digest('hex') + '" }; };' +
     ' }, setStatusRequest: function(fn) { apiStatus = fn; } };', context);
   const hooks = context.module.exports.testHooks;
   hooks.configure(docs, urls, downloadedSize);
@@ -91,7 +93,7 @@ function harness({ docs = [], urls = [], downloadedSize = 10, sendError, orderFi
 }
 
 function doc(size, name = 'statement.pdf') {
-  return { buf: { length: size }, name, kind: 'pdf' };
+  return { buf: { length: size }, name, kind: 'pdf', sha256: require('node:crypto').createHash('sha256').update(name+':'+size).digest('hex') };
 }
 
 test('size boundary: allowed at limit, rejected above limit', () => {
@@ -162,7 +164,7 @@ test('ordinary delivery succeeds and clears stale errors', async () => {
 test('mixed large and small documents retain a link and normal Telegram metadata', async () => {
   const h = harness({ docs: [doc(LIMIT + 1), doc(10)] });await h.poll();
   assert.equal(h.order.files_sent,2);assert.equal(h.order.file_msgs[0].kind,'link');
-  assert.equal(h.order.file_msgs[1].key,'embedded:1:statement.pdf');assert.equal(h.sent.length,1);
+  assert.equal(h.order.file_msgs[1].key,'sha256:'+doc(10).sha256);assert.equal(h.sent.length,1);
 });
 
 test('failed large-link delivery is retried without another paid order',async()=>{
@@ -356,9 +358,16 @@ test('streamed delivery failure keeps a retry and releases its temporary source'
 test('small streamed PDF keeps native Telegram delivery',async()=>{
   let cleaned=0;
   const bytes=Buffer.from('%PDF-1.7\nsmall');
-  const file={name:'small.pdf',bytes:bytes.length,open:async function*(){yield bytes.subarray(0,5);yield bytes.subarray(5);}};
+  const file={name:'small.pdf',bytes:bytes.length,sha256:require('node:crypto').createHash('sha256').update(bytes).digest('hex'),open:async function*(){yield bytes.subarray(0,5);yield bytes.subarray(5);}};
   const h=harness({statusRequest:async()=>({item:{id_req:42,status:[]},hasFiles:true,async documents(){return[file];},async cleanup(){cleaned++;}})});
   await h.poll();assert.equal(h.order.files_sent,1);assert.equal(h.sent.length,1);assert.deepEqual(h.sent[0].source,bytes);assert.equal(cleaned,1);assert.equal(h.linkCalls.length,0);
+});
+
+test('a small streamed original with a changed hash never reaches Telegram or receives a delivery receipt',async()=>{
+  const bytes=Buffer.from('%PDF-1.7\nchanged source bytes');let cleaned=0;
+  const file={name:'changed.pdf',bytes:bytes.length,sha256:'a'.repeat(64),open:async function*(){yield bytes;}};
+  const h=harness({statusRequest:async()=>({item:{id_req:42,status:[]},hasFiles:true,async documents(){return[file];},async cleanup(){cleaned++;}})});await h.poll();
+  assert.equal(h.sent.length,0);assert.equal(h.order.files_sent,0);assert.equal(h.order.file_msgs.length,0);assert.equal(cleaned,1);
 });
 
 test('document extraction errors release the private temporary files without delivering success',async()=>{

@@ -30,12 +30,15 @@ async function loadReportDescendants(db, root, linkedAudits = []) {
   return (await db.query(DESCENDANTS_SQL, [root.id, linkedAudits.map(audit => audit.id)])).rows;
 }
 
-async function loadReportAggregate(db, id) {
+async function loadReportAggregate(db, id, options = {}) {
   const root = (await db.query('SELECT * FROM reports WHERE id=$1', [id])).rows[0];
   if (!root) return null;
   const card = isOrderCard(root.text);
   const number = card && (String(root.text || '').match(/Заявка\s*#(\d+)/i) || [])[1];
-  const linkedOrder = !number && root.reply_to
+  // orders.telegram_msg_id identifies a card only inside the working chat.
+  // A same-number reply in the clients chat is a different Telegram source.
+  const workingChat = String(options.workingChatId ?? process.env.GROUP_CHAT_ID ?? '');
+  const linkedOrder = !number && root.reply_to && workingChat && String(root.chat_id) === workingChat
     ? (await db.query('SELECT id FROM orders WHERE telegram_msg_id=$1 ORDER BY id DESC LIMIT 1', [root.reply_to])).rows[0] : null;
   const orderId = number ? Number(number) : linkedOrder ? Number(linkedOrder.id) : null;
   // A caller's requested order is never an authority for audit seeds. Only

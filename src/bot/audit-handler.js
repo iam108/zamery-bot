@@ -3,7 +3,7 @@ const { saveAudit } = require('../web/handoff');
 const { esc } = require('./formatter');
 const { buildInspectionReport, validateInspection } = require('./audit-inspection');
 const { splitTelegramHtml, photoCaption, deliveryMedia, presentationMedia } = require('./audit-delivery');
-const { createHash } = require('crypto');
+const { createHash, randomUUID } = require('crypto');
 const { normalizeWorkflow, validateWorkflow, buildWorkflowReport } = require('./audit-workflow');
 const { syncOrderReportLink, telegramMessageUrl } = require('../web/order-report-link');
 
@@ -48,9 +48,12 @@ async function handleAuditReport(ctx, data) {
   // Keep only a digest, not full base64 images, during the retry window.
   const digestData = data.documents ? { ...data, documents: data.documents.map(({ source, data: binary, ...meta }) => ({ ...meta, contentHash: createHash('sha256').update(source || Buffer.from(binary, 'base64')).digest('hex') })) } : data;
   const signature = createHash('sha256').update(canonicalJson(digestData)).digest('hex');
-  if (!progress && ctx.auditDelivery) {
+  if (!progress?.job && ctx.auditDelivery) {
     const stored = await ctx.auditDelivery.load();
-    progress = key && seenSubmits.get(key) || (stored && stored.signature ? { ...stored, job: null } : null);
+    // A receipt checkpoint or an explicit retry may have committed despite a
+    // lost response. Between jobs the durable row, not this process's cache,
+    // determines which physical requests may run.
+    progress = stored && stored.signature ? { ...stored, job: null } : null;
   }
   if (progress && progress.signature !== signature) {
     // Existing checkpoints used insertion-ordered JSON. Accept them only
@@ -69,6 +72,7 @@ async function handleAuditReport(ctx, data) {
       const timer = setTimeout(function () { seenSubmits.delete(key); }, 30 * 60 * 1000);
       if (timer.unref) timer.unref();
   }
+  if (key) seenSubmits.set(key, progress);
   progress.documentIds = progress.documentIds || [];
   if (progress.job) return progress.job;
   const job = handleAuditReportInner(ctx, data, progress);
@@ -79,11 +83,73 @@ async function handleAuditReport(ctx, data) {
 
 async function handleAuditReportInner(ctx, data, progress) {
   validateInspection(data);
+  function unknownDelivery() {
+    const { id: cursor, stage, index, count } = progress.inflight || {};
+    return Object.assign(new Error('Ответ Telegram на отправку части отчёта не подтверждён. Проверьте чат. Обычный повтор остановлен, чтобы не создать дубликаты. После проверки можно явно повторить неподтверждённую часть.'), {
+      status: 409, code: 'AUDIT_DELIVERY_UNKNOWN', uncertain: true,
+      ...(cursor ? { delivery_unknown: { cursor, stage, index, count } } : {}),
+    });
+  }
+  function unconfirmedReceipt() {
+    return Object.assign(new Error('Не удалось подтвердить номера отправленных сообщений отчёта. Отправка остановлена; проверьте чат перед повтором.'), { code: 'AUDIT_DELIVERY_RECEIPT', uncertain: true });
+  }
+  const confirmed = new Set();
+  for (const field of ['textIds', 'photoIds', 'documentIds']) {
+    if (!Array.isArray(progress[field])) throw unconfirmedReceipt();
+    for (const id of progress[field]) {
+      if (!Number.isSafeInteger(id) || id < 1 || confirmed.has(id)) throw unconfirmedReceipt();
+      confirmed.add(id);
+    }
+  }
+  function receiptIds(result, count = 1) {
+    const messages = Array.isArray(result) ? result : [result], ids = messages.map(message => message?.message_id);
+    const destination = String(process.env.GROUP_CHAT_ID || '');
+    const wrongChat = messages.some(message => message?.chat != null && (destination.startsWith('@')
+      ? String(message.chat.username || '').toLowerCase() !== destination.slice(1).toLowerCase()
+      : String(message.chat.id) !== destination));
+    if (wrongChat || ids.length !== count || ids.some(id => !Number.isSafeInteger(id) || id < 1 || confirmed.has(id)) || new Set(ids).size !== ids.length) throw unconfirmedReceipt();
+    ids.forEach(id => confirmed.add(id)); return ids;
+  }
   async function checkpoint() {
     if (ctx.auditDelivery) {
-      const { signature, deliveryVersion, textIds, photoIds, documentIds, saved, handoffSent, orderCardLinked, orderCardLinkSkipped, replied } = progress;
-      await ctx.auditDelivery.save({ signature, ...(deliveryVersion != null ? { deliveryVersion } : {}), textIds, photoIds, documentIds, saved, handoffSent, orderCardLinked, ...(orderCardLinkSkipped ? { orderCardLinkSkipped } : {}), replied });
+      const { signature, deliveryVersion, textIds, photoIds, documentIds, saved, handoffSent, orderCardLinked, orderCardLinkSkipped, replied, inflight, lastRiskRetryCursor } = progress;
+      await ctx.auditDelivery.save({ signature, ...(deliveryVersion != null ? { deliveryVersion } : {}), textIds, photoIds, documentIds, saved, handoffSent, orderCardLinked, ...(orderCardLinkSkipped ? { orderCardLinkSkipped } : {}), replied, ...(inflight ? { inflight } : {}), ...(lastRiskRetryCursor ? { lastRiskRetryCursor } : {}) });
     }
+  }
+  if (progress.inflight) throw unknownDelivery();
+  async function sendPart(stage, index, count, send, field) {
+    if (progress.inflight) throw unknownDelivery();
+    const intent = { id: randomUUID(), stage, index, count };
+    progress.inflight = intent;
+    // Never contact Telegram before this intent has been acknowledged by the
+    // durable store. An uncertain SQL acknowledgement is conservative too.
+    await checkpoint();
+    let result;
+    try { result = await tgRetry(send); }
+    catch (error) {
+      const code = Number(error.response?.error_code);
+      if (code >= 400 && code < 500) {
+        delete progress.inflight;
+        try { await checkpoint(); }
+        catch (_) { progress.inflight = intent; throw unknownDelivery(); }
+        throw error;
+      }
+      throw unknownDelivery();
+    }
+    let ids;
+    try { ids = receiptIds(result, count); }
+    catch (_) { throw unknownDelivery(); }
+    const previous = progress[field];
+    if (Array.isArray(previous)) progress[field] = previous.concat(ids);
+    else progress[field] = true;
+    delete progress.inflight;
+    try { await checkpoint(); }
+    catch (_) {
+      progress[field] = previous; progress.inflight = intent;
+      ids.forEach(id => confirmed.delete(id));
+      throw unknownDelivery();
+    }
+    return result;
   }
   const GROUP_ID = process.env.GROUP_CHAT_ID;
   const actor = ctx.from
@@ -214,18 +280,18 @@ async function handleAuditReportInner(ctx, data, progress) {
 
   var tg = ctx.telegram;
   var textParts = splitTelegramHtml(text);
+  if (progress.textIds.length > textParts.length) throw unconfirmedReceipt();
   for (let i = progress.textIds.length; i < textParts.length; i++) {
-    const m = await tgRetry(function () { return tg.sendMessage(GROUP_ID, textParts[i], {
+    await sendPart('summary', i, 1, function () { return tg.sendMessage(GROUP_ID, textParts[i], {
       parse_mode: 'HTML', reply_to_message_id: replyToMsgId || undefined, allow_sending_without_reply: true,
       ...(presentation ? { link_preview_options: { is_disabled: true } } : {}),
-    }); });
-    progress.textIds.push(m.message_id);
-    await checkpoint();
+    }); }, 'textIds');
   }
 
   const mediaPacket = presentation ? presentationMedia(data, { summaryText: plain.join('\n') }) : deliveryMedia(data);
   const photos = mediaPacket.photos;
   const documents = mediaPacket.documents;
+  if (progress.photoIds.length > photos.length || progress.documentIds.length > documents.length) throw unconfirmedReceipt();
   function invalidPhoto(error) {
     return error.response?.error_code === 400 &&
       /PHOTO_INVALID|PHOTO_EXT_INVALID|IMAGE_PROCESS_FAILED|IMAGE_PROCESSING_FAILED/i.test(error.response.description || error.message || '');
@@ -236,11 +302,11 @@ async function handleAuditReportInner(ctx, data, progress) {
   async function sendPreview(photo) {
     const options = { caption: photoCaption(photo, data.order_id, presentation ? data : undefined),
       reply_to_message_id: progress.textIds[0], allow_sending_without_reply: true };
-    try { return await tgRetry(() => tg.sendPhoto(GROUP_ID, { source: previewSource(photo) }, options)); }
+    try { return await sendPart('photos', progress.photoIds.length, 1, () => tg.sendPhoto(GROUP_ID, { source: previewSource(photo) }, options), 'photoIds'); }
     catch (error) {
       if (!invalidPhoto(error)) throw error;
-      return tgRetry(() => tg.sendDocument(GROUP_ID,
-        { source: previewSource(photo), filename: photo.name || 'Фото-выезда.jpg' }, options));
+      return sendPart('photos', progress.photoIds.length, 1, () => tg.sendDocument(GROUP_ID,
+        { source: previewSource(photo), filename: photo.name || 'Фото-выезда.jpg' }, options), 'photoIds');
     }
   }
   if (photos.length) {
@@ -248,25 +314,19 @@ async function handleAuditReportInner(ctx, data, progress) {
       for (let offset = progress.photoIds.length; offset < photos.length;) {
         const batch = photos.slice(offset, offset + 10);
         if (batch.length === 1) {
-          const message = await sendPreview(batch[0]);
-          progress.photoIds.push(message.message_id);
-          await checkpoint();
+          await sendPreview(batch[0]);
         } else {
           try {
             const media = batch.map(photo => ({ type: 'photo', media: { source: previewSource(photo) },
               caption: photoCaption(photo, data.order_id, presentation ? data : undefined) }));
-            const messages = await tgRetry(() => tg.sendMediaGroup(GROUP_ID, media,
-              { reply_to_message_id: progress.textIds[0], allow_sending_without_reply: true }));
-            messages.forEach(message => progress.photoIds.push(message.message_id));
-            await checkpoint();
+            await sendPart('photos', offset, batch.length, () => tg.sendMediaGroup(GROUP_ID, media,
+              { reply_to_message_id: progress.textIds[0], allow_sending_without_reply: true }), 'photoIds');
           } catch (error) {
             if (!invalidPhoto(error)) throw error;
             // A rejected photo album has no receipts. Deliver each original
             // separately so a panorama cannot strand the whole report.
             for (const photo of batch) {
-              const message = await sendPreview(photo);
-              progress.photoIds.push(message.message_id);
-              await checkpoint();
+              await sendPreview(photo);
             }
           }
         }
@@ -274,7 +334,8 @@ async function handleAuditReportInner(ctx, data, progress) {
       }
     } catch (error) {
       console.error('audit photos:', error.code || error.response?.error_code || error.name || 'error');
-      throw new Error('Текст отчёта отправлен, но фотографии не доставлены. Повторите отправку — уже отправленный текст не продублируется.');
+      if (error.code === 'AUDIT_DELIVERY_RECEIPT' || error.code === 'AUDIT_DELIVERY_UNKNOWN') throw error;
+      throw new Error('Текст отчёта отправлен, но доставка фотографий не подтверждена. Проверьте чат и повторите отправку — подтверждённый текст не продублируется.');
     }
   }
 
@@ -289,19 +350,17 @@ async function handleAuditReportInner(ctx, data, progress) {
         };
         if (batch.length === 1) {
           const file = batch[0];
-          const m = await tgRetry(() => tg.sendDocument(GROUP_ID, { source: file.source || Buffer.from(file.data, 'base64'), filename: file.name }, { caption: caption(file), reply_to_message_id: progress.textIds[0], allow_sending_without_reply: true }));
-          progress.documentIds.push(m.message_id);
+          await sendPart('originals', offset, 1, () => tg.sendDocument(GROUP_ID, { source: file.source || Buffer.from(file.data, 'base64'), filename: file.name }, { caption: caption(file), reply_to_message_id: progress.textIds[0], allow_sending_without_reply: true }), 'documentIds');
         } else {
           const media = batch.map(file => ({ type: 'document', media: { source: file.source || Buffer.from(file.data, 'base64'), filename: file.name }, caption: caption(file) }));
-          const msgs = await tgRetry(() => tg.sendMediaGroup(GROUP_ID, media, { reply_to_message_id: progress.textIds[0], allow_sending_without_reply: true }));
-          msgs.forEach(m => progress.documentIds.push(m.message_id));
+          await sendPart('originals', offset, batch.length, () => tg.sendMediaGroup(GROUP_ID, media, { reply_to_message_id: progress.textIds[0], allow_sending_without_reply: true }), 'documentIds');
         }
         offset = progress.documentIds.length;
-        await checkpoint();
       }
     } catch (e) {
       console.error('audit originals:', e.message);
-      throw new Error('Отчёт отправлен частично: не все оригиналы доставлены. Повторите отправку без изменений — подтверждённые пакеты сохраняются.');
+      if (e.code === 'AUDIT_DELIVERY_RECEIPT' || e.code === 'AUDIT_DELIVERY_UNKNOWN') throw e;
+      throw new Error('Не удалось подтвердить доставку оригиналов отчёта. Проверьте чат и повторите отправку без изменений — подтверждённые пакеты сохраняются.');
     }
   }
 
@@ -333,13 +392,11 @@ async function handleAuditReportInner(ctx, data, progress) {
     progress.handoffSent = true;
     await checkpoint();
   } else if (data.order_id && !progress.handoffSent) {
-    await tgRetry(function () { return tg.sendMessage(GROUP_ID,
+    await sendPart('handoff', 0, 1, function () { return tg.sendMessage(GROUP_ID,
       '⚖️ Отчёт по заявке #' + data.order_id + ' добавлен — проверьте замечания перед передачей юристу', {
       reply_to_message_id: sentIds[0],
       reply_markup: { inline_keyboard: [[{ text: '⚖️ Передать юристу', callback_data: 'handoff:' + data.order_id }]] },
-    }); });
-    progress.handoffSent = true;
-    await checkpoint();
+    }); }, 'handoffSent');
   }
 
   if (data.order_id && !progress.orderCardLinked && !progress.orderCardLinkSkipped) {

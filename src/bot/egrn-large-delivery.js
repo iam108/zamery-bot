@@ -22,6 +22,9 @@ function temporaryError(cause, stage) {
     (typeof telegramCode === 'number' && Number.isSafeInteger(telegramCode) && telegramCode > 0 ? 'TELEGRAM_' + telegramCode : undefined) ||
     (sourceCode !== TEMPORARY_CODE ? sourceCode : undefined);
   if (failureCode) error.failure_code = failureCode;
+  if (typeof field(cause, 'uncertain') === 'boolean') error.uncertain = field(cause, 'uncertain');
+  if (error.uncertain === true) error.message = 'Результат отправки оригинала не подтверждён. Проверьте сообщения в чате; администратор может разрешить повтор командой /egrn_retry с номером готового заказа. Новый платный заказ не создавался.';
+  else if (['EGRN_RECIPIENT_UNAVAILABLE','HANDOFF_RECIPIENT_UNAVAILABLE'].includes(failureCode)) error.message = 'Получатель выписки сейчас недоступен. Проверьте доступ сотрудника и назначение юриста; доставка пока не подтверждена.';
   const constraint = identifier(field(cause, 'constraint'));
   if (constraint) error.constraint = constraint;
   const providerCode = identifier(field(cause, 'provider_code'));
@@ -47,7 +50,7 @@ function target(value) {
   const chat = chatId(value.chat);
   if (chat === null) return null;
   const reply = positive(value.reply);
-  return reply ? { chat, reply } : { chat };
+  return { chat, ...(reply ? {reply} : {}), ...(value.case_id != null ? {case_id:value.case_id} : {}) };
 }
 function targetKey(value) { return String(value.chat) + ':' + (value.reply || ''); }
 function requiredTargets(order) {
@@ -122,7 +125,7 @@ function createLargeDelivery(options = {}) {
       return url.href;
     } catch (cause) { throw temporaryError(cause, 'signing'); }
   }
-  async function send(record, destination, preparedUrl) {
+  async function send(record, destination, preparedUrl, beforeSend) {
     const url = preparedUrl || await signedUrl(record.original_id);
     const extra = {
       disable_web_page_preview: true,
@@ -135,7 +138,14 @@ function createLargeDelivery(options = {}) {
     let accounting = '';
     try { accounting = options.budgetText ? await options.budgetText() : ''; }
     catch (_) { accounting = 'Учёт заказов временно недоступен; остаток не сверён.'; }
-    return telegram.sendMessage(destination.chat, messageText(record) + (accounting ? '\n' + accounting : ''), extra);
+    const dispatch = async () => {
+      if (typeof beforeSend === 'function') {
+        try { await beforeSend(destination); }
+        catch (error) { throw Object.assign(temporaryError(error, 'validation'), { uncertain: false }); }
+      }
+      return telegram.sendMessage(destination.chat, messageText(record) + (accounting ? '\n' + accounting : ''), extra);
+    };
+    return options.sendOriginal ? options.sendOriginal(record,destination,dispatch) : dispatch();
   }
   async function complete(order, record, records, descriptorSaved) {
     requireSender(); requirePersist();
@@ -157,7 +167,7 @@ function createLargeDelivery(options = {}) {
       try {
         message = await send(record, destination, url);
         if (!message || !positive(message.message_id)) throw temporaryError(undefined, 'receipt');
-      } catch (cause) { failure ||= temporaryError(cause, 'telegram'); continue; }
+      } catch (cause) { if(cause?.uncertain===true)throw cause;failure ||= temporaryError(cause, 'telegram'); continue; }
       record.deliveries.push({ ...destination, id: positive(message.message_id) });
       setMainReceipt(record, required.main);
       // A database failure must stop the batch before another recipient is
@@ -174,12 +184,12 @@ function createLargeDelivery(options = {}) {
       if (!order || !positive(order.id) || !file || typeof file.name !== 'string' || !file.name.trim() ||
           typeof key !== 'string' || !key || !Array.isArray(records) || !store) throw temporaryError();
       const input = { egrn_order_id: positive(order.id), source_key: key, name: file.name };
-      let original, expectedBytes;
+      let original, expectedBytes, contentHash;
       if (typeof file.open === 'function') {
         if (typeof file.bytes !== 'number' || !Number.isSafeInteger(file.bytes) || file.bytes <= 0 ||
             typeof file.sha256 !== 'string' || !SHA256.test(file.sha256) || typeof store.saveStream !== 'function') throw temporaryError();
         expectedBytes = file.bytes;
-        const sha256 = file.sha256.toLowerCase();
+        const sha256 = file.sha256.toLowerCase(); contentHash = sha256;
         // The store owns iteration and integrity checks. Keep the source lazy so
         // an already stored original does not need to be opened or buffered.
         stage = 'storage';
@@ -189,18 +199,19 @@ function createLargeDelivery(options = {}) {
             original.sha256.toLowerCase() !== sha256) throw temporaryError();
       } else {
         if (!Buffer.isBuffer(file.buf) || !file.buf.length || typeof store.save !== 'function') throw temporaryError();
-        expectedBytes = file.buf.length;
+        expectedBytes = file.buf.length; contentHash = require('node:crypto').createHash('sha256').update(file.buf).digest('hex');
         stage = 'storage';
         original = await store.save({ ...input, buffer: file.buf });
       }
       stage = 'validation';
       const saved = metadata(original, null, order);
       if (saved.bytes !== expectedBytes) throw temporaryError();
+      if (original.sha256 && original.sha256.toLowerCase() !== contentHash) throw temporaryError();
       stage = 'descriptor';
       const existing = records.find(value => value && value.key === key);
       if (existing && (existing.kind !== 'link' || existing.original_id !== saved.id || existing.name !== saved.name ||
           existing.mime !== saved.mime || Number(existing.bytes) !== saved.bytes)) throw temporaryError();
-      const record = existing || { key, kind: 'link', original_id: saved.id, name: saved.name, mime: saved.mime, bytes: saved.bytes,
+      const record = existing || { key, kind: 'link', original_id: saved.id, name: saved.name, mime: saved.mime, bytes: saved.bytes, sha256: contentHash,
         cad_num: String(order.cad_num || ''), label: String(order.label || ''), deliveries: [], chat: chatId(order.chat_id) };
       ensureRecord(records, record);
       // The durable descriptor precedes every first notification. It allows a
@@ -221,11 +232,12 @@ function createLargeDelivery(options = {}) {
       stage = 'validation';
       const saved = metadata(original, record.original_id, order);
       if (saved.name !== record.name || saved.mime !== record.mime || saved.bytes !== Number(record.bytes)) throw temporaryError();
+      if (record.sha256 && original.sha256 !== record.sha256) throw temporaryError();
       stage = 'telegram';
       return await complete(order, record, records, false);
     } catch (cause) { throw temporaryError(cause, stage); }
   }
-  async function copy(record, value) {
+  async function copy(record, value, copyOptions = {}) {
     let stage = 'validation';
     try {
       requireSender();
@@ -238,7 +250,7 @@ function createLargeDelivery(options = {}) {
       const saved = metadata(original, record.original_id);
       if (saved.name !== record.name || saved.mime !== record.mime || saved.bytes !== Number(record.bytes)) throw temporaryError();
       stage = 'telegram';
-      const message = await send(record, destination);
+      const message = await send(record, destination, undefined, copyOptions.beforeSend);
       if (!message || !positive(message.message_id)) throw temporaryError(undefined, 'receipt');
       return message;
     } catch (cause) { throw temporaryError(cause, stage); }

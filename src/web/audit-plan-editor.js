@@ -466,7 +466,7 @@
     on(toolSelect, 'change', () => setTool(toolSelect.value));
     function eventPoint(e) { const rect = canvas.getBoundingClientRect(); return point({ x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height }); }
     on(canvas, 'pointerdown', e => {
-      if (!image || sourceLoading || e.button > 0) return; e.preventDefault(); canvas.setPointerCapture(e.pointerId); const p = eventPoint(e), rect = canvas.getBoundingClientRect();
+      if (pointer || !image || sourceLoading || e.button > 0) return; e.preventDefault(); canvas.setPointerCapture(e.pointerId); const p = eventPoint(e), rect = canvas.getBoundingClientRect();
       pointer = { threshold: e.pointerType === 'touch' ? 8 : 4, id: e.pointerId, start: p, clientX: e.clientX, clientY: e.clientY, scrollLeft: viewport.scrollLeft, scrollTop: viewport.scrollTop, before: snapshot(), points: [p], moved: false };
       if (activeTool === 'edit') { const hit = hitTest(state, p, rect.width, rect.height, 13); selected = hit?.id || null; selectedVertex = hit?.vertex ?? -1; pointer.mark = selected ? copy(state.annotations.find(m => m.id === selected)) : null; draw(false); }
     });
@@ -501,6 +501,7 @@
     async function downloadPreview() { try { const result = await exportPreview(); if (!result) return; const binary = atob(result.data), bytes = Uint8Array.from(binary, c => c.charCodeAt(0)), url = URL.createObjectURL(new Blob([bytes], { type: result.mime })), a = document.createElement('a'); a.href = url; a.download = result.name; document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 30000); } catch (e) { notice(e.message, true); } }
     let ready = loadSelected();
     return {
+      updateEvidence(files) { options.evidence = files; },
       refresh(nextOptions) { if (nextOptions) Object.assign(options, nextOptions); return ready = saveTail.catch(() => {}).then(() => { state = normalise(options.getState?.() || state); return loadSelected(); }); },
       flush, exportPreview,
       destroy() { alive = false; loadToken++; chooserIntent++; chooserToken++; renderTask?.cancel(); candidate?.pdf?.destroy(); controller.abort(); if (chooser.open) chooser.close(); container.replaceChildren(); image = null; },

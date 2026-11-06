@@ -61,9 +61,9 @@ async function createService({ master = false } = {}) {
       assert.ok(String(args[0]) === GROUP || master && String(args[0]) === String(LAWYER));
       const event = { method, args }; messages.push(event);
       if (!master) return method === 'sendMediaGroup' ? args[1].map(() => ({ message_id: ++nextMessage })) : { message_id: ++nextMessage };
-      if (method === 'sendMediaGroup') { event.items = []; for (const item of args[1]) event.items.push(recorded(args[0], { kind: item.type, bytes: await binary(item.media), caption: item.caption })); return event.items; }
+      if (method === 'sendMediaGroup') { event.items = []; for (const item of args[1]) event.items.push(recorded(args[0], { kind: item.type, bytes: await binary(item.media), caption: item.caption })); return event.items.map(item => ({ ...item, chat: { id: Number(args[0]) } })); }
       const item = recorded(args[0], { kind: method, text: method === 'sendMessage' ? args[1] : undefined, bytes: ['sendDocument','sendPhoto'].includes(method) ? await binary(args[1]) : null, filename: args[1]?.filename });
-      event.item = item; return item;
+      event.item = item; return { ...item, chat: { id: Number(args[0]) } };
     };
   }
   if (master) telegram.callApi = async (method, payload) => {
@@ -72,7 +72,7 @@ async function createService({ master = false } = {}) {
       const source = originals.get(String(payload.from_chat_id) + ':' + id); assert.ok(source, 'Telegram copies must reference a recorded source message');
       return recorded(payload.chat_id, { ...source, copied_from: { chat: String(payload.from_chat_id), id } });
     });
-    messages.push({ method, args: [payload], items }); return method === 'copyMessages' ? items : items[0];
+    messages.push({ method, args: [payload], items }); const receipts = items.map(item => ({ message_id: item.message_id })); return method === 'copyMessages' ? receipts : receipts[0];
   };
   const objectStore = {
     configured: () => true,

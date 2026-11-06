@@ -86,8 +86,10 @@ function egrnHarness({ registerError = false, cached = false } = {}) {
   const order = { id: 1, id_statement: 9, cad_num: '77:17:0120316:1', status: 'done', status_text: 'готова', polls: 1, chat_id: 10, ordered_by: 10,
     deliver: [{ chat: 20, order_id: 7 }], files_sent: cached ? 1 : 0, file_msgs: cached ? [{ chat: 10, id: 3, file_id: 'old-id', name: 'ЕГРН.pdf' }] : [] };
   let poll;
-  const context = { module: { exports: {} }, process: { env: { EGRN_TOKEN: 'test', EGRN_DECLARANT_ID: '1' } }, console: { error: (...items) => logs.push(items) }, setTimeout: fn => { poll = fn; }, setInterval() {},
+  const context = { module: { exports: {} }, Buffer, process: { env: { EGRN_TOKEN: 'test', EGRN_DECLARANT_ID: '1' } }, console: { error: (...items) => logs.push(items) }, setTimeout: fn => { poll = fn; }, setInterval() {},
     require: name => {
+      if (name === './egrn-telegram-delivery') return require('./fixtures/egrn-telegram-delivery.cjs');
+      if (name === 'node:crypto') return require('node:crypto');
       if (name === './formatter') return { esc: String };
       if (name === '../db/pool') return { query: async (sql, params) => {
         if(sql.startsWith('UPDATE egrn_orders SET processing_token=gen_random_uuid()')) {order.processing_token='11111111-1111-4111-8111-111111111111';return {rows:[order]};}

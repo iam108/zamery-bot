@@ -13,6 +13,7 @@ const DDL = `
   ALTER TABLE orders ADD COLUMN IF NOT EXISTS request_submit_id TEXT;
   ALTER TABLE orders ADD COLUMN IF NOT EXISTS request_signature TEXT;
   ALTER TABLE orders ADD COLUMN IF NOT EXISTS packet_revision INTEGER NOT NULL DEFAULT 1;
+  ALTER TABLE orders ADD COLUMN IF NOT EXISTS telegram_delivery JSONB NOT NULL DEFAULT '{}';
   CREATE UNIQUE INDEX IF NOT EXISTS orders_request_submit ON orders(submitted_by,request_submit_id);
   CREATE TABLE IF NOT EXISTS order_packet_submissions (
     order_id INT NOT NULL REFERENCES orders(id),

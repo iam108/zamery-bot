@@ -1,6 +1,6 @@
 const { createHash } = require('node:crypto');
 const { getSessionLockPool } = require('../db/session-lock-pool');
-const { canManageCases } = require('./auth');
+const { canManageCases, canAccessCase } = require('./auth');
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DDL = `ALTER TABLE cases ADD COLUMN IF NOT EXISTS handoff_submit_id TEXT;
   ALTER TABLE cases ADD COLUMN IF NOT EXISTS handoff_signature TEXT;
@@ -14,6 +14,7 @@ function json(item) { if(typeof item==='string'){try{return JSON.parse(item);}ca
 function canonical(item) {return JSON.stringify(item,(key,v)=>v&&typeof v==='object'&&!Array.isArray(v)?Object.fromEntries(Object.keys(v).sort().map(name=>[name,v[name]])):v);}
 function esc(item) {return String(item??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function positive(item,label) {if(!/^[1-9]\d*$/.test(String(item))||!Number.isSafeInteger(Number(item)))fail(400,'HANDOFF_INVALID',label);return Number(item);}
+const messageId=item=>(typeof item==='number'||typeof item==='string'&&/^[1-9]\d*$/.test(item))&&Number.isSafeInteger(Number(item))&&Number(item)>0?Number(item):null;
 function https(item) {try{const url=new URL(value(item));return url.protocol==='https:'&&!url.username&&!url.password?url.href:'';}catch(_){return '';}}
 function fields(body) {
   const d={};
@@ -211,17 +212,42 @@ function createHandoffSubmitter(options={}) {
       // Older checkpoints include shared chats. Rebuild the destination from
       // the assigned lawyer on every retry, preserving their file receipts.
       state.recipients=[{chat:String(positive(c.lawyer_tg_id,'Не удалось определить личный чат юриста.')),role:'lawyer'}];
+      const recipientError=message=>Object.assign(new Error(message),{code:'HANDOFF_RECIPIENT_UNAVAILABLE'});
+      const checkRecipient=async chat=>{
+        let row;
+        try {row=(await client.query(`SELECT c.lawyer_tg_id,s.tg_id,s.role,s.approved FROM cases c
+          LEFT JOIN staff s ON s.tg_id=c.lawyer_tg_id WHERE c.id=$1`,[c.id])).rows[0];}
+        catch(_){throw recipientError('Не удалось проверить доступ назначенного юриста. Повторите передачу; подтверждённые материалы сохранены.');}
+        if(!row||String(row.lawyer_tg_id)!==String(chat)||!canAccessCase(row,chat,row))throw recipientError('Получатель больше недоступен или назначение изменилось. Проверьте юриста и повторите передачу; подтверждённые материалы не отправятся повторно.');
+      };
       const save=async()=>{await client.query("UPDATE cases SET data=jsonb_set(COALESCE(data,'{}'::jsonb),'{_handoff}',$1::jsonb,true) WHERE id=$2",[JSON.stringify(state),c.id]);};
       const send=async(operation,run)=>{
+        await checkRecipient(operation.chat);
         state.inflight=operation;await save();let result;
         try{result=await run();}catch(error){
-          if(error?.response){state.inflight=null;await save();}
-          else{state.manual_review='Результат отправки в Telegram неизвестен из-за обрыва связи. Проверьте сообщения вручную; автоматический повтор остановлен, чтобы не создавать дубли.';await save();}
+          const code=Number(error?.response?.error_code);
+          if(code>=400&&code<500||error?.code==='HANDOFF_RECIPIENT_UNAVAILABLE'){state.inflight=null;await save();}
+          else{state.manual_review='Результат отправки в Telegram не подтверждён. Проверьте сообщения вручную; автоматический повтор остановлен, чтобы не создавать дубли.';await save();}
           throw error;
         }
         receiptPending=true;return result;
       };
-      const tg=telegram(),base=options.webappUrl||process.env.WEBAPP_URL;
+      const validateReceipts=(chat,result)=>{
+        const copied=state.auditCopies[String(chat)],request=state.requestCopies?.[String(chat)];
+        const known=new Set([state.cards[String(chat)],...(copied?.messageIds||[]),...Object.values(copied?.sources||{}).flatMap(source=>source.messageIds||[]),
+          ...(request?.messageIds||[]),...(state.materials.confirmed?.[String(chat)]||[]),...Object.values(state.linkedEgrn?.confirmed?.[String(chat)]||{}).map(receipt=>receipt?.message_id)].map(messageId).filter(Boolean));
+        for(const receipt of Array.isArray(result)?result:[result]){
+          const id=messageId(receipt?.message_id);
+          if(!id||known.has(id)||receipt?.chat!=null&&String(receipt.chat.id)!==String(chat))throw Object.assign(new Error('Telegram не подтвердил новые сообщения в личном чате юриста.'),{code:'HANDOFF_TELEGRAM_RECEIPT'});
+          known.add(id);
+        }
+        return result;
+      };
+      const transport=telegram(),tg={
+        async sendMessage(chat,...args){await checkRecipient(chat);return validateReceipts(chat,await transport.sendMessage(chat,...args));},
+        async sendDocument(chat,...args){await checkRecipient(chat);return validateReceipts(chat,await transport.sendDocument(chat,...args));},
+        async callApi(method,payload){await checkRecipient(payload.chat_id);return validateReceipts(payload.chat_id,await transport.callApi(method,payload));},
+      },base=options.webappUrl||process.env.WEBAPP_URL;
       state.linkedEgrn||={files:linkedOriginals(state.packet),confirmed:{},completed:false};
       if(hasPendingLinkedEgrn(state,c.lawyer_tg_id)&&state.completed){state.completed=false;await save();}
       for(const target of state.recipients){
@@ -270,9 +296,9 @@ function createHandoffSubmitter(options={}) {
         const deliver=options.materialDelivery||require('./handoff-materials').createHandoffMaterialsDelivery({telegram:tg});
         const targets=state.recipients.map(target=>({chat:target.chat,reply:state.cards[target.chat]}));
         const exclude=new Set(state.source.hashes||[]);
-        const result=await deliver(Number(state.body.order_id),targets,exclude,{expectedFiles:state.packet.materials,packetHash:state.materials.packetHash,confirmed:state.materials.confirmed,
+        const result=await deliver(Number(state.body.order_id),targets,exclude,{expectedFiles:state.packet.materials,packetHash:state.materials.packetHash,confirmed:state.materials.confirmed,beforeSend:chat=>checkRecipient(chat),
           onPrepared:async prepared=>{Object.assign(state.materials,prepared);state.materials.inflight=true;await save();},
-          onPart:async(chat,index,id,prepared)=>{receiptPending=true;Object.assign(state.materials,prepared);const key=String(chat),ids=state.materials.confirmed[key]||[];if(index!==ids.length)throw new Error('Noncontiguous material receipt');ids.push(id);state.materials.confirmed[key]=ids;await save();receiptPending=false;}});
+          onPart:async(chat,index,id,prepared)=>{receiptPending=true;validateReceipts(chat,{message_id:id});Object.assign(state.materials,prepared);const key=String(chat),ids=state.materials.confirmed[key]||[];if(index!==ids.length)throw new Error('Noncontiguous material receipt');ids.push(id);state.materials.confirmed[key]=ids;await save();receiptPending=false;}});
         if(!result?.ok){
           if(result?.failed?.some(failure=>failure.stage==='receipt'||failure.uncertain===true)){state.manual_review='Результат передачи оригинала не подтверждён. Проверьте уже отправленные документы вручную; автоматический повтор остановлен.';await save();receiptPending=false;return partial(c,state,state.manual_review,false);}
           state.materials.inflight=false;await save();return partial(c,state,(result?.warnings||[]).join(' ')||'Не все оригиналы документов доставлены. Повторите передачу без создания нового клиента.',true);
@@ -319,12 +345,14 @@ function createHandoffSubmitter(options={}) {
         if(state.packet.materials.some(file=>file.role==='egrn')){egrn.completed=true;egrn.result='included';}
         else if(!cad){egrn.completed=true;egrn.result='none';egrn.note='ЕГРН не включена: кадастровый номер не указан.';}
         else {
+          await checkRecipient(String(c.lawyer_tg_id));
           const order=state.body.egrn_order===true&&!egrn.order_started;
           if(order){egrn.order_started=true;await save();}
           let result;
-          try {result=await (options.attachEgrn||require('../bot/egrn').attachOrOrder)({cad,label:c.org,order,orderedBy:owner,orderedName:state.manager_name,targets:[{chat:Number(c.lawyer_tg_id),reply:state.cards[String(c.lawyer_tg_id)]}],note:'Для клиента '+c.org+' (юрист '+c.lawyer_name+')',
-            copyOptions:{strict:true,confirmed:egrn.copies||{},onCopied:async(key)=>{egrn.copies||={};egrn.copies[key]=true;await save();}}});}
+          try {result=await (options.attachEgrn||require('../bot/egrn').attachOrOrder)({cad,label:c.org,order,orderedBy:owner,orderedName:state.manager_name,targets:[{chat:Number(c.lawyer_tg_id),reply:state.cards[String(c.lawyer_tg_id)],case_id:Number(c.id)}],note:'Для клиента '+c.org+' (юрист '+c.lawyer_name+')',
+            copyOptions:{strict:true,confirmed:egrn.copies||{},beforeSend:target=>checkRecipient(target.chat),onCopied:async(key)=>{egrn.copies||={};egrn.copies[key]=true;await save();}}});}
           catch(error){
+            if(error?.code==='HANDOFF_RECIPIENT_UNAVAILABLE')throw error;
             if(error?.uncertain===true){state.manual_review='Результат отправки выписки ЕГРН не подтверждён. Проверьте уже доставленные файлы вручную; автоматический повтор остановлен.';await save();return partial(c,state,state.manual_review,false);}
             egrn.uncertain=order||egrn.uncertain;await save();return partial(c,state,'Пакет клиента создан, но готовность или доставка ЕГРН не подтверждена. Повторите проверку; новый платный заказ повторно не создаётся.',true);
           }
@@ -340,6 +368,7 @@ function createHandoffSubmitter(options={}) {
       }
       state.completed=true;await save();return completed(c,state);
     } catch(error) {
+      if(c&&state&&error?.code==='HANDOFF_RECIPIENT_UNAVAILABLE')return partial(c,state,error.message,true);
       if(c&&state&&receiptPending){state.manual_review='Сообщения отправлены, но подтверждение передачи не сохранилось. Проверьте комплект вручную; автоматический повтор остановлен.';return partial(c,state,state.manual_review,false);}
       if(c&&state&&state.manual_review)return partial(c,state,state.manual_review,false);
       if(c&&state&&!(error instanceof HandoffError))return partial(c,state,'Клиент уже создан, но передача полного комплекта не завершена. Повторите доставку без создания нового клиента.',true);

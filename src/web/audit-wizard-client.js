@@ -36,6 +36,7 @@
   var blobUrls = new Map();
   var uploadIds = new Map();
   var downloadJobs = new Set();
+  var managerPlanIntents = new Map();
   var fieldId = 0;
   var root = document.getElementById('step-content');
   var $ = function (s) { return document.querySelector(s); };
@@ -204,9 +205,9 @@
   function tri(label,path,help,wide) {return input(label,path,{options:TRI,help:help,wide:wide});}
   function checkbox(label,path) {return '<label class="check-field"><input type="checkbox" data-bind="'+esc(path)+'"'+(get(path)?' checked':'')+'><span>'+esc(label)+'</span></label>';}
   function select(label,path,options,help,wide){return input(label,path,{options:[''].concat(options),help:help,wide:wide});}
-  function heading(index){return '<div class="step-heading"><h2>'+esc(STEPS[index][1])+'</h2><p>'+esc(STEPS[index][2])+'</p></div>';}
+  function heading(index){var steps=state.data.object_category==='other'?[['Осмотр','Общий осмотр','Приложите материалы и запишите наблюдения по объекту.'],['Объект','Характеристики объекта','Отметьте известные сведения. Эти поля можно оставить незаполненными.'],['Отчёт','Итог аудитора','Опишите результат осмотра и приложите видео, если оно есть.']]:STEPS;return '<div class="step-heading"><h2>'+esc(steps[index][1])+'</h2><p>'+esc(steps[index][2])+'</p></div>';}
   function uploader(role,subject,label,camera,imageEvidence){var uid=id('upload'),accept='image/jpeg,image/png,image/webp,image/gif,image/heic,image/heif,image/avif,image/tiff,image/bmp';return '<label class="upload-control" for="'+uid+'"><input type="file" id="'+uid+'" data-upload-role="'+esc(role)+'" data-upload-subject="'+esc(subject||'')+'" accept="'+accept+(camera||imageEvidence?'':',application/pdf')+'"'+(camera?' capture="environment"':'')+' multiple><span class="upload-label">'+esc(label||'Добавить файл или фото')+'</span></label>';}
-  function evidenceFor(role,subject){return state.evidence.filter(function(e){return e.role===role&&(subject==null||String(e.subject_id||'')===String(subject));});}
+  function evidenceFor(role,subject){return state.evidence.filter(function(e){return (role==null||e.role===role)&&(subject==null||String(e.subject_id||'')===String(subject));});}
   function evidenceCards(role,subject,evidenceId){var files=evidenceFor(role,subject);if(evidenceId!=null)files=files.filter(function(e){return String(e.id)===String(evidenceId);});if(!files.length)return '';return '<div class="evidence-grid">'+files.map(function(e){var image=/^image\//.test(e.mime||e.mime_type||'');return '<article class="evidence-card"><div class="evidence-preview">'+(image?'<img alt="'+esc(e.name||'Фото')+'" data-evidence-image="'+esc(e.id)+'">':'PDF')+'</div><div class="evidence-details"><div class="evidence-name">'+esc(e.name||'Файл')+'</div><div class="evidence-meta">Оригинал · '+bytes(e.size||e.bytes||0)+'</div><div class="evidence-actions"><button type="button" data-open-evidence="'+esc(e.id)+'">Открыть</button><button type="button" class="remove-evidence" data-delete-evidence="'+esc(e.id)+'" aria-label="Удалить '+esc(e.name||'файл')+'">Убрать</button></div></div></article>';}).join('')+'</div>';}
   function evidenceBlock(role,subject,title,help){var imageEvidence=role==='entrance'||role==='zone';return '<div class="section-heading"><div><h3>'+esc(title)+'</h3>'+(help?'<p>'+esc(help)+'</p>':'')+'</div></div><div class="upload-row">'+uploader(role,subject,'Сделать фото',true)+uploader(role,subject,imageEvidence?'Выбрать фото':'Выбрать файл',false,imageEvidence)+'</div>'+evidenceCards(role,subject);}
 
@@ -320,7 +321,21 @@
     if(result==='clear')return entranceCards();
     return (result==='findings'&&mapMode())||(!result&&state.frozen)?entranceCards()+zoneCards():'';
   }
+  function genericOutsideStep(){
+    return packetSummary()+heading(0)+'<section class="capture-section"><h3>Фото и документы объекта</h3><div class="upload-row">'+uploader('photo','object','Сделать фото',true)+uploader('photo','object','Выбрать файл',false)+'</div>'+evidenceCards(null)+'</section>'+input('Дополнительные объекты рядом / наблюдения','nearby',{type:'textarea',wide:true,maxlength:6000})+
+      '<section class="capture-section"><h3>Проверенные организации рядом · необязательно</h3>'+state.data.zones.map(function(zone,index){var path='zones.'+index+'.';return '<article class="repeat-card"><div class="card-top"><h3>Организация '+(index+1)+'</h3><button type="button" class="button secondary card-remove" data-remove-zone="'+esc(zone.id)+'">Убрать</button></div><div class="fields">'+input('Название или адрес',path+'name',{maxlength:200,wide:true})+input('Расстояние',path+'dist',{maxlength:2000})+input('Комментарий',path+'info',{type:'textarea',maxlength:2000,wide:true})+input('Сведения о лицензии · необязательно',path+'license',{maxlength:2000,wide:true})+'</div></article>';}).join('')+'<button type="button" class="button secondary full" data-add-zone>Добавить организацию</button></section>';
+  }
+  function genericInsideStep(){
+    var facts=[['veranda','Веранда'],['patz','ПАТЗ'],['replan','Перепланировка'],['passport_interest','Интерес к паспорту безопасности'],['is_owner','Собственник']];
+    var checks=[['chk_bti_match','Фактическая планировка соответствует БТИ'],['chk_hall','Торговый зал / зал обслуживания определён'],['chk_storage','Подсобные и складские помещения определены'],['chk_no_replan','Нет самовольных перепланировок'],['chk_clear_borders','Границы объекта однозначно определимы'],['chk_cadastr','Кадастровый номер не разделён']];
+    return heading(1)+'<div class="fields">'+select('Тип здания','building_type',['Жилое','Нежилое','Не проверено'])+select('Помещение в своих границах','boundaries',['Да','Нет','Под вопросом','Не проверено'])+select('БТИ · ответ аудитора','bti',['Да','Нет','Не проверено'])+select('Техническое обследование (ТО)','to',['Нужно','Не нужно','Не обязательно','Не проверено'])+'</div><section class="capture-section"><h3>Отмеченные пункты</h3>'+checks.concat(facts).map(function(item){return checkbox(item[1],item[0]);}).join('')+'</section>';
+  }
+  function genericReportStep(){
+    var p=state.data.inspection;
+    return heading(2)+'<div class="fields">'+input('Итог аудитора','conclusion',{type:'textarea',wide:true,maxlength:6000})+input('Клиент сообщил / договорённости','workflow.followup_notes',{type:'textarea',wide:true,maxlength:2000})+input((state.packet&&(state.packet.video_required||state.packet.has_video))?'Видео из задания менеджера':'Видео · необязательно','workflow.video_url',{type:'url',maxlength:2000,placeholder:'https://disk.yandex.ru/d/…'})+input('Дата осмотра','inspection.visit_date',{type:'date'})+'</div><section class="report-preview"><h3>Сообщение юристу</h3><p><strong>'+esc(p.org)+'</strong><br>'+esc(p.address)+'<br>Общий осмотр · Другое</p><p>'+esc(state.data.conclusion)+'</p><p class="field-note">Ответы и оригиналы приложений сохранятся с отчётом.</p></section>'+reportFeedback(issues())+'<button type="button" class="button primary full" id="submit-audit">Отправить отчёт</button><button type="button" class="button secondary full" id="retry-unknown-delivery" hidden>Повторить неподтверждённую часть</button><p class="field-note" id="submit-status" role="status" aria-live="polite"></p>';
+  }
   function outsideStep(){
+    if(state.data.object_category==='other')return genericOutsideStep();
     var result=state.data.workflow.territory_result,mode=mapMode(),html=packetSummary()+heading(0);
     html+=choices('workflow.territory_result','Что нашли при проверке?',[['clear','Зон нет'],['findings','Есть организации или спорные места']]);
     if(!result&&!state.frozen&&(mode||state.data.entrances.length||state.data.zones.length))html+='<p class="field-note">Материалы прошлой версии сохранены в черновике. Выберите результат проверки, чтобы продолжить.</p>';
@@ -375,6 +390,7 @@
   function setCurrentPlan(plan,planId){planId=planId||activePlanId;if(planId==='main')state.data.plan=plan;else{var i=state.data.additional_plans.findIndex(function(p){return p.id===planId;});if(i>=0)state.data.additional_plans[i]=Object.assign({},plan,{id:planId});}}
 
   function insideStep(){
+    if(state.data.object_category==='other')return genericInsideStep();
     var p=state.data.inspection,files=packetFiles().filter(function(f){return ['plan','egrn','archive'].includes(f.role);}),renewalArchive=isRenewal()&&state.data.workflow.archive_skipped!=='Да'&&files.concat(state.evidence).some(function(f){return f.role==='archive';});
     var html=heading(1)+'<details class="details-block"><summary>Выбрать документ из заявки</summary>'+managerFilesHtml(files,true)+'</details><div class="plan-contexts"><button type="button" class="button secondary'+(activePlanId==='main'?' selected':'')+'" data-plan-context="main">Основной план</button>'+state.data.additional_plans.map(function(plan,i){return '<button type="button" class="button secondary'+(activePlanId===plan.id?' selected':'')+'" data-plan-context="'+esc(plan.id)+'">Доп. лист '+(i+1)+'</button>';}).join('')+'<button type="button" class="button secondary" data-add-plan>+ Ещё лист</button></div>'+(activePlanId!=='main'?'<button type="button" class="text-button" data-remove-plan>Убрать дополнительный лист</button>':'')+'<div class="plan-editor-shell" id="plan-editor"></div>';
     html+='<section class="capture-section"><h3>Помещение по факту</h3><div class="fields">'+input('Этаж на плане','inspection.floor_plan',{maxlength:100})+input('Фактический этаж','inspection.floor_actual',{maxlength:100})+input('Количество кадастров','inspection.cadastral_count',{type:'number',step:'1',maxlength:2})+'</div>'+choices('inspection.within_cadastral','Внешние границы помещения',[['Да','Соблюдены'],['Нет','Нарушены']])+'<div data-cadastral-boundary'+(Number(p.cadastral_count)>1?'':' hidden')+'>'+choices('inspection.inter_cadastral_boundary','Граница между кадастрами',[['Сохранена','Сохранена'],['Объединены','Объединены']])+'</div>'+choices('inspection.rooms_complete','Вся площадь по плану входит в объект',[['Да','Входит целиком'],['Нет','Часть не входит']])+'<p class="field-note">«Часть не входит» — часть площади отрезана или занята соседями. Если убрана только внутренняя перегородка, отметьте это ниже как изменение планировки.</p>'+choices('to','Нужно техническое описание (ТО)',[['Нужно','Да'],['Не нужно','Нет']])+choices('bti','Планировка по выбранному плану',[['Да','Совпадает'],['Нет','Есть изменения']])+(state.data.bti==='Нет'?input('Что отличается','inspection.plan_note',{type:'textarea',wide:true,maxlength:2000,placeholder:'Кратко. Перегородки и границы отметьте на плане.'}):'')+'</section>';
@@ -434,6 +450,14 @@
 
   function issues(){
     var out=[],p=state.data.inspection,packet=state.packet||{};function add(key,title,view,detail){out.push({key:key,title:title,detail:detail||'',step:view});}
+    if(state.data.object_category==='other'){
+      if(!p.org||!p.address)add('packet','Менеджеру нужно дополнить объект и адрес в заявке',0);
+      if(!String(state.data.conclusion||'').trim())add('conclusion','Укажите итог аудитора',2);
+      var genericVideo=state.data.workflow.video_url||'';
+      if((packet.video_required||packet.has_video)&&!genericVideo)add('video','Приложите видео из задания менеджера',2);
+      if(genericVideo){try{if(new URL(genericVideo).protocol!=='https:')throw new Error();}catch(_){add('video','Укажите полную HTTPS-ссылку на видео',2);}}
+      return out;
+    }
     if(!p.org||!p.address||(state.data.object_category!=='tobacco'&&!p.service))add('packet','Менеджеру нужно дополнить заявку',0);
     if(!state.data.building_type)add('building','Выберите: жилое или нежилое здание',0);
     territoryIssues(add,false);
@@ -465,6 +489,7 @@
   }
 
   function requiredIssues(tasks) {
+    if(state.data.object_category==='other')return tasks;
     var keys=['packet','building','floor_plan','floor_actual','cadastral_count','rooms_complete','within_cadastral','kkt_count','kkt_ip','inter','plan','to','compare','note','archive'];
     var required=tasks.filter(function(task){return keys.includes(task.key);});
     territoryIssues(function(key,title,view){if(!required.some(function(task){return task.key===key;}))required.push({key:key,title:title,step:view});},true);
@@ -478,6 +503,7 @@
   }
   function tasksHtml(tasks) { return '<div class="task-list">' + tasks.map(function (t) { return '<div class="task"><div class="task-main"><p>' + esc(t.title) + '</p>' + (t.detail ? '<small>' + esc(t.detail) + '</small>' : '') + '</div><button type="button" data-go-step="' + t.step + '">'+(['Территория →','Помещение →','Отчёт →'][t.step]||'Открыть')+'</button></div>'; }).join('') + '</div>'; }
   function offersActions(tasks) {
+    if(state.data.object_category==='other')return false;
     var outcome=state.data.workflow.conclusion_status;
     return !state.frozen && tasks.length>0 && !requiredIssues(tasks).length && (!outcome || outcome==='ready');
   }
@@ -520,10 +546,11 @@
     if(typeof area.focus==='function')area.focus({preventScroll:true});
   }
   function reportStep(){
+    if(state.data.object_category==='other')return genericReportStep();
     var tasks=issues(),actions=offersActions(tasks);
     return heading(2)+'<div class="fields">'+select('Результат','workflow.conclusion_status',[{value:'ready',label:'Соответствует по проверенным пунктам'},{value:'actions',label:'Нужны действия'},{value:'insufficient',label:'Нужно уточнить'},{value:'obstacle',label:'Есть препятствие'}],'',true)+input('Комментарий аудитора · необязательно','conclusion',{type:'textarea',wide:true,maxlength:6000})+input('Клиент сообщил / договорённости','workflow.followup_notes',{type:'textarea',wide:true,maxlength:2000})+input((state.packet&&(state.packet.video_required||state.packet.has_video))?'Видео в Яндекс Диске':'Видео · необязательно','workflow.video_url',{type:'url',maxlength:2000,placeholder:'https://disk.yandex.ru/d/…'})+(state.data.workflow.video_url?select('Доступность видео','inspection.video_status',['Сделано','Снято — загрузить позже','Не сделано','Не проверено']):'')+input('Дата осмотра','inspection.visit_date',{type:'date'})+'</div>'+reportPreview()+reportFeedback(tasks)+
       '<p class="field-note" id="submit-outcome"'+(actions?'':' hidden')+'>Итог будет «Нужны действия». Ответы и комментарий сохранятся.</p>'+
-      '<button type="button" class="button primary full" id="submit-audit" aria-describedby="submit-outcome">'+(actions?'Отправить с замечаниями':'Отправить отчёт')+'</button><p class="field-note" id="submit-status" role="status" aria-live="polite"></p>';
+      '<button type="button" class="button primary full" id="submit-audit" aria-describedby="submit-outcome">'+(actions?'Отправить с замечаниями':'Отправить отчёт')+'</button><button type="button" class="button secondary full" id="retry-unknown-delivery" hidden>Повторить неподтверждённую часть</button><p class="field-note" id="submit-status" role="status" aria-live="polite"></p>';
   }
   function reportPreview(){
     var p=state.data.inspection,result=state.data.workflow.territory_result,rows=[['Здание',state.data.building_type],['Этаж','план: '+(p.floor_plan||'—')+' · факт: '+(p.floor_actual||'—')],['Кадастры',(p.cadastral_count||'—')+(Number(p.cadastral_count)>1?' · '+(p.inter_cadastral_boundary||'—'):'')],['Границы',p.within_cadastral],['Вся площадь по плану',p.rooms_complete],['ТО',state.data.to],['Кассы',(p.kkt_count||'—')+' · касса ИП: '+(p.kkt_ip||'—')]];
@@ -564,7 +591,6 @@
     if(!state.pendingPacket||state.frozen||state.submitting||state.conflict||state.blocked||state.needsRestore)return;
     if(!window.confirm('Вы сверили объект, выбранный план, фотографии и схему с обновлённой заявкой? Подтвердите только если материалы относятся к этому объекту.'))return;
     var previous=state.data.request_packet||state.packet||{},next=state.pendingPacket;
-    if(next.object_category==='other'){window.location.replace('/audit/legacy'+window.location.search);return;}
     var history=state.data.packet_rechecks||[];
     state.data.packet_rechecks=history.concat([{checked_at:new Date().toISOString(),previous:packetIdentity(previous),current:packetIdentity(next)}]).slice(-10);
     applyPacket(next);state.pendingPacket=null;state.packetError='';notice('');changed();render();
@@ -593,7 +619,7 @@
   }
 
   function refreshChrome() {
-    var index = step(); $('#steps').innerHTML = STEPS.map(function (s, i) { return '<button type="button" class="step-button" data-step="' + i + '"' + (i === index ? ' aria-current="step"' : '') + ' aria-label="' + esc(s[0]) + '"><span>' + (i + 1) + '</span><span>' + esc(s[0]) + '</span></button>'; }).join('');
+    var index = step(),steps=state.data.object_category==='other'?[['Осмотр'],['Объект'],['Отчёт']]:STEPS; $('#steps').innerHTML = steps.map(function (s, i) { return '<button type="button" class="step-button" data-step="' + i + '"' + (i === index ? ' aria-current="step"' : '') + ' aria-label="' + esc(s[0]) + '"><span>' + (i + 1) + '</span><span>' + esc(s[0]) + '</span></button>'; }).join('');
     $('#steps').querySelectorAll('[data-step]').forEach(function (b) { b.onclick = function () { go(Number(b.dataset.step)); }; });
     $('#object-title').textContent = state.data.inspection.org || 'Данные из заявки менеджера'; $('#step-counter').textContent = (index + 1) + ' из 3'; $('#previous-step').disabled = index === 0 || state.submitting; $('#next-step').textContent = index === 2 ? 'К осмотру' : 'Далее →'; $('#next-step').disabled = state.submitting; $('#save-now').disabled = state.submitting || state.frozen || state.conflict;
   }
@@ -672,6 +698,7 @@
       state.data.zones=state.data.zones.filter(function(z){return z.id!==zid;});changed();render();
     };});
     b = $('#submit-audit'); if (b) b.onclick = function(){return submit(!state.frozen&&offersActions(issues())?'actions':'');};
+    b = $('#retry-unknown-delivery'); if (b) b.onclick = function(){return retryUnconfirmedDelivery();};
   }
   function openExternal(url){return actions.openExternal(url,tg,function(href,target){return window.open(href,target);},window);}
   function opensMapAddress(){return !!(tg&&tg.platform==='ios'&&actions.hasTelegramBridge(window));}
@@ -742,11 +769,16 @@
     var targetPlanId = activePlanId;
     var file = packetFiles().find(function(f) { return String(f.id) === String(fileId); });
     if (!file || state.frozen || state.submitting) return;
+    var requestedPlan = currentPlan(targetPlanId);
+    if (!requestedPlan) return;
+    requestedPlan = clone(requestedPlan);
+    var intent = (managerPlanIntents.get(targetPlanId) || 0) + 1;
+    managerPlanIntents.set(targetPlanId, intent);
     queue(async function() {
       try {
         await flush();
         var current = currentPlan(targetPlanId);
-        if (!current) return;
+        if (!current || managerPlanIntents.get(targetPlanId) !== intent || !sameData(current, requestedPlan)) return;
         if (String(current.manager_material_id || '') === String(fileId) && state.evidence.some(function(e) { return e.id === current.evidence_id; })) {
           notify('Документ уже открыт. Выберите нужную страницу в редакторе.');
           return;
@@ -754,6 +786,12 @@
         var result = await fetchAuditFile(file.url, 'Не удалось получить документ из заявки. Повторите действие.');
         var encoded = await readBase64(result.blob);
         var uploaded = await postEvidence({name:file.name, type:file.mime || result.blob.type}, 'plan-source', 'source', encoded);
+        if (editor && editor.updateEvidence) editor.updateEvidence(state.evidence);
+        current = currentPlan(targetPlanId);
+        if (!current || managerPlanIntents.get(targetPlanId) !== intent || !sameData(current, requestedPlan)) {
+          notify('Документ сохранён в исходниках. Более новый выбор плана и разметка оставлены.');
+          return;
+        }
         var previous = clone(current);
         delete previous.versions; delete previous.history; delete previous.pending;
         var versions = (current.versions || []).concat(current.evidence_id ? [previous] : []).slice(-20);
@@ -765,6 +803,7 @@
         render();
         notify('Документ открыт. Выберите лист с графикой.');
       } catch (error) { notify(error.message); }
+      finally { if (managerPlanIntents.get(targetPlanId) === intent) managerPlanIntents.delete(targetPlanId); }
     });
   }
   async function evidenceUrl(eid) {
@@ -820,7 +859,32 @@
     return '';
   }
   async function evidenceId(file,role,subject,data){var key=[file.name,file.type||file.mime,role,subject||'',data].join('\n');if(window.crypto&&crypto.subtle&&window.TextEncoder){var digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(key));var hex=Array.from(new Uint8Array(digest)).map(function(n){return n.toString(16).padStart(2,'0');}).join('').slice(0,32);hex=hex.slice(0,12)+'4'+hex.slice(13,16)+'8'+hex.slice(17);return hex.slice(0,8)+'-'+hex.slice(8,12)+'-'+hex.slice(12,16)+'-'+hex.slice(16,20)+'-'+hex.slice(20,32);}var hash=0;for(var i=0;i<key.length;i++)hash=(Math.imul(31,hash)+key.charCodeAt(i))|0;var short=file.name+':'+role+':'+subject+':'+data.length+':'+hash;if(!uploadIds.has(short))uploadIds.set(short,uuid());return uploadIds.get(short);}
-  async function postEvidence(file,role,subject,data,eid){var result=await request('/api/audit/drafts/'+encodeURIComponent(state.draft.id)+'/evidence',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:eid||await evidenceId(file,role,subject,data),revision:state.draft.revision,name:file.name,mime:file.type||file.mime,role:role,subject_id:subject||'',data:data})});adoptRevision(result);var evidence=result.evidence;if(evidence&&!Array.isArray(evidence)){state.evidence=state.evidence.filter(function(e){return String(e.id)!==String(evidence.id);});state.evidence.push(evidence);}return evidence;}
+  async function recoverEvidenceUpload(attempt) {
+    if (!window.crypto || !window.crypto.subtle || typeof atob !== 'function') return null;
+    var response = await request('/api/audit/drafts/current?order_id=' + encodeURIComponent(orderId)), remote = response.draft;
+    if (!remote || remote.submitting || String(remote.id) !== String(attempt.draft_id) || String(state.draft && state.draft.id) !== String(attempt.draft_id) || ![attempt.revision, attempt.revision + 1].includes(Number(remote.revision)) || !sameData(remote.data, attempt.savedData)) return null;
+    var expected = attempt.file, found = (remote.evidence || []).find(function(file){return String(file.id) === expected.id;});
+    var name = String(expected.name || '').split(/[\\/]/).pop().replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0,180);
+    var size = expected.data.length / 4 * 3 - (expected.data.endsWith('==') ? 2 : expected.data.endsWith('=') ? 1 : 0);
+    if (!found || found.name !== name || found.mime !== expected.mime || found.role !== expected.role || String(found.subject_id || '') !== expected.subject_id || Number(found.bytes) !== size) return null;
+    var binary = atob(expected.data), bytes = new Uint8Array(binary.length);
+    for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    var digest = await window.crypto.subtle.digest('SHA-256', bytes), hash = Array.from(new Uint8Array(digest)).map(function(byte){return byte.toString(16).padStart(2,'0');}).join('');
+    if (found.sha256 !== hash) return null;
+    return { draft: remote, evidence: found };
+  }
+  async function postEvidence(file,role,subject,data,eid){
+    var input = {id:eid||await evidenceId(file,role,subject,data),revision:state.draft.revision,name:file.name,mime:file.type||file.mime,role:role,subject_id:subject||'',data:data};
+    var attempt = {draft_id:state.draft.id,revision:Number(state.draft.revision),savedData:clone(state.draft.data||state.data),file:input}, result;
+    try { result=await request('/api/audit/drafts/'+encodeURIComponent(attempt.draft_id)+'/evidence',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(input)}); }
+    catch (error) {
+      if (error.retryable || error.status >= 500) { try { result = await recoverEvidenceUpload(attempt); } catch (_) {} }
+      if (!result) throw error;
+    }
+    adoptRevision(result);var evidence=result.evidence;
+    if(evidence&&!Array.isArray(evidence)){state.evidence=state.evidence.filter(function(e){return String(e.id)!==String(evidence.id);});state.evidence.push(evidence);}
+    return evidence;
+  }
   async function uploadFiles(files, role, subject, options) {
     options = options || {}; if (!files.length) return;
     if (state.submitting || state.frozen || state.conflict) { notify('Сначала завершите текущую операцию с черновиком.'); return; }
@@ -904,22 +968,28 @@
         if(String(plan.evidence_id)===String(eid)){plan.evidence_id='';plan.annotations=[];plan.pending=null;delete plan.preview_evidence_id;removedReference=true;}
         else if(String(plan.preview_evidence_id)===String(eid)){delete plan.preview_evidence_id;removedReference=true;}
       });
-      if(removedReference){state.dirty=true;state.version++;await flush();}
+      if(removedReference){state.dirty=true;state.version++;}
       if(blobUrls.has(String(eid))){URL.revokeObjectURL(blobUrls.get(String(eid)));blobUrls.delete(String(eid));}
-      localSave();render();notify('Файл убран из проверки.');
+      localSave();render();
+      if(removedReference)await flush();
+      notify('Файл убран из проверки.');
     }catch(error){if(error.status===409){state.conflict=true;localSave();$('#conflict-panel').hidden=false;}notify(error.message);}});
   }
   async function removeGeneratedEvidence(eid){var result=await request('/api/audit/drafts/'+encodeURIComponent(state.draft.id)+'/evidence/'+encodeURIComponent(eid),{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({revision:state.draft.revision})});adoptRevision(result);state.evidence=state.evidence.filter(function(e){return e.id!==eid;});}
   async function exportGraphic(plan,kind,subject){if(!window.AuditPlanEditor||!plan.evidence_id||!plan.annotations.length)return null;var host=document.createElement('div');host.className='export-shell';document.body.appendChild(host);var api;try{api=window.AuditPlanEditor.mount(host,{kind:kind,service:state.data.object_category==='tobacco'?'tobacco':'alcohol',getState:function(){return plan;},onChange:function(){},evidenceUrl:evidenceUrl,evidence:state.evidence});await api.refresh();var result=await api.exportPreview();if(!result)throw new Error('Не удалось подготовить актуальное изображение '+(kind==='map'?'схемы':'плана')+'. Повторите загрузку исходника и отправку отчёта.');result.subject_id=subject;return result;}finally{if(api)api.destroy();host.remove();}}
   async function exportPlan(){return exportGraphic(state.data.plan,'plan','annotation');}
   function freezeControls(){
-    if(!state.frozen)return;
+    if(!state.frozen||state.completed)return;
     root.querySelectorAll('input,select,textarea').forEach(function(control){control.disabled=true;});
-    root.querySelectorAll('button').forEach(function(button){if(button.id!=='submit-audit'&&!button.hasAttribute('data-open-evidence')&&!button.hasAttribute('data-open-egrn')&&!button.hasAttribute('data-go-step')&&!button.hasAttribute('data-download-material')&&!button.hasAttribute('data-download-materials')&&!button.hasAttribute('data-download-archive')&&!button.hasAttribute('data-copy-address')&&!button.hasAttribute('data-copy-archive')&&!button.hasAttribute('data-contact'))button.disabled=true;});
+    root.querySelectorAll('button').forEach(function(button){if(button.id!=='submit-audit'&&button.id!=='retry-unknown-delivery'&&!button.hasAttribute('data-open-evidence')&&!button.hasAttribute('data-open-egrn')&&!button.hasAttribute('data-go-step')&&!button.hasAttribute('data-download-material')&&!button.hasAttribute('data-download-materials')&&!button.hasAttribute('data-download-archive')&&!button.hasAttribute('data-copy-address')&&!button.hasAttribute('data-copy-archive')&&!button.hasAttribute('data-contact'))button.disabled=true;});
     root.querySelectorAll('.plan-editor-shell canvas').forEach(function(canvas){canvas.style.pointerEvents='none';});
     var submitButton=$('#submit-audit');if(submitButton)submitButton.textContent='Повторить отправку этой версии';
     var submitStatus=$('#submit-status');if(submitStatus)submitStatus.textContent='Отправка началась — версия зафиксирована. Можно просмотреть этапы и повторить отправку без изменений.';
     notice('Отправка началась — версия зафиксирована. Можно просмотреть данные и повторить отправку без изменений.');
+    var unknown=state.draft&&state.draft.delivery_unknown,retry=$('#retry-unknown-delivery');
+    if(submitButton)submitButton.disabled=!!unknown||state.submitting||state.retryingDelivery;
+    if(retry){retry.hidden=!unknown;retry.disabled=state.submitting||state.retryingDelivery;}
+    if(unknown){var warning='Telegram мог принять неподтверждённую часть отчёта. Сначала проверьте чат. Явный повтор может создать дубликаты этой части.';if(submitStatus)submitStatus.textContent=warning;notice(warning);}
     $('#save-now').disabled=true;
   }
   function frozenSnapshot(remote){
@@ -930,6 +1000,7 @@
   }
   async function checkSubmissionState(entered,error){
     if(!entered)return;
+    if(error&&error.payload&&error.payload.delivery_unknown&&state.draft)state.draft.delivery_unknown=error.payload.delivery_unknown;
     try{
       var result=await request('/api/audit/drafts/current?order_id='+encodeURIComponent(orderId));
       if(result.draft&&String(result.draft.id)===String(state.draft.id)){
@@ -942,24 +1013,40 @@
       frozenSnapshot(null);
     }
   }
+  async function retryUnconfirmedDelivery(){
+    var unknown=state.draft&&state.draft.delivery_unknown;
+    if(!state.frozen||!unknown||state.submitting||state.retryingDelivery)return;
+    if(!window.confirm('Проверьте чат с отчётом. Telegram мог уже принять эту часть. Повторить её с риском дубликатов? Подтверждённые части повторяться не будут.'))return;
+    state.retryingDelivery=true;freezeControls();
+    try{
+      await queue(function(){return request('/api/audit/drafts/'+encodeURIComponent(state.draft.id)+'/retry-delivery',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({revision:state.draft.revision,cursor:unknown.cursor,acknowledge_duplicate_risk:true})});});
+      if(state.draft.delivery_unknown&&state.draft.delivery_unknown.cursor===unknown.cursor)delete state.draft.delivery_unknown;
+      state.retryingDelivery=false;render();await submit('');
+    }catch(error){await checkSubmissionState(true,error);notify(error.message);}
+    finally{state.retryingDelivery=false;freezeControls();}
+  }
   async function submit(outcome){
-    if(state.submitting)return;
+    if(state.submitting||state.retryingDelivery)return;
+    if(state.frozen&&state.draft&&state.draft.delivery_unknown){notify('Сначала проверьте чат. Для явного повтора используйте «Повторить неподтверждённую часть».');return;}
     if(state.pendingPacket&&!state.frozen){renderPacketUpdate();notify(state.packetError);return;}
     if(state.pendingUploads){notify('Дождитесь загрузки выбранных файлов.');return;}
     try{if(editor&&editor.flush)await editor.flush();}catch(error){notify(error.message);return;}
     var p=state.data.inspection;
     if(!state.frozen){
-      if(!p.org.trim()||!p.address.trim()||(state.data.object_category!=='tobacco'&&!p.service)){notify('В заявке не хватает данных. Менеджеру нужно дополнить объект, адрес или услугу. Наблюдения сохранены в черновике.');go(0);return;}
+      var generic=state.data.object_category==='other';
+      if(!p.org.trim()||!p.address.trim()||(!['tobacco','other'].includes(state.data.object_category)&&!p.service)){notify('В заявке не хватает данных. Менеджеру нужно дополнить объект, адрес или услугу. Наблюдения сохранены в черновике.');go(0);return;}
       var missing=requiredIssues(issues());
       if(missing.length){notify(missing[0].title);showReportIssues();return;}
       if(outcome==='actions'&&offersActions(issues()))chooseConclusion('actions');
-      if(!state.data.workflow.conclusion_status){notify('Выберите результат проверки.');return;}
-      if(state.data.workflow.conclusion_status==='ready'&&issues().length){showReportIssues();return;}
+      if(!generic&&!state.data.workflow.conclusion_status){notify('Выберите результат проверки.');return;}
+      if(!generic&&state.data.workflow.conclusion_status==='ready'&&issues().length){showReportIssues();return;}
       state.data.ui_version=5;state.data.inspection.region='МСК';
+      if(!generic){
       p.all_entrances_checked=state.data.entrances.length&&state.data.entrances.every(function(e){return !['Нет доступа','Не осмотрен'].includes(e.access)&&hasEvidenceImage('entrance',e.id);})?'Да':'Не проверено';
       p.zones_checked=state.data.workflow.territory_result==='clear'||state.data.zones.every(function(z){return z.status!=='pending'&&z.dist!=='Не проверено'&&z.name&&hasEvidenceImage('zone',z.id);})?'Да':'Не проверено';
       state.data.additional_plans=state.data.additional_plans.filter(function(p){return p.evidence_id||p.annotations.length;});['alcohol_present','within_cadastral','all_entrances_checked','zones_checked'].forEach(function(key){if(!p[key])p[key]='Не проверено';});
       if(isRenewal()){if(!p.archive_available)p.archive_available=state.packet&&(state.packet.archive_url||packetFiles().some(function(f){return f.role==='archive';}))?'Да':'Не проверено';if(p.alcohol_present==='Да'&&!p.alcohol_within_licensed)p.alcohol_within_licensed='Не проверено';}
+      }
 
       state.dirty=true;state.version++;localSave();
     }
@@ -992,7 +1079,7 @@
         try{await fetchPacket();render();}catch(packetError){state.packetError=packetError.message;notify(packetError.message);}
       }else if(error.status===409&&!state.frozen){state.conflict=true;$('#conflict-panel').hidden=false;}
       submitStatus=$('#submit-status');
-      if(submitStatus)submitStatus.textContent='Отправка не подтверждена: '+error.message+(state.frozen?' Повторите отправку этой версии без изменений.':' Исправьте замечания и повторите.');
+      if(submitStatus)submitStatus.textContent='Отправка не подтверждена: '+error.message+(state.draft&&state.draft.delivery_unknown?' Сначала проверьте чат; явный повтор может создать дубликаты неподтверждённой части.':state.frozen?' Повторите отправку этой версии без изменений.':' Исправьте замечания и повторите.');
       notify('Отправка не подтверждена. '+error.message);
     }
   }
@@ -1032,7 +1119,7 @@
   }
   function hasInspectionWork() {
     if(state.evidence.length||state.data.entrances.length||state.data.zones.length)return true;
-    if(['building_type','boundaries','bti','to','nearby','veranda','patz','passport','owner_info','conclusion'].some(function(key){return !!state.data[key];}))return true;
+    if(['building_type','boundaries','bti','to','nearby','veranda','patz','passport','owner_info','conclusion','replan','passport_interest','is_owner','chk_bti_match','chk_hall','chk_storage','chk_no_replan','chk_clear_borders','chk_cadastr'].some(function(key){return !!state.data[key];}))return true;
     var sourceFields=['org','address','service','region','archive_url','archive_available'];
     if(Object.keys(state.data.inspection).some(function(key){return !sourceFields.includes(key)&&!!state.data.inspection[key];}))return true;
     var workflow=state.data.workflow||{};
@@ -1042,7 +1129,7 @@
   function applyPacket(packet) {
     state.packet=packet;
     state.data.inspection.org=packet.org||'';state.data.inspection.address=packet.address||'';state.data.inspection.service=packet.service||'';state.data.inspection.region='МСК';
-    state.data.object_category=['catering','retail','tobacco'].includes(packet.object_category)?packet.object_category:'catering';
+    state.data.object_category=['catering','retail','tobacco','other'].includes(packet.object_category)?packet.object_category:'catering';
     state.data.request_packet=clone(packet);state.data.order_material_ids=packetFiles().map(function(file){return file.id;});
     prefillContact(packet.contacts);state.data.inspection.archive_url=packet.archive_url||'';
     if(isRenewal())state.data.inspection.archive_available=packet.archive_url||packetFiles().some(function(file){return file.role==='archive';})?'Да':'Не проверено';
@@ -1058,7 +1145,6 @@
       state.packet=previous;state.pendingPacket=packet;state.packetError='Данные объекта изменились. Сверьте материалы с обновлённой заявкой.';
       renderPacketUpdate();return;
     }
-    if(packet.object_category==='other'){window.location.replace('/audit/legacy'+window.location.search);return;}
     var before=JSON.stringify(stable(state.data));applyPacket(packet);
     if(before!==JSON.stringify(stable(state.data))){state.version++;state.dirty=true;}
     state.pendingPacket=null;state.packetError='';

@@ -182,7 +182,7 @@ function createPacketService(options = {}) {
     });
   }
   async function legacy(id) {
-    const report = await require('./legacy-report').loadReportAggregate(pool, integer(id));
+    const report = await require('./legacy-report').loadReportAggregate(pool, integer(id), { workingChatId: options.workingChatId ?? process.env.GROUP_CHAT_ID });
     if (!report) fail(404, 'REPORT_NOT_FOUND', 'Сохранённый отчёт не найден.');
     return report;
   }

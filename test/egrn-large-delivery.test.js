@@ -15,7 +15,7 @@ const copy = value => JSON.parse(JSON.stringify(value));
 function fixture(overrides = {}) {
   const events = [], sends = [], snapshots = [], records = [];
   const order = {id:7,cad_num:'77:01:0004016:1064',label:'Тестовый объект',chat_id:-1001,status_msg_id:77,ordered_by:3003,deliver:[{chat:2002,reply:88}]};
-  const meta = {id:FILE_ID,egrn_order_id:7,source_key:KEY,name:'ЕГРН.pdf',mime:'application/pdf',bytes:PDF.length};
+  const meta = {id:FILE_ID,egrn_order_id:7,source_key:KEY,name:'ЕГРН.pdf',mime:'application/pdf',bytes:PDF.length,sha256:PDF_SHA256};
   const state = {saveCount:0,getCount:0,signCount:0,persistCount:0,nextMessage:101,failChats:new Set(),failPersistAt:null};
   const store = {
     async save(input) {state.saveCount++;events.push(['save',input]);return {...meta};},
@@ -60,6 +60,12 @@ test('ready large-link notices and free cached copies read current accounting wi
 test('an unavailable accounting snapshot does not prevent the original large-link delivery or its receipt',async()=>{
   const h=fixture({budgetText:async()=>{throw new Error('Synthetic counter read failure');}});await h.service.deliver(h.order,h.file,KEY,h.records);
   assert.equal(h.records[0].deliveries.length,3);assert.ok(h.sends.every(call=>call.text.includes('Учёт заказов временно недоступен')));
+});
+
+test('a free large-link copy rechecks its recipient after metadata, signing and accounting, immediately before Telegram',async()=>{
+  let permitted=true,checked=0;const h=fixture({budgetText:async()=>{permitted=false;return 'Учёт без нового заказа';}}),record=lookupOnlyRecord({bytes:PDF.length});
+  await assert.rejects(h.service.copy(record,{chat:4444},{beforeSend(target){checked++;assert.equal(target.chat,4444);assert.equal(permitted,false);throw Object.assign(new Error('Recipient revoked'),{code:'HANDOFF_RECIPIENT_UNAVAILABLE'});}}),error=>error.uncertain===false&&error.delivery_stage==='validation');
+  assert.equal(checked,1);assert.equal(h.sends.length,0);assert.equal(h.state.saveCount,0);assert.equal(h.records.length,0);
 });
 
 test('original and descriptor are durable before a link is sent; every target receipt is persisted immediately',async()=>{

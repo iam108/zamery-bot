@@ -7,15 +7,19 @@
   function normalizePhone(value) {
     var raw = String(value || '').trim(), digits = raw.replace(/\D/g, '');
     if (!/^\+?[\d() .-]+$/.test(raw) || /\d{1,2}\.\d{1,2}\.\d{4}/.test(raw)) return '';
+    if (raw[0] === '+') {
+      if (digits[0] === '7') return digits.length === 11 ? '+' + digits : '';
+      return digits.length >= 8 && digits.length <= 15 ? '+' + digits : '';
+    }
     if (digits.length === 10) return '+7' + digits;
     if (digits.length === 11 && /^[78]/.test(digits)) return '+7' + digits.slice(1);
-    if (raw[0] === '+' && digits.length >= 8 && digits.length <= 15) return '+' + digits;
     return '';
   }
   function findPhone(value) {
     if (Array.isArray(value)) return value.map(findPhone).find(Boolean) || '';
     if (value && typeof value === 'object') return findPhone(value.phone || value.contact_phone || '') || findPhone(value.comment || '');
     var text = String(value || '');
+    var explicit = normalizePhone(text); if (explicit) return explicit;
     try { var parsed = JSON.parse(text); if (typeof parsed !== 'string') return findPhone(parsed); } catch (_) {}
     // A date next to a phone must neither become a phone nor consume its tail.
     text = text.replace(/\b\d{1,2}\.\d{1,2}\.\d{4}\b/g, ' ');
