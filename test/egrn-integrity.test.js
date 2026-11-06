@@ -17,7 +17,8 @@ function gate() {
 async function fixture(options = {}) {
   const { PGlite } = require(process.env.PGLITE_TEST_MODULE);
   const db = new PGlite(), calls = { paid: 0, status: [], documents: [], copies: [], messages: [] };
-  let tail = Promise.resolve(), poll;
+  let tail = Promise.resolve(), poll, clockOffset = 0;
+  class Clock extends Date { static now() { return Date.now() + clockOffset; } }
   const pool = {
     async connect() {
       const before = tail, next = gate(); tail = next.promise; await before;
@@ -31,8 +32,8 @@ async function fixture(options = {}) {
   };
   const actions = [], commands = [];
   const sandbox = {
-    module: { exports: {} }, Buffer, AbortSignal, URL, Date,
-    process: { env: { EGRN_TOKEN: 'synthetic', EGRN_DECLARANT_ID: '1', EGRN_CHAT_ID: '-100123', ADMIN_TG_IDS: '111' } },
+    module: { exports: {} }, Buffer, AbortSignal, URL, Date: Clock,
+    process: { env: { EGRN_TOKEN: 'synthetic', EGRN_DECLARANT_ID: '1', EGRN_CHAT_ID: '-100123', ADMIN_TG_IDS: options.adminIDs || '111' } },
     console: { log() {}, error() {} }, setTimeout(fn) { poll = fn; }, setInterval() {},
     require(name) {
       if (name === '../db/pool') return pool;
@@ -66,6 +67,8 @@ async function fixture(options = {}) {
     'INSERT INTO egrn_orders(cad_num,type_doc,id_statement,status,status_text,chat_id,ordered_by,status_msg_id,deliver,file_msgs,files_sent) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
     [cad, 'kvarmrusxmlpdf', id, status, 'В работе', -100123, 111, card, JSON.stringify(targets), JSON.stringify(files), filesSent])).rows[0];
   return { db, pool, calls, api, actions, commands, telegram, add, budget: require('../src/bot/egrn-budget').createEgrnBudget({pool}), poll: () => poll(), anotherPoller() { api.setupEgrn(bot); const run = poll; return run; },
+    advanceClock(ms) { clockOffset += ms; },
+    restartCommands() { const start = commands.length; api.setupEgrn(bot); return commands.slice(start); },
     row: async id => (await pool.query('SELECT * FROM egrn_orders WHERE id=$1', [id])).rows[0],
     attach: (chat = 111, extra = {}) => api.attachOrOrder({ cad: CAD, order: true, orderedBy: chat, targets: [{ chat }], ...extra }),
     close: () => db.close() };
@@ -182,6 +185,28 @@ test('private admin topups accept arbitrary amounts and repeat Telegram update I
     const ctx={chat:{id:111,type:'private'},from:{id:111},message:{message_id:51,text:'/egrn_topup 2500,50'},reply:async text=>replies.push(text)};
     await handler({...ctx,from:{id:222}});await handler({...ctx,chat:{id:-100123,type:'supergroup'}});assert.equal((await h.budget.snapshot()).recordedTopupsKopecks,0);
     await handler(ctx);await handler(ctx);assert.equal((await h.budget.snapshot()).recordedTopupsKopecks,250050);assert.ok(replies.every(text=>/По учтённым пополнениям/.test(text)));assert.equal(h.calls.paid,0);
+  }finally{await h.close();}
+});
+
+test('balance commands require a recent private per-admin review and reject an intervening accepted order or credit', pg, async()=>{
+  const h=await fixture({adminIDs:'111,222'});try{
+    const command=name=>h.commands.find(c=>c.name===name).handler,replies=[];
+    const ctx=(text,id,uid=111)=>({chat:{id:uid,type:'private'},from:{id:uid},message:{message_id:id,text},reply:async message=>replies.push(message)});
+    await command('egrn_balance')(ctx('/egrn_balance 4711',50));assert.match(replies.at(-1),/Сначала.*\/egrn_budget/);assert.equal((await h.budget.snapshot()).balanceKnown,false);
+    await command('egrn_budget')(ctx('/egrn_budget',51));await command('egrn_balance')(ctx('/egrn_balance 4711',51,222));assert.match(replies.at(-1),/Сначала.*\/egrn_budget/);await h.attach();await command('egrn_balance')(ctx('/egrn_balance 4711',52));assert.match(replies.at(-1),/Учёт изменился/);assert.equal((await h.budget.snapshot()).balanceKnown,false);
+    await command('egrn_budget')(ctx('/egrn_budget',53));await h.budget.topup('1000',{sourceKey:'intervening-credit',actorId:111});await command('egrn_balance')(ctx('/egrn_balance 4711',54));assert.match(replies.at(-1),/Учёт изменился/);assert.equal((await h.budget.snapshot()).balanceKnown,false);
+    await command('egrn_budget')(ctx('/egrn_budget',55));h.advanceClock(5*60*1000);await command('egrn_balance')(ctx('/egrn_balance 4711',56));assert.match(replies.at(-1),/Сначала.*\/egrn_budget/);assert.equal((await h.budget.snapshot()).balanceKnown,false);assert.equal(h.calls.paid,1);
+  }finally{await h.close();}
+});
+
+test('a guarded balance records once, exact Telegram replay survives a changed snapshot and restart requires a new review for new messages', pg, async()=>{
+  const h=await fixture();try{
+    const command=name=>h.commands.find(c=>c.name===name).handler,replies=[];
+    const ctx=(text,id)=>({chat:{id:111,type:'private'},from:{id:111},message:{message_id:id,text},reply:async message=>replies.push(message)});
+    await command('egrn_budget')(ctx('/egrn_budget',61));const accepted=ctx('/egrn_balance 4711',62);await command('egrn_balance')(accepted);assert.match(replies.at(-1),/Сверка остатка записана/);assert.equal((await h.budget.snapshot()).balanceKopecks,471100);
+    await h.budget.topup('1000',{sourceKey:'later-credit',actorId:111});await h.attach();await command('egrn_balance')(accepted);assert.equal((await h.budget.snapshot()).balanceKopecks,558200);
+    const restarted=h.restartCommands(),balance=restarted.find(c=>c.name==='egrn_balance').handler;await balance(ctx('/egrn_balance 4711',63));assert.match(replies.at(-1),/Сначала.*\/egrn_budget/);assert.equal((await h.budget.snapshot()).balanceKopecks,558200);
+    await balance(accepted);assert.match(replies.at(-1),/Сверка остатка записана/);assert.equal((await h.budget.snapshot()).balanceKopecks,558200);assert.equal(h.calls.paid,1);
   }finally{await h.close();}
 });
 

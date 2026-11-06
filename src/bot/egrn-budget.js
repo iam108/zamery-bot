@@ -1,5 +1,7 @@
 'use strict';
 
+const { createHash } = require('node:crypto');
+
 // This is a record of the shared provider account, never a payment API.
 const DDL = `
   CREATE TABLE IF NOT EXISTS egrn_budget_accounts (
@@ -57,6 +59,14 @@ function parseAmount(value, { allowZero = false } = {}) {
   return kopecks;
 }
 function rubles(kopecks) { const value = BigInt(kopecks), absolute = value < 0n ? -value : value; return (value < 0n ? '−' : '') + absolute / 100n + ',' + String(absolute % 100n).padStart(2, '0') + ' ₽'; }
+function snapshotRevision(value) {
+  return createHash('sha256').update(JSON.stringify([
+    value.account, value.priceKopecks, value.confirmedOrders, value.historicalOrders,
+    value.pendingOrders, value.reservedKopecks, value.recordedTopupsKopecks,
+    value.balanceKnown, value.balanceKopecks, value.trackedNetKopecks, value.trackedAvailableKopecks,
+    new Date(value.trackingStartedAt).toISOString(),
+  ])).digest('hex');
+}
 function describe(value) {
   const lines = ['Заказано выписок: ' + value.confirmedOrders + '.'];
   if (value.balanceKnown) lines.push('Расчётно осталось: ' + value.remainingOrders + ' (доступно ' + rubles(value.availableKopecks) + ').');
@@ -168,6 +178,10 @@ function createEgrnBudget(options = {}) {
         return read(client);
       }
       const before = await read(client);
+      if (kind === 'balance' && context.expectedSnapshot !== undefined) {
+        if (typeof context.expectedSnapshot !== 'string') throw error('EGRN_BUDGET_REVIEW_REQUIRED', 'Сначала прочитайте актуальный учёт командой /egrn_budget, затем повторите сверку остатка.', 409);
+        if (context.expectedSnapshot !== snapshotRevision(before)) throw error('EGRN_BUDGET_SNAPSHOT_CHANGED', 'Учёт изменился после просмотра. Снова выполните /egrn_budget и проверьте сумму перед сверкой остатка.', 409);
+      }
       if (kind === 'balance' && before.pendingOrders) throw error('EGRN_BUDGET_PENDING', 'Сначала подтвердите результат ' + before.pendingOrders + ' заказов у поставщика, затем повторите сверку баланса.', 409);
       safe(BigInt(before.recordedTopupsKopecks) + BigInt(kind === 'topup' ? kopecks : 0));
       const next = kind === 'balance' ? kopecks : current.balance_kopecks == null ? null : safe(BigInt(current.balance_kopecks) + BigInt(kopecks));
@@ -192,4 +206,4 @@ function createEgrnBudget(options = {}) {
     async reconcile(order, provider) { return provider == null ? this.reject(order) : this.accept(order, provider); },
     topup: (amount, context) => event('topup', amount, context), syncBalance: (amount, context) => event('balance', amount, context) };
 }
-module.exports = { DDL, createEgrnBudget, parseAmount, describe };
+module.exports = { DDL, createEgrnBudget, parseAmount, describe, snapshotRevision };

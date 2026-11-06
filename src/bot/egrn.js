@@ -680,6 +680,7 @@ function setupEgrn(bot) {
   });
 
   // These commands record the provider account; they never transfer money.
+  const budgetReviews = new Map();
   function budgetAdmin(ctx) {
     return ctx.chat?.type === 'private' && String(process.env.ADMIN_TG_IDS || '').split(/[\s,;]+/).includes(String(ctx.from?.id));
   }
@@ -691,9 +692,17 @@ function setupEgrn(bot) {
       if (!Number.isSafeInteger(ctx.message.message_id) || ctx.message.message_id < 1) return ctx.reply('Не удалось определить номер сообщения. Отправьте команду отдельным сообщением.');
       try {
         await ensureTables();
-        const snapshot = await budget()[operation](match[1], { actorId: ctx.from.id, sourceKey: 'telegram:' + ctx.chat.id + ':' + ctx.message.message_id });
+        const context = { actorId: ctx.from.id, sourceKey: 'telegram:' + ctx.chat.id + ':' + ctx.message.message_id };
+        if (operation === 'syncBalance') {
+          const reviewed = budgetReviews.get(String(ctx.from.id)), age = reviewed ? Date.now() - reviewed.at : -1;
+          context.expectedSnapshot = age >= 0 && age < 5 * 60 * 1000 ? reviewed.revision : null;
+        }
+        const snapshot = await budget()[operation](match[1], context);
         return ctx.reply((operation === 'topup' ? 'Пополнение учтено: ' : 'Сверка остатка записана: ') + match[1] + ' ₽.\n' + budget().describe(snapshot));
-      } catch (failure) { return ctx.reply(failure.status ? failure.message : 'Не удалось подтвердить запись. Проверьте /egrn_budget перед повторной командой.'); }
+      } catch (failure) {
+        if (failure.code === 'EGRN_BUDGET_SNAPSHOT_CHANGED' || failure.code === 'EGRN_BUDGET_REVIEW_REQUIRED') budgetReviews.delete(String(ctx.from.id));
+        return ctx.reply(failure.status ? failure.message : 'Не удалось подтвердить запись. Проверьте /egrn_budget перед повторной командой.');
+      }
     });
   }
   bot.command('egrn_budget', async function (ctx) {
@@ -702,7 +711,9 @@ function setupEgrn(bot) {
       await ensureTables();
       const snapshot = await budget().snapshot(), history = await budget().previewHistory();
       const range = history.fromDate ? new Date(history.fromDate).toLocaleDateString('ru-RU', { timeZone: 'Europe/Moscow' }) + ' — ' + new Date(history.toDate).toLocaleDateString('ru-RU', { timeZone: 'Europe/Moscow' }) : 'даты не сохранены';
-      return ctx.reply(budget().describe(snapshot) + '\n\nДо начала учёта: ' + history.confirmedOrders + ' подтверждённых заказов (' + range + '). Оценка по текущей цене: ' + (history.estimatedKopecks / 100).toFixed(2) + ' ₽; это не подтверждение списаний. Неопределённых старых заказов: ' + history.unknownOrders + '. Старое пополнение автоматически не добавлено.');
+      const result = await ctx.reply(budget().describe(snapshot) + '\n\nДо начала учёта: ' + history.confirmedOrders + ' подтверждённых заказов (' + range + '). Оценка по текущей цене: ' + (history.estimatedKopecks / 100).toFixed(2) + ' ₽; это не подтверждение списаний. Неопределённых старых заказов: ' + history.unknownOrders + '. Старое пополнение автоматически не добавлено.');
+      budgetReviews.set(String(ctx.from.id), { revision: require('./egrn-budget').snapshotRevision(snapshot), at: Date.now() });
+      return result;
     } catch (_) { return ctx.reply('Учёт временно недоступен. Повторите позднее; платный заказ не создавался.'); }
   });
 
