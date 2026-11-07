@@ -39,7 +39,6 @@ async function tgRetry(fn) {
 async function handleAuditReport(ctx, data) {
   data = normalizeWorkflow(data);
   validateInspection(data);
-  validateWorkflow(data);
   const mediaLimit = data.schema_version === 3 ? 60 : 10;
   if (data.photos && (!Array.isArray(data.photos) || data.photos.length > mediaLimit ||
     data.photos.some(function (p) { return !p || typeof p.data !== 'string' || !p.data; }))) {
@@ -66,10 +65,14 @@ async function handleAuditReport(ctx, data) {
     if (progress.signature !== legacySignature) throw new Error('Этот отчёт уже начал отправляться. Повторите без изменений или откройте новую форму для нового отчёта.');
     progress.signature = signature;
   }
+  // Only an exactly matched former checkpoint may retain its validation
+  // contract. Request fields cannot enable this path for a fresh report.
+  const legacyDelivery = !!progress && progress.signature === signature && (progress.deliveryVersion == null || [1, 2].includes(progress.deliveryVersion));
+  validateWorkflow(data, { legacyDelivery });
   if (!progress) {
-    progress = { signature, ...(data.ui_version === 5 ? { deliveryVersion: 2 } : {}), textIds: [], photoIds: [], documentIds: [], saved: false, handoffSent: false, orderCardLinked: false, replied: false, job: null };
+    progress = { signature, ...(data.ui_version === 5 ? { deliveryVersion: 3 } : {}), textIds: [], photoIds: [], documentIds: [], saved: false, handoffSent: false, orderCardLinked: false, replied: false, job: null };
   }
-  if (progress.deliveryVersion != null && ![1, 2].includes(progress.deliveryVersion)) throw new Error('Неизвестный формат доставки отчёта. Отправка остановлена, чтобы не потерять материалы.');
+  if (progress.deliveryVersion != null && ![1, 2, 3].includes(progress.deliveryVersion)) throw new Error('Неизвестный формат доставки отчёта. Отправка остановлена, чтобы не потерять материалы.');
   if (key && !seenSubmits.has(key)) {
       seenSubmits.set(key, progress);
       const timer = setTimeout(function () { seenSubmits.delete(key); }, 30 * 60 * 1000);
@@ -78,13 +81,13 @@ async function handleAuditReport(ctx, data) {
   if (key) seenSubmits.set(key, progress);
   progress.documentIds = progress.documentIds || [];
   if (progress.job) return progress.job;
-  const job = handleAuditReportInner(ctx, data, progress);
+  const job = handleAuditReportInner(ctx, data, progress, { legacyDelivery });
   progress.job = job;
   job.catch(function () { if (progress.job === job) progress.job = null; });
   return job;
 }
 
-async function handleAuditReportInner(ctx, data, progress) {
+async function handleAuditReportInner(ctx, data, progress, validationOptions) {
   validateInspection(data);
   function unknownDelivery() {
     const { id: cursor, stage, index, count } = progress.inflight || {};
@@ -161,14 +164,15 @@ async function handleAuditReportInner(ctx, data, progress) {
 
   // Unversioned durable checkpoints must finish in the exact former order.
   // Persist the new order before Telegram can acknowledge its first message.
-  const presentation = data.ui_version === 5 && progress.deliveryVersion === 2;
+  const presentation = data.ui_version === 5 && [2, 3].includes(progress.deliveryVersion);
+  const albumFirst = presentation && progress.deliveryVersion === 3;
   if (presentation) await checkpoint();
 
   var text;
   var plain;
   if (presentation) {
-    const summary = require('./audit-summary').buildAuditSummary(data, actor || 'аудитор');
-    text = summary.html;
+    const summaries = require('./audit-summary'), summary = summaries.buildAuditSummary(data, actor || 'аудитор');
+    text = albumFirst ? summaries.buildAuditBrief(data, actor || 'аудитор').html : summary.html;
     plain = [summary.plain];
   } else {
 
@@ -197,7 +201,7 @@ async function handleAuditReportInner(ctx, data, progress) {
   var inspectionReport = buildInspectionReport(data);
   lines.push.apply(lines, inspectionReport.html);
   plain.push.apply(plain, inspectionReport.plain);
-  const workflowReport = buildWorkflowReport(data);
+  const workflowReport = buildWorkflowReport(data, validationOptions);
   lines.push.apply(lines, workflowReport.html);
   plain.push.apply(plain, workflowReport.plain);
 
@@ -275,7 +279,10 @@ async function handleAuditReportInner(ctx, data, progress) {
   if (data.order_id) {
     try {
       const order = await getOrderById(data.order_id);
-      if (order && order.telegram_msg_id) replyToMsgId = order.telegram_msg_id;
+      if (order && order.telegram_msg_id) {
+        const raw = order.telegram_msg_id, id = Number(raw);
+        replyToMsgId = albumFirst ? (typeof raw === 'number' || typeof raw === 'string' && /^[1-9]\d*$/.test(raw)) && Number.isSafeInteger(id) && id > 0 ? id : null : raw;
+      }
     } catch(e) {
       console.error('getOrderById error:', e.message);
     }
@@ -284,16 +291,20 @@ async function handleAuditReportInner(ctx, data, progress) {
   var tg = ctx.telegram;
   var textParts = splitTelegramHtml(text);
   if (progress.textIds.length > textParts.length) throw unconfirmedReceipt();
-  for (let i = progress.textIds.length; i < textParts.length; i++) {
-    await sendPart('summary', i, 1, function () { return tg.sendMessage(GROUP_ID, textParts[i], {
-      parse_mode: 'HTML', reply_to_message_id: replyToMsgId || undefined, allow_sending_without_reply: true,
-      ...(presentation ? { link_preview_options: { is_disabled: true } } : {}),
-    }); }, 'textIds');
+  async function sendSummary() {
+    for (let i = progress.textIds.length; i < textParts.length; i++) {
+      await sendPart('summary', i, 1, function () { return tg.sendMessage(GROUP_ID, textParts[i], {
+        parse_mode: 'HTML', reply_to_message_id: replyToMsgId || (albumFirst ? progress.photoIds[0] : undefined), allow_sending_without_reply: true,
+        ...(presentation ? { link_preview_options: { is_disabled: true } } : {}),
+      }); }, 'textIds');
+    }
   }
+  if (!albumFirst) await sendSummary();
 
   const mediaPacket = presentation ? presentationMedia(data, { summaryText: plain.join('\n') }) : deliveryMedia(data);
   const photos = mediaPacket.photos;
-  const documents = mediaPacket.documents;
+  const reportNumber = String(data.order_id || 'аудит').replace(/[^a-zа-яё\d_-]/ig, '_').slice(0, 30);
+  const documents = albumFirst ? [{ name: 'Отчёт-' + reportNumber + '-полный.txt', mime: 'text/plain', source: Buffer.from(plain.join('\n'), 'utf8'), caption: 'Полный отчёт аудитора' + (data.order_id ? ' · заявка #' + data.order_id : '') + '\nВсе записанные ответы и замечания.' }, ...mediaPacket.documents] : mediaPacket.documents;
   if (progress.photoIds.length > photos.length || progress.documentIds.length > documents.length) throw unconfirmedReceipt();
   function invalidPhoto(error) {
     return error.response?.error_code === 400 &&
@@ -304,7 +315,7 @@ async function handleAuditReportInner(ctx, data, progress) {
   }
   async function sendPreview(photo) {
     const options = { caption: photoCaption(photo, data.order_id, presentation ? data : undefined),
-      reply_to_message_id: progress.textIds[0], allow_sending_without_reply: true };
+      reply_to_message_id: albumFirst ? replyToMsgId || undefined : progress.textIds[0], allow_sending_without_reply: true };
     try { return await sendPart('photos', progress.photoIds.length, 1, () => tg.sendPhoto(GROUP_ID, { source: previewSource(photo) }, options), 'photoIds'); }
     catch (error) {
       if (!invalidPhoto(error)) throw error;
@@ -323,7 +334,7 @@ async function handleAuditReportInner(ctx, data, progress) {
             const media = batch.map(photo => ({ type: 'photo', media: { source: previewSource(photo) },
               caption: photoCaption(photo, data.order_id, presentation ? data : undefined) }));
             await sendPart('photos', offset, batch.length, () => tg.sendMediaGroup(GROUP_ID, media,
-              { reply_to_message_id: progress.textIds[0], allow_sending_without_reply: true }), 'photoIds');
+              { reply_to_message_id: albumFirst ? replyToMsgId || undefined : progress.textIds[0], allow_sending_without_reply: true }), 'photoIds');
           } catch (error) {
             if (!invalidPhoto(error)) throw error;
             // A rejected photo album has no receipts. Deliver each original
@@ -338,9 +349,11 @@ async function handleAuditReportInner(ctx, data, progress) {
     } catch (error) {
       console.error('audit photos:', error.code || error.response?.error_code || error.name || 'error');
       if (error.code === 'AUDIT_DELIVERY_RECEIPT' || error.code === 'AUDIT_DELIVERY_UNKNOWN') throw error;
-      throw new Error('Текст отчёта отправлен, но доставка фотографий не подтверждена. Проверьте чат и повторите отправку — подтверждённый текст не продублируется.');
+      throw new Error(albumFirst ? 'Доставка фотографий не завершена. Повторите отправку без изменений — подтверждённые материалы сохраняются, итог ещё не отправлен.' : 'Текст отчёта отправлен, но доставка фотографий не подтверждена. Проверьте чат и повторите отправку — подтверждённый текст не продублируется.');
     }
   }
+
+  if (albumFirst) await sendSummary();
 
   if (documents.length) {
     try {
@@ -379,7 +392,9 @@ async function handleAuditReportInner(ctx, data, progress) {
     const links = [];
     const video = Object.hasOwn(data.workflow || {}, 'video_url') ? data.workflow.video_url : data.video_url;
     if (video) links.push({ text: '▶ Видео на Диске', url: video });
-    const originals = telegramMessageUrl(GROUP_ID, progress.documentIds[0]);
+    const fullReport = albumFirst && telegramMessageUrl(GROUP_ID, progress.documentIds[0]);
+    if (fullReport) links.push({ text: '📄 Полный отчёт', url: fullReport });
+    const originals = telegramMessageUrl(GROUP_ID, progress.documentIds[albumFirst ? 1 : 0]);
     if (originals) links.push({ text: '📎 Оригиналы', url: originals });
     if (links.length) keyboard.push(links);
     if (data.order_id) keyboard.push([{ text: '⚖️ Передать юристу', callback_data: 'handoff:' + data.order_id }]);

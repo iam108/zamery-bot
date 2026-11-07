@@ -144,6 +144,7 @@ test('known Telegram file size must match downloaded bytes before storage or pub
 }));
 
 async function managerSave(h) {
+  await h.db.exec("CREATE TABLE IF NOT EXISTS staff(tg_id BIGINT PRIMARY KEY,name TEXT,role TEXT,approved BOOLEAN); INSERT INTO staff VALUES(108,'Author','manager',true) ON CONFLICT(tg_id) DO NOTHING;");
   await h.db.exec("ALTER TABLE orders ADD COLUMN IF NOT EXISTS object_type TEXT; ALTER TABLE orders ADD COLUMN IF NOT EXISTS has_video BOOLEAN; ALTER TABLE orders ADD COLUMN IF NOT EXISTS zones_info TEXT; ALTER TABLE orders ADD COLUMN IF NOT EXISTS deadline DATE; ALTER TABLE orders ADD COLUMN IF NOT EXISTS contacts TEXT; CREATE TABLE IF NOT EXISTS logs(order_id INT,action TEXT,actor TEXT,details TEXT); UPDATE orders SET owner_name='Client',object_type='Общепит алкоголь',service='Получение' WHERE id=58;");
   const originals=require('../src/web/order-materials'),materials={...originals,ensureOrderMaterials:h.store.ensure,saveOrderMaterials:h.store.save,saveOrderMaterialsInTransaction:h.store.saveInTransaction,listOrderMaterials:h.store.list,markOrderMaterialDelivered:h.store.delivered};
   const context=vm.createContext({module:{exports:{}},require(name){if(name==='./pool')return h.pool;if(name==='../web/order-materials')return materials;throw new Error(name);}});

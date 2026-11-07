@@ -463,7 +463,8 @@
     territoryIssues(add,false);
     [['floor_plan','Этаж на плане'],['floor_actual','Фактический этаж'],['cadastral_count','Количество кадастров'],['rooms_complete','Входит ли вся площадь по плану в объект'],['within_cadastral','Границы помещения'],['kkt_count','Количество касс'],['kkt_ip','Наличие кассы ИП']].forEach(function(pair){if(!p[pair[0]])add(pair[0],'Укажите: '+pair[1].toLowerCase(),1);});
     if(p.cadastral_count&&!/^[1-9]\d?$/.test(p.cadastral_count))add('cadastral_count','Количество кадастров: целое число от 1 до 99',1);
-    if(p.floor_plan&&p.floor_actual&&String(p.floor_plan).trim().toLowerCase().replace(/этаж/g,'').replace(/\s+/g,' ').trim()!==String(p.floor_actual).trim().toLowerCase().replace(/этаж/g,'').replace(/\s+/g,' ').trim())add('floor-mismatch','Этаж на плане и фактический этаж отличаются',1);
+    if(p.floor_plan&&p.floor_actual&&p.floor_plan!=='Не проверено'&&p.floor_actual!=='Не проверено'&&String(p.floor_plan).trim().toLowerCase().replace(/этаж/g,'').replace(/\s+/g,' ').trim()!==String(p.floor_actual).trim().toLowerCase().replace(/этаж/g,'').replace(/\s+/g,' ').trim())add('floor-mismatch','Этаж на плане и фактический этаж отличаются',1);
+    ['floor_plan','floor_actual'].forEach(function(key){if(p[key]==='Не проверено')add('unverified:'+key,key==='floor_plan'?'Этаж на плане не проверен':'Фактический этаж не проверен',1);});
     if(isRenewal()&&state.data.workflow.archive_skipped!=='Да'){
       if(p.archive_match==='Нет')add('archive-mismatch','Есть расхождения с архивом',1);
       if(!p.archive_match||p.archive_match==='Не проверено')add('archive-unchecked','Сверка с архивом не выполнена',1);
@@ -501,7 +502,44 @@
     else if(state.packet&&(state.packet.video_required||state.packet.has_video))required=required.concat(tasks.filter(function(task){return task.key==='video';}));
     return required;
   }
-  function tasksHtml(tasks) { return '<div class="task-list">' + tasks.map(function (t) { return '<div class="task"><div class="task-main"><p>' + esc(t.title) + '</p>' + (t.detail ? '<small>' + esc(t.detail) + '</small>' : '') + '</div><button type="button" data-go-step="' + t.step + '">'+(['Территория →','Помещение →','Отчёт →'][t.step]||'Открыть')+'</button></div>'; }).join('') + '</div>'; }
+  function taskDetails(task) {
+    var aliases={changes:'plan-mismatch','archive-skip':'archive-skipped',alcohol:'alcohol-unknown',tobacco_display:'tobacco-display',tobacco_price_list:'tobacco-prices',tobacco_advertising:'tobacco-ads'};
+    var id=aliases[task.key]||task.key,p=state.data.inspection;
+    var paths={packet:!p.org?'inspection.org':!p.address?'inspection.address':'inspection.service',building:'building_type',floor_plan:'inspection.floor_plan',floor_actual:'inspection.floor_actual',cadastral_count:'inspection.cadastral_count',rooms_complete:'inspection.rooms_complete',within_cadastral:'inspection.within_cadastral',kkt_count:'inspection.kkt_count',kkt_ip:'inspection.kkt_ip',inter:'inspection.inter_cadastral_boundary',plan:'plan.annotations',to:'to',compare:'bti',note:'inspection.plan_note',archive:'workflow.archive_skipped',video:'workflow.video_url','video-url':'workflow.video_url',territory:'workflow.territory_result','map-mode':'map.mode',map:'map.evidence_id',organizations:'zones',entrances:'entrances',conclusion:'conclusion'};
+    var control=paths[task.key]||'';
+    var entrance=state.data.entrances.find(function(e){return task.key==='entrance-'+e.id||task.key==='photo-'+e.id||task.key==='entrance-name-'+e.id;});
+    var zone=state.data.zones.find(function(z){return ['zone-','photo-','name-','zone-status-','source-','resolution-','measure-entrance-','measure-distance-'].some(function(prefix){return task.key===prefix+z.id;});});
+    if(entrance){control=task.key==='photo-'+entrance.id?'evidence.entrance.'+entrance.id:'entrances.'+entrance.id+(task.key==='entrance-name-'+entrance.id?'.label':'.access');id=task.key==='entrance-'+entrance.id?'entrance:'+entrance.id:'required:'+control;}
+    if(zone){var prefix=task.key.slice(0,-String(zone.id).length);control=prefix==='photo-'?'evidence.zone.'+zone.id:'zones.'+zone.id+({ 'name-':'.name','source-':'.source','resolution-':'.resolution','measure-entrance-':'.entrance_id','measure-distance-':'.dist' }[prefix]||'.status');id=prefix==='zone-'?'zone:'+zone.id:prefix==='measure-distance-'&&zone.dist==='Не проверено'?'zone-distance:'+zone.id:'required:'+control;}
+    if(control&&!entrance&&!zone)id='required:'+control;
+    if(/^tobacco_/.test(task.key)&&!p[task.key])id='required:inspection.'+task.key;
+    if(task.key==='video'&&state.data.workflow.video_url)id='video-status';
+    if(task.key==='tobacco'){id=p.tobacco_display==='Открытая'?'tobacco-display':p.tobacco_price_list==='Нет'?'tobacco-prices':'tobacco-ads';}
+    var rules=typeof window==='object'&&window.AuditReportIssues;
+    var detail=rules&&rules.describe(state.data,{id:id,label:task.title});
+    return detail||{id:id,reason:task.title,control:control,step:task.step,kind:requiredIssues([task]).some(function(t){return t.key===task.key;})?'missing_required':'unverified'};
+  }
+  function tasksHtml(tasks) { return '<div class="task-list">' + tasks.map(function (t) { var d=taskDetails(t);return '<div class="task" data-report-issue="'+esc(d.id)+'"><div class="task-main"><p>'+esc(d.reason||t.title)+'</p>'+(t.detail?'<small>'+esc(t.detail)+'</small>':'')+'</div><button type="button" data-go-step="'+t.step+'" data-issue-control="'+esc(d.control||'')+'">'+(d.control?'Проверить ответ':'Открыть раздел')+'</button></div>'; }).join('') + '</div>'; }
+  async function goIssue(control,index) {
+    await go(index);
+    if(step()!==index)return;
+    var path=control;
+    ['entrances','zones'].forEach(function(list){state.data[list].some(function(item,i){var prefix=list+'.'+item.id+'.';if(path.indexOf(prefix)!==0)return false;path=list+'.'+i+'.'+path.slice(prefix.length);return true;});});
+    var controls=Array.from(root.querySelectorAll('[data-bind],[data-choice]'));
+    var matching=controls.filter(function(node){return node.dataset.bind===path||node.dataset.choice===path;});
+    var target=matching.find(function(node){return node.getAttribute('aria-pressed')==='true';})||matching[0];
+    if(!target&&/^evidence\.(entrance|zone)\./.test(control)){var parts=control.split('.'),subject=parts.slice(2).join('.');target=Array.from(root.querySelectorAll('[data-upload-role]')).find(function(node){return node.dataset.uploadRole===parts[1]&&node.dataset.uploadSubject===subject;});if(target)target=target.closest('.upload-control');}
+    if(!target&&/^plan\./.test(control))target=root.querySelector('#plan-editor button');
+    if(!target&&/^(zones|entrances)\./.test(control))target=root.querySelector('#map-editor .ape-viewport')||root.querySelector('#map-editor button');
+    if(!target&&/^map\./.test(control)){target=root.querySelector('#map-editor button')||root.querySelector('[data-territory-upload]');if(target&&target.matches('input'))target=target.closest('.upload-control');if(!target)target=root.querySelector('[data-choice="map.mode"]');}
+    if(!target&&control==='workflow.archive_skipped')target=root.querySelector('[data-skip-archive]');
+    if(!target)target=root.querySelector('.step-heading');
+    if(!target)return;
+    root.querySelectorAll('[data-report-target]').forEach(function(node){node.removeAttribute('data-report-target');});
+    var group=target.closest('.choice-field,.field,.upload-control')||target;group.setAttribute('data-report-target','');
+    if(!target.matches('button,input,select,textarea,a,[tabindex]'))target.setAttribute('tabindex','-1');
+    target.scrollIntoView({block:'center',behavior:'auto'});target.focus({preventScroll:true});
+  }
   function offersActions(tasks) {
     if(state.data.object_category==='other')return false;
     var outcome=state.data.workflow.conclusion_status;
@@ -514,7 +552,7 @@
   }
   function bindReportFeedback(scope) {
     scope.querySelectorAll('[data-conclusion-choice]').forEach(function(button){button.onclick=function(){chooseConclusion(button.dataset.conclusionChoice);};});
-    scope.querySelectorAll('[data-go-step]').forEach(function(button){button.onclick=function(){go(Number(button.dataset.goStep));};});
+    scope.querySelectorAll('[data-go-step]').forEach(function(button){button.onclick=function(){return goIssue(button.dataset.issueControl||'',Number(button.dataset.goStep));};});
   }
   function refreshReportFeedback() {
     var area=$('#report-feedback');if(!area)return;
@@ -548,7 +586,7 @@
   function reportStep(){
     if(state.data.object_category==='other')return genericReportStep();
     var tasks=issues(),actions=offersActions(tasks);
-    return heading(2)+'<div class="fields">'+select('Результат','workflow.conclusion_status',[{value:'ready',label:'Соответствует по проверенным пунктам'},{value:'actions',label:'Нужны действия'},{value:'insufficient',label:'Нужно уточнить'},{value:'obstacle',label:'Есть препятствие'}],'',true)+input('Комментарий аудитора · необязательно','conclusion',{type:'textarea',wide:true,maxlength:6000})+input('Клиент сообщил / договорённости','workflow.followup_notes',{type:'textarea',wide:true,maxlength:2000})+input((state.packet&&(state.packet.video_required||state.packet.has_video))?'Видео в Яндекс Диске':'Видео · необязательно','workflow.video_url',{type:'url',maxlength:2000,placeholder:'https://disk.yandex.ru/d/…'})+(state.data.workflow.video_url?select('Доступность видео','inspection.video_status',['Сделано','Снято — загрузить позже','Не сделано','Не проверено']):'')+input('Дата осмотра','inspection.visit_date',{type:'date'})+'</div>'+reportPreview()+reportFeedback(tasks)+
+    return heading(2)+'<div class="fields">'+select('Результат','workflow.conclusion_status',[{value:'ready',label:'Соответствует по проверенным пунктам'},{value:'actions',label:'Нужны действия'},{value:'insufficient',label:'Нужно уточнить'},{value:'obstacle',label:'Есть препятствие'}],'',true)+'</div>'+reportFeedback(tasks)+'<div class="fields">'+input('Комментарий аудитора · необязательно','conclusion',{type:'textarea',wide:true,maxlength:6000})+input('Клиент сообщил / договорённости','workflow.followup_notes',{type:'textarea',wide:true,maxlength:2000})+input((state.packet&&(state.packet.video_required||state.packet.has_video))?'Видео в Яндекс Диске':'Видео · необязательно','workflow.video_url',{type:'url',maxlength:2000,placeholder:'https://disk.yandex.ru/d/…'})+(state.data.workflow.video_url?select('Доступность видео','inspection.video_status',['Сделано','Снято — загрузить позже','Не сделано','Не проверено']):'')+input('Дата осмотра','inspection.visit_date',{type:'date'})+'</div>'+reportPreview()+
       '<p class="field-note" id="submit-outcome"'+(actions?'':' hidden')+'>Итог будет «Нужны действия». Ответы и комментарий сохранятся.</p>'+
       '<button type="button" class="button primary full" id="submit-audit" aria-describedby="submit-outcome">'+(actions?'Отправить с замечаниями':'Отправить отчёт')+'</button><button type="button" class="button secondary full" id="retry-unknown-delivery" hidden>Повторить неподтверждённую часть</button><p class="field-note" id="submit-status" role="status" aria-live="polite"></p>';
   }
@@ -557,7 +595,9 @@
     if(state.data.object_category!=='tobacco')rows.push(['Алкоголь',p.alcohol_present]);else rows.push(['Табак',[p.tobacco_display,p.tobacco_price_list,p.tobacco_advertising].filter(Boolean).join(' · ')]);
     if(result)rows.push(['Территория',result==='clear'?'Зоны и спорные объекты не выявлены':'Проверено организаций и спорных мест — '+state.data.zones.length],['Входы',state.data.entrances.length]);
     var scheme=result==='findings'||state.frozen&&!result?'схема, ':'';
-    return '<section class="report-preview"><h3>Сообщение юристу</h3><p><strong>'+esc(p.address)+'</strong><br>'+esc(p.service)+' · '+esc(({catering:'Алкоголь · общепит',retail:'Алкоголь · магазин',tobacco:'Табак'})[state.data.object_category]||'')+'</p><dl class="report-facts">'+rows.map(function(r){return '<div><dt>'+esc(r[0])+'</dt><dd>'+esc(r[1]||'—')+'</dd></div>';}).join('')+'</dl>'+(state.data.workflow.conclusion_status?'<p><strong>Результат:</strong> '+esc(({ready:'Соответствует по проверенным пунктам',actions:'Нужны действия',insufficient:'Нужно уточнить',obstacle:'Есть препятствие'})[state.data.workflow.conclusion_status])+'</p>':'')+(state.data.conclusion?'<p>'+esc(state.data.conclusion)+'</p>':'')+(p.plan_note?'<p><strong>Изменения:</strong> '+esc(p.plan_note)+'</p>':'')+(state.data.workflow.archive_skipped==='Да'?'<p class="warning">Архив не предоставлен. Сверка с архивом не выполнена.</p>':'')+'<p class="field-note">К сообщению прилагаются '+scheme+'размеченные планы, фотографии, оригиналы выезда и ссылка на документы заявки.</p></section>';
+    var review=issues().map(taskDetails),actions=review.filter(function(item){return item.kind==='adverse';}),questions=review.filter(function(item){return item.kind==='unverified';});
+    function briefList(title,items,maximum){if(!items.length)return '';return '<div class="report-brief-section"><h4>'+title+'</h4><ul>'+items.slice(0,maximum).map(function(item){return '<li>'+esc(item.reason)+'</li>';}).join('')+'</ul>'+(items.length>maximum?'<p class="field-note">Ещё '+(items.length-maximum)+' — в полном отчёте.</p>':'')+'</div>';}
+    return '<section class="report-preview"><h3>Краткий итог в Telegram</h3><p><strong>'+esc(p.org)+'</strong><br>'+esc(p.address)+'<br>'+esc(p.service)+' · '+esc(({catering:'Алкоголь · общепит',retail:'Алкоголь · магазин',tobacco:'Табак'})[state.data.object_category]||'')+'</p>'+(state.data.workflow.conclusion_status?'<p class="report-outcome"><strong>'+esc(({ready:'Соответствует по проверенным пунктам',actions:'Нужны действия',insufficient:'Нужно уточнить',obstacle:'Есть препятствие'})[state.data.workflow.conclusion_status])+'</strong></p>':'')+briefList('Замечания / что исправить',actions,3)+briefList('Вопросы юристу',questions,2)+(state.data.conclusion?'<p><strong>Аудитор:</strong> '+esc(state.data.conclusion.length>320?state.data.conclusion.slice(0,320)+'…':state.data.conclusion)+'</p>':'')+'<details class="report-detail"><summary>Все сведения об осмотре</summary><dl class="report-facts">'+rows.map(function(r){return '<div><dt>'+esc(r[0])+'</dt><dd>'+esc(r[1]||'—')+'</dd></div>';}).join('')+'</dl>'+(p.plan_note?'<p><strong>Изменения:</strong> '+esc(p.plan_note)+'</p>':'')+(state.data.conclusion&&state.data.conclusion.length>320?'<p><strong>Комментарий аудитора полностью:</strong> '+esc(state.data.conclusion)+'</p>':'')+'</details><p class="field-note">Сначала '+scheme+'планы и фотографии. Затем краткий итог, полный текст отчёта и оригиналы. Все ответы и комментарии сохраняются полностью.</p></section>';
   }
 
   function normalizeLayout(){if(!state.frozen){state.data.ui_version=5;state.data.inspection.region='МСК';state.data.map=state.data.map||{evidence_id:'',page:1,annotations:[]};state.data.additional_plans=state.data.additional_plans||[];}}
@@ -640,8 +680,8 @@
       control.addEventListener(control.tagName==='SELECT'||control.type==='checkbox'?'change':'input',capture);
       if(rebuild)control.addEventListener('change',rebuildAfterChange);
     });
-    bindRoot.querySelectorAll('[data-go-step]').forEach(function (b) { b.onclick = function () { go(Number(b.dataset.goStep)); }; });
-    bindRoot.querySelectorAll('[data-conclusion-choice]').forEach(function (button) { button.onclick=function(){chooseConclusion(button.dataset.conclusionChoice);}; });
+    bindRoot.querySelectorAll('[data-go-step]').forEach(function(button){button.onclick=function(){return button.dataset.issueControl?goIssue(button.dataset.issueControl,Number(button.dataset.goStep)):go(Number(button.dataset.goStep));};});
+    bindRoot.querySelectorAll('[data-conclusion-choice]').forEach(function(button){button.onclick=function(){chooseConclusion(button.dataset.conclusionChoice);};});
     bindRoot.querySelectorAll('[data-upload-role]').forEach(function (control) { control.onchange = function () { var files = Array.from(control.files || []); uploadFiles(files, control.dataset.uploadRole, control.dataset.uploadSubject).catch(function (error) { notify(error.message); }).finally(function () { control.value = ''; }); }; });
     bindRoot.querySelectorAll('[data-territory-upload]').forEach(function(control){control.onchange=function(){var file=(control.files||[])[0];if(file)uploadTerritoryImage(file,control.dataset.territoryUpload).catch(function(error){notify(error.message);}).finally(function(){control.value='';});};});
     bindRoot.querySelectorAll('[data-open-evidence]').forEach(function (b) { b.onclick = function () { openEvidence(b.dataset.openEvidence); }; });
@@ -1079,6 +1119,8 @@
       refreshChrome();
       if(error.payload&&error.payload.code==='AUDIT_PACKET_CHANGED'&&!state.frozen){
         try{await fetchPacket();render();}catch(packetError){state.packetError=packetError.message;notify(packetError.message);}
+      }else if(error.payload&&error.payload.code==='AUDIT_CONCLUSION_CONFLICT'&&!state.frozen){
+        showReportIssues();
       }else if(error.status===409&&!state.frozen){state.conflict=true;$('#conflict-panel').hidden=false;}
       submitStatus=$('#submit-status');
       if(submitStatus)submitStatus.textContent='Отправка не подтверждена: '+error.message+(state.draft&&state.draft.delivery_unknown?' Сначала проверьте чат; явный повтор может создать дубликаты неподтверждённой части.':state.frozen?' Повторите отправку этой версии без изменений.':' Исправьте замечания и повторите.');

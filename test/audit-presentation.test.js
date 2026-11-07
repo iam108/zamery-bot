@@ -95,7 +95,12 @@ function harness(options = {}) {
       throw new Error('Unexpected handler dependency: ' + name);
     } };
   vm.createContext(context); vm.runInContext(fs.readFileSync(path.join(ROOT, 'audit-handler.js'), 'utf8'), context);
-  return { events, delivered, saves, holder, ctx, send: data => context.module.exports.handleAuditReport(ctx, data) };
+  return { events, delivered, saves, holder, ctx, send: data => {
+    // These fixtures pin the former summary-first contract. Fresh v3 delivery
+    // has its own suite; existing signed/versionless checkpoints stay exact.
+    if (!holder.value.signature) holder.value = { signature: signature(data), deliveryVersion: 2, textIds: [], photoIds: [], documentIds: [], saved: false, handoffSent: false, orderCardLinked: false, replied: false };
+    return context.module.exports.handleAuditReport(ctx, data);
+  } };
 }
 function keyboard(h) { return h.events.filter(e => e.method === 'editMessageReplyMarkup').at(-1)?.args[3]?.inline_keyboard.flat() || []; }
 function onceFailure(target, detail = 'Telegram rejected ' + target) { let hit = false; return async method => { if (method === target && !hit) { hit = true; throw Object.assign(new Error(detail), { response: { error_code: 400, description: detail } }); } }; }

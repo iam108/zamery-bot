@@ -1,12 +1,16 @@
 const pool = require('./pool');
 
-async function createOrder(data, client) {
+function packetAccessDenied() {
+  return Object.assign(new Error('Доступ к сохранению заявки изменился. Откройте форму заново после проверки доступа.'), { status: 403, code: 'ORDER_PACKET_FORBIDDEN' });
+}
+
+async function createOrder(data, client, requiredStaffId = null) {
   if (!client) await require('../web/order-materials').ensureOrderMaterials();
   const connection = client || pool;
   const { rows } = await connection.query(
     `INSERT INTO orders 
       (address, owner_name, object_type, object_name, has_video, zones_info, deadline, contacts, submitted_by, service, cad_num, archive_url, request_submit_id, request_signature)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+     ${requiredStaffId == null ? 'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)' : 'SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14 WHERE EXISTS (SELECT 1 FROM staff WHERE tg_id=$15 AND approved IS TRUE)'}
      ON CONFLICT(submitted_by,request_submit_id) DO NOTHING
      RETURNING *`,
     [
@@ -24,16 +28,18 @@ async function createOrder(data, client) {
       data.archive_url || null,
       data.request_submit_id || null,
       data.request_signature || null,
+      ...(requiredStaffId == null ? [] : [requiredStaffId]),
     ]
   );
   if (rows[0]) return rows[0];
+  if (requiredStaffId != null && !(await connection.query('SELECT tg_id FROM staff WHERE tg_id=$1 AND approved IS TRUE', [requiredStaffId])).rows.length) throw packetAccessDenied();
   const existing = (await connection.query('SELECT * FROM orders WHERE submitted_by=$1 AND request_submit_id=$2', [data.submitted_by, data.request_submit_id])).rows[0];
   if (!existing) throw new Error('Не удалось сохранить заявку.');
   if (existing.request_signature !== data.request_signature) throw new Error('Эта заявка уже сохранена с другими данными. Откройте новую форму для новой заявки.');
   return existing;
 }
 
-async function createOrderWithMaterials(data, prepared) {
+async function createOrderWithMaterials(data, prepared, options = {}) {
   const materials = require('../web/order-materials');
   // Schema setup uses its own connection. Finish it before leasing the single
   // transaction client so this also works when the pool has max: 1.
@@ -41,7 +47,7 @@ async function createOrderWithMaterials(data, prepared) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const order = await createOrder(data, client);
+    const order = await createOrder(data, client, options.requiredStaffId);
     await materials.saveOrderMaterialsInTransaction(client, order.id, prepared);
     await client.query('COMMIT');
     return order;
@@ -86,13 +92,13 @@ async function getOrderById(id) {
   return rows[0] || null;
 }
 
-async function updateOrderPacket(id, data, client) {
+async function updateOrderPacket(id, data, client, requiredStaffId = null) {
   if (!client) await require('../web/order-materials').ensureOrderMaterials();
   const { rows } = await (client || pool).query(`UPDATE orders SET address=$1,owner_name=$2,object_type=$3,object_name=$4,
     has_video=$5,zones_info=$6,deadline=$7,contacts=$8,service=$9,cad_num=$10,archive_url=$11,packet_revision=packet_revision+1
-    WHERE id=$12 RETURNING *`, [data.address, data.owner_name, data.object_type, data.object_name || null,
+    WHERE id=$12${requiredStaffId == null ? '' : " AND EXISTS (SELECT 1 FROM staff WHERE tg_id=$13 AND approved IS TRUE AND (role='manager' OR orders.submitted_by=$13))"} RETURNING *`, [data.address, data.owner_name, data.object_type, data.object_name || null,
     data.has_video || false, data.zones_info || null, data.deadline || null, data.contacts || null,
-    data.service || null, data.cad_num || null, data.archive_url || null, id]);
+    data.service || null, data.cad_num || null, data.archive_url || null, id, ...(requiredStaffId == null ? [] : [requiredStaffId])]);
   return rows[0] || null;
 }
 
@@ -108,6 +114,7 @@ async function updateOrderPacketWithMaterials(id, data, prepared, intent) {
     await client.query('BEGIN');
     const current = (await client.query('SELECT * FROM orders WHERE id=$1 FOR UPDATE', [id])).rows[0];
     if (!current) throw fail('Заявка не найдена.', 404, 'ORDER_NOT_FOUND');
+    if (intent.requiredStaffId != null && !(await client.query("SELECT tg_id FROM staff WHERE tg_id=$1 AND approved IS TRUE AND (role='manager' OR $2::bigint=tg_id)", [intent.requiredStaffId, current.submitted_by])).rows.length) throw packetAccessDenied();
     const receipt = (await client.query('SELECT signature,packet_revision FROM order_packet_submissions WHERE order_id=$1 AND actor_id=$2 AND submit_id=$3', [id, actor, intent.submitId])).rows[0];
     // A lost acknowledgement can replay after a restart or another edit.
     // The receipt confirms the original write; it never restores its old fields.
@@ -119,7 +126,8 @@ async function updateOrderPacketWithMaterials(id, data, prepared, intent) {
     if (Number(current.packet_revision) !== revision) throw fail('Заявка уже изменена другим менеджером. Ваши данные остались в форме. Загрузите актуальную версию перед сохранением.', 409, 'ORDER_PACKET_CONFLICT', current.packet_revision);
     // Version validation, originals, fields, log and receipt share one commit.
     await materials.saveOrderMaterialsInTransaction(client, id, prepared);
-    const order = await updateOrderPacket(id, data, client);
+    const order = await updateOrderPacket(id, data, client, intent.requiredStaffId);
+    if (!order) throw packetAccessDenied();
     await client.query('INSERT INTO logs(order_id,action,actor,details) VALUES($1,$2,$3,$4)', [id, 'packet_updated', intent.actorName || String(actor), 'Менеджер обновил данные и пакет документов заявки']);
     await client.query('INSERT INTO order_packet_submissions(order_id,actor_id,submit_id,signature,packet_revision) VALUES($1,$2,$3,$4,$5)', [id, actor, intent.submitId, intent.signature, order.packet_revision]);
     await client.query('COMMIT');

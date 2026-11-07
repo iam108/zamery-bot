@@ -41,7 +41,12 @@ function createAuditSubmitter(drafts, deliver, options = {}) {
         const packet = snapshot.data.request_packet;
         if (!packet || !packet.org || !packet.address || (!['tobacco','other'].includes(packet.object_category) && !packet.service)) throw new Error('В заявке не хватает данных объекта или услуги. Менеджеру нужно дополнить заявку.');
       }
-      data = hydrateDraftReport(snapshot);
+      // Old frozen deliveries finish under the policy they started with. The
+      // delivery handler verifies this stored digest against the exact payload
+      // before it can send anything; request fields cannot enable this option.
+      const validation = { legacyDelivery: /^[a-f\d]{64}$/i.test(storedProgress?.signature || '') && [undefined,1,2].includes(storedProgress?.deliveryVersion) };
+      // Hydration validates before any delivery checkpoint freezes the draft.
+      data = hydrateDraftReport(snapshot, validation);
       validateInspection(data);
     } catch (e) {
       await drafts.releaseDraftSubmission(owner, id, revision).catch(() => {});

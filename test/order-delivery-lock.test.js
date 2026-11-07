@@ -65,6 +65,7 @@ test('a one-slot SQL pool remains available while a separate bounded session poo
 
 test('concurrent creation confirmations from different handlers publish one card and one copy of each original', async () => {
   const pool = {}, files = new Map(); let order, cards = 0, documents = 0, creates = 0, releaseCard, cardStarted;
+  pool.query=async(sql,values)=>sql.includes('SELECT s.*')?{rows:[{tg_id:108,name:'Автор',role:'manager',approved:true,access_order_id:order?.id,order_submitted_by:108}]}:{rows:[]};
   const started = new Promise(resolve => { cardStarted = resolve; }), gate = new Promise(resolve => { releaseCard = resolve; });
   const materials = { ...materialModule, ensureOrderMaterials: async () => {}, listOrderMaterials: async (id, originals) => [...files.values()].map(file => originals ? { ...file } : { id: file.id, role: file.role }), markOrderMaterialDelivered: async (id, fileId, msg) => { files.get(fileId).telegram_msg_id = msg; } };
   const queries = { async createOrderWithMaterials(data, originals) { creates++; order ||= { ...data, id: 58, packet_revision: 1, status: 'new', submitted_name: 'Автор' }; for (const file of originals) if (!files.has(file.id)) files.set(file.id, { ...file }); return { ...order }; },

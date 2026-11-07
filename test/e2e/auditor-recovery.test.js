@@ -3,6 +3,7 @@ const { before, after, test } = require('node:test');
 const assert = require('node:assert/strict');
 const { randomUUID } = require('node:crypto');
 const { chromium } = require('playwright');
+const yauzl = require('yauzl');
 const { createService, openPage, multiPagePdf, sampleImage, until, hash } = require('./helpers');
 
 let service, browser;
@@ -11,6 +12,7 @@ after(async () => { await browser?.close(); await service?.close(); });
 const step = (page, index) => page.locator('#steps [data-step="' + index + '"]').click();
 const choice = (page, path, value) => page.locator('[data-choice="' + path + '"][data-value="' + value + '"]').click();
 const clean = visit => { assert.deepEqual(visit.errors, []); assert.deepEqual(visit.blocked, []); };
+async function unzip(buffer){const zip=await new Promise((resolve,reject)=>yauzl.fromBuffer(buffer,{lazyEntries:true},(error,value)=>error?reject(error):resolve(value))),files=[];return new Promise((resolve,reject)=>{zip.on('error',reject);zip.on('end',()=>resolve(files));zip.on('entry',entry=>zip.openReadStream(entry,async(error,stream)=>{if(error)return reject(error);try{const chunks=[];for await(const chunk of stream)chunks.push(chunk);files.push(Buffer.concat(chunks));zip.readEntry();}catch(failure){reject(failure);}}));zip.readEntry();});}
 
 test('a delayed manager PDF import retains the newer selected page and exposes the saved original without remounting it', { timeout: 60000 }, async () => {
   const pdf = multiPagePdf(), material = randomUUID(), name = 'Synthetic-delayed-manager.pdf';
@@ -113,15 +115,17 @@ test('an accepted photo album with a lost Telegram acknowledgement survives reop
     const retry=page.locator('#retry-unknown-delivery');await retry.waitFor({state:'visible'});
     assert.equal(await page.locator('#submit-audit').isDisabled(),true);
     const unknown=await service.draft(61);assert.equal(unknown.delivery.inflight.stage,'photos');const cursor=unknown.delivery.inflight.id;
+    assert.equal(unknown.delivery.deliveryVersion,3);assert.equal(unknown.delivery.textIds.length,0);assert.equal(service.messages.slice(before).filter(event=>event.method==='sendMessage').length,0,'An unconfirmed photo album cannot be followed by a v3 brief');
     assert.equal((await service.pool.query('SELECT id FROM audits WHERE order_id=61')).rows.length,0);
     await page.reload();await retry.waitFor({state:'visible'});assert.equal((await service.draft(61)).delivery.inflight.id,cursor);
     page.once('dialog',dialog=>dialog.dismiss());await retry.click();
     assert.equal(service.messages.slice(before).filter(event=>event.method==='sendMediaGroup').length,1);
     page.once('dialog',dialog=>dialog.accept());await retry.click();await page.getByRole('heading',{name:'Отчёт отправлен'}).waitFor();
-    const events=service.messages.slice(before);assert.equal(events.filter(event=>event.method==='sendMessage').length,1,'Confirmed summary remains single');
-    assert.equal(events.filter(event=>event.method==='sendMediaGroup').length,2,'Only the explicitly authorized unknown album can repeat');
-    assert.equal(events.filter(event=>event.method==='sendDocument').length,1,'Original ZIP is sent once after album confirmation');
-    assert.equal((await service.pool.query('SELECT id FROM audits WHERE order_id=61')).rows.length,1);
+    const events=service.messages.slice(before);assert.equal(events.filter(event=>event.method==='sendMessage').length,1,'The brief is sent once after photo confirmation');
+    const photoAlbums=events.filter(event=>event.method==='sendMediaGroup'&&event.args[1][0].type==='photo'),documentAlbums=events.filter(event=>event.method==='sendMediaGroup'&&event.args[1][0].type==='document');
+    assert.equal(photoAlbums.length,2,'Only the explicitly authorized unknown photo album can repeat');assert.equal(documentAlbums.length,1,'The full TXT and ZIP document album is sent once');assert.equal(events.filter(event=>event.method==='sendDocument').length,0);assert.equal(documentAlbums[0].args[1].length,2);
+    assert.ok(events.indexOf(photoAlbums[1])<events.findIndex(event=>event.method==='sendMessage'));assert.ok(events.findIndex(event=>event.method==='sendMessage')<events.indexOf(documentAlbums[0]));
+    const audits=(await service.pool.query('SELECT * FROM audits WHERE order_id=61')).rows;assert.equal(audits.length,1);const [full,archive]=documentAlbums[0].args[1];assert.equal(full.media.filename,'Отчёт-61-полный.txt');assert.equal(full.media.source.toString('utf8'),audits[0].text);assert.match(archive.media.filename,/оригиналы\.zip$/);const entries=await unzip(archive.media.source);for(const original of audits[0].report_data.documents)assert.ok(entries.some(bytes=>hash(bytes)===original.sha256),'The original ZIP retains '+original.name);
     const done=(await service.pool.query('SELECT * FROM audit_drafts WHERE id=$1',[unknown.id])).rows[0];assert.ok(done.submitted_at);assert.equal(done.delivery.inflight,undefined);assert.equal(done.delivery.lastRiskRetryCursor,cursor);
     assert.equal((await service.pool.query('SELECT COUNT(*)::int AS count FROM audit_evidence WHERE draft_id=$1',[unknown.id])).rows[0].count,3);clean(visit);
   }finally{telegram.sendMediaGroup=sendAlbum;await visit.context.close();}

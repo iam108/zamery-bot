@@ -16,7 +16,7 @@ async function fixture(run) {
   const events = [], locks = new Map(), storedId = randomUUID();
   let sequence = 900, signed = 0, packetCalls = 0, paidCalls = 0, beforeSend, beforeWrite, beforeResolve;
   await db.exec(`CREATE TABLE staff(tg_id BIGINT PRIMARY KEY,name TEXT,role TEXT,approved BOOLEAN);
-    INSERT INTO staff VALUES(808,'Юрист проверки','lawyer',true);
+    INSERT INTO staff VALUES(808,'Юрист проверки','lawyer',true),(101,'Менеджер','manager',true);
     CREATE TABLE orders(id INT PRIMARY KEY,address TEXT,object_name TEXT,object_type TEXT,cad_num TEXT,service TEXT,telegram_msg_id BIGINT);
     INSERT INTO orders VALUES(60,'Москва, Лесная, 5','ООО Проверка','Общепит','77:01:0004016:1064','Продление',50);
     CREATE TABLE audits(id INT PRIMARY KEY,order_id INT,text TEXT,report_data JSONB,chat_id BIGINT,msg_ids BIGINT[],created_at TIMESTAMPTZ DEFAULT NOW());
@@ -55,7 +55,8 @@ async function fixture(run) {
     async callApi(method, payload) { if (method === 'copyMessages') { const result = await action({ type: 'audit', chat: String(payload.chat_id), payload }); sequence += Math.max(0,payload.message_ids.length-1); return payload.message_ids.map((_, i) => ({ message_id: result.message_id + i })); } assert.equal(method, 'copyMessage'); return action({ type: 'native', chat: String(payload.chat_id), payload }); },
     async sendDocument(chat, file, opts) { if (typeof file === 'string') return action({ type: 'native-fallback', chat: String(chat), file, opts }); const chunks = []; for await (const chunk of file.source) chunks.push(Buffer.from(chunk)); return action({ type: 'zip', chat: String(chat), bytes: Buffer.concat(chunks), opts }); },
   };
-  const options = { pool, ready: async () => {}, packetService: { async packet() { packetCalls++; return structuredClone(packet); } }, telegram, webappUrl: 'https://bot.example', pickChecklist: () => 'QA', clientsChatId: CLIENTS,
+  // Group notices have separate publisher/master coverage; this fixture pins private originals only.
+  const options = { pool, ready: async () => {}, packetService: { async packet() { packetCalls++; return structuredClone(packet); } }, telegram, webappUrl: 'https://bot.example', pickChecklist: () => 'QA', clientsChatId: '',
     loadReport: async () => (await db.query('SELECT * FROM audits WHERE id=15')).rows[0],
     materialDelivery: createHandoffMaterialsDelivery({ telegram, loadMaterials: async () => [material] }),
     async resolveEgrnLinkForDelivery(order, id, expected) { if (beforeResolve) await beforeResolve({ order, id, expected }); return links.delivery(order, id, expected); },

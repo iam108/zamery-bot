@@ -140,7 +140,7 @@ function setupWeb(app) {
     return res.json(await submit(req.tgUser.id, data.draft_id, data.revision, fakeCtx));
   } catch (e) {
     console.error('api/audit error:', e);
-    const expose = ['AUDIT_PACKET_CHANGED', 'AUDIT_DELIVERY_UNKNOWN'].includes(e.code);
+    const expose = ['AUDIT_PACKET_CHANGED', 'AUDIT_DELIVERY_UNKNOWN', 'AUDIT_CONCLUSION_CONFLICT'].includes(e.code);
     const pending = e.code === 'AUDIT_DELIVERY_UNKNOWN' && e.delivery_unknown;
     const unknown = pending && typeof pending.cursor === 'string' && /^[a-f\d-]{36}$/i.test(pending.cursor)
       ? { cursor: pending.cursor, stage: String(pending.stage || '').slice(0, 40), index: pending.index, count: pending.count } : null;

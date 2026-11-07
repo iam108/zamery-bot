@@ -40,8 +40,16 @@ function fixture(options = {}) {
     sendDocument: async (chat, file) => { calls.push({ document: file.filename, content: file.source.toString() }); return { message_id: 901 }; },
     sendMessage: async () => { throw new Error('Existing order must not create another card'); },
   };
-  const handlers = createManagerHandlers({ materials, queries, pool: {}, telegramDelivery: orderDeliveryDouble({ materials, queries, getTelegram: () => telegram }), loadOrderReportLink: async () => null, getTelegram: () => telegram, format: item => 'order ' + item.id, attachOrOrder: async () => { throw new Error('No EGRN requested'); }, ...options });
-  const request = (role = 'manager', uid = 109) => ({ params: { id: '58' }, tgUser: { id: uid }, staff: { name: 'Менеджер', role }, files: [], body: { address: 'Москва, новый адрес', owner_name: 'Клиент', object_type: 'Общепит алкоголь', service: 'Продление', archive_url: '', submit_id: 'edit-1', packet_revision: 1 } });
+  const staff=new Map(),notices=new Map(),pool={async query(sql,values){
+    if(sql.includes('SELECT s.*'))return{rows:staff.has(values[0])?[{...staff.get(values[0]),access_order_id:order.id,order_submitted_by:order.submitted_by}]:[]};
+    if(options.pool?.query)return options.pool.query(sql,values);
+    if(sql.includes('manual_order_attachments'))return{rows:[]};
+    if(sql.startsWith('SELECT telegram_delivery'))return{rows:[{notice:notices.get(values[1])}]};
+    if(sql.startsWith('UPDATE orders SET telegram_delivery')){notices.set(values[1],JSON.parse(values[2]));return{rows:[{id:58}]};}
+    throw new Error('Unexpected fixture SQL');
+  }};
+  const handlers = createManagerHandlers({ materials, queries, telegramDelivery: orderDeliveryDouble({ materials, queries, getTelegram: () => telegram }), loadOrderReportLink: async () => null, getTelegram: () => telegram, format: item => 'order ' + item.id, attachOrOrder: async () => { throw new Error('No EGRN requested'); }, ...options,pool });
+  const request = (role = 'manager', uid = 109) => {staff.set(uid,{tg_id:uid,name:'Менеджер',role,approved:true});return { params: { id: '58' }, tgUser: { id: uid }, staff: { name: 'Менеджер', role }, files: [], body: { address: 'Москва, новый адрес', owner_name: 'Клиент', object_type: 'Общепит алкоголь', service: 'Продление', archive_url: '', submit_id: 'edit-1', packet_revision: 1 } };};
   const response = () => ({ statusCode: 200, headers: {}, status(n) { this.statusCode = n; return this; }, set(k,v) { this.headers[k] = v; return this; }, json(value) { this.body = value; return this; } });
   return { handlers, request, response, files, calls, telegram, order: () => order };
 }
@@ -136,7 +144,7 @@ for (const edit of [false, true]) test('EGRN delivery failure remains retryable 
     materials: { ...originalMaterials, ensureOrderMaterials: async () => {}, listOrderMaterials: async () => [], saveOrderMaterials: async () => {} },
     queries: { getOrderById: async () => ({ ...order }), createOrderWithMaterials: async data => { creates++; order = { ...order, ...data }; return { ...order }; },
       updateOrderPacketWithMaterials: async (id, data) => { order = { ...order, ...data, packet_revision: 2 }; return { order: { ...order }, saved_revision: 2, replayed: false }; }, setTelegramMsgId: async (id, msg) => { order.telegram_msg_id = msg; }, addLog: async () => {} },
-    pool: {}, format: () => 'order', getTelegram: () => ({ sendMessage: async () => { cards++; return { message_id: 900 }; }, editMessageText: async () => {} }),
+    pool: {query:async()=>({rows:[{tg_id:108,name:'Автор',role:'manager',approved:true,access_order_id:58,order_submitted_by:108}]})}, format: () => 'order', getTelegram: () => ({ sendMessage: async () => { cards++; return { message_id: 900 }; }, editMessageText: async () => {} }),
     attachOrOrder: async options => { assert.equal(options.requestKey, 'manager-order:58:77:01:0000001:12'); attempts++; if (attempts === 1) throw new Error('Synthetic EGRN connection failure'); return { result: 'none' }; },
   };
   options.telegramDelivery = orderDeliveryDouble(options);

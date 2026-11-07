@@ -42,8 +42,30 @@ function createManagerHandlers(options = {}) {
   const attachOrOrder = options.attachOrOrder || (data => require('../bot/egrn').attachOrOrder(data));
   const withOrderLock = options.withOrderDeliveryLock || require('../db/order-delivery-lock').createOrderDeliveryLock(pool, options.orderLockOptions);
   const loadReportLink = options.loadOrderReportLink || (id => require('./order-report-link').loadOrderReportLink(id, { pool }));
-  const delivery = options.telegramDelivery || require('./order-telegram-delivery').createOrderTelegramDelivery({ pool, telegram: getTelegram, groupId: options.groupId, ready: materials.ensureOrderMaterials });
   const recent = new Map();
+
+  async function currentAccess(req, order) {
+    let row;
+    try { row = (await pool.query(`SELECT s.*,o.id AS access_order_id,o.submitted_by AS order_submitted_by FROM staff s
+      LEFT JOIN orders o ON o.id=$2 WHERE s.tg_id=$1 AND s.approved IS TRUE`, [req.tgUser.id, order?.id ?? null])).rows[0]; }
+    catch (_) { throw Object.assign(new Error('Не удалось проверить текущий доступ к заявке. Повторите проверку позднее.'), { status: 503, code: 'ORDER_PACKET_ACCESS_UNAVAILABLE', response: { error_code: 403 } }); }
+    if (!row || order && (!row.access_order_id || row.role !== 'manager' && String(row.order_submitted_by) !== String(req.tgUser.id))) {
+      // This is a known refusal before transport, so the durable Telegram
+      // protocol may safely retry after access is restored, without unknown ACK.
+      throw Object.assign(new Error('Доступ к заявке изменился. Проверьте доступ и откройте форму заново.'), { status: 403, code: 'ORDER_PACKET_FORBIDDEN', response: { error_code: 403 } });
+    }
+    req.staff = row;
+  }
+
+  function guardedTelegram(req, order) {
+    const telegram = getTelegram();
+    return new Proxy(telegram, { get(target, key) {
+      const value = target[key];
+      if (typeof value !== 'function') return value;
+      if (!['sendMessage', 'editMessageText', 'sendDocument'].includes(key)) return value.bind(target);
+      return async (...args) => { await currentAccess(req, order); return value.apply(target, args); };
+    } });
+  }
 
   async function publishEgrnNotice(order, egrn, telegram, text) {
     const chat = String((typeof options.groupId === 'function' ? options.groupId() : options.groupId) ?? process.env.GROUP_CHAT_ID);
@@ -90,7 +112,7 @@ function createManagerHandlers(options = {}) {
   }
 
   async function savePacket(req, res) {
-    let order, key, signature, ownsRecent = false, savedRevision, replayed = false;
+    let order, key, signature, ownsRecent = false, savedRevision, replayed = false, saved = false;
     const edit = req.params.id != null;
     const finish = (body, status = 200) => {
       // Only coalesce active requests in memory. Completed retries must read
@@ -104,9 +126,9 @@ function createManagerHandlers(options = {}) {
       if (edit) {
         order = await queries.getOrderById(orderId(req.params.id));
         if (!order) return finish({ ok: false, error: 'Заявка не найдена.' }, 404);
-        if (!canEditPacket(order, req)) return finish({ ok: false, error: 'Изменить заявку может её автор или менеджер.' }, 403);
+        await currentAccess(req, order);
         existing = await materials.listOrderMaterials(order.id);
-      }
+      } else await currentAccess(req);
       const sid = String((req.body && req.body.submit_id) || '').slice(0, 40);
       key = sid ? req.tgUser.id + ':' + (edit ? order.id : 'new') + ':' + sid : null;
       const prepared = materials.prepareMaterials(req.files || [], req.body.file_roles || []);
@@ -121,10 +143,10 @@ function createManagerHandlers(options = {}) {
       if (recent.size > 500) for (const [cachedKey, cached] of recent) { if (!cached.pending) { recent.delete(cachedKey); break; } }
       if (key) { recent.set(key, { signature, pending: true }); ownsRecent = true; }
       if (edit) {
-        const saved = await queries.updateOrderPacketWithMaterials(order.id, data, prepared, { actorId: req.tgUser.id, actorName: req.staff.name, submitId: sid, signature, expectedRevision: req.body.packet_revision });
-        order = saved.order; savedRevision = saved.saved_revision; replayed = saved.replayed;
+        const result = await queries.updateOrderPacketWithMaterials(order.id, data, prepared, { actorId: req.tgUser.id, actorName: req.staff.name, submitId: sid, signature, expectedRevision: req.body.packet_revision, requiredStaffId: req.tgUser.id });
+        order = result.order; savedRevision = result.saved_revision; replayed = result.replayed;
       } else {
-        order = await queries.createOrderWithMaterials({ ...data, submitted_by: req.tgUser.id }, prepared);
+        order = await queries.createOrderWithMaterials({ ...data, submitted_by: req.tgUser.id }, prepared, { requiredStaffId: req.tgUser.id });
         // Creation is revision 1 even when a late duplicate returns a row that
         // another manager has already edited. The old form must not inherit it.
         savedRevision = 1; replayed = Number(order.packet_revision) > 1;
@@ -133,11 +155,14 @@ function createManagerHandlers(options = {}) {
           await pool.query('UPDATE orders SET submitted_name=$1 WHERE id=$2 AND submitted_name IS NULL', [req.staff.name, order.id]);
         }
       }
+      saved = true;
 
       const publish = async () => {
       order = await queries.getOrderById(order.id);
       if (!order) throw Object.assign(new Error('Заявка не найдена.'), { status: 404 });
-      const telegram = getTelegram();
+      await currentAccess(req, order);
+      const telegram = guardedTelegram(req, order);
+      const delivery = options.telegramDelivery || require('./order-telegram-delivery').createOrderTelegramDelivery({ pool, telegram, groupId: options.groupId, ready: materials.ensureOrderMaterials });
       const warnings = [];
       if (replayed && savedRevision !== Number(order.packet_revision)) warnings.push('Ваше сохранение подтверждено. После него заявку изменил другой менеджер; доставка использует актуальные данные.');
       let card;
@@ -150,7 +175,7 @@ function createManagerHandlers(options = {}) {
           try { await queries.addLog(order.id, 'created', req.staff.name, 'Заявка и материалы сохранены; карточка отправлена в чат'); }
           catch (error) { console.error('order card log:', error.message); }
         }
-      } catch (e) { console.error('order card delivery:', e.message); warnings.push('Не удалось проверить или обновить доставку карточки. Повторите проверку позднее.'); }
+      } catch (e) { if (['ORDER_PACKET_FORBIDDEN', 'ORDER_PACKET_ACCESS_UNAVAILABLE'].includes(e.code)) throw e; console.error('order card delivery:', e.message); warnings.push('Не удалось проверить или обновить доставку карточки. Повторите проверку позднее.'); }
       if (order.telegram_msg_id && card?.usable !== false) {
         for (const file of await materials.listOrderMaterials(order.id, true)) {
           if (file.telegram_msg_id) continue;
@@ -173,6 +198,7 @@ function createManagerHandlers(options = {}) {
         // Номер и карточка могли сохраниться до временной ошибки прошлого запроса.
         if (order.cad_num && sameCad) {
           try {
+            await currentAccess(req, order);
             const egrn = await attachOrOrder({ cad: order.cad_num, label: [order.owner_name, order.object_name].filter(Boolean).join(' · '), order: orderEgrn,
               requestKey: 'manager-order:' + order.id + ':' + order.cad_num,
               orderedBy: req.tgUser.id, orderedName: req.staff.name,
@@ -194,6 +220,8 @@ function createManagerHandlers(options = {}) {
       return edit ? await publish() : await withOrderLock(order.id, publish);
     } catch (e) {
       console.error('api/order error:', e.message);
+      if (['ORDER_PACKET_FORBIDDEN', 'ORDER_PACKET_ACCESS_UNAVAILABLE'].includes(e.code) && saved) return finish({ ok: true, id: order.id, packet_revision: savedRevision, current_revision: Number(order.packet_revision), replayed,
+        warning: 'Заявка #' + order.id + ' и документы сохранены. Текущий доступ не подтверждён; дальнейшая доставка остановлена. Проверьте доступ перед повтором этой же заявки.' });
       finish({ ok: false, id: order && order.id, error: e.message, code: e.code, packet_revision: e.packet_revision, busy: e.busy }, e.status || 400);
     }
   }

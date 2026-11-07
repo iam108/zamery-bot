@@ -279,6 +279,7 @@ test('a reopened form with a new submit UUID cannot create a second ordinary cas
   const same=await h.restart()(h.context);assert.equal(same.id,first.id);assert.equal(same.delivery_complete,true);
 }));
 test('parallel forms from different staff for the same order respect the business lock and cannot create case two',pg,async()=>fixture(async h=>{
+  await h.db.query("INSERT INTO staff VALUES(202,'Другой менеджер','manager',true)");
   let start,release;const started=new Promise(resolve=>{start=resolve;}),gate=new Promise(resolve=>{release=resolve;});let held=false;
   h.setMutation(async event=>{if(event.type==='card'&&!held){held=true;start();await gate;}});
   const running=h.submit(h.context);await started;

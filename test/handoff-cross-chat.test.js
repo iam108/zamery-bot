@@ -35,7 +35,7 @@ async function fixture(run) {
     await db.exec(`ALTER TABLE staff ADD COLUMN approved BOOLEAN DEFAULT true;
       CREATE TABLE orders(id INT PRIMARY KEY,address TEXT,object_name TEXT,owner_name TEXT,contacts TEXT,object_type TEXT,region TEXT,service TEXT,cad_num TEXT,archive_url TEXT,telegram_msg_id BIGINT);
       INSERT INTO orders(id,address,object_name,object_type,region,service) VALUES(60,'Москва, Synthetic, 5','ООО Synthetic','Общепит','МСК','Продление');
-      INSERT INTO staff(tg_id,name,role) VALUES(808,'Synthetic lawyer','lawyer');
+      INSERT INTO staff(tg_id,name,role) VALUES(808,'Synthetic lawyer','lawyer'),(101,'Synthetic manager','manager');
       INSERT INTO reports(id,chat_id,first_id,msg_ids,text,author) VALUES(9,-100200,80,'{80,81}','Заявка #60','Synthetic manager');
       INSERT INTO reports(id,chat_id,first_id,msg_ids,text,author,reply_to) VALUES(10,-100200,82,'{82}','Reply with a source attachment','Synthetic auditor',80);`);
     const auditIds = Array.from({ length: 105 }, (_, i) => 80 + i);

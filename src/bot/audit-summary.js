@@ -149,4 +149,78 @@ function buildAuditSummary(data, actor) {
   return { html: html.join('\n'), plain: plain.join('\n') };
 }
 
-module.exports = { buildAuditSummary };
+// The brief is a separate projection for fresh delivery versions. Keep the
+// full summary above unchanged: old partial deliveries depend on its chunks,
+// and saved reports/original archives must retain every recorded observation.
+function briefText(item, limit) {
+  const text=value(item).replace(/\s+/g,' ');
+  if(esc(text).length<=limit)return text;
+  let result='',length=0;
+  for(const character of text){const size=esc(character).length;if(length+size>limit-1)break;result+=character;length+=size;}
+  return result.trimEnd()+'…';
+}
+
+function buildAuditBrief(data, actor) {
+  const {isGenericAudit}=require('./audit-generic'),generic=isGenericAudit(data);
+  const p=data.inspection||{},w=data.workflow||{},packet=data.request_packet||{},html=[],plain=[];
+  const line=(text,limit=220,bold=false)=>{const short=briefText(text,limit);html.push(bold?'<b>'+esc(short)+'</b>':esc(short));plain.push(short);};
+  const blank=()=>{html.push('');plain.push('');};
+  const org=briefText(p.org||packet.org||'Организация не указана',160),number=data.order_id?'№'+briefText(data.order_id,20):'аудитора';
+  line(org+' · отчёт '+number,210,true);
+  const service=value(p.service||packet.service)||(data.object_category==='tobacco'?'Проверка объекта':'услуга не указана');
+  const category={catering:'алкоголь · общепит',retail:'алкоголь · магазин',tobacco:'табак'}[data.object_category]||'тип объекта не указан';
+  line(generic?'Общий осмотр · Другое':service+' · '+category,110);
+  line('📍 '+value(p.address||packet.address||'адрес не указан'),245);
+  const outcome=CONCLUSIONS[w.conclusion_status]||'Результат не указан';
+  if(generic)line('Итог аудитора: '+(value(data.conclusion)||'не указан'),310,true);
+  else{
+    const icon={ready:'🟢',actions:'🟠',insufficient:'🟡',obstacle:'🔴'}[w.conclusion_status]||'⚪';
+    line(icon+' Итог аудитора: '+outcome.toLowerCase(),110,true);
+  }
+
+  blank();
+  const building=['Жилое','Нежилое'].includes(data.building_type)?data.building_type.toLowerCase():'не отмечено';
+  const to={'Нужно':'требуется','Не нужно':'не требуется','Не обязательно':'не обязательно'}[data.to]||'не проверено';
+  const facts=['Здание: '+building,'ТО: '+to];
+  if(!generic){
+    if(data.object_category==='tobacco'){
+      facts.push('Выкладка: '+(['Закрытая','Открытая','Товара нет'].includes(p.tobacco_display)?p.tobacco_display.toLowerCase():'не проверена'));
+      facts.push('Перечень цен: '+({'Есть':'есть','Нет':'нет'}[p.tobacco_price_list]||'не проверен'));
+      facts.push('Реклама: '+({'Есть':'есть','Нет':'нет'}[p.tobacco_advertising]||'не проверена'));
+    }else facts.push('Алкоголь: '+answer(p.alcohol_present,'есть','нет','наличие не проверено'));
+  }
+  line(facts.join(' · '),230);
+
+  if(!generic){
+    const entrances=Array.isArray(data.entrances)?data.entrances:[],zones=Array.isArray(data.zones)?data.zones:[];
+    const inspected=entrances.filter(entrance=>entrance.access==='Осмотрен').length;
+    const plan=answer(data.bti,'совпадает','есть расхождения','не проверен');
+    const territory=w.territory_result==='clear'&&!zones.length?'зон и спорных объектов не выявлено':w.territory_result==='findings'&&zones.length?'описано '+zones.length+' организаций':w.territory_result==='clear'&&zones.length?'ответы расходятся':'результат не отмечен';
+    line('Осмотр: входы '+inspected+' из '+entrances.length+' · план: '+plan+' · территория: '+territory,220);
+
+    const issues=require('./audit-workflow').compactReportIssues(data);
+    const label=issue=>issue.id==='floor-mismatch'?'Этаж: по плану '+(value(p.floor_plan)||'не указан')+', фактически '+(value(p.floor_actual)||'не указан')+'.':issue.label;
+    const actions=unique(issues.filter(issue=>issue.kind==='adverse').map(label));
+    if(value(w.mitigation))actions.unshift('Предлагает аудитор: '+value(w.mitigation));
+    const questions=unique(issues.filter(issue=>issue.kind==='unverified'||issue.kind==='missing_required').map(label));
+    if(w.conclusion_status==='actions'&&!actions.length){
+      actions.push('Конкретные действия не указаны.');questions.push('Уточнить причину выбранного итога.');
+    }
+    const list=(heading,items,limit,cap)=>{
+      if(!items.length)return;blank();line(heading,50,true);
+      items.slice(0,limit).forEach(item=>line('• '+item,cap));
+      if(items.length>limit)line('Ещё '+(items.length-limit)+' пунктов — в полном отчёте.',70);
+    };
+    list('Замечания / действия',actions,3,150);
+    list('Уточнить юристу',questions,2,140);
+    if(w.conclusion_status==='ready'&&!actions.length&&!questions.length)line('Замечаний по проверенным пунктам не отмечено.',100);
+    const comment=value(data.conclusion);
+    if(comment&&comment!==outcome){blank();line('Комментарий аудитора: '+comment,160);}
+  }
+  blank();line((value(p.visit_date)?visitDate(p.visit_date)+' · ':'')+'Аудитор: '+(value(actor)||'не указан'),100);
+  const originals=(Array.isArray(data.documents)&&data.documents.length)||(Array.isArray(data.evidence)&&data.evidence.length);
+  line(originals?'Полный текст и исходники — в приложениях к отчёту.':'Полный текст — в приложенном файле отчёта.',80);
+  return{html:html.join('\n'),plain:plain.join('\n')};
+}
+
+module.exports = { buildAuditSummary, buildAuditBrief };

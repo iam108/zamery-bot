@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { buildAuditSummary } = require('../src/bot/audit-summary');
+const { buildAuditSummary, buildAuditBrief } = require('../src/bot/audit-summary');
 const { compactVisit, addOrganization } = require('./helpers/audit-v5');
 const { splitTelegramHtml } = require('../src/bot/audit-delivery');
 const copy = value => JSON.parse(JSON.stringify(value));
@@ -155,4 +155,67 @@ test('a Unicode source URL that expands past a Telegram message remains fully re
   assert.ok(parts.length > 0); assert.ok(parts.every(part => part.length <= 3500));
   assert.ok(result.plain.includes(source));
   assert.ok(parts.join('').includes(source));
+});
+
+test('brief leads with the exact object, service, outcome and critical recorded facts while preserving the full report', () => {
+  const data=compactVisit('catering','Получение');data.workflow.conclusion_status='actions';data.workflow.territory_result='clear';
+  data.map={annotations:[]};data.inspection.visit_date='2026-11-07';data.to='Нужно';data.inspection.alcohol_present='Да';
+  data.bti='Нет';data.inspection.plan_note='Снесена перегородка между залом и складом';
+  const before=copy(data),full=buildAuditSummary(data,'@audit'),brief=buildAuditBrief(freeze(data),'@audit');
+  assert.match(brief.html,/^<b>ООО Пример · отчёт №58<\/b>/);assert.match(brief.plain,/Получение · алкоголь · общепит/);assert.match(brief.plain,/Москва, Никольская, 1/);
+  assert.match(brief.plain,/Итог аудитора: нужны действия/);assert.match(brief.plain,/Здание: жилое/);assert.match(brief.plain,/ТО: требуется/);assert.match(brief.plain,/Алкоголь: есть/);
+  assert.match(brief.plain,/Снесена перегородка между залом и складом/);assert.match(brief.plain,/07\.11\.2026/);assert.match(brief.plain,/@audit/);
+  assert.ok(brief.html.length<=2600);assert.equal(splitTelegramHtml(brief.html).length,1);assert.deepEqual(copy(data),before);assert.deepEqual(buildAuditSummary(data,'@audit'),full);
+});
+
+test('brief separates unresolved facts from recorded discrepancies and names the actual floor values', () => {
+  const data=compactVisit('retail','Продление');data.workflow.conclusion_status='insufficient';data.inspection.floor_actual='2';
+  data.workflow.archive_skipped='Да';data.inspection.alcohol_present='Не проверено';data.workflow.territory_result='clear';data.map={annotations:[]};
+  const brief=buildAuditBrief(data,'аудитор');
+  assert.match(brief.plain,/Этаж: по плану 1, фактически 2/);assert.match(brief.plain,/Уточнить юристу/);assert.match(brief.plain,/Архив не предоставлен|сверка с архивом не выполнена/);assert.match(brief.plain,/Наличие алкоголя не установлено|наличие алкоголя/i);
+  assert.doesNotMatch(brief.plain,/Архив свер[её]н|Алкоголь: нет|без замечаний/i);
+});
+
+test('brief caps concrete action and lawyer-question lists and explicitly points to omitted items in the full report', () => {
+  const data=addOrganization(compactVisit('catering','Продление'),{status:'pending',name:'Учебный центр',note:'Нужно уточнить назначение'});
+  Object.assign(data.inspection,{floor_actual:'2',rooms_complete:'Нет',within_cadastral:'Нет',alcohol_present:'Не проверено'});data.to='Нужно';data.bti='Нет';data.inspection.plan_note='Изменена перегородка';data.workflow.archive_skipped='Да';data.workflow.conclusion_status='actions';
+  const brief=buildAuditBrief(data,'аудитор'),actions=brief.plain.split('Замечания / действия\n')[1].split('\n\n')[0],questions=brief.plain.split('Уточнить юристу\n')[1].split('\n\n')[0];
+  assert.equal(actions.split('\n').filter(line=>line.startsWith('• ')).length,3);assert.equal(questions.split('\n').filter(line=>line.startsWith('• ')).length,2);assert.match(actions,/Ещё \d+.*полном отч[её]те/);assert.match(questions,/Ещё \d+.*полном отч[её]те/);assert.ok(brief.html.length<=2600);
+});
+
+test('brief never invents tasks from a free-text comment and keeps an unexplained action outcome explicit', () => {
+  const data=compactVisit();data.workflow.territory_result='clear';data.map={annotations:[]};data.workflow.conclusion_status='actions';data.conclusion='Клиент сообщил: перегородка может быть временной.';
+  const brief=buildAuditBrief(data,'аудитор');assert.match(brief.plain,/Конкретные действия не указаны/);assert.match(brief.plain,/Уточнить причину выбранного итога/);assert.match(brief.plain,/Комментарий аудитора: Клиент сообщил: перегородка может быть временной/);
+  assert.doesNotMatch(brief.plain,/Снести|Убрать перегородку|нарушение границ/);
+});
+
+test('brief does not claim full inspection for an uninspected entrance or an unspecified territory result', () => {
+  const data=compactVisit();data.entrances[0].access='Не осмотрен';data.workflow.conclusion_status='insufficient';delete data.workflow.territory_result;
+  const brief=buildAuditBrief(data,'аудитор');assert.match(brief.plain,/входы 0 из 1/i);assert.match(brief.plain,/территория: результат не отмечен/i);assert.doesNotMatch(brief.plain,/все входы осмотрены|зон нет|ограничений нет|без замечаний/i);
+});
+
+test('tobacco brief shows its recorded checks without carrying stale alcohol or renewal answers into the outcome', () => {
+  const data=compactVisit('tobacco');Object.assign(data.inspection,{tobacco_display:'Открытая',tobacco_price_list:'Нет',tobacco_advertising:'Не проверено',alcohol_present:'Да',alcohol_within_licensed:'Нет',archive_match:'Нет'});data.workflow.conclusion_status='actions';
+  const brief=buildAuditBrief(data,'аудитор');assert.match(brief.plain,/табак/i);assert.match(brief.plain,/открытая выкладка|Выкладка: открытая/i);assert.match(brief.plain,/ценами отсутствует|Перечень цен: нет/i);assert.match(brief.plain,/Реклама: не проверена/);assert.doesNotMatch(brief.plain,/Алкоголь|алкоголь|Архив/);
+});
+
+test('generic brief attributes the written outcome and optional facts without manufacturing a licence conclusion or tasks', () => {
+  const data={ui_version:5,object_category:'other',order_id:62,inspection:{org:'Другой объект',address:'Москва, Тестовая, 62'},workflow:{conclusion_status:'ready'},building_type:'Нежилое',to:'Не обязательно',conclusion:'Владелец уточнит назначение помещения; документы не представлены.',entrances:[],zones:[]};
+  const brief=buildAuditBrief(freeze(data),'@audit');assert.match(brief.plain,/Общий осмотр · Другое/);assert.match(brief.plain,/Владелец уточнит назначение помещения; документы не представлены/);assert.match(brief.plain,/ТО: не обязательно/);assert.doesNotMatch(brief.plain,/соответствует по проверенным|Алкоголь|Замечания \/ действия|Замечаний.*не отмечено/i);
+});
+
+test('brief bounds escaped Unicode and long comments without losing any full-report observations or inventing media links', () => {
+  const data=compactVisit();data.inspection.org='&<😀>'.repeat(200);data.inspection.address='&<Адрес😀>'.repeat(200);data.workflow.mitigation='&<Действие😀>'.repeat(300);data.conclusion='&<Комментарий😀>'.repeat(600);data.workflow.followup_notes='ЛИЧНЫЕ ДОГОВОРЁННОСТИ';data.request_packet.contacts='ПРИВАТНЫЕ КОНТАКТЫ';
+  const full=buildAuditSummary(data,'@audit'),brief=buildAuditBrief(freeze(data),'<actor😀>');
+  assert.ok(brief.html.length<=2600,brief.html.length);assert.equal(splitTelegramHtml(brief.html).length,1);assert.doesNotMatch(brief.html,/<actor|<Адрес|<Комментарий|ПРИВАТНЫЕ КОНТАКТЫ|ЛИЧНЫЕ ДОГОВОРЁННОСТИ|href=/);assert.match(brief.html,/&lt;/);assert.match(brief.plain,/…/);assert.match(brief.plain,/полный|полном/i);assert.ok(full.plain.includes(data.conclusion));assert.deepEqual(buildAuditSummary(data,'@audit'),full);
+});
+
+test('the largest escaped identity, lists, comment and attribution still fit one brief without splitting emoji or HTML entities', () => {
+  const data=compactVisit('catering','Продление'),long='&<😀>'.repeat(500);
+  Object.assign(data.inspection,{org:long,address:long,floor_actual:'2',rooms_complete:'Нет',within_cadastral:'Нет',alcohol_present:'Не проверено',licensed_boundaries_match:'Не проверено'});data.to='Нужно';data.bti='Нет';data.inspection.plan_note=long;
+  data.workflow.archive_skipped='Да';data.workflow.conclusion_status='actions';data.workflow.mitigation=long;data.conclusion=long;
+  for(let i=0;i<8;i++)addOrganization(data,{id:'org-'+i,code:'О'+i,status:'confirmed',name:long,note:long});
+  const brief=buildAuditBrief(freeze(data),long);assert.ok(brief.html.length<=2600,brief.html.length);assert.equal(splitTelegramHtml(brief.html).length,1);
+  assert.ok(brief.plain.includes('Ещё '));assert.equal(Array.from(brief.html).some(character=>character.length===1&&/[\uD800-\uDFFF]/.test(character)),false);
+  assert.equal((brief.html.match(/<b>/g)||[]).length,(brief.html.match(/<\/b>/g)||[]).length);assert.doesNotMatch(brief.html,/&(?:am|l|g)$/);
 });

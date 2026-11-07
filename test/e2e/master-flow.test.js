@@ -84,8 +84,14 @@ test('master: manager originals become an annotated audit, private lawyer packag
     const groupButtons=notice.args[2]?.reply_markup?.inline_keyboard?.flat()||[];assert.ok(groupButtons.some(button=>button.url==='https://t.me/LRSZamer_bot?start=case_'+assigned.id));assert.ok(groupButtons.every(button=>!button.web_app),'Group navigation must use the private bot and must not embed a staff credential');
     for(const event of sent){const target=event.method.startsWith('copy')?event.args[0].chat_id:event.args[0];if(String(target)===clientsGroup){assert.equal(event,notice);assert.equal(event.item.bytes,null);}else assert.equal(String(target),String(LAWYER));}
     const privateOriginals=[...service.originals.values()].filter(item=>item.chat===String(LAWYER));
-    const archives=privateOriginals.filter(item=>item.kind==='sendDocument'&&/\.zip$/i.test(item.filename||''));assert.equal(archives.length,2);
+    const archives=privateOriginals.filter(item=>['sendDocument','document'].includes(item.kind)&&Buffer.isBuffer(item.bytes)&&item.bytes.length>=4&&item.bytes.readUInt32LE(0)===0x04034b50);assert.equal(archives.length,2);
     const auditArchive=archives.find(item=>item.copied_from),managerArchive=archives.find(item=>!item.copied_from);assert.ok(auditArchive);assert.ok(managerArchive);
+    const checkpoint=(await service.pool.query('SELECT delivery FROM audit_drafts WHERE id=$1',[audit.draft_id])).rows[0].delivery;assert.equal(checkpoint.deliveryVersion,3);assert.equal(checkpoint.documentIds.length,2);
+    // The adapter records media-album bytes without native Document filenames;
+    // bind both copied originals to their exact durable Telegram receipt IDs.
+    const fullReports=privateOriginals.filter(item=>item.copied_from?.chat===GROUP&&item.copied_from.id===checkpoint.documentIds[0]);assert.equal(fullReports.length,1,'The lawyer receives the full report TXT exactly once');assert.equal(fullReports[0].bytes.toString('utf8'),audit.text);assert.equal(auditArchive.copied_from.id,checkpoint.documentIds[1]);
+    const workingFull=service.originals.get(GROUP+':'+checkpoint.documentIds[0]),workingArchive=service.originals.get(GROUP+':'+checkpoint.documentIds[1]);assert.ok(workingFull);assert.ok(workingArchive);assert.ok(fullReports[0].bytes.equals(workingFull.bytes),'The private TXT is the byte-exact group full report');assert.ok(auditArchive.bytes.equals(workingArchive.bytes),'The private audit ZIP is the same original archive, not rebuilt or truncated');
+    for(const id of audit.msg_ids)assert.equal(privateOriginals.filter(item=>item.copied_from?.chat===String(audit.chat_id)&&item.copied_from.id===Number(id)).length,1,'Every audit message, including brief, TXT and ZIP, is copied once');
     const auditEntries=await unzip(auditArchive.bytes),managerEntries=await unzip(managerArchive.bytes);
     assert.ok(auditEntries.some(item=>hash(item.bytes)===hash(plan)&&item.bytes.equals(plan)),'Copied audit ZIP must physically deliver the byte-exact manager plan');
     const deliveredHashes=new Set(auditEntries.map(item=>hash(item.bytes)));

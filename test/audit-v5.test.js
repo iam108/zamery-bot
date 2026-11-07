@@ -258,7 +258,7 @@ test('drawn findings require actual measurements or an honest follow-up', () => 
   data.zones[0].dist = '0';
   assert.throws(() => validateWorkflow(data), /Укажите расстояние/);
   data.zones[0].dist = 'Не проверено';
-  assert.throws(() => validateWorkflow(data), /замечания или непроверенные сведения/);
+  assert.throws(() => validateWorkflow(data), error => error.code === 'AUDIT_CONCLUSION_CONFLICT' && /Соседняя организация: расстояние не проверено/.test(error.message));
   data.workflow.conclusion_status = 'insufficient';
   assert.doesNotThrow(() => validateWorkflow(data));
   assert.ok(followupTasks(data).some(task => task.id === 'zone-distance:org-4'));

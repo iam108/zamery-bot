@@ -1,6 +1,7 @@
 const { esc } = require('./formatter');
 const { validateInspection, compactInspectionIssues } = require('./audit-inspection');
 const { isGenericAudit, validateGenericAudit, buildGenericAuditSummary } = require('./audit-generic');
+const { describe: describeReportIssue } = require('../../public/audit-report-issues');
 
 const CONCLUSIONS = { ready: 'Соответствует по проверенным пунктам', actions: 'Нужны действия', insufficient: 'Недостаточно данных', obstacle: 'Выявлено препятствие' };
 const ZONE_STATUS = { pending: 'Требует уточнения', confirmed: 'Ограничение подтверждено аудитором', excluded: 'Ограничение исключено с основанием' };
@@ -114,10 +115,10 @@ function followupTasks(data) {
   return tasks;
 }
 
-function validateWorkflow(data) {
+function validateWorkflow(data, options = {}) {
   if (data.schema_version !== 3) return;
   if (isGenericAudit(data)) return validateGenericAudit(data);
-  if (data.ui_version === 5) return validateCompactWorkflow(data);
+  if (data.ui_version === 5) return validateCompactWorkflow(data, options);
   const w = data.workflow || {}, p = data.inspection || {};
   if (!CONCLUSIONS[w.conclusion_status]) throw new Error('Выберите итог проверки: соответствует, нужны действия, недостаточно данных или препятствие.');
   if (!Array.isArray(data.entrances) || data.entrances.length > 30) throw new Error('Можно описать до 30 входов.');
@@ -156,9 +157,9 @@ function validateWorkflow(data) {
   }
 }
 
-function buildWorkflowReport(data) {
+function buildWorkflowReport(data, options = {}) {
   if (data.schema_version !== 3) return { plain: [], html: [] };
-  validateWorkflow(data);
+  validateWorkflow(data, options);
   if (isGenericAudit(data)) { const summary=buildGenericAuditSummary(data);return {plain:summary.plain.split('\n'),html:summary.html.split('\n')}; }
   if (data.ui_version === 5) return buildCompactWorkflowReport(data);
   if (data.ui_version === 4) return buildSimpleReport(data);
@@ -268,7 +269,7 @@ function activeDraftEvidence(draft) {
   return files;
 }
 
-function hydrateDraftReport(draft) {
+function hydrateDraftReport(draft, options = {}) {
   const input = draft.data;
   const territoryResult = input?.ui_version === 5 && input.workflow?.territory_result;
   const explicitTerritory = territoryResult === 'clear' || territoryResult === 'findings';
@@ -283,7 +284,7 @@ function hydrateDraftReport(draft) {
   data.evidence = activeEvidence;
   data.documents = files.map(file => ({ id: file.id, name: file.name, mime: file.mime, role: file.role, subject_id: file.subject_id, sha256: file.sha256, source: file.buffer }));
   data.photos = [];
-  validateWorkflow(data);
+  validateWorkflow(data, options);
   return data;
 }
 
@@ -298,6 +299,72 @@ function compactFollowupTasks(data) {
     }
   }
   return tasks;
+}
+
+// These are findings in the auditor's recorded answers, not legal conclusions.
+// Keep the existing follow-up labels stable for saved/full report presentation.
+function compactReportIssues(data) {
+  if (!data || data.ui_version !== 5 || isGenericAudit(data)) return [];
+  const p = data.inspection || {}, w = data.workflow || {};
+  const entrances = Array.isArray(data.entrances) ? data.entrances : [], zones = Array.isArray(data.zones) ? data.zones : [];
+  const evidence = Array.isArray(data.evidence) ? data.evidence : [], materials = Array.isArray(data.request_packet?.materials) ? data.request_packet.materials : [];
+  const issues = [], required = new Set();
+  const missing = (control, label, step, action = label) => { if (!required.has(control)) { required.add(control); issues.push({ ...describeReportIssue(data, { id: 'required:' + control, label }), action }); } };
+  for (const [key, label] of [['org', 'организацию'], ['address', 'адрес объекта'], ['floor_plan', 'этаж на плане'], ['floor_actual', 'фактический этаж']]) {
+    if (!nonempty(p[key])) missing('inspection.' + key, 'Укажите ' + label + '.', key === 'org' || key === 'address' ? 0 : 1);
+  }
+  if (!(data.object_category === 'tobacco' && !p.service) && !['Получение', 'Продление', 'Переоформление'].includes(p.service)) missing('inspection.service', 'В заявке не указана услуга.', 0, 'Попросите менеджера уточнить услугу в исходной заявке.');
+  for (const [control, value, choices, label] of [
+    ['building_type', data.building_type, ['Жилое', 'Нежилое'], 'Выберите: жилое или нежилое здание.'],
+    ['bti', data.bti, ['Да', 'Нет'], 'Укажите результат сверки с представленным планом.'],
+    ['to', data.to, ['Нужно', 'Не нужно'], 'Укажите, требуется ли техническое описание.'],
+    ['inspection.rooms_complete', p.rooms_complete, ['Да', 'Нет'], 'Укажите, вся ли площадь по плану входит в объект.'],
+    ['inspection.within_cadastral', p.within_cadastral, ['Да', 'Нет'], 'Укажите, соблюдены ли внешние границы помещения.'],
+    ['inspection.kkt_count', p.kkt_count, ['1', '2'], 'Выберите количество касс: 1 или 2.'],
+    ['inspection.kkt_ip', p.kkt_ip, ['Да', 'Нет'], 'Укажите, есть ли касса ИП.'],
+  ]) if (!choices.includes(value)) missing(control, label, control === 'building_type' ? 0 : 1);
+  if (typeof p.cadastral_count !== 'string' || !/^[1-9]\d?$/.test(p.cadastral_count)) missing('inspection.cadastral_count', 'Количество кадастровых помещений: целое число от 1 до 99.', 1);
+  if (Number(p.cadastral_count) > 1 && !['Сохранена', 'Объединены'].includes(p.inter_cadastral_boundary)) missing('inspection.inter_cadastral_boundary', 'Укажите сохранность границы между кадастровыми помещениями.', 1);
+  if (data.bti === 'Нет' && !nonempty(p.plan_note)) missing('inspection.plan_note', 'Коротко опишите, что отличается на плане.', 1);
+  const answers = ['Да', 'Нет', 'Не проверено'];
+  if (data.object_category === 'tobacco') {
+    for (const [key, choices, label] of [['tobacco_display', ['Закрытая', 'Открытая', 'Товара нет', 'Не проверено'], 'выкладку табака'], ['tobacco_price_list', ['Есть', 'Нет', 'Не проверено'], 'перечень продукции с ценами'], ['tobacco_advertising', ['Есть', 'Нет', 'Не проверено'], 'наличие рекламы табака']]) {
+      if (!choices.includes(p[key])) missing('inspection.' + key, 'Укажите ' + label + '.', 1);
+    }
+  } else {
+    if (!answers.includes(p.alcohol_present)) missing('inspection.alcohol_present', 'Укажите наличие алкоголя на объекте.', 1);
+    if (p.service === 'Продление' && p.alcohol_present === 'Да' && !answers.includes(p.alcohol_within_licensed)) missing('inspection.alcohol_within_licensed', 'Укажите размещение алкоголя относительно лицензированной зоны.', 1);
+  }
+  const video = Object.hasOwn(w, 'video_url') ? w.video_url : data.video_url || '';
+  if (data.request_packet?.video_required && !video) missing('workflow.video_url', 'Менеджер запросил видео: приложите ссылку на Яндекс Диск.', 2);
+  if (p.service === 'Продление' && w.archive_skipped !== 'Да' && ![...evidence, ...materials].some(file => file?.role === 'archive')) missing('workflow.archive_skipped', 'Архивная графика не приложена.', 0, 'Добавьте архив или явно отметьте «Архив не предоставлен»; это сохранит вопрос о сверке открытым.');
+  if (!entrances.length) missing('entrances', 'Добавьте хотя бы один вход и его фото.', 0);
+  const photo = (role, id) => evidence.some(file => file?.subject_id === id && file.role === role && /^image\//.test(file.mime || ''));
+  for (const entrance of entrances) if (!photo('entrance', entrance.id)) missing('evidence.entrance.' + entrance.id, 'Добавьте фото входа «' + (entrance.label || entrance.id) + '».', 0);
+  for (const zone of zones) if (!photo('zone', zone.id)) missing('evidence.zone.' + zone.id, 'Добавьте фото организации «' + (zone.name || zone.id) + '».', 0);
+  const drawing = (value, type, subject, requireMarks) => {
+    const step = type === 'map' ? 0 : 1, name = type === 'map' ? 'схемы территории' : 'плана помещения';
+    if (!value || !evidence.some(file => file?.id === value.evidence_id && (type === 'map' ? ['map-source'] : ['plan-source', 'egrn', 'archive']).includes(file.role))) missing(type + '.evidence_id', 'Выберите исходный файл ' + name + '.', step);
+    if (requireMarks && (!Array.isArray(value?.annotations) || !value.annotations.length)) missing(type + '.annotations', 'Сохраните разметку ' + name + '.', step);
+    if (value?.pending?.points?.length) missing(type + '.pending', 'Завершите незамкнутую разметку ' + name + '.', step);
+    if (value?.annotations?.length && !evidence.some(file => file?.role === type && file.subject_id === subject && /^image\//.test(file.mime || '') && (!value.preview_evidence_id || value.preview_evidence_id === file.id))) missing(type + '.preview_evidence_id', 'Сохраните изображение размеченного ' + (type === 'map' ? 'плана территории' : 'плана помещения') + '.', step);
+  };
+  drawing(data.plan, 'plan', 'annotation', true);
+  if (w.territory_result === 'clear') {
+    if (zones.length || data.map?.evidence_id || data.map?.annotations?.length || data.map?.preview_evidence_id || data.map?.pending?.points?.length) missing('workflow.territory_result', 'Выбрано «Зон нет», но сохранены организации или схема территории.', 0, 'Сверьте результат территории с отмеченными фактами; исправьте ошибочный ответ или ошибочно добавленные сведения.');
+  } else if (w.territory_result === 'findings' && data.map?.mode === 'attached') {
+    if (!evidence.some(file => file?.id === data.map.evidence_id && file.role === 'map' && file.subject_id === 'attached' && /^image\/(jpeg|png)$/.test(file.mime || ''))) missing('map.evidence_id', 'Приложите готовую схему территории в JPG или PNG.', 0);
+  } else drawing(data.map, 'map', 'annotation', true);
+  if (w.territory_result === 'findings' && !zones.length) missing('zones', 'Добавьте хотя бы одну проверенную организацию или спорное место.', 0);
+
+  const tasks = compactFollowupTasks({ ...data, inspection: p, workflow: w, entrances, zones });
+  for (const task of tasks) {
+    const issue = describeReportIssue(data, task);
+    if (!issue || required.has(issue.control) || task.id === 'floor-mismatch' && (!nonempty(p.floor_plan) || !nonempty(p.floor_actual) || p.floor_plan === 'Не проверено' || p.floor_actual === 'Не проверено')) continue;
+    issues.push(issue);
+  }
+  for (const key of ['floor_plan', 'floor_actual']) if (p[key] === 'Не проверено') issues.push(describeReportIssue(data, { id: 'unverified:' + key }));
+  return issues;
 }
 
 function validateCompactDrawing(drawing, type, evidence, subject, requireMarks) {
@@ -361,7 +428,7 @@ function validateCompactTerritory(data, evidence) {
   return { marks: drawing.annotations, checkMarks: true };
 }
 
-function validateCompactWorkflow(data) {
+function validateCompactWorkflow(data, options = {}) {
   validateInspection(data);
   const p = data.inspection, w = data.workflow || {}, evidence = data.evidence || [];
   if (!CONCLUSIONS[w.conclusion_status]) throw new Error('Выберите результат выезда.');
@@ -418,7 +485,21 @@ function validateCompactWorkflow(data) {
       if (!data.entrances.some(item => item.id === mark.fromEntranceId) || !data.zones.some(item => item.id === mark.toObjectId)) throw new Error('Свяжите линию замера с существующим входом и организацией.');
     }
   }
-  if (w.conclusion_status === 'ready' && compactFollowupTasks(data).length) throw new Error('В отчёте есть замечания или непроверенные сведения. Выберите «Нужны действия» или «Недостаточно данных».');
+  if (w.conclusion_status === 'ready') {
+    const issues = compactReportIssues(data).filter(issue => options.legacyDelivery !== true || !['unverified:floor_plan', 'unverified:floor_actual'].includes(issue.id));
+    // Only a server-verified older delivery can finish under its original
+    // rules. Unequal floor answers were already a conflict in that version.
+    if (options.legacyDelivery === true && !issues.some(issue => issue.id === 'floor-mismatch')) {
+      const oldFloorConflict = compactFollowupTasks(data).find(task => task.id === 'floor-mismatch');
+      if (oldFloorConflict) issues.push(describeReportIssue(data, oldFloorConflict));
+    }
+    if (issues.length) {
+      const reasons = issues.slice(0, 3).map(issue => issue.reason).join(' ');
+      const error = new Error('Итог «Соответствует» расходится с ответами. В отчёте есть замечания или непроверенные сведения: ' + reasons + (issues.length > 3 ? ' И ещё ' + (issues.length - 3) + ' замечаний.' : '') + ' Исправьте ошибочный ответ или выберите итог «Нужны действия» / «Недостаточно данных», сохранив факты.');
+      error.code = 'AUDIT_CONCLUSION_CONFLICT'; error.issues = issues;
+      throw error;
+    }
+  }
 }
 
 function buildCompactWorkflowReport(data) {
@@ -462,4 +543,4 @@ function buildCompactWorkflowReport(data) {
   return { plain, html: plain.map(esc) };
 }
 
-module.exports = { activeDraftEvidence, normalizeWorkflow, validateWorkflow, buildWorkflowReport, followupTasks, hydrateDraftReport, CONCLUSIONS, TERRITORY_CLEAR_LABEL };
+module.exports = { activeDraftEvidence, normalizeWorkflow, validateWorkflow, buildWorkflowReport, followupTasks, compactReportIssues, hydrateDraftReport, CONCLUSIONS, TERRITORY_CLEAR_LABEL };

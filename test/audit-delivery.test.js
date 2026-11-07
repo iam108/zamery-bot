@@ -79,7 +79,16 @@ function harness(options = {}) {
     } };
   vm.createContext(context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../src/bot/audit-handler.js'), 'utf8'), context);
-  return { ctx, calls, saved, send: data => context.module.exports.handleAuditReport(ctx, data) };
+  return { ctx, calls, saved, send: data => {
+    if (options.deliveryVersion === 2 && !ctx.auditDelivery) {
+      const normalized = require('../src/bot/audit-workflow').normalizeWorkflow(data);
+      const digest = { ...normalized, documents: normalized.documents.map(({ source, data: binary, ...meta }) => ({ ...meta, contentHash: require('node:crypto').createHash('sha256').update(source || Buffer.from(binary, 'base64')).digest('hex') })) };
+      const signature = require('node:crypto').createHash('sha256').update(JSON.stringify(digest, (key, item) => item && typeof item === 'object' && !Array.isArray(item) ? Object.fromEntries(Object.keys(item).sort().map(name => [name, item[name]])) : item)).digest('hex');
+      let progress = { signature, deliveryVersion: 2, textIds: [], photoIds: [], documentIds: [], saved: false, handoffSent: false, replied: false };
+      ctx.auditDelivery = { load: async () => progress, save: async value => { progress = value; } };
+    }
+    return context.module.exports.handleAuditReport(ctx, data);
+  } };
 }
 
 function data(extra = {}) {
@@ -257,7 +266,7 @@ test('new UI5 sends one preview album and one originals ZIP without repeating ei
   report.submit_id = 'v5-inline-retry';
   report.documents = report.evidence.map(file => ({ ...file, source: Buffer.from('original-' + file.id) }));
   let failSave = true;
-  const h = harness({ saveFailure: async () => { if (failSave) { failSave = false; throw new Error('save retry'); } } });
+  const h = harness({ deliveryVersion: 2, saveFailure: async () => { if (failSave) { failSave = false; throw new Error('save retry'); } } });
   await assert.rejects(h.send(report), /save retry/);
   const albums = h.calls.filter(call => call.method === 'sendMediaGroup');
   assert.equal(albums.length, 1);

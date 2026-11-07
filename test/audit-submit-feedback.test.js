@@ -31,6 +31,7 @@ function harness(data = compactVisit()) {
     state: { data, evidence, packet: data.request_packet, draft: { id: randomUUID(), revision: 10 }, version: 0, dirty: false,
       pendingUploads: 0, submitting: false, frozen: false, completed: false },
     URL,
+    window: { AuditReportIssues: require('../public/audit-report-issues') },
     root: { querySelector: node, querySelectorAll: () => [], innerHTML: '' },
     $: node, tail: Promise.resolve(), queuedJobs: 0, timer: null, clearTimeout, editor: null, tg: null, orderId: '58', localKey: 'synthetic-audit-submit-feedback', clone: copy,
     defaults: { map: { evidence_id: '', page: 1, annotations: [] } },
@@ -60,7 +61,7 @@ function harness(data = compactVisit()) {
   };
   vm.createContext(c);
   vm.runInContext(['updateClosingConfirmation','setOutcome','queue','isRenewal','packetFiles','evidenceFor','adoptRevision','removeGeneratedEvidence','mapMode','rememberTerritory','switchTerritoryMode','chooseTerritory','hasEvidenceImage','validDistance','territoryIssues','issues','requiredIssues','tasksHtml',
-    'offersActions','reportFeedback','bindReportFeedback','refreshReportFeedback','chooseConclusion','showReportIssues','reportPreview','submit'].map(actualFunction).join('\n'), c);
+    'taskDetails','goIssue','offersActions','reportFeedback','bindReportFeedback','refreshReportFeedback','chooseConclusion','showReportIssues','reportPreview','submit'].map(actualFunction).join('\n'), c);
   return { c, calls, node };
 }
 
@@ -71,8 +72,8 @@ test('a contradictory positive result shows the exact missing-area answer beside
   const { c, calls, node } = harness(data), before = copy(c.state.data);
   const tasks = c.issues(), html = c.reportFeedback(tasks);
   assert.equal(tasks.length, 1); assert.equal(tasks[0].key, 'rooms-incomplete');
-  assert.match(html, /Не вся площадь по выбранному плану входит в объект/);
-  assert.match(html, /data-go-step="1"/); assert.match(html, /Помещение →/);
+  assert.match(html, /не вся площадь по выбранному плану входит в объект/);
+  assert.match(html, /data-go-step="1"/); assert.match(html, /data-issue-control="inspection.rooms_complete"/); assert.match(html,/Проверить ответ/);
   assert.match(html, /data-conclusion-choice="actions"/); assert.match(html, /data-conclusion-choice="insufficient"/);
   assert.doesNotMatch(html, /<details|\shidden(?:>|\s)/);
   await c.submit();
@@ -185,7 +186,7 @@ test('unchecked archive comparison and uninspected entrances remain visible befo
   assert.ok(tasks.some(item => item.key === 'archive-unchecked'));
   assert.ok(tasks.some(item => item.key === 'entrance-' + data.entrances[0].id));
   assert.match(c.reportFeedback(tasks), /Сверка с архивом не выполнена/);
-  assert.match(c.reportFeedback(tasks), /осмотр не завершён/);
+  assert.match(c.reportFeedback(tasks), /Главный вход: Не осмотрен/);
 });
 
 test('hidden renewal and extra-cadastral answers do not block an acquisition with one cadastral unit', () => {
@@ -193,13 +194,14 @@ test('hidden renewal and extra-cadastral answers do not block an acquisition wit
   const { c } = harness(data); assert.equal(c.issues().length, 0);
 });
 
-test('quick outcome buttons stay inert for a frozen report and the issue action opens its named section', () => {
+test('quick outcome buttons stay inert for a frozen report and the issue action opens its named section', async () => {
   const { c } = harness(), before = copy(c.state.data); c.state.frozen = true;
   c.chooseConclusion('actions'); assert.deepEqual(copy(c.state.data), before);
   const outcomeButton = { dataset: { conclusionChoice: 'insufficient' } }, sectionButton = { dataset: { goStep: '1' } }, events = [];
   c.chooseConclusion = value => events.push(['choice', value]); c.go = value => events.push(['section', value]);
+  c.step=()=>0; // A rejected navigation never focuses an unrelated field.
   c.bindReportFeedback({ querySelectorAll: selector => selector === '[data-conclusion-choice]' ? [outcomeButton] : [sectionButton] });
-  outcomeButton.onclick(); sectionButton.onclick();
+  outcomeButton.onclick(); await sectionButton.onclick();
   assert.deepEqual(events, [['choice', 'insufficient'], ['section', 1]]);
 });
 

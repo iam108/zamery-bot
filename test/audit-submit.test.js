@@ -62,6 +62,24 @@ test('validation failure releases the draft before any delivery starts', async (
   assert.equal(h.state.locked, false);
 });
 
+test('a concrete conclusion conflict releases the editable draft before any delivery receipt and a corrected outcome reuses its facts', async () => {
+  const data=compactVisit();data.inspection.rooms_complete='Нет';data.conclusion='Часть площади занята соседями.';
+  const h=harness(data);h.snapshot.evidence=data.evidence.map(file=>({...file,buffer:Buffer.from('STORED_ORIGINAL')}));
+  let sends=0;const submit=createAuditSubmitter(h.drafts,async(ctx,report)=>{sends++;assert.equal(report.inspection.rooms_complete,'Нет');assert.equal(report.conclusion,data.conclusion);},{loadPacket:async()=>data.request_packet});
+  await assert.rejects(submit(108,h.id,4,h.context),error=>error.code==='AUDIT_CONCLUSION_CONFLICT'&&/Часть не входит/.test(error.message));
+  assert.equal(sends,0);assert.equal(h.state.frozen,false);assert.equal(h.state.releases,1);assert.deepEqual(h.state.delivery,{});
+  assert.equal(h.snapshot.data.workflow.conclusion_status,'ready');assert.equal(h.snapshot.data.inspection.rooms_complete,'Нет');
+  h.snapshot.data.workflow.conclusion_status='actions';assert.equal((await submit(108,h.id,4,h.context)).ok,true);assert.equal(sends,1);
+});
+
+test('choosing actions cannot waive the required entrance photo or freeze a blocked draft', async () => {
+  const data=compactVisit();data.workflow.conclusion_status='actions';const h=harness(data);
+  h.snapshot.evidence=data.evidence.filter(file=>file.role!=='entrance').map(file=>({...file,buffer:Buffer.from('STORED_ORIGINAL')}));
+  let sends=0;const submit=createAuditSubmitter(h.drafts,async()=>{sends++;},{loadPacket:async()=>data.request_packet});
+  await assert.rejects(submit(108,h.id,4,h.context),/фото входа/i);
+  assert.equal(sends,0);assert.equal(h.state.frozen,false);assert.deepEqual(h.state.delivery,{});
+});
+
 test('successful submission closes once and repeated request returns without redelivery', async () => {
   const h = harness();
   let deliveries = 0;
