@@ -5,9 +5,10 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const { Markup } = require('telegraf');
+const { canManageCases } = require('../src/web/auth');
 
-function harness(initialStaff) {
-  let staff = initialStaff, start;
+function harness(initialStaff, adminIds = '') {
+  let staff = initialStaff, start, configuredAdmins = adminIds;
   const replies = [], reads = [], keys = [];
   const bot = { start(handler) { start = handler; }, action() {}, command() {}, hears() {}, on() {}, catch() {} };
   const setups = {
@@ -25,7 +26,13 @@ function harness(initialStaff) {
     require(name) {
       if (name === 'telegraf') return { Markup, Telegraf: function () { return bot; } };
       if (name === '../web/auth') return { ensureStaff: async () => {},
-        canManageCases: actor => actor?.approved === true && actor.role === 'manager',
+        canManageCases(actor, id) {
+          // Use the real synchronous policy with an isolated configuration,
+          // including runtime changes, without exposing the host environment.
+          const before = process.env.ADMIN_TG_IDS; process.env.ADMIN_TG_IDS = configuredAdmins;
+          try { return canManageCases(actor, id); }
+          finally { if (before === undefined) delete process.env.ADMIN_TG_IDS; else process.env.ADMIN_TG_IDS = before; }
+        },
         keyQuery(id) { keys.push(id); return 'u=' + id + '&k=synthetic-key-' + id; } };
       if (name === '../db/pool') return { async query(sql, args) {
         assert.equal(sql, 'SELECT * FROM staff WHERE tg_id=$1'); reads.push(args[0]);
@@ -37,7 +44,7 @@ function harness(initialStaff) {
   });
   vm.runInContext(fs.readFileSync(require.resolve('../src/bot/index'), 'utf8'), context);
   context.module.exports.setupBot();
-  return { replies, reads, keys, setStaff(value) { staff = value; },
+  return { replies, reads, keys, setStaff(value) { staff = value; }, setAdminIds(value) { configuredAdmins = value; },
     async start(type = 'private') { await start({ from: { id: 42 }, chat: { id: type === 'private' ? 42 : -100123, type },
       reply: async (text, extra) => replies.push({ text, extra }) }); },
   };
@@ -66,6 +73,7 @@ for (const role of ['lawyer', 'auditor']) test('manual client creation is not ad
   const h = harness({ tg_id: 42, name: 'Сотрудник', role, approved: true });
   await h.start();
   assert.equal(find(h.replies.at(-1), '＋ Создать клиента'), undefined);
+  assert.equal(find(h.replies.at(-1), '⚖️ Передать юристу'), undefined);
   if (role === 'lawyer') assert.ok(buttons(h.replies.at(-1)).some(button => button === '📂 Мои клиенты' || button.text === '📂 Мои клиенты'));
   else assert.ok(find(h.replies.at(-1), '🔍 Отчёт аудитора'));
 });
@@ -83,4 +91,34 @@ test('start rechecks current approval and ignores nonprivate chats', async () =>
   h.setStaff({ tg_id: 42, role: 'manager', approved: false }); await h.start();
   assert.equal(find(h.replies.at(-1), '＋ Создать клиента'), undefined);
   assert.deepEqual(h.reads, [42, 42]); assert.deepEqual(h.keys, [42]);
+});
+
+for (const role of ['lawyer', 'auditor']) test('an approved configured admin with role ' + role + ' gets both client buttons and retains their role menu', async () => {
+  const h = harness({ tg_id: 42, name: 'Администратор', role, approved: true }, '999; 42,100');
+  await h.start(); const reply = h.replies.at(-1);
+  const create = find(reply, '＋ Создать клиента'), handoff = find(reply, '⚖️ Передать юристу');
+  assert.ok(create?.web_app, 'The backend-authorized admin needs the manual client entry point');
+  assert.ok(handoff?.web_app, 'The same admin needs the existing linked handoff entry point');
+  assert.equal(create.web_app.url, 'https://bot.example/handoff?mode=manual&u=42&k=synthetic-key-42');
+  assert.equal(handoff.web_app.url, 'https://bot.example/handoff?u=42&k=synthetic-key-42');
+  if (role === 'lawyer') assert.ok(buttons(reply).some(button => button === '📂 Мои клиенты' || button.text === '📂 Мои клиенты'));
+  else assert.ok(find(reply, '🔍 Отчёт аудитора'));
+  assert.equal(buttons(reply).filter(button => button.text === '＋ Создать клиента').length, 1);
+  assert.equal(buttons(reply).filter(button => button.text === '⚖️ Передать юристу').length, 1);
+  assert.deepEqual(h.reads, [42]); assert.deepEqual(h.keys, [42]);
+});
+
+for (const approved of [false, null]) test('configured admin IDs never bypass staff approval: ' + approved, async () => {
+  const h = harness({ tg_id: 42, name: 'Администратор', role: 'lawyer', approved }, '42');
+  await h.start(); assert.equal(find(h.replies.at(-1), '＋ Создать клиента'), undefined);
+  assert.equal(find(h.replies.at(-1), '⚖️ Передать юристу'), undefined); assert.deepEqual(h.keys, []);
+});
+
+test('a repeated private start applies admin revocation and keeps the lawyer menu', async () => {
+  const h = harness({ tg_id: 42, name: 'Администратор', role: 'lawyer', approved: true }, '42');
+  await h.start(); assert.ok(find(h.replies.at(-1), '＋ Создать клиента')); assert.ok(find(h.replies.at(-1), '⚖️ Передать юристу'));
+  h.setAdminIds('999'); await h.start(); const reply = h.replies.at(-1);
+  assert.equal(find(reply, '＋ Создать клиента'), undefined); assert.equal(find(reply, '⚖️ Передать юристу'), undefined);
+  assert.ok(buttons(reply).some(button => button === '📂 Мои клиенты' || button.text === '📂 Мои клиенты'));
+  assert.deepEqual(h.reads, [42, 42]); assert.deepEqual(h.keys, [42, 42]);
 });

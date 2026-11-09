@@ -84,6 +84,11 @@ function setupBot() {
     if (me.role === 'manager') kb = [[createClientBtn], [requestsBtn], [zamer, handoffBtn], ['📄 Выписка ЕГРН']];
     else if (me.role === 'lawyer') kb = [[requestsBtn], [zamer, '📂 Мои клиенты'], ['📄 Выписка ЕГРН']];
     else kb = [[Markup.button.webApp('🔍 Отчёт аудитора', WEBAPP_URL + '/audit' + kq)], ['📄 Выписка ЕГРН']];
+    // Administrators can manage clients without losing their lawyer/auditor tools.
+    if (me.role !== 'manager' && canManageCases(me, ctx.from.id)) {
+      kb.unshift([createClientBtn]);
+      kb.splice(kb.length - 1, 0, [handoffBtn]);
+    }
     const pending = me.requested_role && me.requested_role !== me.role ? '\n⏳ Запрос на роль «' + ROLES[me.requested_role] + '» ждёт одобрения.' : '';
     await ctx.reply('👋 ' + me.name + ' (' + ROLES[me.role] + ')' + pending + '\n\nВыбери действие:', Markup.keyboard(kb).resize());
   });
