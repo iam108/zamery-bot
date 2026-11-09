@@ -17,7 +17,7 @@ async function fixture(run,options={}) {
   const pool = { async query(sql, params) {
     queries.push(sql);
     if(beforeAccess&&sql.startsWith('SELECT to_jsonb(c) AS access_case'))await beforeAccess(db);
-    if (/^UPDATE cases SET data=/.test(sql)) {
+    if (sql.includes('UPDATE cases SET data=')) {
       writes++;
       if (beforeWrite) await beforeWrite({ sql, params, number: writes, db });
     }
@@ -31,8 +31,9 @@ async function fixture(run,options={}) {
     require(name) {
       if (name === '../db/pool') return pool;
       if (name === '../checklists') return { LISTS: {}, STAGES: ['Сбор документов', 'Подано', 'Выездная проверка', 'Архив'], pickChecklist: () => 'QA', flagLabels: () => options.flagLabels||{} };
-      if (name === '../bot/instance') return { telegram: { async sendMessage(...args) { telegram.push(args); return { message_id: telegram.length }; } } };
+      if (name === '../bot/instance') return { telegram: { async sendMessage(...args) { telegram.push(args); if(options.sendMessage)return options.sendMessage(...args);return { message_id: telegram.length }; } } };
       if (name === './handoff-packet') return { setupHandoffPacket: () => ({}) };
+      if (name === './handoff-manual' || name === './handoff-manual-materials') return require('../src/web/' + name);
       if (name === './auth') return require('../src/web/auth');
       if (name === './reminder-recipients') return require('../src/web/reminder-recipients');
       if (name === './http-errors') return require('../src/web/http-errors');
@@ -40,7 +41,7 @@ async function fixture(run,options={}) {
     },
   };
   vm.createContext(context); vm.runInContext(source, context);
-  const app = { get(url, ...handlers) { routes.set('GET ' + url, handlers.at(-1)); }, post(url, ...handlers) { routes.set('POST ' + url, handlers.at(-1)); } };
+  const app = { get(url, ...handlers) { routes.set('GET ' + url, handlers.at(-1)); }, post(url, ...handlers) { routes.set('POST ' + url, handlers.at(-1)); }, delete(url,...handlers) {routes.set('DELETE '+url,handlers.at(-1));} };
   try {
     context.module.exports.setupHandoff(app);
     await Promise.all(initialization);
@@ -74,6 +75,32 @@ async function fixture(run,options={}) {
 }
 const checkpoint = generation => ({ version: 2, generation, completed: generation > 1, cards: { '808': 900 + generation }, materials: { confirmed: { '808': [1000 + generation] } }, egrn: { copies: { confirmed: true } } });
 const asDate = value => value instanceof Date ? value.toISOString().slice(0, 10) : String(value).slice(0, 10);
+
+test('concurrent identical checklist transitions notify each destination once while accepting exact save replay',pg,async()=>fixture(async h=>{
+  h.environment.CLIENTS_CHAT_ID='-100222';await h.seed({_stage:'Сбор документов',_handoff:checkpoint(2)});
+  let arrivals=0,release;const gate=new Promise(resolve=>{release=resolve;});h.interleave(async()=>{if(++arrivals===2)release();else await gate;});
+  const body={_stage:'Подано',_submittedOn:'2026-11-05',fl_egrn:{s:'yes',c:'Synthetic finding'}};
+  const results=await Promise.all([h.rawSave(body,{expectedRevision:0}),h.rawSave(body,{expectedRevision:0})]);
+  assert.ok(results.every(item=>item.status===200&&item.result.ok));assert.equal((await h.row()).checklist_revision,1);
+  const flags=h.telegram.filter(args=>args[1].includes('Красный флаг'));assert.deepEqual(flags.map(args=>String(args[0])).sort(),['-100222','101']);
+  assert.equal(h.telegram.filter(args=>args[1].includes('Заявление подано')).length,1);assert.deepEqual((await h.row()).data._handoff,checkpoint(2));
+}, {flagLabels:{fl_egrn:'Synthetic restriction'}}));
+
+test('concurrent identical completion saves emit one completion notice and genuine later completion emits another',pg,async()=>fixture(async h=>{
+  h.environment.CLIENTS_CHAT_ID='-100222';await h.seed({answer:'Pending'});let arrivals=0,release;const gate=new Promise(resolve=>{release=resolve;});
+  h.interleave(async()=>{if(++arrivals===2)release();else await gate;});
+  const first=await Promise.all([h.rawSave({answer:'Completed'},{expectedRevision:0,done:1,total:1}),h.rawSave({answer:'Completed'},{expectedRevision:0,done:1,total:1})]);
+  assert.ok(first.every(item=>item.result.ok));assert.equal(h.telegram.filter(args=>args[1].includes('Чек-лист выполнен')).length,1);assert.ok((await h.row()).completed_at);
+  h.interleave(null);await h.save({answer:'Reopened'},{done:0,total:1});assert.equal((await h.row()).completed_at,null);
+  await h.save({answer:'Completed again'},{done:1,total:1});assert.equal(h.telegram.filter(args=>args[1].includes('Чек-лист выполнен')).length,2);
+}));
+
+test('a lost completion-message ACK after commit does not duplicate the notice when the client retries its exact old revision',pg,async()=>fixture(async h=>{
+  h.environment.CLIENTS_CHAT_ID='-100222';await h.seed({answer:'Pending'});
+  const body={answer:'Completed'},extra={expectedRevision:0,done:1,total:1},first=await h.rawSave(body,extra);
+  assert.equal(first.result.ok,false);assert.equal((await h.row()).checklist_revision,1);assert.ok((await h.row()).completed_at);
+  const retry=await h.rawSave(body,extra);assert.equal(retry.result.ok,true);assert.equal(retry.result.revision,1);assert.equal(h.telegram.length,1);
+}, {sendMessage:async()=>{throw new Error('Synthetic accepted completion notice with lost ACK');}}));
 
 for(const change of ['approval','role','assignment'])test('checklist saving rejects a current '+change+' change in its atomic write and preserves answers and checkpoint',pg,async()=>fixture(async h=>{
   await h.seed({answer:'Original',_comment:'Private original note',_handoff:checkpoint(2)});let changed=false;
@@ -142,7 +169,7 @@ test('first transition to submitted preserves the latest checkpoint across both 
   h.interleave(async ({ number, db }) => { await db.query("UPDATE cases SET data=jsonb_set(data,'{_handoff}',$1::jsonb) WHERE id=17", [checkpoint(number + 1)]); });
   const result = await h.save({ _stage: 'Подано', _submittedOn: '2026-11-02', document: { s: 'yes' }, _handoff: { malicious: true } });
   const row = await h.row();
-  assert.equal(h.queries.filter(sql => /^UPDATE cases SET data=/.test(sql)).length, 1);
+  assert.equal(h.queries.filter(sql => sql.includes('UPDATE cases SET data=')).length, 1);
   assert.deepEqual(row.data._handoff, checkpoint(2)); assert.equal(row.data._stage, 'Подано');
   assert.equal(asDate(row.submitted_on), '2026-11-02'); assert.equal(asDate(row.decision_due), '2026-11-24');
   assert.equal(row.data._submittedOn, '2026-11-02'); assert.equal(row.data._decisionDue, '2026-11-24');
@@ -155,7 +182,7 @@ test('editing an already submitted date preserves the latest checkpoint across t
   h.interleave(async ({ number, db }) => { await db.query("UPDATE cases SET data=jsonb_set(data,'{_handoff}',$1::jsonb) WHERE id=17", [checkpoint(number + 5)]); });
   const result = await h.save({ _stage: 'Подано', _submittedOn: '2026-11-03', _handoff: null });
   const row = await h.row();
-  assert.equal(h.queries.filter(sql => /^UPDATE cases SET data=/.test(sql)).length, 1);
+  assert.equal(h.queries.filter(sql => sql.includes('UPDATE cases SET data=')).length, 1);
   assert.deepEqual(row.data._handoff, checkpoint(6));
   assert.equal(asDate(row.submitted_on), '2026-11-03'); assert.equal(asDate(row.decision_due), '2026-11-25');
   assert.equal(row.data._decisionDue, '2026-11-25'); assert.equal(row.reminded_on, null); assert.equal(result.decisionDue, '2026-11-25');

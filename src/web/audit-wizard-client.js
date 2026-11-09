@@ -858,22 +858,39 @@
   }
   function loadThumbnails(scope){(scope||root).querySelectorAll('[data-evidence-image]').forEach(function(image){evidenceUrl(image.dataset.evidenceImage).then(function(url){if(image.isConnected)image.src=url;}).catch(function(){if(image.isConnected)image.alt='Превью недоступно. Оригинал можно открыть повторно.';});});}
   async function openEvidence(eid){try{var url=await evidenceUrl(eid);var e=state.evidence.find(function(x){return String(x.id)===String(eid);});var link=document.createElement('a');link.href=url;link.download=e&&e.name||'document';document.body.appendChild(link);link.click();link.remove();}catch(error){notify(error.message);}}
-  async function readBase64(file) {
+  async function readBase64(file, signal) {
     function unreadable() { return new Error('Не удалось открыть «' + (file.name || 'файл') + '». Выберите его заново через «Файлы» → «На устройстве».'); }
     if (!file.size) throw new Error('Файл «' + (file.name || 'без названия') + '» пустой.');
+    var reader, timer, stopped, rejectStopped;
+    var interrupted = new Promise(function (_, reject) { rejectStopped = reject; });
+    function stop(cancelled) {
+      if (stopped) return;
+      stopped = Object.assign(new Error(cancelled ? 'Чтение файла отменено.' : 'Не удалось дождаться файла «' + (file.name || 'файл') + '». Сохраните его на устройстве и выберите ещё раз.'), {code:cancelled?'AUDIT_FILE_CANCELLED':'AUDIT_FILE_TIMEOUT'});
+      rejectStopped(stopped);
+      if (reader) { reader.onload=reader.onerror=reader.onabort=null;try{reader.abort();}catch(_){} }
+    }
+    function cancel() { stop(true); }
+    if (signal && signal.aborted) cancel();
+    else {
+      if(signal)signal.addEventListener('abort',cancel,{once:true});
+      timer=setTimeout(function(){stop(false);},30000);
+    }
+    async function capture() {
+    if(stopped)throw stopped;
     // Android's picker can return a temporary content-provider file. Capture
     // its bytes in the selection callback, before saving or clearing the input.
     if (typeof file.arrayBuffer === 'function') {
       try {
         var bytes = new Uint8Array(await file.arrayBuffer());
+        if(stopped)throw stopped;
         if (bytes.length !== file.size) throw unreadable();
         var binary = '';
         for (var offset = 0; offset < bytes.length; offset += 32768) binary += String.fromCharCode.apply(null, bytes.subarray(offset, offset + 32768));
         return btoa(binary);
       } catch (error) { /* Some WebViews support only the FileReader path. */ }
     }
+    if(stopped)throw stopped;
     return new Promise(function (resolve, reject) {
-      var reader;
       try {
         reader = new FileReader();
         reader.onload = function () {
@@ -886,6 +903,13 @@
         reader.readAsDataURL(file);
       } catch (error) { reject(unreadable()); }
     });
+    }
+    try { return await Promise.race([interrupted,capture()]); }
+    finally {
+      clearTimeout(timer);
+      if(signal)signal.removeEventListener('abort',cancel);
+      if(reader)reader.onload=reader.onerror=reader.onabort=null;
+    }
   }
   function fileMime(file, data) {
     var declared = String(file.type || file.mime || '').toLowerCase();
@@ -937,7 +961,7 @@
     state.pendingUploads += files.length; status('Читаю выбранные файлы…');
     // Start every read now, not after the network queue. Observe rejections now
     // as well: a failed picker read must not become an unhandled rejection.
-    var prepared = Promise.all(options.preparedData || files.map(readBase64)).then(function (data) { return { data: data }; }, function (error) { return { error: error }; });
+    var prepared = Promise.all(options.preparedData || files.map(function(file){return readBase64(file);})).then(function (data) { return { data: data }; }, function (error) { return { error: error }; });
     return queue(async function () {
       var saved = [], remaining = files.length;
       try {
@@ -969,7 +993,7 @@
     state.pendingUploads++; status('Читаю выбранный файл…');
     var data;
     try {
-      data = await readBase64(file);
+      data = await readBase64(file,signal);
       if(signal&&signal.aborted)throw Object.assign(new Error('Открытие файла отменено.'),{code:'AUDIT_PDF_CANCELLED'});
       var type = fileMime(file, data);
       if (type !== file.type) file = { name: file.name, size: file.size, type: type };

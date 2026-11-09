@@ -877,7 +877,7 @@ async function sendCaseReminders(bot) {
           if (!access.checked || !access.allowed.includes(chat)) continue;
           await require('./reminder-delivery').deliverRecipient({
             key: 'case:'+r.id+':'+(r.created_at && r.created_at.toISOString ? r.created_at.toISOString() : r.created_at)+':'+chat,
-            slot: chat, window: due, delivery: receipts, now: Date.now(), nextRetryAt: when => reminderRetryAt(when,false),
+            slot: chat, expectedChat: chat, window: due, delivery: receipts, now: Date.now(), nextRetryAt: when => reminderRetryAt(when,false),
             acknowledged: () => Number.isSafeInteger(Number(receipts[chat])) && Number(receipts[chat]) > 0,
             acknowledge: id => { receipts[chat] = id; },
             persist: () => client.query('UPDATE case_reminders SET delivery=$1 WHERE id=$2', [JSON.stringify(receipts), r.id]),
@@ -954,7 +954,7 @@ async function sendDecisionReminders(bot) {
         try {
           if (access.checked && access.allowed.includes(lawyer)) {
             await require('./reminder-delivery').deliverRecipient({
-              key: 'decision:'+c.id+':'+due+':'+today+':dm:'+lawyer, slot: 'dm:'+lawyer, window: today, delivery: receipts, now: Date.now(), nextRetryAt: when => reminderRetryAt(when,true),
+              key: 'decision:'+c.id+':'+due+':'+today+':dm:'+lawyer, slot: 'dm:'+lawyer, expectedChat: lawyer, window: today, delivery: receipts, now: Date.now(), nextRetryAt: when => reminderRetryAt(when,true),
               acknowledged: () => receipts.dm && receipts.dm.on === today && receipts.dm.chat === lawyer && receipts.dm.message_id > 0,
               acknowledge: id => { receipts.dm = { on: today, chat: lawyer, message_id: id }; }, persist: checkpoint,
               beforeSend: async () => { var gate = await refreshAccess(); return gate && gate.checked && gate.allowed.includes(lawyer); },
@@ -974,7 +974,7 @@ async function sendDecisionReminders(bot) {
           if (!access) continue;
           const notice = text + (access.checked && access.allowed.includes(lawyer) ? '' : '\n\n⚠️ Личный получатель недоступен. Проверьте назначенного юриста и его доступ.');
           await require('./reminder-delivery').deliverRecipient({
-            key: 'decision:'+c.id+':'+due+':group:'+group, slot: 'group:'+group, window: due, delivery: receipts, now: Date.now(), nextRetryAt: when => reminderRetryAt(when,true),
+            key: 'decision:'+c.id+':'+due+':group:'+group, slot: 'group:'+group, expectedChat: group, window: due, delivery: receipts, now: Date.now(), nextRetryAt: when => reminderRetryAt(when,true),
             acknowledged: () => receipts.group && receipts.group.message_id > 0,
             acknowledge: id => { receipts.group = { chat: group, message_id: id }; }, persist: checkpoint,
             beforeSend: active,
@@ -1343,6 +1343,8 @@ function setupHandoff(app) {
   startDecisionReminders(bot);
   const WEBAPP_URL = process.env.WEBAPP_URL;
   const packetService = require('./handoff-packet').setupHandoffPacket(app);
+  require('./handoff-manual').setupHandoffManual(app,{pool,ready:ensureTables});
+  require('./handoff-manual-materials').setupHandoffManualMaterials(app,{pool,ready:ensureTables});
   let submitV2;
   async function notifyCaseCreator(snapshot, message) {
     for(let attempt=0;attempt<2;attempt++){
@@ -1474,7 +1476,9 @@ function setupHandoff(app) {
       if (done > total || total > 1000) return res.status(400).json({ ok: false, error: 'Проверьте количество пунктов чек-листа.' });
       var nowDone = total > 0 && done >= total;
       var saved = (await pool.query(
-        `UPDATE cases SET data=($1::jsonb - '_handoff' - '_workspaceNote' - '_comment')
+        `WITH checklist_before AS MATERIALIZED (
+          SELECT id AS prior_id,data AS prior_data,completed_at AS prior_completed_at FROM cases WHERE id=$4 FOR UPDATE
+        ) UPDATE cases SET data=($1::jsonb - '_handoff' - '_workspaceNote' - '_comment')
           || CASE WHEN data ? '_handoff' THEN jsonb_build_object('_handoff', data -> '_handoff') ELSE '{}'::jsonb END
           || CASE WHEN data ? '_workspaceNote' THEN jsonb_build_object('_workspaceNote', data -> '_workspaceNote') ELSE '{}'::jsonb END
           || CASE
@@ -1488,7 +1492,8 @@ function setupHandoff(app) {
           done=$2, total=$3, completed_at=` + (nowDone ? 'COALESCE(completed_at, NOW())' : 'NULL') + `,
           submitted_on=$9::date, decision_due=$10::date,
           reminded_on=CASE WHEN decision_due IS DISTINCT FROM $10::date THEN NULL ELSE reminded_on END
-          WHERE id=$4
+          FROM checklist_before
+          WHERE id=$4 AND checklist_before.prior_id=cases.id
           AND EXISTS (SELECT 1 FROM staff current_actor WHERE current_actor.tg_id=$11 AND current_actor.approved IS TRUE
             AND (current_actor.role='manager' OR $12::boolean OR current_actor.role='lawyer' AND cases.lawyer_tg_id=current_actor.tg_id))
           AND (checklist_revision=$8 OR
@@ -1498,7 +1503,8 @@ function setupHandoff(app) {
             OR ($6::text IS NOT NULL AND COALESCE(data ->> '_comment', '') = $6)
             OR ($6::text IS NULL AND (NOT COALESCE(data ? '_workspaceNote', false) OR NOT ($1::jsonb ? '_comment')))
           )
-          RETURNING COALESCE(data ->> '_comment', '') AS note, checklist_revision`,
+          RETURNING COALESCE(data ->> '_comment', '') AS note, checklist_revision,
+            checklist_before.prior_data AS previous_data,checklist_before.prior_completed_at AS previous_completed_at`,
         [data, done, total, id, preserveNote, expectedNote, requestedNote, expectedRevision, subOn, due,req.tgUser.id,canManageCases({approved:true,role:'auditor'},req.tgUser.id)]
       )).rows[0];
       if (!saved) {
@@ -1514,6 +1520,9 @@ function setupHandoff(app) {
         });
       }
 
+      // An exact concurrent replay may pass the equality branch after another
+      // save committed. Notify only the transition this locked write observed.
+      old = saved.previous_data || {};
       var CLIENTS = process.env.CLIENTS_CHAT_ID;
       // Новые красные флаги ЕГРН → сразу уведомление
       var labels = flagLabels(c.checklist_key);
@@ -1534,7 +1543,7 @@ function setupHandoff(app) {
           : '📌 <b>' + esc(c.org) + '</b>: ' + esc(data._stage);
         try { await bot.telegram.sendMessage(CLIENTS, stageMsg + '\n⚖️ ' + esc(c.lawyer_name) + '\n#заявка' + c.id, { parse_mode: 'HTML' }); } catch (e) { console.error(e.message); }
       }
-      if (nowDone && !c.completed_at && CLIENTS) {
+      if (nowDone && !saved.previous_completed_at && CLIENTS) {
         await bot.telegram.sendMessage(CLIENTS, '✅ <b>Чек-лист выполнен</b>\n🏢 ' + esc(c.org) + '\n⚖️ ' + esc(c.lawyer_name) + '\n#заявка' + c.id, { parse_mode: 'HTML' });
       }
       res.json({ ok: true, note: saved.note, revision: Number(saved.checklist_revision), submittedOn: data._submittedOn || null, decisionDue: data._decisionDue || null });

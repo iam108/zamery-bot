@@ -256,6 +256,22 @@ test('unconfirmed provider result remains a durable reservation and never silent
   } finally { await h.close(); }
 });
 
+test('an array-shaped provider identifier stays unconfirmed across restart without charging or repeating the POST', pg, async () => {
+  const h = await fixture({ orderApi() { return new Response(JSON.stringify({ id_statement: [9001] })); } });
+  try {
+    await assert.rejects(h.attach(), error => error.code === 'EGRN_ORDER_UNCONFIRMED' && error.uncertain === true);
+    const order = (await h.pool.query('SELECT * FROM egrn_orders')).rows[0];
+    assert.equal(order.status, 'order_unknown'); assert.equal(order.id_statement, null);
+    const accounting = await h.budget.snapshot();
+    assert.equal(accounting.confirmedOrders, 0); assert.equal(accounting.pendingOrders, 1);
+    const restarted = h.restartApi();
+    const retry = await restarted.attachOrOrder({ cad: CAD, order: true, force: true, orderedBy: 111, targets: [{chat:111}] });
+    assert.equal(retry.result, 'uncertain'); assert.equal(h.calls.paid, 1);
+    assert.equal(h.calls.documents.length, 0); assert.equal(h.calls.copies.length, 0);
+    assert.equal((await h.pool.query('SELECT * FROM egrn_orders')).rows.length, 1);
+  } finally { await h.close(); }
+});
+
 test('a reservation surviving process death before the POST is not converted into another paid request', pg, async () => {
   const h = await fixture();
   try {

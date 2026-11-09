@@ -13,7 +13,7 @@ function emptyPacket(requestId) {
 }
 function unboundPrefill(id=9){return{ok:true,order:null,report:null,lawyers:[{tg_id:108,name:'Елена'}],request:{id,text:'Saved request',f:{org:'ООО Пример',address:'Москва, Тестовая, 1',kind:'Общепит',region:'МСК',service:'Получение',client:'Анна',phone:'+79991234567'}}};}
 function harness(options = {}) {
-  const nodes = new Map(), calls = [], stored = new Map(Object.entries(options.stored || {})), events = new Map(), revoked = [], created = [];
+  const nodes = new Map(), calls = [], stored = new Map(Object.entries(options.stored || {})), persistent = new Map(Object.entries(options.persistent || {})), events = new Map(), revoked = [], created = [];
   const timers=new Map();let now=0,timerId=0;
   class Node {
     constructor(id = '') { this.id = id; this.children = []; this.listeners = {}; this.hidden = false; this.disabled = false; this.value = ''; this.textContent = ''; this.parts = new Map(); this.innerHTML = ''; this.dataset = {}; this.style = {}; this.open = false; this.checked = false; this.classList = { add() {}, remove() {}, toggle() {} }; }
@@ -40,6 +40,8 @@ function harness(options = {}) {
     calls.push(['fetch', url, init]);
     if(options.fetch){const custom=options.fetch(url,init,response);if(custom!==undefined)return custom;}
     if (url.startsWith('/api/handoff/prefill')) return response(options.prefill || responses.prefill);
+    if (url.startsWith('/api/handoff/manual-matches')) return response({ok:true,matches:options.matches||[],has_more:options.hasMore===true});
+    if (url.startsWith('/api/handoff/manual-materials')) return response({ok:true,files:options.manualFiles||[],limits:{files:20,fileBytes:12582912,totalBytes:104857600}});
     if (url.startsWith('/api/handoff/packet')) {
       packetRequests++;const query=new URL(url,'https://bot.example').searchParams;
       if(!query.get('order_id')&&!query.get('report_id'))return options.emptyPacketFetch?options.emptyPacketFetch(url,response):response(emptyPacket(query.get('request_id')));
@@ -59,9 +61,9 @@ function harness(options = {}) {
   TestURL.revokeObjectURL = url => revoked.push(url);
   const window = { HandoffModel: page.model(), crypto: { randomUUID: require('node:crypto').randomUUID }, addEventListener: (name, fn) => events.set(name, fn), matchMedia: () => ({ matches: false }) };
   const location = { search: options.query || '?order_id=60', origin: 'https://bot.example', href: 'https://bot.example/handoff' + (options.query || '?order_id=60') };
-  const context = { window, document, location, history, fetch, URL: TestURL, URLSearchParams, AbortController, sessionStorage: { getItem: key => stored.get(key) || null, setItem: (key, value) => stored.set(key, value) }, setTimeout: (fn, ms) => { if(options.virtualClock){const id=++timerId;timers.set(id,{fn,at:now+ms});return id;}const timer = setTimeout(fn, ms); timer.unref(); return timer; }, clearTimeout:id=>{if(options.virtualClock)timers.delete(id);else clearTimeout(id);}, Date, Math, console };
+  const context = { window, document, location, history, fetch, URL: TestURL, URLSearchParams, AbortController, FormData, sessionStorage: { getItem: key => stored.get(key) || null, setItem: (key, value) => stored.set(key, value),removeItem:key=>stored.delete(key) },localStorage:{getItem:key=>persistent.get(key)||null,setItem:(key,value)=>persistent.set(key,value),removeItem:key=>persistent.delete(key)}, setTimeout: (fn, ms) => { if(options.virtualClock){const id=++timerId;timers.set(id,{fn,at:now+ms});return id;}const timer = setTimeout(fn, ms); timer.unref(); return timer; }, clearTimeout:id=>{if(options.virtualClock)timers.delete(id);else clearTimeout(id);}, Date, Math, console };
   vm.createContext(context); vm.runInContext('(' + page.client.toString() + ')();', context);
-  return { context, node, nodes, calls, stored, events, revoked, created, responses, response,timers,async tick(ms){const target=now+ms;for(;;){const next=[...timers].filter(([,v])=>v.at<=target).sort((a,b)=>a[1].at-b[1].at)[0];if(!next)break;now=next[1].at;timers.delete(next[0]);next[1].fn();await pause();}now=target;await pause();}, postRequests: () => postRequests, packetRequests: () => packetRequests, cached: () => JSON.parse(stored.get('handoff-v2:staff:order-60') || 'null') };
+  return { context, node, nodes, calls, stored,persistent, events, revoked, created, responses, response,timers,async tick(ms){const target=now+ms;for(;;){const next=[...timers].filter(([,v])=>v.at<=target).sort((a,b)=>a[1].at-b[1].at)[0];if(!next)break;now=next[1].at;timers.delete(next[0]);next[1].fn();await pause();}now=target;await pause();}, postRequests: () => postRequests, packetRequests: () => packetRequests, cached: () => JSON.parse(stored.get('handoff-v2:staff:order-60') || 'null') };
 }
 function lawyer(h) { h.node('lawyers').value = '108'; h.node('lawyers').onchange(); }
 
@@ -523,4 +525,178 @@ test('an already-assigned server rejection shows the actual recipient and case w
   assert.equal(h.node('delivery-title').textContent, 'Юрист назначен: Мария'); assert.match(h.node('delivery-text').textContent, /81/);
   assert.equal(h.node('assignment').hidden, true); assert.equal(h.node('retry-send').hidden, true); assert.equal(h.node('open-report').disabled, false);
   h.node('retry-send').click(); await pause(); assert.equal(h.postRequests(), 1);
+});
+
+for(const phase of ['headers','body'])test('a stalled original '+phase+' releases the download button and a late result cannot download or replace a successful retry',async()=>{
+  const p=packet();p.report.media=p.report.media.filter(file=>file.id==='source');p.materials=[];let finish,attempts=0;
+  const h=harness({packet:p,virtualClock:true,query:'?order_id=60&view=report',fetch(url){if(!url.includes('/files/source?download=1'))return;attempts++;if(attempts>1)return{ok:true,blob:async()=>({type:'application/pdf',size:400})};return phase==='headers'?new Promise(resolve=>{finish=()=>resolve({ok:true,blob:async()=>({type:'application/pdf',size:400})});}):{ok:true,blob:()=>new Promise(resolve=>{finish=()=>resolve({type:'application/pdf',size:400});})};}});
+  await pause();const button=h.node('report-originals').querySelectorAll('[data-download]')[0];button.click();await pause();assert.equal(button.disabled,true);
+  await h.tick(180001);assert.equal(button.disabled,false);assert.match(h.node('report-notice').textContent,/вовремя/);assert.equal(h.created.length,0);assert.equal(h.calls.find(call=>call[0]==='fetch'&&call[1].includes('/files/source?download=1'))[2].signal.aborted,true);
+  button.click();await pause();assert.equal(button.disabled,false);assert.equal(h.created.length,1);assert.equal(h.calls.filter(call=>call[0]==='click'&&call[1]==='a').length,1);
+  finish();await pause();assert.equal(h.created.length,1);assert.equal(h.calls.filter(call=>call[0]==='click'&&call[1]==='a').length,1);
+});
+
+for(const outcome of ['success','failure'])test('closing and reopening a report cancels an old original '+outcome+' without affecting the new report',async()=>{
+ const p=packet();p.report.media=p.report.media.filter(file=>file.id==='source');p.materials=[];let finish,reject;const h=harness({packet:p,virtualClock:true,query:'?order_id=60',fetch(url){if(url.includes('/files/source?download=1'))return new Promise((resolve,fail)=>{finish=()=>resolve({ok:true,blob:async()=>({type:'application/pdf',size:400})});reject=()=>fail(new Error('Old request failed'));});}});
+ await pause();h.node('open-report').click();const old=h.node('report-originals').querySelectorAll('[data-download]')[0];old.click();await pause();const signal=h.calls.find(call=>call[0]==='fetch'&&call[1].includes('download=1'))[2].signal;
+ h.node('report-close').click();await pause();assert.equal(signal.aborted,true);assert.equal(old.disabled,false);h.node('open-report').click();h.node('report-notice').textContent='Current report message';if(outcome==='success')finish();else reject();await pause();assert.equal(h.created.length,0);assert.equal(h.node('report-notice').textContent,'Current report message');assert.equal(h.node('report-originals').querySelectorAll('[data-download]')[0].disabled,false);
+});
+
+for(const phase of ['headers','body'])test('a stalled gallery '+phase+' shows retry and cannot attach an older image after its deadline',async()=>{
+ const p=packet();p.report.media=p.report.media.filter(file=>file.id==='map');p.materials=[];let finish,attempts=0;
+ const h=harness({packet:p,virtualClock:true,query:'?order_id=60&view=report',fetch(url){if(!url.includes('/files/map'))return;attempts++;if(attempts>1)return{ok:true,blob:async()=>({type:'image/png',size:100})};return phase==='headers'?new Promise(resolve=>{finish=()=>resolve({ok:true,blob:async()=>({type:'image/png',size:100})});}):{ok:true,blob:()=>new Promise(resolve=>{finish=()=>resolve({type:'image/png',size:100});})};}});
+ await pause();await h.tick(180001);const card=h.node('gallery').children[0],status=card.querySelector('.image-state');assert.match(status.textContent,/не загрузилось/);assert.equal(status.children[0].textContent,'Повторить');assert.equal(h.created.length,0);status.children[0].click();await pause();assert.equal(h.created.length,1);finish();await pause();assert.equal(h.created.length,1);
+});
+
+test('a late refreshed EGRN link cannot open outside a report that the user already closed',async()=>{
+ const p=packet();p.report.media=[];p.materials=[];p.egrn_links=[{id:'12345678-1234-4123-8123-123456789abc',name:'Large original.pdf',bytes:300000000,url:'/api/audit/orders/60/egrn/12345678-1234-4123-8123-123456789abc/link'}];let finish;
+ const h=harness({packet:p,query:'?order_id=60',fetch(url){if(url.includes('/egrn/'))return new Promise(resolve=>{finish=()=>resolve({ok:true,status:200,json:async()=>({ok:true,url:'https://storage.example/signed-original'})});});}});await pause();h.node('open-report').click();h.node('report-originals').querySelectorAll('[data-download]')[0].click();await pause();h.node('report-close').click();h.node('open-report').click();finish();await pause();assert.equal(h.calls.filter(call=>call[0]==='click'&&call[1]==='a').length,0);assert.equal(h.node('report-notice').textContent,'');
+});
+
+for(const [contentType,blobType] of [
+  ['text/html; charset=utf-8','text/html'],['application/xhtml+xml','application/xhtml+xml'],
+  ['application/json; charset=utf-8','application/json'],['application/problem+json','application/problem+json'],
+  ['application/octet-stream','text/html'],['','application/json'],
+])test('a successful service response '+contentType+' / '+blobType+' cannot be downloaded as an original PDF',async()=>{
+  const p=packet();p.report.media=p.report.media.filter(file=>file.id==='source');p.materials=[];
+  const h=harness({packet:p,query:'?order_id=60&view=report',fetch(url){if(url.includes('/files/source?download=1'))return{ok:true,status:200,headers:{get:()=>contentType},blob:async()=>({type:blobType,size:400})};}});
+  await pause();const button=h.node('report-originals').querySelectorAll('[data-download]')[0];button.click();await pause();
+  assert.equal(button.disabled,false);assert.match(h.node('report-notice').textContent,/служебный ответ/);
+  assert.equal(h.created.length,0);assert.equal(h.calls.filter(call=>call[0]==='click'&&call[1]==='a').length,0);
+  assert.equal(h.calls.find(call=>call[0]==='fetch'&&call[1].includes('/files/source?download=1'))[2].signal.aborted,true);
+});
+
+test('a gallery service page exposes retry instead of leaving a cancelled image loading forever',async()=>{
+  const p=packet();p.report.media=p.report.media.filter(file=>file.id==='map');p.materials=[];let attempt=0;
+  const h=harness({packet:p,query:'?order_id=60&view=report',fetch(url){if(url.includes('/files/map'))return ++attempt===1?{ok:true,headers:{get:()=> 'text/html'},blob:async()=>({type:'text/html',size:100})}:{ok:true,headers:{get:()=> 'image/png'},blob:async()=>({type:'image/png',size:100})};}});
+  await pause();const state=h.node('gallery').children[0].querySelector('.image-state');assert.match(state.textContent,/не загрузилось/);assert.equal(state.children[0].textContent,'Повторить');assert.equal(h.created.length,0);
+  state.children[0].click();await pause();assert.equal(h.created.length,1);assert.equal(attempt,2);
+});
+
+for(const [name,mime] of [
+  ['Full report.txt','text/plain; charset=utf-8'],['Original.pdf','application/pdf'],['Plan.png','image/png'],
+  ['Archive.zip','application/zip'],['Document.docx','application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+  ['Table.xlsx','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],['Legacy.pdf','application/octet-stream'],
+])test('a genuine '+name+' remains downloadable with its declared response type',async()=>{
+  const p=packet();p.report.media=[{...p.report.media.find(file=>file.id==='source'),name,mime:mime.split(';')[0]}];p.materials=[];
+  const h=harness({packet:p,query:'?order_id=60&view=report',fetch(url){if(url.includes('/files/source?download=1'))return{ok:true,status:200,headers:{get:()=>mime},blob:async()=>({type:mime,size:400})};}});
+  await pause();h.node('report-originals').querySelectorAll('[data-download]')[0].click();await pause();
+  assert.equal(h.created.length,1);assert.equal(h.calls.filter(call=>call[0]==='click'&&call[1]==='a').length,1);assert.equal(h.node('report-notice').textContent,'');
+});
+
+function manualDraft(h){return JSON.parse(h.persistent.get('handoff-v2:staff:manual')||h.stored.get('handoff-v2:staff:manual')||'null');}
+function fillManual(h,changes={}){
+  const values={org:'ООО Новый клиент',address:'Химки, Новая улица, 7',kind:'Общепит',service:'Получение',...changes};
+  for(const [key,value] of Object.entries(values)){h.node(key).value=value;h.node(key).listeners.change.call(h.node(key));}
+  lawyer(h);
+}
+const manualDocument={id:'12345678-1234-4123-8123-123456789abc',name:'Сохранённый план.pdf',mime:'application/pdf',role:'document',bytes:100,sha256:'a'.repeat(64)};
+
+test('manual client mode ignores stale source and readonly URL parameters and uses an isolated editable draft',async()=>{
+  const ordinary={version:2,profile:{org:'Ordinary source draft'},submitId:'ordinary',completed:{id:1,name:'Old lawyer'}};
+  const h=harness({query:'?mode=manual&order_id=60&request_id=8&report_src=a&report_id=15&case_id=39&view=report',stored:{'handoff-v2:staff:order-60':JSON.stringify(ordinary)}});await pause();
+  assert.equal(h.node('page-title').textContent,'Создать клиента');assert.equal(h.node('details').open,true);assert.equal(h.node('cad-field').hidden,true);assert.equal(h.node('packet-section').hidden,true);assert.equal(h.node('readonly-note').hidden,true);
+  assert.equal(h.node('org').value,'');assert.equal(h.node('region').value,'МО');assert.equal(h.node('priority').value,'обычный');assert.equal(h.node('go').textContent,'Создать и передать');assert.equal(h.node('go').disabled,false);
+  assert.equal(h.node('manual-optional').hidden,false);assert.equal(h.node('manual-optional').open,false);assert.deepEqual(h.node('manual-optional-fields').children.map(item=>item.id),['inn-field','contact-section','comment-field','priority-field']);
+  assert.ok(manualDraft(h).submitId);assert.deepEqual(JSON.parse(h.stored.get('handoff-v2:staff:order-60')),ordinary);
+  const requests=h.calls.filter(call=>call[0]==='fetch');assert.ok(requests.some(call=>call[1]==='/api/handoff/packet'));assert.equal(requests.some(call=>/[?&](?:order_id|request_id|case_id|report_id)=/.test(call[1])),false);
+});
+
+test('manual review and payload contain only real client facts and optional saved files, without report or EGRN claims',async()=>{
+  const h=harness({query:'?mode=manual'});await pause();fillManual(h,{region:'МСК'});h.node('go').click();await pause();
+  assert.equal(h.node('review').hidden,false);assert.equal(h.node('review-title').textContent,'Проверьте клиента');assert.equal(h.node('confirm-send').textContent,'Подтвердить создание');
+  assert.match(h.node('review-list').innerHTML,/Карточка клиента/);assert.match(h.node('review-list').innerHTML,/Чек-лист/);assert.doesNotMatch(h.node('review-list').innerHTML,/ЕГРН|[Оо]тчёт|[Оо]ригиналы|Фото|Схемы/);
+  h.node('confirm-send').click();await pause();const body=JSON.parse(h.calls.find(call=>call[1]==='/api/handoff')[2].body);
+  assert.equal(body.manual_client,true);assert.equal(body.handoff_version,2);for(const key of ['order_id','request_id','report_id','report_src'])assert.equal(body[key],null,key);
+  assert.equal(body.egrn_order,false);assert.equal(body.cad_num,'');assert.equal(body.audit_text,'');assert.equal(body.region,'МСК');assert.deepEqual(body.contacts,[]);assert.deepEqual(body.manual_files,[]);
+  assert.match(h.node('delivery-title').textContent,/Клиент создан/);assert.doesNotMatch(h.node('delivery-text').textContent,/ЕГРН|отчёт/);
+});
+
+test('manual creation requires a selected lawyer and displays the actual available workload',async()=>{
+  const h=harness({query:'?mode=manual',prefill:{ok:true,lawyers:[{tg_id:108,name:'Елена',active_cases:3},{tg_id:109,name:'Мария',active_cases:0}]}});await pause();fillManual(h);h.node('lawyers').value='';h.node('lawyers').onchange.call(h.node('lawyers'));h.node('go').click();await pause();
+  assert.equal(h.node('review').hidden,true);assert.match(h.node('form-error').textContent,/Выберите юриста/);assert.match(h.node('lawyers').innerHTML,/Елена · 3 в работе/);assert.match(h.node('lawyers').innerHTML,/Мария · 0 в работе/);assert.equal(h.postRequests(),0);
+});
+
+for(const field of ['org','address','kind','service','region'])test('manual '+field+' is required before matches, review or creation',async()=>{
+  const h=harness({query:'?mode=manual'});await pause();fillManual(h,{[field]:''});h.node('go').click();await pause();
+  assert.equal(h.node('review').hidden,true);assert.ok(h.node('form-error').textContent);assert.equal(h.calls.some(call=>call[1].startsWith('/api/handoff/manual-matches')),false);assert.equal(h.postRequests(),0);
+});
+
+test('manual matching exposes existing cases and requires a deliberate new-client choice without merging',async()=>{
+  const h=harness({query:'?mode=manual',matches:[{case_id:39,org:'ООО Новый клиент',address:'Химки, Новая улица, 7',lawyer_name:'Елена',stage:'Архив',checklist_url:'https://foreign.invalid/ignored'}],hasMore:true});await pause();fillManual(h);h.node('go').click();await pause();
+  assert.equal(h.node('review').hidden,true);assert.equal(h.node('manual-matches').hidden,false);assert.match(h.node('manual-match-list').innerHTML,/\/checklist\?case_id=39/);assert.doesNotMatch(h.node('manual-match-list').innerHTML,/foreign.invalid/);assert.match(h.node('manual-match-list').innerHTML,/Архив/);assert.equal(h.node('manual-match-more').hidden,false);assert.equal(h.postRequests(),0);
+  h.node('manual-create-new').checked=true;h.node('manual-create-new').onchange.call(h.node('manual-create-new'));h.node('go').click();await pause();assert.equal(h.node('review').hidden,false);
+  h.node('review-back').click();h.node('address').value='Другой адрес';h.node('address').listeners.input.call(h.node('address'));assert.equal(h.node('manual-create-new').checked,false);assert.equal(h.node('manual-matches').hidden,true);
+});
+
+test('a late manual match response cannot open review or authorize a new client after the facts changed',async()=>{
+  let release;const h=harness({query:'?mode=manual',fetch(url){if(url.startsWith('/api/handoff/manual-matches'))return new Promise(resolve=>{release=()=>resolve({ok:true,json:async()=>({ok:true,matches:[]})});});}});await pause();fillManual(h);h.node('go').click();await pause();assert.equal(h.node('go').disabled,true);
+  h.node('address').value='Новый выбранный адрес';h.node('address').listeners.input.call(h.node('address'));release();await pause();assert.equal(h.node('review').hidden,true);assert.equal(h.node('manual-matches').hidden,true);assert.equal(h.node('address').value,'Новый выбранный адрес');assert.equal(h.postRequests(),0);
+});
+
+test('one malformed manual match cannot be silently dropped or authorize creation as if no match existed',async()=>{
+  for(const id of ['INVALID',true,[39],{},0,-1,1.5,2147483648]){
+    const h=harness({query:'?mode=manual',matches:[{case_id:39,org:'Valid existing client'},{case_id:id,org:'Malformed existing client'}]});await pause();fillManual(h);h.node('go').click();await pause();
+    assert.equal(h.node('review').hidden,true,String(id));assert.match(h.node('manual-match-status').textContent,/Не удалось проверить/);assert.equal(h.node('manual-match-retry').hidden,false);assert.equal(h.node('manual-match-list').innerHTML,'');h.node('confirm-send').click();await pause();assert.equal(h.postRequests(),0);
+  }
+});
+
+test('a canonical numeric-string case match remains visible and requires deliberate duplicate consent',async()=>{
+  const h=harness({query:'?mode=manual',matches:[{case_id:'39',org:'Existing client',address:'Saved address'}]});await pause();fillManual(h);h.node('go').click();await pause();assert.equal(h.node('review').hidden,true);assert.match(h.node('manual-match-list').innerHTML,/case_id=39/);assert.equal(h.node('manual-create-new').checked,false);
+});
+
+test('manual durable storage restores unblurred fields, contacts and comment in a fresh page without session cache',async()=>{
+  const first=harness({query:'?mode=manual'});await pause();const sid=manualDraft(first).submitId;
+  first.node('org').value='Без blur';first.node('org').listeners.input.call(first.node('org'));first.node('comment').value='Комментарий до закрытия';first.node('comment').oninput.call(first.node('comment'));
+  first.node('add-contact').click();first.node('contacts').listeners.input({target:{dataset:{contact:'0',field:'phone'},value:'+79991234567'}});
+  const next=harness({query:'?mode=manual',persistent:Object.fromEntries(first.persistent)});await pause();assert.equal(next.node('org').value,'Без blur');assert.equal(next.node('comment').value,'Комментарий до закрытия');assert.match(next.node('contacts').innerHTML,/79991234567/);assert.equal(manualDraft(next).submitId,sid);
+  const foreign=harness({query:'?mode=manual&u=another',persistent:Object.fromEntries(first.persistent)});await pause();assert.equal(foreign.node('org').value,'');
+});
+
+test('manual upload serializes files and sends only acknowledged metadata after all uploads complete',async()=>{
+  const files=[],posts=[];let release;
+  const h=harness({query:'?mode=manual',fetch(url,init,response){if(url.startsWith('/api/handoff/manual-materials')){if(init.method==='POST'){posts.push({url,init});const result={...manualDocument,id:posts.length===1?manualDocument.id:'22345678-1234-4123-8123-123456789abc',name:init.body.get('file').name};if(posts.length===1)return new Promise(resolve=>{release=()=>{files.push(result);resolve(response({ok:true,files:[...files]}));};});files.push(result);}return response({ok:true,files:[...files]});}}});await pause();fillManual(h);const sid=manualDraft(h).submitId;
+  h.node('manual-files').files=[new File(['one'],'first.pdf',{type:'application/pdf'}),new File(['two'],'second.pdf',{type:'application/pdf'})];h.node('manual-files').onchange.call(h.node('manual-files'));await pause();assert.equal(posts.length,1);assert.equal(h.node('go').disabled,true);assert.equal(manualDraft(h).submitId,sid);
+  release();await pause();assert.equal(posts.length,2);assert.ok(posts.every(call=>new URL(call.url,'https://bot.example').searchParams.get('submit_id')===sid));assert.ok(posts.every(call=>!call.init.headers||!call.init.headers['Content-Type']));assert.equal(h.node('go').disabled,false);assert.match(h.node('manual-file-list').innerHTML,/first.pdf/);assert.match(h.node('manual-file-list').innerHTML,/second.pdf/);
+  h.node('go').click();await pause();h.node('confirm-send').click();await pause();const body=JSON.parse(h.calls.find(call=>call[1]==='/api/handoff')[2].body);assert.deepEqual(body.manual_files,files);assert.equal(body.submit_id,sid);
+});
+
+test('a manual file-first lost upload ACK keeps its durable SID and reopening discovers the saved original',async()=>{
+  let saved=[];const first=harness({query:'?mode=manual',fetch(url,init,response){if(url.startsWith('/api/handoff/manual-materials')){if(init.method==='POST'){saved=[manualDocument];throw new Error('Lost upload ACK');}return response({ok:true,files:saved});}}});await pause();const sid=manualDraft(first).submitId;
+  first.node('manual-files').files=[new File(['source'],'source.pdf')];first.node('manual-files').onchange.call(first.node('manual-files'));await pause();assert.equal(manualDraft(first).submitId,sid);assert.equal(first.node('go').disabled,true);assert.equal(first.node('manual-files-retry').hidden,false);
+  const next=harness({query:'?mode=manual',persistent:Object.fromEntries(first.persistent),manualFiles:saved});await pause();assert.equal(manualDraft(next).submitId,sid);assert.match(next.node('manual-file-list').innerHTML,/Сохранённый план/);assert.equal(next.calls.some(call=>call[1].startsWith('/api/handoff/manual-materials')&&call[2].method==='POST'),false);
+});
+
+test('a definite manual rejection before case creation preserves SID and uploaded originals for an edited retry',async()=>{
+  const bodies=[];const h=harness({query:'?mode=manual',manualFiles:[manualDocument],post(n,body){bodies.push(body);return n===1?{ok:false,status:400,json:async()=>({ok:false,case_created:false,error:'Проверьте данные'})}:h.response({ok:true,id:75,delivery_complete:true});}});await pause();fillManual(h);const sid=manualDraft(h).submitId;h.node('go').click();await pause();h.node('confirm-send').click();await pause();assert.equal(manualDraft(h).submitId,sid);assert.match(h.node('manual-file-list').innerHTML,/Сохранённый план/);assert.equal(h.node('go').disabled,false);
+  h.node('comment').value='Исправленный комментарий';h.node('comment').oninput.call(h.node('comment'));h.node('go').click();await pause();h.node('confirm-send').click();await pause();assert.equal(bodies.length,2);assert.equal(bodies[1].submit_id,sid);assert.deepEqual(bodies[1].manual_files,[manualDocument]);assert.equal(bodies[1].comment,'Исправленный комментарий');
+});
+
+test('unknown manual delivery cannot reset or mutate files and restart replays the exact frozen payload',async()=>{
+  const first=harness({query:'?mode=manual',manualFiles:[manualDocument],post(){throw new Error('Lost handoff ACK');}});await pause();fillManual(first);first.node('go').click();await pause();first.node('confirm-send').click();await pause();const body=JSON.parse(first.calls.find(call=>call[1]==='/api/handoff')[2].body);
+  assert.equal(first.node('manual-create-another').hidden,true);assert.equal(first.node('manual-add-files').disabled,true);first.node('manual-create-another').click();assert.equal(manualDraft(first).submitId,body.submit_id);
+  const next=harness({query:'?mode=manual',manualFiles:[manualDocument],persistent:Object.fromEntries(first.persistent)});await pause();assert.equal(next.node('manual-create-another').hidden,true);next.node('retry-send').click();await pause();assert.deepEqual(JSON.parse(next.calls.find(call=>call[1]==='/api/handoff')[2].body),body);assert.match(next.node('delivery-title').textContent,/Клиент создан/);
+});
+
+test('manual success stays visible across reopening until explicit create-another resets only this draft',async()=>{
+  const first=harness({query:'?mode=manual',manualFiles:[manualDocument]});await pause();fillManual(first);first.node('go').click();await pause();first.node('confirm-send').click();await pause();const sid=manualDraft(first).submitId;
+  const second=harness({query:'?mode=manual',persistent:Object.fromEntries(first.persistent),fetch(url,init,response){if(url.startsWith('/api/handoff/manual-materials'))return response({ok:true,files:new URL(url,'https://bot.example').searchParams.get('submit_id')===sid?[manualDocument]:[]});}});await pause();assert.match(second.node('delivery-title').textContent,/Клиент создан/);assert.equal(second.node('manual-create-another').hidden,false);assert.equal(second.postRequests(),0);
+  second.node('manual-create-another').click();await pause();assert.notEqual(manualDraft(second).submitId,sid);assert.equal(second.node('org').value,'');assert.equal(second.node('region').value,'МО');assert.equal(second.node('manual-file-list').innerHTML,'');assert.equal(second.node('delivery').hidden,true);assert.equal(second.node('go').disabled,false);assert.equal(second.postRequests(),0);
+});
+
+test('a malformed manual creation ACK preserves the exact pending intent and saved files until a valid retry confirms it',async()=>{
+  const invalid=[{},...[true,[75],0,-1,1.5,2147483648,Number.MAX_SAFE_INTEGER+1,'INVALID'].map(id=>({id,delivery_complete:true})),...[undefined,'true',1].map(delivery_complete=>({id:75,delivery_complete}))];
+  for(const ack of invalid){
+    const bodies=[],h=harness({query:'?mode=manual',manualFiles:[manualDocument],post(n,body){bodies.push(body);return h.response(n===1?{ok:true,...ack}:{ok:true,id:75,delivery_complete:true});}});await pause();fillManual(h);h.node('go').click();await pause();h.node('confirm-send').click();await pause();
+    assert.equal(manualDraft(h).completed,null);assert.deepEqual(manualDraft(h).pending.payload,bodies[0]);assert.equal(h.node('manual-create-another').hidden,true);assert.match(h.node('delivery-text').textContent,/не подтверждён/);assert.doesNotMatch(h.node('delivery-title').textContent,/Клиент создан/);assert.match(h.node('manual-file-list').innerHTML,/Сохранённый план/);
+    h.node('retry-send').click();await pause();assert.deepEqual(bodies[1],bodies[0]);assert.match(h.node('delivery-title').textContent,/Клиент создан/);assert.equal(h.node('manual-create-another').hidden,false);
+  }
+});
+
+test('manual partial and group-only recovery accept only the same confirmed case ID and preserve documents',async()=>{
+  const bodies=[],h=harness({query:'?mode=manual',manualFiles:[manualDocument],post(n,body){bodies.push(body);const responses=[{id:75,delivery_complete:false,retry:true},{id:76,delivery_complete:true},{id:75,delivery_complete:true,group_notice:{status:'pending'}},{delivery_complete:true},{id:75,delivery_complete:true,group_notice:{status:'confirmed'}}];return h.response({ok:true,...responses[n-1]});}});await pause();fillManual(h);h.node('go').click();await pause();h.node('confirm-send').click();await pause();assert.equal(manualDraft(h).pending.caseId,75);
+  h.node('retry-send').click();await pause();assert.equal(manualDraft(h).completed,null);assert.equal(manualDraft(h).pending.caseId,75);assert.equal(h.node('manual-create-another').hidden,true);assert.match(h.node('manual-file-list').innerHTML,/Сохранённый план/);
+  h.node('retry-send').click();await pause();assert.equal(manualDraft(h).completed.id,75);assert.deepEqual(bodies[2],bodies[0]);
+  h.node('retry-send').click();await pause();assert.equal(h.node('manual-create-another').hidden,true);assert.match(h.node('delivery-text').textContent,/не подтверждён/);
+  h.node('retry-send').click();await pause();assert.deepEqual(bodies[3],{resume_case_id:75});assert.deepEqual(bodies[4],bodies[3]);assert.equal(manualDraft(h).completed.id,75);assert.match(h.node('manual-file-list').innerHTML,/Сохранённый план/);
 });

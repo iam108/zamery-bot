@@ -102,6 +102,15 @@ function metadata(row) {
   return { id: row.id, name: row.name, mime: row.mime, role: row.role, bytes: Number(row.bytes), sha256: row.sha256,
     telegram_msg_id: row.telegram_msg_id, url: '/api/audit/orders/' + row.order_id + '/materials/' + row.id };
 }
+function verifiedOriginal(row) {
+  const bytes = Number(row.bytes);
+  if (!Number.isSafeInteger(bytes) || bytes < 1 || bytes > LIMITS.fileBytes ||
+      !(Buffer.isBuffer(row.content) || row.content instanceof Uint8Array) || row.content.byteLength !== bytes ||
+      !/^[a-f\d]{64}$/i.test(row.sha256 || '') || createHash('sha256').update(row.content).digest('hex') !== row.sha256.toLowerCase()) {
+    throw Object.assign(error('Не удалось подтвердить целостность документа заявки. Выдача остановлена: требуется проверить и восстановить исходный файл.', 503), {code:'ORDER_MATERIAL_INTEGRITY'});
+  }
+  return { ...metadata(row), buffer: Buffer.from(row.content) };
+}
 function createMaterialsStore(pool = defaultPool) {
   let ready;
   async function ensure() {
@@ -125,7 +134,7 @@ function createMaterialsStore(pool = defaultPool) {
     if (!found.rows.length) throw error('Заявка не найдена.', 404);
     if (role && !ROLES.includes(role)) throw error('Неизвестное назначение документа.');
     const rows = (await pool.query('SELECT ' + (originals ? '*' : 'order_id,id,name,mime,role,bytes,sha256,telegram_msg_id') + ' FROM order_materials WHERE order_id=$1' + (role ? ' AND role=$2' : '') + ' ORDER BY created_at,id', role ? [id, role] : [id])).rows;
-    return rows.map(row => originals ? { ...metadata(row), buffer: Buffer.from(row.content) } : metadata(row));
+    return rows.map(row => originals ? verifiedOriginal(row) : metadata(row));
   }
   // The caller has ensured the schema and owns BEGIN/COMMIT. Do not lease a
   // second connection here: new order metadata and originals must commit together.
@@ -148,7 +157,7 @@ function createMaterialsStore(pool = defaultPool) {
       if (!/^[0-9a-f-]{36}$/i.test(String(fileId))) throw error('Некорректный номер документа.');
       await ensure(); const row = (await pool.query('SELECT * FROM order_materials WHERE order_id=$1 AND id=$2', [id, fileId])).rows[0];
       if (!row) throw error('Документ не найден.', 404);
-      return { ...metadata(row), buffer: Buffer.from(row.content) };
+      return verifiedOriginal(row);
     },
     async delivered(id, fileId, messageId) { await ensure(); await pool.query('UPDATE order_materials SET telegram_msg_id=$1 WHERE order_id=$2 AND id=$3', [messageId, orderNumber(id), fileId]); },
   };

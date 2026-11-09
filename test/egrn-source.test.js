@@ -65,6 +65,27 @@ test('request selection ignores other orders even when id_req follows their embe
   await empty(directory);
 });
 
+test('numeric BIGINT request tokens retain exact identity and cannot select an adjacent foreign original', async t => {
+  const directory = await root(t), wanted = pdf(301, 0x61), other = pdf(303, 0x62);
+  const encode = (id, file) => '{"id_req":' + id + ',"status":[{"type":"processed","file":"' + file.toString('base64') + '"}]}';
+  const body = '{"other":' + encode('9007199254740992', other) + ',"selected":' + encode('9007199254740993', wanted) + '}';
+  const result = await readStatusResponse(pieces(body, 3), { idReq: '9007199254740993', root: directory });
+  try {
+    assert.equal(result.item.id_req, '9007199254740993');
+    const docs = await result.documents(); assert.equal(docs.length, 1); assert.deepEqual(await read(docs[0]), wanted);
+  } finally { await result.cleanup(); }
+  await empty(directory);
+  await assert.rejects(readStatusResponse(pieces(encode('9007199254740993', other)), { idReq: '9007199254740992', root: directory }), error => error.code === 'EGRN_SOURCE_REQUEST');
+  await empty(directory);
+});
+
+test('array-shaped request identities cannot authorize an embedded or downloadable original', async t => {
+  const directory = await root(t);
+  const body = JSON.stringify({ id_req: [77], status: [{ type: 'processed', file: pdf().toString('base64') }], download_url: 'https://provider.example/foreign.pdf' });
+  await assert.rejects(readStatusResponse(pieces(body), { idReq: 77, root: directory }), error => error.code === 'EGRN_SOURCE_REQUEST');
+  await empty(directory);
+});
+
 test('a matching request cannot inherit files from an explicitly different nested request', async t => {
   const directory = await root(t), wanted = pdf(259), other = pdf(261, 0x63);
   const body = JSON.stringify({ ...status(wanted), previous: status(other, { id_req: 3 }) });

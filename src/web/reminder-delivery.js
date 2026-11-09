@@ -4,6 +4,13 @@ const LEASE_MS = 2 * 60 * 1000;
 const RETRY_MS = 10 * 60 * 1000;
 const MAX_RETRY_MS = 60 * 60 * 1000;
 const validReceipt = value => (typeof value === 'number' || typeof value === 'string' && /^[1-9]\d*$/.test(value)) && Number.isSafeInteger(Number(value)) && Number(value) > 0;
+function matchesRecipient(message, expectedChat) {
+  if (expectedChat == null || message?.chat == null) return true;
+  if (typeof message.chat !== 'object' || Array.isArray(message.chat)) return false;
+  const target = String(expectedChat);
+  if (target.startsWith('@')) return typeof message.chat.username === 'string' && message.chat.username.toLowerCase() === target.slice(1).toLowerCase();
+  return ['number', 'string'].includes(typeof message.chat.id) && String(message.chat.id) === target;
+}
 const { calendarDate: dateOnly } = require('../calendar-date');
 const retryDelay = attempt => Math.min(MAX_RETRY_MS, RETRY_MS * 2 ** Math.min(6, Math.max(0, attempt-1)));
 
@@ -17,7 +24,7 @@ function createReminderDelivery(options = {}) {
     pending.delete(key); pending.set(key, { receipt, until: now + 24 * 60 * 60 * 1000 });
     while (pending.size > maximum) pending.delete(pending.keys().next().value);
   }
-  async function deliverRecipient({ key, slot, window, delivery, acknowledged, acknowledge, persist, send, beforeSend, now = Date.now(), nextRetryAt = time => time }) {
+  async function deliverRecipient({ key, slot, window, delivery, acknowledged, acknowledge, persist, send, beforeSend, expectedChat, now = Date.now(), nextRetryAt = time => time }) {
     delivery._attempts ||= {};
     let attempt = delivery._attempts[slot];
     if (!attempt || attempt.window !== window) attempt = { window, count: 0 };
@@ -59,7 +66,7 @@ function createReminderDelivery(options = {}) {
     let message;
     try {
       message = await send();
-      if (!validReceipt(message && message.message_id)) throw new Error('Missing Telegram receipt');
+      if (!validReceipt(message && message.message_id) || !matchesRecipient(message, expectedChat)) throw new Error('Missing Telegram receipt for the intended recipient');
     } catch (error) {
       const code = Number(error?.response?.error_code);
       const rejected = code >= 400 && code < 500;

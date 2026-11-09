@@ -134,13 +134,19 @@ function setupWeb(app) {
       from: { id: req.tgUser.id, username: req.tgUser.username || null, first_name: req.staff.name },
       telegram: botInstance.telegram,
       reply: async () => {},
+      checkAuditAccess: async () => {
+        let current;
+        try { current = await pool.query('SELECT tg_id FROM staff WHERE tg_id=$1 AND approved IS TRUE', [req.tgUser.id]); }
+        catch (_) { throw Object.assign(new Error('Не удалось проверить действующий доступ к отправке. Повторите после восстановления связи.'), { status: 503, code: 'AUDIT_ACCESS_UNAVAILABLE', auditAccessFailure: true }); }
+        if (!current.rows.length) throw Object.assign(new Error('Доступ к отправке отчёта изменился. Проверьте доступ и повторите отправку после его восстановления.'), { status: 403, code: 'AUDIT_FORBIDDEN', auditAccessFailure: true });
+      },
     };
     const drafts = require('./audit-drafts');
     const submit = require('./audit-submit').createAuditSubmitter(drafts, handleAuditReport, { loadPacket: require('./audit-packet').loadAuditPacket });
     return res.json(await submit(req.tgUser.id, data.draft_id, data.revision, fakeCtx));
   } catch (e) {
     console.error('api/audit error:', e);
-    const expose = ['AUDIT_PACKET_CHANGED', 'AUDIT_DELIVERY_UNKNOWN', 'AUDIT_CONCLUSION_CONFLICT'].includes(e.code);
+    const expose = ['AUDIT_PACKET_CHANGED', 'AUDIT_DELIVERY_UNKNOWN', 'AUDIT_CONCLUSION_CONFLICT', 'AUDIT_FORBIDDEN', 'AUDIT_ACCESS_UNAVAILABLE'].includes(e.code);
     const pending = e.code === 'AUDIT_DELIVERY_UNKNOWN' && e.delivery_unknown;
     const unknown = pending && typeof pending.cursor === 'string' && /^[a-f\d-]{36}$/i.test(pending.cursor)
       ? { cursor: pending.cursor, stage: String(pending.stage || '').slice(0, 40), index: pending.index, count: pending.count } : null;

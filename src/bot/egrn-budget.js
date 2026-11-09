@@ -85,11 +85,11 @@ function createEgrnBudget(options = {}) {
   if (typeof account !== 'string' || !account || account.length > 200 || !Number.isSafeInteger(price) || price < 1) throw new TypeError('Invalid EGRN budget account or price');
   let initialized;
   const id = value => {
-    if (!/^[1-9]\d*$/.test(String(value)) || !Number.isSafeInteger(Number(value)) || Number(value) > 2147483647) throw error('EGRN_BUDGET_ORDER', 'Некорректный номер заказа.');
+    if (!['number', 'string'].includes(typeof value) || !/^[1-9]\d*$/.test(String(value)) || !Number.isSafeInteger(Number(value)) || Number(value) > 2147483647) throw error('EGRN_BUDGET_ORDER', 'Некорректный номер заказа.');
     return Number(value);
   };
   const statement = value => {
-    if (typeof value === 'number' && !Number.isSafeInteger(value) || !/^[1-9]\d{0,18}$/.test(String(value)) || BigInt(value) > 9223372036854775807n) throw error('EGRN_BUDGET_STATEMENT', 'Некорректный номер заказа поставщика.');
+    if (!['number', 'string'].includes(typeof value) || typeof value === 'number' && !Number.isSafeInteger(value) || !/^[1-9]\d{0,18}$/.test(String(value)) || BigInt(value) > 9223372036854775807n) throw error('EGRN_BUDGET_STATEMENT', 'Некорректный номер заказа поставщика.');
     return String(value);
   };
   async function lock(client) {

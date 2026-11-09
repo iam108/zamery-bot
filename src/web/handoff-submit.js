@@ -2,6 +2,7 @@ const { createHash } = require('node:crypto');
 const { getSessionLockPool } = require('../db/session-lock-pool');
 const { canManageCases, canAccessCase } = require('./auth');
 const { createHandoffNoticePublisher, initialNotice, pendingNotice, noticeWarning, SAVE_CHECKPOINT_SQL } = require('./handoff-group-notice');
+const { manualClient } = require('./handoff-manual');
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DDL = `ALTER TABLE cases ADD COLUMN IF NOT EXISTS handoff_submit_id TEXT;
   ALTER TABLE cases ADD COLUMN IF NOT EXISTS handoff_signature TEXT;
@@ -96,6 +97,7 @@ function cardText(c,state) {
   if(state.packet.report)lines.push('Полный отчёт и оригиналы — следом.');
   else if(c.audit_text)lines.push(esc(short(c.audit_text,1000)));
   if(state.packet.materials.length)lines.push('Документы заявки: '+state.packet.materials.length+'.');
+  if(state.packet.manual_materials?.length)lines.push('Документы клиента: '+state.packet.manual_materials.length+'.');
   if(c.comment)lines.push('💬 '+esc(short(c.comment,500)));
   if(state.manager_name)lines.push('Передал: '+esc(short(state.manager_name,100)));
   lines.push('#заявка'+c.id);return lines.join('\n');
@@ -123,6 +125,8 @@ function completed(c,state) {const warn=[state.egrn?.note,noticeWarning(state,c.
 
 function createHandoffSubmitter(options={}) {
   const pool=options.pool||require('../db/pool');let initialized;
+  let manualMaterials;
+  const manualStore=()=>manualMaterials||=options.manualMaterialsStore||require('./handoff-manual-materials').createManualMaterialsStore(pool);
   async function ensure() {
     if(!initialized)initialized=(async()=>{if(options.ready)await options.ready();await pool.query(DDL);})().catch(error=>{initialized=null;throw error;});
     return initialized;
@@ -170,6 +174,7 @@ function createHandoffSubmitter(options={}) {
       body = checkpoint.body;
     }
     if (!body || typeof body !== 'object' || Array.isArray(body) || body.handoff_version !== 2 || !UUID.test(body.submit_id || '')) fail(400, 'HANDOFF_INVALID', 'Для передачи нужен постоянный номер отправки и версия формы 2.');
+    const manual=manualClient(body);
     const orderId=body.order_id==null?null:positive(body.order_id,'Выберите заявку на выезд.'),reportId=body.report_id==null?null:positive(body.report_id,'Выберите сохранённый отчёт аудитора.');
     if(orderId>2147483647||reportId>2147483647)fail(400,'HANDOFF_INVALID','Некорректный номер заявки или отчёта.');
     if(orderId&&!reportId||reportId&&!['a','r'].includes(body.report_src)||!reportId&&body.report_src!=null)fail(400,'HANDOFF_INVALID','Выберите сохранённый отчёт аудитора.');
@@ -182,6 +187,7 @@ function createHandoffSubmitter(options={}) {
     let c,state,client,locked=false,orderLocked=false,unlockError,receiptPending=false;
     try {
       await ensure();
+      if(manual)await manualStore().ensure();
       c=await getExisting(pool,owner,submitId);
       if(c)state=compatible(c,signature);
       await checkActor(pool,user.id);
@@ -216,6 +222,14 @@ function createHandoffSubmitter(options={}) {
         const checklist=(options.pickChecklist||require('../checklists').pickChecklist)(d.region,d.kind,d.service);
         if(!checklist)fail(400,'HANDOFF_CHECKLIST','Для выбранной услуги не найден чек-лист.');
         const picked=reportId?await loadReport(body.report_src,reportId):null,source=picked?sourceReport(picked):{sources:[],hashes:[]};
+        if(manual){
+          try {packet.manual_materials=await manualStore().freeze(client,owner,submitId,body.manual_files||[]);}
+          catch(error){
+            const messages={HANDOFF_MATERIAL_CHANGED:'Документы клиента изменились. Обновите список перед передачей.',HANDOFF_MATERIAL_INTEGRITY:'Не удалось подтвердить целостность документа клиента. Передача остановлена.',HANDOFF_MATERIAL_INVALID:'Проверьте список документов клиента.'};
+            if(messages[error.code])throw new HandoffError(error.code==='HANDOFF_MATERIAL_INTEGRITY'?503:error.code==='HANDOFF_MATERIAL_CHANGED'?409:400,error.code,messages[error.code]);
+            throw error;
+          }
+        }
         if (requestId !== (packet.request ? Number(packet.request.id) : null)) fail(409, 'HANDOFF_REQUEST_MISMATCH', 'Исходная заявка не совпадает с просмотренным комплектом. Обновите форму.');
         let request=null;
         if(requestId){
@@ -227,7 +241,7 @@ function createHandoffSubmitter(options={}) {
         }
         const recipients=[{chat:String(lawyer.tg_id),role:'lawyer'}];
         const groupNotice=initialNotice(options.clientsChatId??process.env.CLIENTS_CHAT_ID);
-        state={version:2,body:JSON.parse(serialized),fields:d,packet,source,request,manager_name:value(staff?.name),recipients,cards:{},auditCopies:{},requestCopies:{},materials:{confirmed:{},completed:!orderId},linkedEgrn:{files:linkedOriginals(packet),confirmed:{},completed:false},egrn:{completed:false,order_started:false},completed:false,...(groupNotice?{groupNotice}:{})};
+        state={version:2,body:JSON.parse(serialized),fields:d,packet,source,request,manager_name:value(staff?.name),recipients,cards:{},auditCopies:{},requestCopies:{},materials:{confirmed:{},completed:manual?!packet.manual_materials.length:!orderId},linkedEgrn:{files:linkedOriginals(packet),confirmed:{},completed:false},egrn:{completed:manual,order_started:false,...(manual?{result:'skipped-manual'}:{})},completed:false,...(groupNotice?{groupNotice}:{})};
         reportUrl(options.webappUrl||process.env.WEBAPP_URL,state);
         await checkActor(client,user.id);
         c=(await client.query(`INSERT INTO cases(order_id,lawyer_tg_id,lawyer_name,checklist_key,org,inn,client,phone,address,region,kind,service,priority,comment,audit_text,total,created_by,contacts,request_id,handoff_submit_id,handoff_signature,data)
@@ -335,10 +349,12 @@ function createHandoffSubmitter(options={}) {
         }
       }
       if(!state.materials.completed){
-        const deliver=options.materialDelivery||require('./handoff-materials').createHandoffMaterialsDelivery({telegram:tg});
+        const deliver=manual
+          ? options.manualMaterialDelivery||require('./handoff-materials').createHandoffMaterialsDelivery({telegram:tg,loadMaterials:id=>manualStore().loadCase(id),label:'Клиент',description:'Документы клиента.'})
+          : options.materialDelivery||require('./handoff-materials').createHandoffMaterialsDelivery({telegram:tg});
         const targets=state.recipients.map(target=>({chat:target.chat,reply:state.cards[target.chat]}));
         const exclude=new Set(state.source.hashes||[]);
-        const result=await deliver(Number(state.body.order_id),targets,exclude,{expectedFiles:state.packet.materials,packetHash:state.materials.packetHash,confirmed:state.materials.confirmed,beforeSend:chat=>checkRecipient(chat),
+        const result=await deliver(manual?Number(c.id):Number(state.body.order_id),targets,exclude,{expectedFiles:manual?state.packet.manual_materials:state.packet.materials,packetHash:state.materials.packetHash,confirmed:state.materials.confirmed,beforeSend:chat=>checkRecipient(chat),
           onPrepared:async prepared=>{Object.assign(state.materials,prepared);state.materials.inflight=true;await save();},
           onPart:async(chat,index,id,prepared)=>{receiptPending=true;validateReceipts(chat,{message_id:id});Object.assign(state.materials,prepared);const key=String(chat),ids=state.materials.confirmed[key]||[];if(index!==ids.length)throw new Error('Noncontiguous material receipt');ids.push(id);state.materials.confirmed[key]=ids;await save(true);receiptPending=false;}});
         if(!result?.ok){

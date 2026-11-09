@@ -53,6 +53,65 @@ function harness() {
   return { c, events, notices, status, uploads };
 }
 
+function readClock(c) {
+  const timers = new Map(); let serial = 0;
+  c.setTimeout = (fn, ms) => { const id = ++serial; timers.set(id, { fn, ms }); return id; };
+  c.clearTimeout = id => timers.delete(id);
+  return { timers, tick(ms) { for (const [id, timer] of [...timers]) if (timer.ms <= ms) { timers.delete(id); timer.fn(); } } };
+}
+
+test('a stalled phone file read releases the upload queue and a later valid screenshot can be saved', async () => {
+  const { c, uploads } = harness(), clock = readClock(c), delayed = deferred();
+  const chosen = file('stalled.jpg'); chosen.arrayBuffer = () => delayed.promise;
+  let outcome;
+  c.uploadFiles([chosen], 'interior', '', { noRender: true }).catch(error => { outcome = error; });
+  await settle(); assert.equal(c.state.pendingUploads, 1);
+  clock.tick(30000); await settle();
+  assert.equal(outcome?.code, 'AUDIT_FILE_TIMEOUT'); assert.equal(c.state.pendingUploads, 0); assert.equal(c.queuedJobs, 0);
+  assert.equal(uploads.length, 0); assert.equal(clock.timers.size, 0);
+  delayed.resolve(arrayBuffer([0xff, 0xd8, 0xff, 0xe0, 0, 1])); await settle();
+  assert.equal(uploads.length, 0, 'A late provider result cannot create an orphan original');
+  await c.uploadFiles([file('retry.jpg')], 'interior', '', { noRender: true });
+  assert.equal(uploads.length, 1); assert.equal(uploads[0].file.name, 'retry.jpg'); assert.equal(c.state.pendingUploads, 0);
+  assert.equal(clock.timers.size, 0);
+});
+
+test('a stalled FileReader is aborted at the deadline and does not retain event handlers', async () => {
+  const { c } = harness(), clock = readClock(c), chosen = file(); delete chosen.arrayBuffer;
+  let reader, aborted = 0, outcome;
+  c.FileReader = class { constructor() { reader = this; } readAsDataURL() {} abort() { aborted++; this.onabort?.(); } };
+  c.readBase64(chosen).catch(error => { outcome = error; });
+  await settle(); clock.tick(30000); await settle();
+  assert.equal(outcome?.code, 'AUDIT_FILE_TIMEOUT'); assert.equal(aborted, 1);
+  assert.equal(reader.onload, null); assert.equal(reader.onerror, null); assert.equal(reader.onabort, null);
+  assert.equal(clock.timers.size, 0);
+});
+
+for (const legacy of [false, true]) test('closing the sheet chooser cancels a stalled ' + (legacy ? 'FileReader' : 'arrayBuffer') + ' without uploading or freezing the report', async () => {
+  const { c, uploads } = harness(), clock = readClock(c), chosen = file(), delayed = deferred(), controller = new AbortController();
+  let outcome, reader, aborted = 0;
+  chosen.arrayBuffer = () => delayed.promise;
+  if (legacy) { delete chosen.arrayBuffer; c.FileReader = class { constructor() { reader = this; } readAsDataURL() {} abort() { aborted++; this.onabort?.(); } }; }
+  load(c, 'uploadEditorSource');
+  c.uploadEditorSource(chosen, 'plan-source', controller.signal).catch(error => { outcome = error; });
+  await settle(); assert.equal(c.state.pendingUploads, 1);
+  controller.abort(); await settle();
+  assert.equal(outcome?.code, 'AUDIT_FILE_CANCELLED'); assert.equal(c.state.pendingUploads, 0); assert.equal(clock.timers.size, 0);
+  if (legacy) { assert.equal(aborted, 1); assert.equal(reader.onload, null); }
+  else delayed.resolve(arrayBuffer([0xff, 0xd8, 0xff, 0xe0, 0, 1]));
+  await settle(); assert.equal(uploads.length, 0);
+  assert.equal((await c.uploadEditorSource(file('retry.jpg'), 'plan-source')).id, 'evidence-1');
+});
+
+test('a cancelled read never touches the phone provider and successful reads detach their cancellation listener', async () => {
+  const { c } = harness(), clock = readClock(c), controller = new AbortController(); controller.abort();
+  await assert.rejects(c.readBase64({ ...file(), arrayBuffer() { assert.fail('Cancelled source must not be read'); } }, controller.signal), error => error.code === 'AUDIT_FILE_CANCELLED');
+  let added = 0, removed = 0;
+  const signal = { aborted: false, addEventListener() { added++; }, removeEventListener() { removed++; } };
+  assert.equal(await c.readBase64(file(), signal), '/9j/4AAB');
+  assert.equal(added, 1); assert.equal(removed, 1); assert.equal(clock.timers.size, 0);
+});
+
 test('selected Android file bytes are encoded directly, including data larger than one conversion chunk', async () => {
   const { c } = harness(), bytes = Array.from({ length: 70001 }, (_, n) => n % 256);
   const chosen = file('large-screenshot.jpg', bytes);

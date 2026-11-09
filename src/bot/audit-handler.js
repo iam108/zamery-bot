@@ -21,8 +21,9 @@ function canonicalJson(value) {
 }
 
 // Telegram иногда просит подождать (429 Too Many Requests) — ждём указанное время и повторяем
-async function tgRetry(fn) {
+async function tgRetry(fn, beforeRequest) {
   for (let attempt = 0; attempt < 4; attempt++) {
+    if (beforeRequest) await beforeRequest();
     try { return await fn(); }
     catch (e) {
       const wait = e && e.response && e.response.parameters && e.response.parameters.retry_after;
@@ -89,6 +90,16 @@ async function handleAuditReport(ctx, data) {
 
 async function handleAuditReportInner(ctx, data, progress, validationOptions) {
   validateInspection(data);
+  async function checkAccess() {
+    if (!ctx.checkAuditAccess) return;
+    try { await ctx.checkAuditAccess(); }
+    catch (error) {
+      throw Object.assign(new Error(error.code === 'AUDIT_FORBIDDEN' ? error.message : 'Не удалось проверить действующий доступ к отправке. Повторите после восстановления связи.'), {
+        status: error.code === 'AUDIT_FORBIDDEN' ? 403 : 503,
+        code: error.code === 'AUDIT_FORBIDDEN' ? 'AUDIT_FORBIDDEN' : 'AUDIT_ACCESS_UNAVAILABLE', auditAccessFailure: true,
+      });
+    }
+  }
   function unknownDelivery() {
     const { id: cursor, stage, index, count } = progress.inflight || {};
     return Object.assign(new Error('Ответ Telegram на отправку части отчёта не подтверждён. Проверьте чат. Обычный повтор остановлен, чтобы не создать дубликаты. После проверки можно явно повторить неподтверждённую часть.'), {
@@ -125,16 +136,17 @@ async function handleAuditReportInner(ctx, data, progress, validationOptions) {
   if (progress.inflight) throw unknownDelivery();
   async function sendPart(stage, index, count, send, field) {
     if (progress.inflight) throw unknownDelivery();
+    await checkAccess();
     const intent = { id: randomUUID(), stage, index, count };
     progress.inflight = intent;
     // Never contact Telegram before this intent has been acknowledged by the
     // durable store. An uncertain SQL acknowledgement is conservative too.
     await checkpoint();
     let result;
-    try { result = await tgRetry(send); }
+    try { result = await tgRetry(send, checkAccess); }
     catch (error) {
       const code = Number(error.response?.error_code);
-      if (code >= 400 && code < 500) {
+      if (error.auditAccessFailure || code >= 400 && code < 500) {
         delete progress.inflight;
         try { await checkpoint(); }
         catch (_) { progress.inflight = intent; throw unknownDelivery(); }
@@ -166,7 +178,7 @@ async function handleAuditReportInner(ctx, data, progress, validationOptions) {
   // Persist the new order before Telegram can acknowledge its first message.
   const presentation = data.ui_version === 5 && [2, 3].includes(progress.deliveryVersion);
   const albumFirst = presentation && progress.deliveryVersion === 3;
-  if (presentation) await checkpoint();
+  if (presentation) { await checkAccess(); await checkpoint(); }
 
   var text;
   var plain;
@@ -348,7 +360,7 @@ async function handleAuditReportInner(ctx, data, progress, validationOptions) {
       }
     } catch (error) {
       console.error('audit photos:', error.code || error.response?.error_code || error.name || 'error');
-      if (error.code === 'AUDIT_DELIVERY_RECEIPT' || error.code === 'AUDIT_DELIVERY_UNKNOWN') throw error;
+      if (error.auditAccessFailure || error.code === 'AUDIT_DELIVERY_RECEIPT' || error.code === 'AUDIT_DELIVERY_UNKNOWN') throw error;
       throw new Error(albumFirst ? 'Доставка фотографий не завершена. Повторите отправку без изменений — подтверждённые материалы сохраняются, итог ещё не отправлен.' : 'Текст отчёта отправлен, но доставка фотографий не подтверждена. Проверьте чат и повторите отправку — подтверждённый текст не продублируется.');
     }
   }
@@ -375,7 +387,7 @@ async function handleAuditReportInner(ctx, data, progress, validationOptions) {
       }
     } catch (e) {
       console.error('audit originals:', e.message);
-      if (e.code === 'AUDIT_DELIVERY_RECEIPT' || e.code === 'AUDIT_DELIVERY_UNKNOWN') throw e;
+      if (e.auditAccessFailure || e.code === 'AUDIT_DELIVERY_RECEIPT' || e.code === 'AUDIT_DELIVERY_UNKNOWN') throw e;
       throw new Error('Не удалось подтвердить доставку оригиналов отчёта. Проверьте чат и повторите отправку без изменений — подтверждённые пакеты сохраняются.');
     }
   }
@@ -400,7 +412,7 @@ async function handleAuditReportInner(ctx, data, progress, validationOptions) {
     if (data.order_id) keyboard.push([{ text: '⚖️ Передать юристу', callback_data: 'handoff:' + data.order_id }]);
     if (keyboard.length) {
       try {
-        await tgRetry(() => tg.editMessageReplyMarkup(GROUP_ID, progress.textIds[0], undefined, { inline_keyboard: keyboard }));
+        await tgRetry(() => tg.editMessageReplyMarkup(GROUP_ID, progress.textIds[0], undefined, { inline_keyboard: keyboard }), checkAccess);
       } catch (e) {
         // Telegram may have applied the exact same keyboard before a lost
         // checkpoint. Only its explicit "not modified" response is success.
@@ -419,7 +431,9 @@ async function handleAuditReportInner(ctx, data, progress, validationOptions) {
 
   if (data.order_id && !progress.orderCardLinked && !progress.orderCardLinkSkipped) {
     try {
-      const result = await tgRetry(() => syncOrderReportLink(data.order_id, { telegram: tg, groupId: GROUP_ID }));
+      const guardedTelegram = Object.create(tg);
+      guardedTelegram.editMessageReplyMarkup = async (...args) => { await checkAccess(); return tg.editMessageReplyMarkup(...args); };
+      const result = await tgRetry(() => syncOrderReportLink(data.order_id, { telegram: guardedTelegram, groupId: GROUP_ID }), checkAccess);
       if (result.state === 'linked') progress.orderCardLinked = true;
       else if (result.state === 'skipped') progress.orderCardLinkSkipped = { code: result.code, warning: result.warning };
       else throw new Error('Не подтверждено обновление карточки заявки.');
@@ -431,6 +445,7 @@ async function handleAuditReportInner(ctx, data, progress, validationOptions) {
         throw error;
       }
     } catch (error) {
+      if (error.auditAccessFailure) throw error;
       throw Object.assign(new Error('Отчёт и материалы сохранены, но не удалось подтвердить кнопку «Перейти к отчёту» в заявке. Повторите отправку без изменений — отчёт не продублируется.'), { code: 'ORDER_CARD_LINK_RETRY' });
     }
   }
@@ -438,6 +453,7 @@ async function handleAuditReportInner(ctx, data, progress, validationOptions) {
   const warning = progress.orderCardLinkSkipped?.warning;
   if (ctx.reply && !progress.replied) {
     const confirmation = presentation ? '✅ Отчёт и материалы отправлены в группу.' : '✅ Отчёт' + (photos.length ? ' и фото (' + photos.length + ')' : '') + ' отправлены в группу!';
+    await checkAccess();
     await ctx.reply(confirmation + (warning ? '\n' + warning : ''));
     progress.replied = true;
     await checkpoint();

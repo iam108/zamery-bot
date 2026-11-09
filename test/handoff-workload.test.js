@@ -28,7 +28,7 @@ async function fixture(run){
       (5,NULL,101,'{"_stage":"Решение получено"}','2026-11-01'),(6,NULL,101,'null',NULL),
       (7,NULL,102,'{"_handoff":{"completed":false}}',NULL),(8,NULL,102,'{"_stage":"Архив","_handoff":{"completed":false}}',NULL),
       (9,NULL,104,'{}',NULL),(10,NULL,105,'{}',NULL),(11,NULL,NULL,'{}',NULL),(12,NULL,102,'"Legacy checklist text"',NULL);`);
-    context.module.exports.setupHandoff({get(path,handler){routes.set(path,handler);},post(){}});await context.module.exports.qa.ensureDeadlines();
+    context.module.exports.setupHandoff({get(path,handler){routes.set(path,handler);},post(){},delete(){}});await context.module.exports.qa.ensureDeadlines();
     const request=async({id=2001,role='manager',approved=true,order_id}={})=>{let status=200,result;const before=queries.length;await routes.get('/api/handoff/prefill')({query:{...(order_id?{order_id:String(order_id)}:{})},staff:{role,approved},tgUser:{id}},{status(value){status=value;return this;},json(value){result=value;return this;}});return{status,result,queries:queries.slice(before)};};
     await run({request,pool,db});
   }finally{if(priorAdmins===undefined)delete process.env.ADMIN_TG_IDS;else process.env.ADMIN_TG_IDS=priorAdmins;await tail;await db.close();}

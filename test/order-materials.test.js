@@ -91,6 +91,23 @@ test('persisted request packet survives retry, isolates order ids and supplies i
   assert.equal((await db.query('SELECT COUNT(*) AS count FROM order_materials')).rows[0].count, 2);
 }));
 
+for (const corruption of ['same-size bytes', 'truncated bytes', 'length', 'digest']) test('manager originals reject ' + corruption + ' before a single download, ZIP or packet can publish them', { skip: !process.env.PGLITE_TEST_MODULE }, async () => database(async (store, db) => {
+  const prepared = prepareMaterials([original('Valid.png'), original('Damaged.png', 'abcdefghi')]);
+  await store.save(58, prepared); const file = prepared[1];
+  if (corruption === 'same-size bytes' || corruption === 'truncated bytes') await db.query('UPDATE order_materials SET content=$1 WHERE order_id=58 AND id=$2', [Buffer.from(corruption === 'same-size bytes' ? 'XXXXXXXXX' : 'abc'), file.id]);
+  else await db.query('UPDATE order_materials SET ' + (corruption === 'length' ? 'bytes=1' : "sha256='invalid'") + ' WHERE order_id=58 AND id=$1', [file.id]);
+  await assert.rejects(store.download(58, file.id), error => error.code === 'ORDER_MATERIAL_INTEGRITY' && error.status === 503);
+  await assert.rejects(store.list(58, true), error => error.code === 'ORDER_MATERIAL_INTEGRITY');
+  const routes = new Map(); require('../src/web/order-materials').setupOrderMaterials({ get(url, fn) { routes.set(url, fn); } }, store);
+  const res = { statusCode:200, status(code){this.statusCode=code;return this;},json(body){this.body=body;},set(){assert.fail('No successful attachment headers or ZIP bytes after integrity failure');} };
+  await routes.get('/api/audit/orders/:id/materials/download-all')({params:{id:'58'},query:{}}, res);
+  assert.equal(res.statusCode, 503); assert.equal(res.body.ok, false); assert.match(res.body.error, /целостность/);
+  assert.deepEqual((await store.download(58, prepared[0].id)).buffer, prepared[0].buffer, 'An unaffected original remains downloadable');
+  await db.query('UPDATE order_materials SET content=$1,bytes=$2,sha256=$3 WHERE order_id=58 AND id=$4', [file.buffer, file.bytes, file.sha256, file.id]);
+  assert.deepEqual((await store.download(58, file.id)).buffer, file.buffer);
+  assert.equal((await store.list(58, true)).length, 2);
+}));
+
 test('same manager submission returns same order; changed payload cannot overwrite it', { skip: !process.env.PGLITE_TEST_MODULE }, async () => database(async (store, db, pool) => {
   const context = { module: { exports: {} }, require(name) {
     if (name === './pool') return pool;

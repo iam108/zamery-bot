@@ -91,6 +91,22 @@ test('duplicate provider statement aliases charge once and release only the matc
   money(await budget.reject(2),87100,74200); money(await budget.reject(3),87100);
 }));
 
+test('coercible nonprimitive order and statement identifiers cannot create a reservation or charge', pg, () => fixture(async ({ budget }) => {
+  await budget.syncBalance('1000', event('identifier-opening'));
+  for (const badOrder of [[1], [[1]], new Number(1)]) {
+    await assert.rejects(budget.reserve(badOrder), error => error.code === 'EGRN_BUDGET_ORDER');
+  }
+  money(await budget.snapshot(), 100000); assert.equal((await budget.snapshot()).pendingOrders, 0);
+  await budget.reserve('1');
+  for (const badStatement of [[7001], [[7001]], new String('7001')]) {
+    await assert.rejects(budget.accept(1, badStatement), error => error.code === 'EGRN_BUDGET_STATEMENT');
+  }
+  let snapshot = await budget.snapshot(); money(snapshot, 100000, 87100);
+  assert.equal(snapshot.confirmedOrders, 0); assert.equal(snapshot.pendingOrders, 1);
+  snapshot = await budget.accept('1', '9223372036854775807'); money(snapshot, 87100);
+  assert.equal(snapshot.confirmedOrders, 1); assert.equal(snapshot.pendingOrders, 0);
+}));
+
 test('the reservation price remains immutable across later configured price changes', pg, () => fixture(async ({ budget, other }) => {
   await budget.syncBalance('1000', event('opening')); await budget.reserve(1);
   const changed = other({ priceKopecks: 20000 }); await changed.ensure();

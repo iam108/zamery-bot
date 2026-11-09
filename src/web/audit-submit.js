@@ -3,6 +3,7 @@ const { validateInspection } = require('../bot/audit-inspection');
 
 function createAuditSubmitter(drafts, deliver, options = {}) {
   return async function submit(owner, id, revision, ctx) {
+    const checkAccess = async () => { if (ctx.checkAuditAccess) await ctx.checkAuditAccess(); };
     const run = async () => {
     const snapshot = await drafts.loadDraftForSubmit(owner, id, revision);
     if (snapshot.submitted_at) {
@@ -15,6 +16,9 @@ function createAuditSubmitter(drafts, deliver, options = {}) {
     let trustedPacket;
     let storedProgress;
     try {
+      // Original hydration and packet loading can outlive the middleware's
+      // staff snapshot. Only the current approved row authorizes publication.
+      await checkAccess();
       if (snapshot.data?.ui_version >= 4) {
         if (!snapshot.order_id) throw new Error('Откройте проверку из заявки менеджера.');
         storedProgress = await drafts.loadDraftDelivery(owner, id);
@@ -48,12 +52,15 @@ function createAuditSubmitter(drafts, deliver, options = {}) {
       // Hydration validates before any delivery checkpoint freezes the draft.
       data = hydrateDraftReport(snapshot, validation);
       validateInspection(data);
+      await checkAccess();
     } catch (e) {
       await drafts.releaseDraftSubmission(owner, id, revision).catch(() => {});
       e.status = e.status || 400;
       throw e;
     }
+    try {
     if (trustedPacket && !storedProgress?.packet) await drafts.saveDraftDelivery(owner, id, revision, { ...storedProgress, packet: trustedPacket });
+    await checkAccess();
     const deliveryCtx = { ...ctx, auditDelivery: {
       load: () => drafts.loadDraftDelivery(owner, id),
       save: progress => drafts.saveDraftDelivery(owner, id, revision, trustedPacket ? { ...progress, packet: trustedPacket } : progress),
@@ -61,8 +68,24 @@ function createAuditSubmitter(drafts, deliver, options = {}) {
     // From this point onward a Telegram request may have reached its target
     // even when its response or checkpoint is lost. Keep this version frozen.
     const result = await deliver(deliveryCtx, data);
+    await checkAccess();
     await drafts.markDraftSubmitted(owner, id, revision);
     return { ok: true, draft_id: id, ...(result?.warning ? { warning: result.warning } : {}) };
+    } catch (error) {
+      if ((error.auditAccessFailure || error.code === 'AUDIT_FORBIDDEN') && !storedProgress?.signature) {
+        // A fresh, definitely unsent attempt is editable after access returns.
+        // Confirmed or ambiguous physical delivery must retain its frozen row.
+        try {
+          const current = await drafts.loadDraftDelivery(owner, id);
+          if (!current.inflight && !current.saved && !current.handoffSent && !current.replied &&
+            ['textIds', 'photoIds', 'documentIds'].every(field => !current[field]?.length)) {
+            await drafts.saveDraftDelivery(owner, id, revision, {});
+            await drafts.releaseDraftSubmission(owner, id, revision);
+          }
+        } catch (_) { /* Keep a possibly committed checkpoint frozen. */ }
+      }
+      throw error;
+    }
     };
     return drafts.withDraftDeliveryLock ? drafts.withDraftDeliveryLock(owner, id, run) : run();
   };

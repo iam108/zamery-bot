@@ -114,12 +114,18 @@ function base64Writer(workspace) {
   };
 }
 
+function sameRequestId(value, wanted) {
+  return ['number', 'string'].includes(typeof value) && ['number', 'string'].includes(typeof wanted) &&
+    (typeof value !== 'number' || Number.isSafeInteger(value)) &&
+    (typeof wanted !== 'number' || Number.isSafeInteger(wanted)) && String(value) === String(wanted);
+}
+
 function selectRequest(data, idReq) {
-  const matches = []; const wanted = String(idReq); let otherRequests = false;
+  const matches = []; let otherRequests = false;
   function walk(value) {
     if (!value || typeof value !== 'object') return;
     if (Object.hasOwn(value, 'id_req')) {
-      if (String(value.id_req) === wanted) { matches.push(value); return; }
+      if (sameRequestId(value.id_req, idReq)) { matches.push(value); return; }
       otherRequests = true;
     }
     for (const child of Object.values(value)) walk(child);
@@ -166,7 +172,13 @@ async function parseResponse(body, workspace, options) {
         case 'endKey': charge(Buffer.byteLength(key)); stack[stack.length - 1].key = key; key = undefined; break;
         case 'startNumber': number = ''; break;
         case 'numberChunk': number += token.value; if (number.length > 128) throw failure('EGRN_SOURCE_METADATA', 'Некорректное число в ответе сервиса ЕГРН.'); break;
-        case 'endNumber': put(Number(number)); number = undefined; break;
+        case 'endNumber': {
+          const value = Number(number);
+          // Provider identifiers are BIGINTs. Keep an unsafe integer token
+          // exact instead of rounding it into another request's identity.
+          put(Number.isInteger(value) && !Number.isSafeInteger(value) ? number : value);
+          number = undefined; break;
+        }
         case 'trueValue': case 'falseValue': case 'nullValue': put(token.value); break;
         case 'startString': string = { value: '', mode: 'probe' }; break;
         case 'stringChunk': {
@@ -199,7 +211,7 @@ async function parseResponse(body, workspace, options) {
     const item = selectRequest(root, options.idReq), selected = [], seen = new Set();
     function collect(value) {
       if (!value || typeof value !== 'object') return;
-      if (Object.hasOwn(value, 'id_req') && String(value.id_req) !== String(options.idReq)) return;
+      if (Object.hasOwn(value, 'id_req') && !sameRequestId(value.id_req, options.idReq)) return;
       const file = files.get(value);
       if (file) {
         if (!seen.has(file.sha256)) { selected.push(file); seen.add(file.sha256); }
@@ -211,7 +223,7 @@ async function parseResponse(body, workspace, options) {
     if (selected.length > MAX_FILES) throw failure('EGRN_SOURCE_FILES', 'Сервис передал слишком много файлов для одного заказа.');
     function ownRequest(value) {
       if (!value || typeof value !== 'object') return value;
-      if (Object.hasOwn(value, 'id_req') && String(value.id_req) !== String(options.idReq)) return undefined;
+      if (Object.hasOwn(value, 'id_req') && !sameRequestId(value.id_req, options.idReq)) return undefined;
       const result = Array.isArray(value) ? [] : Object.create(null);
       for (const [key, child] of Object.entries(value)) {
         const clean = ownRequest(child);

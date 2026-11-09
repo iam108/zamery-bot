@@ -63,6 +63,8 @@ function archives(files, maximum) {
 }
 function createHandoffMaterialsDelivery(options = {}) {
   const telegram = options.telegram;
+  const label = options.label === 'Клиент' ? 'Клиент' : 'Заявка';
+  const subject = label === 'Клиент' ? 'клиента' : 'заявки';
   if (typeof telegram?.sendDocument !== 'function') throw new TypeError('A Telegram document sender is required.');
   const load = options.loadMaterials || (id => require('./order-materials').loadOrderMaterials(id));
   const maximum = options.maxPartBytes == null ? MAX_PART_BYTES : options.maxPartBytes;
@@ -89,6 +91,7 @@ function createHandoffMaterialsDelivery(options = {}) {
       const selected = all.filter(file => !excluded.has(file.sha256));
       result.files = selected.length; result.excluded = all.length - selected.length;
       result.packetHash = digest(Buffer.from(JSON.stringify({ version: 1, orderId, maximum,
+        ...(label === 'Клиент' ? { scope: 'manual-client' } : {}),
         files: all.map(file => [String(file.id || ''), file.name, String(file.mime || ''), String(file.role || ''), file.bytes, file.sha256]), excluded: [...excluded].sort() })));
       if (deliveryOptions.packetHash != null && deliveryOptions.packetHash !== result.packetHash) throw problem('MATERIAL_PACKET_CHANGED');
       packets = archives(selected, maximum); result.parts = packets.length;
@@ -121,13 +124,13 @@ function createHandoffMaterialsDelivery(options = {}) {
       if (stop) break;
       for (let index = target.messageIds.length; index < packets.length; index++) {
         const part = packets[index], suffix = packets.length > 1 ? '-' + String(index + 1).padStart(2, '0') + '-из-' + String(packets.length).padStart(2, '0') : '';
-        const filename = 'Заявка-' + orderId + '-документы' + suffix + '.zip';
+        const filename = label + '-' + orderId + '-документы' + suffix + '.zip';
         const source = Readable.from(part.chunks, { objectMode: false }); let stage = 'recipient';
         try {
           if (deliveryOptions.beforeSend && await deliveryOptions.beforeSend(target.chat,index) === false) throw problem('MATERIAL_RECIPIENT_UNAVAILABLE');
           stage = 'telegram';
           const message = await telegram.sendDocument(target.chat, { source, filename }, {
-            caption: '📎 Документы заявки #' + orderId + (packets.length > 1 ? ' · часть ' + (index + 1) + ' из ' + packets.length : '') + '\nОригиналы документов менеджера.',
+            caption: '📎 Документы ' + subject + ' #' + orderId + (packets.length > 1 ? ' · часть ' + (index + 1) + ' из ' + packets.length : '') + '\nОригиналы документов менеджера.',
             ...(target.reply != null ? { reply_to_message_id: target.reply } : {})
           });
           const id=messageId(message?.message_id),chat=String(target.chat);

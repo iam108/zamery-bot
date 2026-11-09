@@ -320,7 +320,7 @@ async function apiOrder(cad, typeDoc) {
     });
     const data = await response.json();
     const statement = data?.id_statement;
-    if (!response.ok || typeof statement === 'number' && !Number.isSafeInteger(statement) || !/^[1-9]\d{0,18}$/.test(String(statement || '')) || BigInt(statement)>9223372036854775807n) throw new Error('Unconfirmed order');
+    if (!response.ok || !['number', 'string'].includes(typeof statement) || typeof statement === 'number' && !Number.isSafeInteger(statement) || !/^[1-9]\d{0,18}$/.test(String(statement || '')) || BigInt(statement)>9223372036854775807n) throw new Error('Unconfirmed order');
     return data.id_statement;
   } catch (cause) {
     const rejected = response && [400, 401, 403, 404, 405, 409, 422].includes(response.status);

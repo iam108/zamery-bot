@@ -39,7 +39,7 @@ function pendingNotice(state) {
 function noticeWarning(state, caseId) {
   const notice = object(state.groupNotice);
   if (!pendingNotice(state)) return '';
-  const prefix = 'Отчёт и собранные материалы доставлены в личный чат юриста. ';
+  const prefix = state.body?.manual_client === true ? 'Карточка клиента доставлена в личный чат юриста. ' : 'Отчёт и собранные материалы доставлены в личный чат юриста. ';
   if (notice.status === 'unknown' || notice.intent) return prefix + 'Публикация краткой карточки в чате клиентов не подтверждена. Проверьте чат перед повтором: возможен дубликат. Проверка: /handoff_notice ' + caseId + '.';
   return prefix + (notice.warning || 'Краткая карточка в чате клиентов ещё не опубликована.') + ' Проверка: /handoff_notice ' + caseId + '.';
 }
@@ -49,9 +49,9 @@ function summary(row, state) {
   lines.push('Адрес: ' + clean(row.address), (row.order_id ? 'Заявка #' + row.order_id + ' · ' : row.request_id ? 'Исходная заявка #' + row.request_id + ' · ' : '') + 'Клиент #' + row.id,
     [clean(row.kind, 100), clean(row.service, 100)].filter(Boolean).join(' · '),
     'Юрист: ' + clean(row.lawyer_name, 200), 'Приоритет: ' + clean(row.priority, 100),
-    'Отчёт и собранные материалы — в личке юриста.');
+    state.body?.manual_client === true ? 'Карточка клиента — в личке юриста.' + (state.packet?.manual_materials?.length ? ' Приложенные документы — там же.' : '') : 'Отчёт и собранные материалы — в личке юриста.');
   if (['waiting', 'ordered'].includes(state.egrn?.result)) lines.push('ЕГРН: ожидается.');
-  lines.push('Открыть клиента и отчёт: https://t.me/LRSZamer_bot?start=case_' + row.id,
+  lines.push((state.body?.manual_client === true ? 'Открыть клиента: ' : 'Открыть клиента и отчёт: ') + 'https://t.me/LRSZamer_bot?start=case_' + row.id,
     'В работе у юриста: ' + Number(row.active_cases) + ' клиентов');
   return lines.join('\n');
 }
@@ -129,7 +129,7 @@ function createHandoffNoticePublisher(options = {}) {
     try {
       // Recheck after the durable intent, immediately before the Telegram call.
       const telegram = options.telegram || require('../bot/instance').telegram;
-      receipt = await telegram.sendMessage(notice.target, notice.text, { disable_web_page_preview: true, reply_markup: { inline_keyboard: [[{ text: 'Открыть клиента и отчёт', url: 'https://t.me/LRSZamer_bot?start=case_' + row.id }]] } });
+      receipt = await telegram.sendMessage(notice.target, notice.text, { disable_web_page_preview: true, reply_markup: { inline_keyboard: [[{ text: state.body?.manual_client === true ? 'Открыть клиента' : 'Открыть клиента и отчёт', url: 'https://t.me/LRSZamer_bot?start=case_' + row.id }]] } });
       if (!receipt || Array.isArray(receipt) || !positive(receipt.message_id) || receipt.chat != null && String(receipt.chat.id) !== notice.target || knownIds(current, state, notice.target).has(Number(receipt.message_id))) throw Object.assign(new Error('Invalid group notice acknowledgement'), { code: 'HANDOFF_NOTICE_ACK' });
     } catch (error) {
       const code = Number(error?.response?.error_code);

@@ -15,7 +15,7 @@ async function fixture(run) {
   const reminderModule = require('../src/web/reminder-delivery');
   let reminderDelivery = { ...reminderModule, ...reminderModule.createReminderDelivery() };
   const { PGlite } = require(process.env.PGLITE_TEST_MODULE), db = new PGlite(), locks = new Map(), deliveries = [];
-  let scheduledTick, mutation = () => {}, failure = null, sequence = 1, rejectWrite = null, beforeQuery = null;
+  let scheduledTick, mutation = () => {}, failure = null, sequence = 1, rejectWrite = null, beforeQuery = null, receipt = value => value;
   const query = async (sql, values) => {
     if (beforeQuery) await beforeQuery(sql,values);
     if (rejectWrite && rejectWrite(sql,values)) throw new Error('Synthetic lost receipt storage');
@@ -34,7 +34,7 @@ async function fixture(run) {
   const telegram = { async sendMessage(chat, text) {
     const event = { chat: String(chat), text }; deliveries.push(event); await mutation(event);
     if (failure === String(chat)) throw Object.assign(new Error('Synthetic explicit rejection'), { response: { error_code: 400 } });
-    event.id = sequence++; return { message_id: event.id };
+    event.id = sequence++; return receipt({ message_id: event.id },event);
   } };
   const context = vm.createContext({ module: { exports: {} }, Date: TestDate, console: { error() {}, log() {} }, process: { env: { CLIENTS_CHAT_ID: '-100200', WEBAPP_URL: 'https://example.invalid' } },
     setTimeout(fn) { scheduledTick = fn; }, setInterval() {}, require(name) {
@@ -51,7 +51,7 @@ async function fixture(run) {
     await api.ensureTables(); await api.ensureDeadlines(); api.startDecisionReminders({ telegram });
     await db.exec("ALTER TABLE staff ADD COLUMN approved BOOLEAN; INSERT INTO staff(tg_id,name,role,approved) VALUES(808,'Synthetic lawyer','lawyer',true),(909,'Replacement lawyer','lawyer',true),(101,'Synthetic manager','manager',true),(102,'Other manager','manager',true); INSERT INTO cases(id,org,lawyer_tg_id,lawyer_name,created_by,data,submitted_on,decision_due) VALUES(17,'Synthetic client',808,'Synthetic lawyer',101,'{\"_stage\":\"Подано\"}','2026-10-15','2026-11-05')");
     const routes = new Map();
-    context.module.exports.setupHandoff({ get(path,...handlers) { routes.set('GET '+path,handlers.at(-1)); }, post(path,...handlers) { routes.set('POST '+path,handlers.at(-1)); } });
+    context.module.exports.setupHandoff({ get(path,...handlers) { routes.set('GET '+path,handlers.at(-1)); }, post(path,...handlers) { routes.set('POST '+path,handlers.at(-1)); }, delete(path,...handlers) {routes.set('DELETE '+path,handlers.at(-1));} });
     const getReminders = async (actor = 808) => {
       let result;
       await routes.get('GET /api/checklist/reminders')({ query: { case_id: 17 }, tgUser: { id: actor }, staff: { role: actor === 808 ? 'lawyer' : 'manager', approved: true } }, { json(value) { result = value; }, status() { return this; } });
@@ -67,7 +67,7 @@ async function fixture(run) {
       let body,status=200;await routes.get('POST /api/checklist/reminders/done')({body:{id:1},tgUser:{id:actor},staff:{role:'lawyer',approved:true}},
         {json(value){body=value;},status(value){status=value;return this;}});return{...body,status};
     };
-    await run({ db, deliveries, getReminders, complete, tick: () => scheduledTick(), reminders: () => api.sendCaseReminders({ telegram }), fail(chat) { failure = chat == null ? null : String(chat); }, mutate(fn) { mutation = fn; }, advance(ms) { currentNow += ms; }, rejectWrites(fn) { rejectWrite = fn; }, beforeQuery(fn) { beforeQuery = fn; }, restart() { reminderDelivery = { ...reminderModule, ...reminderModule.createReminderDelivery() }; }, row: async () => (await db.query('SELECT * FROM cases WHERE id=17')).rows[0] });
+    await run({ db, deliveries, getReminders, complete, tick: () => scheduledTick(), reminders: () => api.sendCaseReminders({ telegram }), fail(chat) { failure = chat == null ? null : String(chat); }, mutate(fn) { mutation = fn; }, advance(ms) { currentNow += ms; }, rejectWrites(fn) { rejectWrite = fn; }, beforeQuery(fn) { beforeQuery = fn; }, receipt(fn) { receipt=fn; }, group(value) { context.process.env.CLIENTS_CHAT_ID=value; }, restart() { reminderDelivery = { ...reminderModule, ...reminderModule.createReminderDelivery() }; }, row: async () => (await db.query('SELECT * FROM cases WHERE id=17')).rows[0] });
   } finally { await db.close(); }
 }
 
@@ -76,6 +76,32 @@ test('failed decision DM retries the same day without repeating the confirmed gr
   h.fail(null); h.advance(10*60*1000); await h.tick(); assert.ok((await h.row()).reminded_on);
   assert.equal(h.deliveries.filter(event => event.chat === '808').length, 2);
   assert.equal(h.deliveries.filter(event => event.chat === '-100200').length, 1);
+}));
+
+test('a foreign-chat case-reminder ACK stays unknown across restart and retains the other recipient receipt',pg,async()=>fixture(async h=>{
+  await h.db.exec("INSERT INTO case_reminders(id,case_id,remind_on,text,created_by) VALUES(1,17,'2026-11-05','Synthetic reminder',101)");
+  h.receipt((ack,event)=>({...ack,chat:{id:event.chat==='808'?909:Number(event.chat)}}));await h.reminders();
+  let row=(await h.db.query('SELECT * FROM case_reminders WHERE id=1')).rows[0],status=(await h.getReminders()).items[0].deliveryStatus;
+  assert.equal(row.sent_at,null);assert.equal(row.delivery['808'],undefined);assert.ok(row.delivery['101']);assert.equal(status.state,'unknown');assert.equal(status.confirmed,1);assert.equal(status.duplicatePossible,true);
+  const count=h.deliveries.length;h.restart();await h.reminders();assert.equal(h.deliveries.length,count);assert.equal((await h.getReminders()).items[0].deliveryStatus.state,'unknown');
+  h.advance(11*60*1000);h.receipt((ack,event)=>({...ack,chat:{id:Number(event.chat)}}));await h.reminders();
+  row=(await h.db.query('SELECT * FROM case_reminders WHERE id=1')).rows[0];assert.ok(row.sent_at);assert.ok(row.delivery['808']);assert.equal(h.deliveries.filter(event=>event.chat==='101').length,1);assert.equal(h.deliveries.filter(event=>event.chat==='808').length,2);
+}));
+
+test('a foreign-chat decision DM ACK never confirms the day and its valid group receipt survives the delayed retry',pg,async()=>fixture(async h=>{
+  h.receipt((ack,event)=>({...ack,chat:{id:event.chat==='808'?909:Number(event.chat)}}));await h.tick();
+  let row=await h.row(),status=(await h.getReminders()).decisionDeliveryStatus;assert.equal(row.reminded_on,null);assert.equal(row.decision_reminder_delivery.dm,undefined);assert.ok(row.decision_reminder_delivery.group.message_id);assert.equal(status.state,'unknown');assert.equal(status.confirmed,1);
+  const count=h.deliveries.length;h.restart();await h.tick();assert.equal(h.deliveries.length,count);
+  h.advance(11*60*1000);h.receipt((ack,event)=>({...ack,chat:{id:Number(event.chat)}}));await h.tick();
+  row=await h.row();assert.ok(row.reminded_on);assert.equal((await h.getReminders()).decisionDeliveryStatus.state,'confirmed');assert.equal(h.deliveries.filter(event=>event.chat==='-100200').length,1);assert.equal(h.deliveries.filter(event=>event.chat==='808').length,2);
+}));
+
+for(const group of ['-100200','@SyntheticGroup'])test('a '+group+' decision-group ACK matches the configured destination before confirming a day',pg,async()=>fixture(async h=>{
+  h.group(group);h.receipt((ack,event)=>({...ack,chat:event.chat===group?{id:-100999,username:'OtherGroup'}:{id:Number(event.chat)}}));await h.tick();
+  let row=await h.row();assert.equal(row.reminded_on,null);assert.ok(row.decision_reminder_delivery.dm.message_id);assert.equal(row.decision_reminder_delivery.group,undefined);assert.equal((await h.getReminders()).decisionDeliveryStatus.state,'unknown');
+  const count=h.deliveries.length;h.restart();await h.tick();assert.equal(h.deliveries.length,count);
+  h.advance(11*60*1000);h.receipt((ack,event)=>({...ack,chat:event.chat===group?{id:-100200,username:'sYnThEtIcGrOuP'}:{id:Number(event.chat)}}));await h.tick();
+  row=await h.row();assert.ok(row.reminded_on);assert.equal(row.decision_reminder_delivery.group.chat,group);assert.equal((await h.getReminders()).decisionDeliveryStatus.state,'confirmed');assert.equal(h.deliveries.filter(event=>event.chat==='808').length,1);assert.equal(h.deliveries.filter(event=>event.chat===group).length,2);
 }));
 
 test('failed initial decision group notice retries without repeating the confirmed lawyer DM', pg, async () => fixture(async h => {

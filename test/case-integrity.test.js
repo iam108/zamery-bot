@@ -53,7 +53,7 @@ async function fixture(run) {
     },
   });
   vm.runInContext(source + '\nmodule.exports.testReminders=sendCaseReminders;module.exports.testReport=addToReports;', context);
-  const app = { get(path, ...handlers) { routes.set('GET ' + path, handlers.at(-1)); }, post(path, ...handlers) { routes.set('POST ' + path, handlers.at(-1)); } };
+  const app = { get(path, ...handlers) { routes.set('GET ' + path, handlers.at(-1)); }, post(path, ...handlers) { routes.set('POST ' + path, handlers.at(-1)); }, delete(path,...handlers) {routes.set('DELETE '+path,handlers.at(-1));} };
   context.module.exports.setupHandoff(app); context.module.exports.setupRequestsWeb(app);
   await Promise.all(pending); await new Promise(resolve => setImmediate(resolve)); await Promise.all(pending);
   await db.exec("ALTER TABLE staff ADD COLUMN approved BOOLEAN;INSERT INTO staff(tg_id,name,role,approved) VALUES(101,'Manager','manager',true),(808,'Lawyer','lawyer',true),(909,'Auditor','auditor',true);");
