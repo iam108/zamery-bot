@@ -9,6 +9,24 @@ test('a permanent submission conflict stops immediately instead of waiting and r
   assert.match(h.alerts[0], /другими данными/);
 });
 
+test('authentication loss after an unknown acknowledgement retains the exact submission for confirmation', async () => {
+  const h=harness();let posts=0;
+  h.c.respond=()=>{if(++posts===1)throw new Error('Synthetic lost acknowledgement');return response({ok:false,error:'Synthetic authentication loss'},401);};
+  await h.c.submitForm();
+  assert.equal(posts,2);
+  const pending=h.c.pendingManagerSubmission;
+  assert.ok(pending?.uncertain);assert.equal(pending.body,h.requests[0].options.body);
+  assert.equal(h.nodes.get('submit-btn').disabled,true);
+  assert.equal(h.nodes.get('submit-btn').textContent,'Повторить подтверждение');
+  h.nodes.get('address').value='Москва, новая правка после потери связи';
+  assert.equal(await h.c.checkManagerAccess(),true);
+  h.c.respond=()=>response({ok:false,error:'Synthetic permanent stop'},400);
+  await h.c.submitForm();
+  assert.equal(h.requests.at(-1).options.body,pending.body);
+  assert.equal(h.requests.at(-1).options.body.entries.find(([name])=>name==='address')[1],'Москва, адрес');
+  assert.equal(h.nodes.get('address').value,'Москва, новая правка после потери связи');
+});
+
 test('saved creation with a delivery warning becomes an editable existing packet and preserves EGRN intent and newer typing', async () => {
   const h = harness(), sent = { name: 'План.pdf', size: 4, materialRole: 'plan' };
   h.c.attachedFiles.push(sent); const originalId = h.c.submitId;

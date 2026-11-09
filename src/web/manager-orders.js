@@ -257,6 +257,8 @@ function setupManagerOrders(app, options = {}) {
     next();
   });
   const handlers = createManagerHandlers();
+  // requireStaff is installed for /api/order before these routes.
+  app.get('/api/order/access', (req, res) => res.set('Cache-Control', 'no-store').json({ ok: true }));
   app.get('/api/order/:id', handlers.read);
   app.post('/api/order', parse, handlers.save);
   app.post('/api/order/:id', parse, handlers.save);

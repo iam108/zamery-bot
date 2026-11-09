@@ -19,6 +19,7 @@ function setupBot() {
   require('./handoff-notice-admin').setupHandoffNoticeAdmin(bot, { pool });
   const auth = require('../web/auth');
   const { ensureStaff, canManageCases } = auth;
+  const staffMenu = require('./staff-menu').getStaffMenu(bot, { pool, auth, webappUrl: WEBAPP_URL });
   const openCase = require('./case-open').setupCaseOpen(bot, { pool, auth, webappUrl: WEBAPP_URL });
   const { parsePairing, approvePairing, canPair } = require('../web/workspace');
   const { esc } = require('./formatter');
@@ -73,6 +74,9 @@ function setupBot() {
     }
     if (!me) return ctx.reply('👋 Привет! Кто вы в команде?', roleKb());
     if (!me.approved) return ctx.reply('⏳ Заявка на доступ (' + (ROLES[me.requested_role || me.role] || '') + ') ждёт одобрения. Как только её одобрят, я напишу.');
+    // Repair the personal menu in the background; the working keyboard must
+    // remain available even if Telegram's configuration endpoint is slow.
+    Promise.resolve().then(() => staffMenu.refresh(ctx.from.id)).catch(() => {});
     // Кнопки клавиатуры не получают подпись Telegram — добавляем личный ключ сотрудника
     const kq = '?' + require('../web/auth').keyQuery(ctx.from.id);
     console.log('/start keyboard with key for', ctx.from.id, me.role);

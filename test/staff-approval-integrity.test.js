@@ -36,6 +36,7 @@ async function fixture(run, options = {}) {
     if(name==='./case-open')return {setupCaseOpen(){return async()=>{};}};
     if(name==='./manual-order-attachments')return {setupManualOrderAttachments(){}};
     if(name==='./staff-approval')return require('../src/bot/staff-approval');
+    if(name==='./staff-menu')return {getStaffMenu(){return {async refresh(){}};}};
     throw new Error('Unexpected require: '+name);
   }});
   vm.runInContext(fs.readFileSync(require.resolve('../src/bot/index'),'utf8'),context);context.module.exports.setupBot();

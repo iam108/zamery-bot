@@ -34,6 +34,7 @@ function harness(staff = { tg_id: 42, role: 'auditor', approved: true }, options
       if (name === './handoff-notice-admin') return require('../src/bot/handoff-notice-admin');
       if (name === './case-open') return require('../src/bot/case-open');
       if (name === './staff-approval') return require('../src/bot/staff-approval');
+      if (name === './staff-menu') return { getStaffMenu() { return { async refresh() {} }; } };
       if (name === '../web/order-report-link') return { loadOrderReportLink: options.loadOrderReportLink || (async () => null) };
       if (name === '../db/order-delivery-lock') return { withOrderDeliveryLock: options.withOrderDeliveryLock || (async (id, run) => run()) };
       if (name === './audit-handler') return { handleAuditReport: async () => calls.push('audit') };

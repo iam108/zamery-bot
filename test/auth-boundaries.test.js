@@ -84,6 +84,66 @@ test('browser authentication headers stay on the exact application origin', asyn
   assert.equal(calls.at(-1).options.headers.get('X-Custom'), 'preserved');
 });
 
+function clientHarness(auth, { search = '', hash = '', telegram } = {}) {
+  const calls = [], stored = [];
+  const context = vm.createContext({ URL, URLSearchParams, Headers, Request,
+    location: { href: 'https://bot.example/form' + search + hash, origin: 'https://bot.example', search, hash },
+    sessionStorage: { getItem() { return null; }, setItem(...args) { stored.push(args); } },
+    window: { Telegram: telegram, fetch: async (url, options) => { calls.push({ url, options }); return {}; } },
+  });
+  vm.runInContext(auth.clientScript(), context);
+  return { context, calls, stored };
+}
+
+test('the inline and external authentication bridges share one idempotent, embeddable script', async () => {
+  const { auth, routes } = authHarness(); let external;
+  routes.get('/auth.js')({}, { type() { return this; }, set() { return this; }, send(value) { external = value; } });
+  assert.equal(auth.clientScript(), external); assert.doesNotMatch(external, /<\/script/i);
+  const h = clientHarness(auth, { search: '?u=42&k=synthetic-key' });
+  const installed = h.context.window.fetch; vm.runInContext(external, h.context);
+  assert.equal(h.context.window.fetch, installed);
+  await h.context.window.fetch('/api/order'); assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0].options.headers.get('X-Tg-U'), '42'); assert.equal(h.calls[0].options.headers.get('X-Tg-K'), 'synthetic-key');
+});
+
+for (const prefix of ['', 'form?']) test('a missing SDK forwards the exact signed launch query from hash prefix ' + prefix + ' only to our origin', async () => {
+  const { auth, env } = authHarness();
+  const signed = telegramSignature(env, { auth_date: String(Math.floor(Date.now() / 1000)), user: JSON.stringify({ id: 42, first_name: 'R&D + / = Ж </script>' }) });
+  const h = clientHarness(auth, { hash: '#' + prefix + 'tgWebAppData=' + encodeURIComponent(signed) + '&tgWebAppPlatform=macos' });
+  const body = new FormData(); body.append('address', 'Synthetic address');
+  await h.context.window.fetch('/api/order', { method: 'POST', body, headers: { 'X-Custom': 'preserved' } });
+  assert.equal(h.calls[0].options.body, body); assert.equal(h.calls[0].options.headers.get('X-Tg-Init'), signed);
+  assert.equal(h.calls[0].options.headers.get('X-Custom'), 'preserved'); assert.equal(auth.checkInitData(h.calls[0].options.headers.get('X-Tg-Init')).id, 42);
+  assert.deepEqual(h.stored, [], 'The launch query must not become another persistent credential cache');
+  for (const url of ['https://other.example/collect', '//bot.example.evil.invalid/api', new Request('https://other.example/request')]) {
+    await h.context.window.fetch(url); assert.equal(h.calls.at(-1).options.headers?.get('X-Tg-Init'), undefined);
+  }
+});
+
+test('SDK initialization appearing after bridge installation takes precedence over the launch-hash fallback', async () => {
+  const { auth, env } = authHarness(), now = String(Math.floor(Date.now() / 1000));
+  const fallback = telegramSignature(env, { auth_date: now, user: JSON.stringify({ id: 42 }) });
+  const sdk = telegramSignature(env, { auth_date: now, user: JSON.stringify({ id: 43 }) });
+  const h = clientHarness(auth, { hash: '#tgWebAppData=' + encodeURIComponent(fallback) });
+  await h.context.window.fetch('/api/order'); assert.equal(h.calls.at(-1).options.headers.get('X-Tg-Init'), fallback);
+  h.context.window.Telegram = { WebApp: { initData: sdk } };
+  await h.context.window.fetch('/api/order'); assert.equal(h.calls.at(-1).options.headers.get('X-Tg-Init'), sdk);
+});
+
+test('unsafe Telegram user fields are never promoted to an authentication header', async () => {
+  const { auth } = authHarness();
+  const h = clientHarness(auth, { telegram: { WebApp: { initData: '', initDataUnsafe: { user: { id: 42 } } } } });
+  await h.context.window.fetch('/api/order');
+  assert.equal(h.calls[0].options.headers.get('X-Tg-Init'), null); assert.equal(h.calls[0].options.headers.get('X-Tg-U'), null);
+});
+
+test('a malformed non-header launch value cannot suppress a separately supplied personal key', async () => {
+  const { auth } = authHarness(), h = clientHarness(auth, { search: '?u=42&k=synthetic-key', hash: '#tgWebAppData=' + encodeURIComponent('💥') });
+  await h.context.window.fetch('/api/order');
+  assert.equal(h.calls[0].options.headers.get('X-Tg-Init'), null);
+  assert.equal(h.calls[0].options.headers.get('X-Tg-U'), '42'); assert.equal(h.calls[0].options.headers.get('X-Tg-K'), 'synthetic-key');
+});
+
 test('an absent, blank or non-string administrator password cannot establish a session', () => {
   const previous = process.env.ADMIN_PASSWORD;
   try {

@@ -12,13 +12,16 @@ function harness(options = {}) {
   for (const match of html.matchAll(/<(\w+)[^>]*\bid="([^"]+)"[^>]*>/g)) nodes.set(match[2], element(match[1]));
   const context = { window: {}, location: { search: '' }, URLSearchParams, URL, console, Date: options.virtualClock ? class extends Date { static now() { return now; } } : Date, Math, AbortController, alert: text => alerts.push(text),
     FormData: class { constructor() { this.entries = []; } append(...entry) { this.entries.push(entry); } },
-    setTimeout(fn, delay) { const id = ++serial; waits.push(delay); timers.set(id, { fn, at: now + delay }); if (!options.virtualClock && delay < 30000) queueMicrotask(() => { if (timers.delete(id)) fn(); }); return id; },
+    setTimeout(fn, delay) { const id = ++serial; waits.push(delay); timers.set(id, { fn, at: now + delay }); if (!options.virtualClock && delay < 2000) queueMicrotask(() => { if (timers.delete(id)) fn(); }); return id; },
     clearTimeout(id) { timers.delete(id); },
-    document: { getElementById: id => nodes.get(id), querySelectorAll: () => [...nodes.values()].filter(node => ['INPUT', 'SELECT', 'TEXTAREA'].includes(node.tagName)), createElement: element },
-    fetch: async (url, requestOptions) => { requests.push({ url, options: requestOptions }); return context.respond(url, requestOptions); },
+    document: { readyState:'loading', addEventListener() {}, getElementById: id => nodes.get(id), querySelectorAll: () => [...nodes.values()].filter(node => ['INPUT', 'SELECT', 'TEXTAREA'].includes(node.tagName)), createElement: element },
+    // These unit tests exercise submissions; the real access gate is covered in browser tests.
+    fetch: async (url, requestOptions) => { if(url==='/api/order/access')return response({ok:true});requests.push({ url, options: requestOptions }); return context.respond(url, requestOptions); },
   };
   vm.createContext(context);
   for (const match of html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)) vm.runInContext(match[1], context);
+  // Submission unit tests begin after authentication; browser tests execute real startup.
+  context.managerAccessReady=true;
   for (const [field, value] of Object.entries({ address: 'Москва, адрес', owner_name: 'Клиент', object_type: 'Общепит алкоголь', service: 'Получение', cad_num: '77:01:0000001:12' })) nodes.get(field).value = value;
   nodes.get('egrn_order').checked = true;
   return { c: context, nodes, alerts, requests, waits, timers,

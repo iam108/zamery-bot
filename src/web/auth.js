@@ -120,10 +120,18 @@ const CLIENT_JS = "(function(){var f=window.fetch;if(!f||f.__tg)return;" +
   "var q=new URLSearchParams(location.search),ku=q.get('u'),kk=q.get('k');" +
   "try{if(ku&&kk){sessionStorage.setItem('tg_u',ku);sessionStorage.setItem('tg_k',kk)}else{ku=sessionStorage.getItem('tg_u');kk=sessionStorage.getItem('tg_k')}}catch(e){}" +
   "var w=function(u,o){o=o||{};try{var tg=window.Telegram&&window.Telegram.WebApp;var d=tg&&tg.initData;" +
+  // The official SDK reads the opaque, URL-encoded tgWebAppData launch
+  // parameter from the fragment. Forward that same signed query if the SDK
+  // has not loaded; only requireStaff may validate or trust its contents.
+  "if(!d){var fragment=String(location.hash||'').replace(/^#/,'');var start=fragment.indexOf('?');if(start>=0)fragment=fragment.slice(start+1);d=new URLSearchParams(fragment).get('tgWebAppData')||'';}" +
   "var s=String(u);if(typeof Request==='function'){try{s=Object.getOwnPropertyDescriptor(Request.prototype,'url').get.call(u)}catch(e){}}" +
   "if(new URL(s,location.href).origin===location.origin){var h=new Headers(o.headers||(u&&u.headers)||{});" +
-  "if(d)h.set('X-Tg-Init',d);if(ku&&kk){h.set('X-Tg-U',ku);h.set('X-Tg-K',kk)}o.headers=h;}}catch(e){}" +
+  "if(d){try{h.set('X-Tg-Init',d)}catch(e){}}if(ku&&kk){h.set('X-Tg-U',ku);h.set('X-Tg-K',kk)}o.headers=h;}}catch(e){}" +
   "return f.call(this,u,o)};w.__tg=1;window.fetch=w;})();";
+
+// The form embeds exactly the same bridge as /auth.js so a failed extra
+// script request cannot remove authentication from an otherwise valid entry.
+function clientScript() { return CLIENT_JS; }
 
 function setupAuth(app) {
   ensureStaff().catch(function (e) { console.error('staff table:', e.message); });
@@ -135,4 +143,4 @@ function setupAuth(app) {
   });
 }
 
-module.exports = { setupAuth, requireStaff, checkInitData, signCase, checkCaseSig, ensureStaff, keyQuery, canManageCases, canAccessCase };
+module.exports = { setupAuth, requireStaff, checkInitData, signCase, checkCaseSig, ensureStaff, keyQuery, canManageCases, canAccessCase, clientScript };

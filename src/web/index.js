@@ -382,7 +382,7 @@ function miniAppForm() {
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>Новая заявка</title>
 <script src="https://telegram.org/js/telegram-web-app.js"><\/script>
-<script src="/auth.js"><\/script>
+<script>${require('./auth').clientScript()}<\/script>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--tg-theme-bg-color,#0f172a);color:var(--tg-theme-text-color,#f1f5f9);padding:16px 16px 100px}
@@ -408,6 +408,12 @@ function miniAppForm() {
 </style></head><body>
 <h1 id="form-heading">📋 Заявка на выезд · Москва</h1>
 <p style="font-size:14px;line-height:1.5;margin-bottom:20px;color:var(--tg-theme-hint-color,#94a3b8)">Заполняет менеджер. Данные и все приложенные документы автоматически получит аудитор.</p>
+<div id="form-access" role="status" style="font-size:14px;line-height:1.5;margin-bottom:16px">
+  <p id="form-access-message">Проверяем вход…</p>
+  <button id="form-access-retry" type="button" onclick="checkManagerAccess()" hidden style="padding:10px 14px;margin-top:8px">Проверить вход ещё раз</button>
+  <a id="form-access-open" href="https://t.me/LRSZamer_bot?start=form" target="_blank" rel="noopener noreferrer" hidden style="margin-top:8px;color:var(--tg-theme-link-color,#2481cc)">Открыть бот и обновить меню</a>
+</div>
+<fieldset id="form-access-fields" disabled style="border:0;min-width:0">
 <p id="packet-status" role="status" style="font-size:14px;line-height:1.5;margin-bottom:16px" hidden></p>
 <button id="packet-retry" type="button" onclick="loadExistingPacket()" style="padding:10px 14px;margin-bottom:16px" hidden>Повторить загрузку</button>
 <div class="field">
@@ -493,8 +499,9 @@ function miniAppForm() {
   </label>
   <div id="files-preview" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px"></div>
 </div>
+</fieldset>
 <div class="bottom">
-  <button class="submit-btn" id="submit-btn" onclick="submitForm()">Отправить заявку</button>
+  <button class="submit-btn" id="submit-btn" onclick="submitForm()" disabled>Отправить заявку</button>
 </div>
 <script>
 var tg = (window.Telegram && window.Telegram.WebApp) || {
@@ -523,6 +530,47 @@ var preservePacketInputs = false;
 var packetRevision = null;
 var submitId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 var pendingManagerSubmission = null, activeManagerSubmission = null;
+var managerAccessReady = false, managerAccessRequest = null;
+function showManagerAccessError(status) {
+  managerAccessReady=false;
+  document.getElementById('form-access').hidden=false;
+  document.getElementById('form-access-fields').disabled=true;
+  document.getElementById('submit-btn').disabled=true;
+  document.getElementById('submit-btn').textContent=pendingManagerSubmission?'Повторить подтверждение':editOrderId?'Сохранить изменения':'Отправить заявку';
+  document.getElementById('packet-status').hidden=true;
+  var denied=status===401||status===403;
+  var retained=attachedFiles.length||['address','owner_name','contacts'].some(function(id){return !!document.getElementById(id).value;});
+  var reminder=retained?' Введённый текст и файлы остаются в этом окне; не закрывайте его, пока они вам нужны.':'';
+  document.getElementById('form-access-message').textContent=denied
+    ? (status===403 ? 'Доступ к форме не подтверждён. Обратитесь к администратору.' : 'Telegram не передал данные для входа. Откройте бот, нажмите «Начать» или /start и откройте «Заявка на замер» из нового меню.')+reminder
+    : 'Не удалось проверить вход. Проверьте связь и повторите.'+reminder;
+  document.getElementById('form-access-retry').hidden=false;
+  document.getElementById('form-access-open').hidden=status!==401;
+}
+function checkManagerAccess() {
+  if(managerAccessRequest)return managerAccessRequest;
+  document.getElementById('form-access').hidden=false;
+  document.getElementById('form-access-message').textContent='Проверяем вход…';
+  document.getElementById('form-access-retry').hidden=true;
+  document.getElementById('form-access-open').hidden=true;
+  document.getElementById('form-access-fields').disabled=true;
+  document.getElementById('submit-btn').disabled=true;
+  managerAccessRequest=(async function(){
+    try {
+      await managerFetch('/api/order/access',{cache:'no-store'},async function(response){
+        if(!response.ok)throw Object.assign(new Error('Не удалось проверить вход.'),{status:response.status});
+        var data=await response.json();if(!data||data.ok!==true)throw new Error('Некорректный ответ проверки входа.');
+      },15000);
+      managerAccessReady=true;document.getElementById('form-access-fields').disabled=false;
+      document.getElementById('submit-btn').disabled=!packetReady||!packetCanEdit;
+      document.getElementById('form-access').hidden=true;
+      if(editOrderId&&!packetReady)await loadExistingPacket(packetRevision!==null);
+      return true;
+    } catch(error) {showManagerAccessError(error.status);return false;}
+    finally {managerAccessRequest=null;}
+  })();
+  return managerAccessRequest;
+}
 async function managerFetch(url, options, consume, timeoutMs) {
   var controller=typeof AbortController==='function'?new AbortController():null, source=options&&options.signal;
   var requestOptions=Object.assign({},options||{}), timer, rejectStopped;
@@ -646,6 +694,7 @@ function fileToBase64(file) {
 }
 async function submitForm() {
   if(activeManagerSubmission){var stopped=new Error('Ожидание прекращено.');stopped.code='MANAGER_WAIT_STOPPED';activeManagerSubmission.abort(stopped);return;}
+  if(!managerAccessReady && !await checkManagerAccess())return;
   if(!packetReady || !packetCanEdit) return;
   if(!pendingManagerSubmission) {
   var valid = true;
@@ -711,11 +760,13 @@ for (var attempt = 0; attempt < waits.length; attempt++) {
     var r=received.response,txt=received.text;
     try { result = JSON.parse(txt); } catch (pe) { result = null; }
     if (result && result.ok) break;
+    if(r.status===401||r.status===403){if(!pending.uncertain)pendingManagerSubmission=null;showManagerAccessError(r.status);return;}
     var snippet = String(txt || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80);
     lastErr = result ? (result.error || 'ошибка сервера') + ' [' + r.status + ']' : 'сервер ответил ' + r.status + (snippet ? ': ' + snippet : '');
     var retry = r.status === 429 || r.status >= 500 || !result || (result && result.busy);
     if (!retry) {pendingManagerSubmission=null;break;}
-  } catch (ne) { lastErr = 'нет связи (' + ne.message + ')'; if(ne.code==='MANAGER_REQUEST_TIMEOUT'||ne.code==='MANAGER_WAIT_STOPPED')break; }
+    pending.uncertain=true;
+  } catch (ne) { pending.uncertain=true;lastErr = 'нет связи (' + ne.message + ')'; if(ne.code==='MANAGER_REQUEST_TIMEOUT'||ne.code==='MANAGER_WAIT_STOPPED')break; }
   result = null;
 }
     if (result && result.ok) {
@@ -758,7 +809,9 @@ if (attachedFiles.length > 0) {
     if(activeManagerSubmission===controller)activeManagerSubmission=null;
   }
 }
-if(editOrderId) loadExistingPacket();
+function initializeManagerForm(){checkManagerAccess();}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',initializeManagerForm,{once:true});
+else initializeManagerForm();
 <\/script></body></html>`;
 }
 function statsPage({ byMonth, byType }) {

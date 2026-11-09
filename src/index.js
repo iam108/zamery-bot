@@ -25,7 +25,13 @@ async function main() {
 
   const bot = setupBot();
   await bot.telegram.deleteWebhook({ drop_pending_updates: false });
-  bot.launch({}, () => console.log('Bot started polling')).catch(error => {
+  bot.launch({}, () => {
+    console.log('Bot started polling');
+    // Serial, rate-limited maintenance must never delay incoming updates.
+    Promise.resolve().then(() => require('./bot/staff-menu').getStaffMenu(bot).syncApproved()).then(counts => {
+      console.log('Staff menus checked:', counts.updated, 'updated,', counts.skipped, 'skipped,', counts.failed, 'failed');
+    }).catch(() => console.error('Staff menu sync unavailable'));
+  }).catch(error => {
     console.error('Bot polling stopped:', error.code || error.response?.error_code || error.name || 'error');
     process.exit(1);
   });

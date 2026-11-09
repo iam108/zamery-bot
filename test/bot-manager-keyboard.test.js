@@ -9,7 +9,7 @@ const { canManageCases } = require('../src/web/auth');
 
 function harness(initialStaff, adminIds = '') {
   let staff = initialStaff, start, configuredAdmins = adminIds;
-  const replies = [], reads = [], keys = [];
+  const replies = [], reads = [], keys = [], menuUpdates = [];
   const bot = { start(handler) { start = handler; }, action() {}, command() {}, hears() {}, on() {}, catch() {} };
   const setups = {
     '../web/handoff': { setupReportsBot() {} }, './egrn': { setupEgrn() {} },
@@ -18,6 +18,7 @@ function harness(initialStaff, adminIds = '') {
     './case-open': { setupCaseOpen() { return async () => {}; } },
     './staff-approval': { createStaffApprovalHandler() { return async () => {}; } },
     './manual-order-attachments': { setupManualOrderAttachments() {} },
+    './staff-menu': { getStaffMenu() { return { async refresh(id) { menuUpdates.push(id); } }; } },
     '../db/queries': {}, '../web/manager-orders': {}, '../web/order-report-link': {}, '../db/order-delivery-lock': {},
     './formatter': { esc: String }, '../web/workspace': {},
   };
@@ -44,13 +45,20 @@ function harness(initialStaff, adminIds = '') {
   });
   vm.runInContext(fs.readFileSync(require.resolve('../src/bot/index'), 'utf8'), context);
   context.module.exports.setupBot();
-  return { replies, reads, keys, setStaff(value) { staff = value; }, setAdminIds(value) { configuredAdmins = value; },
+  return { replies, reads, keys,menuUpdates, setStaff(value) { staff = value; }, setAdminIds(value) { configuredAdmins = value; },
     async start(type = 'private') { await start({ from: { id: 42 }, chat: { id: type === 'private' ? 42 : -100123, type },
       reply: async (text, extra) => replies.push({ text, extra }) }); },
   };
 }
 function buttons(reply) { return reply?.extra?.reply_markup?.keyboard?.flat() || []; }
 function find(reply, text) { return buttons(reply).find(button => button.text === text); }
+
+test('approved private start repairs the same actor menu while unapproved and group starts issue no menu key', async () => {
+  const h=harness({tg_id:42,name:'Юрист',role:'lawyer',approved:true});
+  await h.start();assert.deepEqual(h.menuUpdates,[42]);
+  h.setStaff({tg_id:42,role:'lawyer',approved:false});await h.start();assert.deepEqual(h.menuUpdates,[42]);
+  await h.start('supergroup');assert.deepEqual(h.menuUpdates,[42]);
+});
 
 test('an approved manager receives independent client creation and keeps the existing linked handoff button', async () => {
   const h = harness({ tg_id: 42, name: 'Менеджер', role: 'manager', approved: true });
