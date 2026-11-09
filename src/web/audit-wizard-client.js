@@ -12,7 +12,7 @@
   var localKey = 'audit-wizard-v3:' + uid + ':' + (orderId || 'new');
   var STEPS = [
     ['Территория', 'Входы и проверка территории', 'Укажите результат проверки территории и приложите фото каждого входа.'],
-    ['Помещение', 'План помещения', 'Выберите нужный лист PDF и отметьте фактическую планировку.'],
+    ['Помещение', 'План помещения', 'Приложите готовый план или выполните разметку в боте.'],
     ['Отчёт', 'Результат проверки', 'Краткий вывод и вопросы, которые осталось решить.']
   ];
   var TRI = ['', 'Да', 'Нет', 'Не проверено'];
@@ -23,7 +23,7 @@
     schema_version: 3, ui_version: 5, object_category: 'catering', order_id: orderId,
     inspection: {service:'',org:'',address:'',visit_date:'',region:'МСК',floor_plan:'',floor_actual:'',plan_source:'',plan_note:'',structural_elements:'',archive_available:'',archive_match:'',archive_url:'',alcohol_present:'',alcohol_within_licensed:'',within_cadastral:'',licensed_boundaries_match:'',entrances_plan:'',entrances_actual:'',all_entrances_checked:'',zones_checked:'',video_status:'',repair_state:'',risks:''},
     workflow: {step:0,contact_name:'',contact_phone:'',call_status:'',appointment_at:'',access_notes:'',preliminary_status:'',precheck_notes:'',documents:{egrn:'',lease:'',plan:'',license:''},video_url:'',followup_notes:'',mitigation:'',conclusion_status:''},
-    entrances: [], zones: [], plan: {evidence_id:'',page:1,annotations:[],wall_basis:''}, map:{evidence_id:'',page:1,annotations:[]}, additional_plans:[],
+    entrances: [], zones: [], plan: {mode:'attached',evidence_id:'',page:1,annotations:[],pending:null,wall_basis:''}, map:{evidence_id:'',page:1,annotations:[]}, additional_plans:[],
     building_type:'',boundaries:'',bti:'',to:'',nearby:'',veranda:false,patz:false,passport:false,owner_info:'',conclusion:''
   };
   var state = {data:clone(defaults),draft:null,evidence:[],dirty:false,version:0,conflict:false,submitting:false,frozen:false,completed:false,loaded:false,localSaved:false,pendingUploads:0,uploadText:'',serverError:'',recoveryData:null,packet:null,viewStep:null,packetError:''};
@@ -388,11 +388,18 @@
   }
   function currentPlan(planId){planId=planId||activePlanId;if(planId==='main')return state.data.plan;return state.data.additional_plans.find(function(p){return p.id===planId;});}
   function setCurrentPlan(plan,planId){planId=planId||activePlanId;if(planId==='main')state.data.plan=plan;else{var i=state.data.additional_plans.findIndex(function(p){return p.id===planId;});if(i>=0)state.data.additional_plans[i]=Object.assign({},plan,{id:planId});}}
+  function switchPlanMode(mode) {
+    if(activePlanId!=='main'||state.frozen||state.submitting||!['attached','draw'].includes(mode))return;
+    var current=state.data.plan,previous=current.mode||'draw';if(previous===mode)return;
+    var versions=state.data.plan_modes||(state.data.plan_modes={});versions[previous]=clone(current);
+    state.data.plan=versions[mode]?clone(versions[mode]):{evidence_id:'',page:1,annotations:[],pending:null};state.data.plan.mode=mode;
+  }
 
   function insideStep(){
     if(state.data.object_category==='other')return genericInsideStep();
     var p=state.data.inspection,files=packetFiles().filter(function(f){return ['plan','egrn','archive'].includes(f.role);}),renewalArchive=isRenewal()&&state.data.workflow.archive_skipped!=='Да'&&files.concat(state.evidence).some(function(f){return f.role==='archive';});
-    var html=heading(1)+'<details class="details-block"><summary>Выбрать документ из заявки</summary>'+managerFilesHtml(files,true)+'</details><div class="plan-contexts"><button type="button" class="button secondary'+(activePlanId==='main'?' selected':'')+'" data-plan-context="main">Основной план</button>'+state.data.additional_plans.map(function(plan,i){return '<button type="button" class="button secondary'+(activePlanId===plan.id?' selected':'')+'" data-plan-context="'+esc(plan.id)+'">Доп. лист '+(i+1)+'</button>';}).join('')+'<button type="button" class="button secondary" data-add-plan>+ Ещё лист</button></div>'+(activePlanId!=='main'?'<button type="button" class="text-button" data-remove-plan>Убрать дополнительный лист</button>':'')+'<div class="plan-editor-shell" id="plan-editor"></div>';
+    var html=heading(1)+'<details class="details-block"><summary>Выбрать документ из заявки</summary>'+managerFilesHtml(files,true)+'</details><div class="plan-contexts"><button type="button" class="button secondary'+(activePlanId==='main'?' selected':'')+'" data-plan-context="main">Основной план</button>'+state.data.additional_plans.map(function(plan,i){return '<button type="button" class="button secondary'+(activePlanId===plan.id?' selected':'')+'" data-plan-context="'+esc(plan.id)+'">Доп. лист '+(i+1)+'</button>';}).join('')+'<button type="button" class="button secondary" data-add-plan>+ Ещё лист</button></div>'+(activePlanId!=='main'?'<button type="button" class="text-button" data-remove-plan>Убрать дополнительный лист</button>':'')+
+      (activePlanId==='main'?choices('plan.mode','Как подготовить план?',[['attached','Прикрепить готовый план'],['draw','Разметить в боте']])+'<p class="field-note">'+(state.data.plan.mode==='attached'?'Выберите готовый рисунок в JPG, PNG или PDF. Для PDF выберите нужный лист. Рисовать контур в боте не нужно.':'Выберите исходный план и отметьте фактическую планировку. Ранее подготовленный план сохранится при переключении режима.')+'</p>':'')+'<div class="plan-editor-shell" id="plan-editor"></div>';
     html+='<section class="capture-section"><h3>Помещение по факту</h3><div class="fields">'+input('Этаж на плане','inspection.floor_plan',{maxlength:100})+input('Фактический этаж','inspection.floor_actual',{maxlength:100})+input('Количество кадастров','inspection.cadastral_count',{type:'number',step:'1',maxlength:2})+'</div>'+choices('inspection.within_cadastral','Внешние границы помещения',[['Да','Соблюдены'],['Нет','Нарушены']])+'<div data-cadastral-boundary'+(Number(p.cadastral_count)>1?'':' hidden')+'>'+choices('inspection.inter_cadastral_boundary','Граница между кадастрами',[['Сохранена','Сохранена'],['Объединены','Объединены']])+'</div>'+choices('inspection.rooms_complete','Вся площадь по плану входит в объект',[['Да','Входит целиком'],['Нет','Часть не входит']])+'<p class="field-note">«Часть не входит» — часть площади отрезана или занята соседями. Если убрана только внутренняя перегородка, отметьте это ниже как изменение планировки.</p>'+choices('to','Нужно техническое описание (ТО)',[['Нужно','Да'],['Не нужно','Нет']])+choices('bti','Планировка по выбранному плану',[['Да','Совпадает'],['Нет','Есть изменения']])+(state.data.bti==='Нет'?input('Что отличается','inspection.plan_note',{type:'textarea',wide:true,maxlength:2000,placeholder:'Кратко. Перегородки и границы отметьте на плане.'}):'')+'</section>';
     if(renewalArchive)html+='<details class="details-block"><summary>Сверка с архивом</summary>'+managerFilesHtml(files.filter(function(f){return f.role==='archive';}),false)+choices('inspection.archive_match','Планировка совпадает с архивом',[['Да','Да'],['Нет','Нет']])+choices('inspection.licensed_boundaries_match','Лицензированные границы сохранены',[['Да','Да'],['Нет','Нет']])+'</details>';
     html+=evidenceBlock('interior','rooms','Фото помещения · необязательно','Общий вид зала, бара или помещений. Можно добавить несколько фото.');
@@ -401,10 +408,12 @@
     html+='<section class="capture-section"><h3>Кассы</h3>'+choices('inspection.kkt_count','Количество касс',[['1','1'],['2','2']])+choices('inspection.kkt_ip','Есть касса ИП',[['Да','Да'],['Нет','Нет']])+'</section>';
     return html;
   }
-  function syncMapCards(){
+  function syncMapCards(previousMap){
     var marks=state.data.map.annotations||[],oldEntrances=state.data.entrances||[],oldZones=state.data.zones||[],before=JSON.stringify([oldEntrances,oldZones]);
     var entrances=marks.filter(function(m){return m.tool==='entrance';}).map(function(m,i){var prior=oldEntrances.find(function(e){return e.id===m.id;})||{};return Object.assign({},prior,{id:String(m.id),label:String(m.label||'Вход '+(i+1)),kind:prior.kind||'',location:prior.location||'',facing:prior.facing||'',access:prior.access||'Осмотрен',notes:prior.notes||''});});
-    var zones=marks.filter(function(m){return m.tool==='hazard';}).map(function(m){var prior=oldZones.find(function(z){return z.id===m.id;})||{},measurement=marks.find(function(x){return ['route','straight'].includes(x.tool)&&x.toObjectId===m.id;});return Object.assign({},prior,{id:String(m.id),name:String(m.label||''),type:prior.type||'',status:String(m.status||'pending'),entrance_id:String(measurement&&measurement.fromEntranceId||''),dist:String(measurement&&measurement.distance||''),method:measurement?(measurement.tool==='straight'?'Прямая линия':'Пешеходный маршрут'):'',points:measurement?String(measurement.code||''):'',license:m.status==='licensed'?String(m.source||'Сведения аудитора'):'',source:String(m.source||''),info:String(m.note||''),resolution:String(m.note||'')});});
+    var zones=marks.filter(function(m){return m.tool==='hazard';}).map(function(m){var prior=oldZones.find(function(z){return z.id===m.id;})||{},measurement=marks.find(function(x){return ['route','straight'].includes(x.tool)&&x.toObjectId===m.id;}),previous=(previousMap&&previousMap.annotations||[]).find(function(x){return x.id===m.id;}),note=String(m.note||''),source=String(m.source||m.sourceUrl||'');
+      var resolution=previous&&String(previous.note||'')!==note?note:note||String(prior.resolution||prior.note||'');
+      return Object.assign({},prior,{id:String(m.id),name:String(m.label||''),type:prior.type||'',status:String(m.status||'pending'),entrance_id:String(measurement&&measurement.fromEntranceId||''),dist:String(measurement&&measurement.distance||''),method:measurement?(measurement.tool==='straight'?'Прямая линия':'Пешеходный маршрут'):'',points:measurement?String(measurement.code||''):'',license:m.status==='licensed'?source||'Сведения аудитора':'',source:source,note:note,info:note,resolution:resolution});});
     if(!marks.length&&(oldEntrances.length||oldZones.length))state.data.legacy_territory=state.data.legacy_territory||{entrances:clone(oldEntrances),zones:clone(oldZones)};
     state.data.entrances=entrances;state.data.zones=zones;
     if(before!==JSON.stringify([entrances,zones])){var host=$('#territory-evidence');if(host){host.innerHTML=territoryCards();bind(host);loadThumbnails(host);}}
@@ -476,7 +485,9 @@
     if(Number(p.cadastral_count)>1&&p.inter_cadastral_boundary==='Объединены')add('inter-cadastral','Граница между кадастровыми помещениями убрана',1);
     if(p.rooms_complete==='Нет')add('rooms-incomplete','Не вся площадь по выбранному плану входит в объект',1,'Указано «Часть не входит». Если ответ выбран случайно, исправьте его в разделе «Помещение». Убранная внутренняя перегородка — это изменение планировки.');
     if(p.within_cadastral==='Нет')add('cadastral-boundaries','Указано нарушение внешних границ помещения',1);
-    if(!state.data.plan.evidence_id||!state.data.plan.annotations.length)add('plan','Выберите лист и сохраните разметку плана',1);
+    if(!state.data.plan.evidence_id)add('plan',state.data.plan.mode==='attached'?'Прикрепите готовый план в JPG, PNG или PDF':'Выберите лист и сохраните разметку плана',1);
+    else if(state.data.plan.mode==='attached'&&state.data.plan.annotations.length)add('plan','В режиме готового плана не добавляйте разметку в боте. Вернитесь к сохранённой разметке или выберите готовый файл.',1);
+    else if(state.data.plan.mode!=='attached'&&!state.data.plan.annotations.length)add('plan','Выберите лист и сохраните разметку плана',1);
     else if(state.data.plan.pending&&state.data.plan.pending.points&&state.data.plan.pending.points.length)add('plan','Завершите контур на плане или отмените незавершённые точки',1);
     if(!state.data.to)add('to','Укажите, нужно ли техническое описание (ТО)',1);
     if(!state.data.bti)add('compare','Укажите результат сверки планировки',1);
@@ -522,6 +533,7 @@
   }
   function tasksHtml(tasks) { return '<div class="task-list">' + tasks.map(function (t) { var d=taskDetails(t);return '<div class="task" data-report-issue="'+esc(d.id)+'"><div class="task-main"><p>'+esc(d.reason||t.title)+'</p>'+(t.detail?'<small>'+esc(t.detail)+'</small>':'')+'</div><button type="button" data-go-step="'+t.step+'" data-issue-control="'+esc(d.control||'')+'">'+(d.control?'Проверить ответ':'Открыть раздел')+'</button></div>'; }).join('') + '</div>'; }
   async function goIssue(control,index) {
+    if(/^plan\./.test(control))activePlanId='main';
     await go(index);
     if(step()!==index)return;
     var path=control;
@@ -529,6 +541,7 @@
     var controls=Array.from(root.querySelectorAll('[data-bind],[data-choice]'));
     var matching=controls.filter(function(node){return node.dataset.bind===path||node.dataset.choice===path;});
     var target=matching.find(function(node){return node.getAttribute('aria-pressed')==='true';})||matching[0];
+    if(!target&&editor&&typeof editor.focusIssue==='function'&&(/^(zones|entrances)\./.test(control)||/^plan\./.test(control)))target=await editor.focusIssue(control);
     if(!target&&/^evidence\.(entrance|zone)\./.test(control)){var parts=control.split('.'),subject=parts.slice(2).join('.');target=Array.from(root.querySelectorAll('[data-upload-role]')).find(function(node){return node.dataset.uploadRole===parts[1]&&node.dataset.uploadSubject===subject;});if(target)target=target.closest('.upload-control');}
     if(!target&&/^plan\./.test(control))target=root.querySelector('#plan-editor button');
     if(!target&&/^(zones|entrances)\./.test(control))target=root.querySelector('#map-editor .ape-viewport')||root.querySelector('#map-editor button');
@@ -548,8 +561,11 @@
   }
   function reportFeedback(tasks) {
     if(!tasks.length)return '<section id="report-feedback" hidden></section>';
-    var ready=state.data.workflow.conclusion_status==='ready',missing=requiredIssues(tasks).length>0;
-    return '<section id="report-feedback" class="report-feedback'+(ready?' report-feedback-warning':'')+'" tabindex="-1" aria-live="polite"><h3>'+(missing?'Дополните обязательные сведения':ready?'Итог «Соответствует» расходится с ответами':'Что требует внимания')+'</h3><p>'+(missing?'Откройте указанный раздел и заполните недостающие сведения.':ready?'Если ответы верны, выберите итог с замечаниями. Если ответ выбран случайно — исправьте его в нужном разделе.':'Эти сведения останутся в отчёте вместе с выбранным итогом.')+'</p>'+tasksHtml(tasks)+(ready&&!missing&&!state.frozen?'<div class="report-feedback-actions"><button type="button" class="button secondary" data-conclusion-choice="actions">Выбрать: Нужны действия</button><button type="button" class="button secondary" data-conclusion-choice="insufficient">Выбрать: Нужно уточнить</button></div>':'')+'</section>';
+    var outcome=state.data.workflow.conclusion_status,ready=outcome==='ready',required=requiredIssues(tasks),missing=required.length>0,observations=tasks.filter(function(task){return !required.some(function(item){return item.key===task.key;});});
+    var html='<section id="report-feedback" class="report-feedback'+(ready?' report-feedback-warning':'')+'" tabindex="-1" aria-live="polite"><h3>'+(missing?'Дополните обязательные сведения':ready?'Итог «Соответствует» расходится с ответами':'Зафиксированные наблюдения')+'</h3>';
+    if(missing)html+='<div data-report-group="required"><p>Что мешает отправке: откройте указанные поля и дополните обязательные сведения.</p>'+tasksHtml(required)+'</div>';
+    if(observations.length)html+='<div data-report-group="observations"><p>'+(ready?'Если ответы верны, выберите итог с замечаниями. Если ответ выбран случайно — исправьте его в нужном разделе.':outcome?'Эти наблюдения сохранятся с выбранным итогом и не мешают отправке.':'Эти наблюдения останутся в отчёте. Выберите подходящий итог проверки.')+'</p>'+tasksHtml(observations)+'</div>';
+    return html+(ready&&!missing&&!state.frozen?'<div class="report-feedback-actions"><button type="button" class="button secondary" data-conclusion-choice="actions">Выбрать: Нужны действия</button><button type="button" class="button secondary" data-conclusion-choice="insufficient">Выбрать: Нужно уточнить</button></div>':'')+'</section>';
   }
   function bindReportFeedback(scope) {
     scope.querySelectorAll('[data-conclusion-choice]').forEach(function(button){button.onclick=function(){chooseConclusion(button.dataset.conclusionChoice);};});
@@ -650,10 +666,10 @@
       if(kind==='map')plan=Object.assign({},plan,{mode:'draw'});
       if(state.frozen||state.blocked||!mountedPlan())return false;
       if(sameData(mountedPlan(),plan))return true;
-      if(kind==='map'){state.data.map=plan;syncMapCards();}else if(mountedPlanId==='main')state.data.plan=plan;else{var i=state.data.additional_plans.findIndex(function(p){return p.id===mountedPlanId;});if(i<0)return false;state.data.additional_plans[i]=Object.assign({},plan,{id:mountedPlanId});}
+      if(kind==='map'){var previousMap=state.data.map;state.data.map=plan;syncMapCards(previousMap);}else if(mountedPlanId==='main')state.data.plan=plan;else{var i=state.data.additional_plans.findIndex(function(p){return p.id===mountedPlanId;});if(i<0)return false;state.data.additional_plans[i]=Object.assign({},plan,{id:mountedPlanId});}
       if(!state.data.inspection.visit_date)state.data.inspection.visit_date=localDate();changed();return true;
     }
-    if(window.AuditPlanEditor&&typeof window.AuditPlanEditor.mount==='function'){try{editor=window.AuditPlanEditor.mount(container,{kind:kind,service:state.data.object_category==='tobacco'?'tobacco':'alcohol',getState:mountedPlan,onSnapshot:acceptSnapshot,onChange:function(){
+    if(window.AuditPlanEditor&&typeof window.AuditPlanEditor.mount==='function'){try{editor=window.AuditPlanEditor.mount(container,{kind:kind,artworkOnly:kind==='plan'&&mountedPlan().mode==='attached',service:state.data.object_category==='tobacco'?'tobacco':'alcohol',getState:mountedPlan,onSnapshot:acceptSnapshot,onChange:function(){
       if(state.frozen||state.blocked||!mountedPlan())return false;
       return (state.dirty||state.serverError)?saveNow():undefined;
     },evidenceUrl:evidenceUrl,evidence:state.evidence,onUpload:function(file,meta){return uploadEditorSource(file,meta.role,meta.signal);}});}catch(error){container.textContent='Не удалось открыть редактор. Оригинал можно скачать выше.';}}
@@ -698,6 +714,7 @@
         if(editor&&editor.flush)await editor.flush();
         if(path==='workflow.territory_result')chooseTerritory(value);
         else if(path==='map.mode')switchTerritoryMode(value);
+        else if(path==='plan.mode')switchPlanMode(value);
         else set(path,value);
         changed();render();
       }catch(error){notify(error.message);}
@@ -836,7 +853,7 @@
         var previous = clone(current);
         delete previous.versions; delete previous.history; delete previous.pending;
         var versions = (current.versions || []).concat(current.evidence_id ? [previous] : []).slice(-20);
-        setCurrentPlan({id:current.id, evidence_id:uploaded.id, manager_material_id:fileId, page:1, annotations:[], versions:versions}, targetPlanId);
+        setCurrentPlan({id:current.id, mode:current.mode||'draw', evidence_id:uploaded.id, manager_material_id:fileId, page:1, annotations:[], versions:versions}, targetPlanId);
         state.data.inspection.plan_source = file.role === 'egrn' ? 'ЕГРН' : file.role === 'archive' ? 'Архив' : 'План из заявки';
         state.dirty = true;
         state.version++;
@@ -1043,7 +1060,7 @@
     }catch(error){if(error.status===409){state.conflict=true;localSave();$('#conflict-panel').hidden=false;}notify(error.message);}});
   }
   async function removeGeneratedEvidence(eid){var result=await request('/api/audit/drafts/'+encodeURIComponent(state.draft.id)+'/evidence/'+encodeURIComponent(eid),{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({revision:state.draft.revision})});adoptRevision(result);state.evidence=state.evidence.filter(function(e){return e.id!==eid;});}
-  async function exportGraphic(plan,kind,subject){if(!window.AuditPlanEditor||!plan.evidence_id||!plan.annotations.length)return null;var host=document.createElement('div');host.className='export-shell';document.body.appendChild(host);var api;try{api=window.AuditPlanEditor.mount(host,{kind:kind,service:state.data.object_category==='tobacco'?'tobacco':'alcohol',getState:function(){return plan;},onChange:function(){},evidenceUrl:evidenceUrl,evidence:state.evidence});await api.refresh();var result=await api.exportPreview();if(!result)throw new Error('Не удалось подготовить актуальное изображение '+(kind==='map'?'схемы':'плана')+'. Повторите загрузку исходника и отправку отчёта.');result.subject_id=subject;return result;}finally{if(api)api.destroy();host.remove();}}
+  async function exportGraphic(plan,kind,subject){if(!window.AuditPlanEditor||!plan.evidence_id||!plan.annotations.length&&!(kind==='plan'&&plan.mode==='attached'))return null;var host=document.createElement('div');host.className='export-shell';document.body.appendChild(host);var api;try{api=window.AuditPlanEditor.mount(host,{kind:kind,artworkOnly:kind==='plan'&&plan.mode==='attached',service:state.data.object_category==='tobacco'?'tobacco':'alcohol',getState:function(){return plan;},onChange:function(){},evidenceUrl:evidenceUrl,evidence:state.evidence});await api.refresh();var result=await api.exportPreview();if(!result)throw new Error('Не удалось подготовить актуальное изображение '+(kind==='map'?'схемы':'плана')+'. Повторите загрузку исходника и отправку отчёта.');result.subject_id=subject;return result;}finally{if(api)api.destroy();host.remove();}}
   async function exportPlan(){return exportGraphic(state.data.plan,'plan','annotation');}
   function freezeControls(){
     if(!state.frozen||state.completed)return;
@@ -1176,6 +1193,8 @@
   }
   function restoreData(raw,preserveVersion){
     var next=merge(clone(defaults),raw||{});
+    if(raw&&raw.plan&&!raw.plan.mode){if(preserveVersion){if(!Object.prototype.hasOwnProperty.call(raw.plan,'mode'))delete next.plan.mode;}else next.plan.mode=raw.plan.evidence_id||raw.plan.annotations&&raw.plan.annotations.length||raw.plan.pending&&raw.plan.pending.points&&raw.plan.pending.points.length?'draw':'attached';}
+    if(preserveVersion&&raw&&raw.plan&&!Object.prototype.hasOwnProperty.call(raw.plan,'pending'))delete next.plan.pending;
     if(Number(raw&&raw.ui_version)<4){var old=Number(raw&&raw.workflow&&raw.workflow.step)||0;next.workflow.step=old<4?0:old<6?1:2;}
     next.ui_version=preserveVersion&&raw&&raw.ui_version?raw.ui_version:5;next.inspection.region='МСК';return next;
   }

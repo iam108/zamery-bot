@@ -34,6 +34,41 @@ function harness() {
   vm.createContext(c);load(c,'requiredIssues','stable','sameData','draftWriteOptions','updateClosingConfirmation','recoverUnconfirmedWrite','setOutcome','queue','step','isRenewal','evidenceFor','mapMode','adoptRevision','removeGeneratedEvidence','submit','currentPlan','setCurrentPlan');return c;
 }
 
+test('switching the main plan to a ready artwork parks all drawn points and restores both modes after a draft reload',()=>{
+  const c=harness();load(c,'switchPlanMode','merge','restoreData');
+  c.state.data.plan.pending={tool:'boundary',points:[{x:.2,y:.3}]};const drawn=copy(c.state.data.plan);
+  c.switchPlanMode('attached');assert.equal(c.state.data.plan.mode,'attached');assert.deepEqual(copy(c.state.data.plan.annotations),[]);assert.equal(c.state.data.plan.pending,null);
+  assert.deepEqual(copy(c.state.data.plan_modes.draw),drawn);
+  Object.assign(c.state.data.plan,{evidence_id:'ready-pdf',page:4});const attached=copy(c.state.data.plan);
+  c.state.data=c.restoreData(copy(c.state.data));c.switchPlanMode('draw');
+  assert.deepEqual(copy(c.state.data.plan.pending),drawn.pending);assert.deepEqual(copy(c.state.data.plan.annotations),drawn.annotations);assert.equal(c.state.data.plan.evidence_id,drawn.evidence_id);
+  c.switchPlanMode('attached');assert.deepEqual(copy(c.state.data.plan),attached);
+});
+
+test('a frozen legacy drawing keeps its exact former mode-less shape while an editable old drawing retains draw semantics',()=>{
+  const c=harness();load(c,'merge','restoreData');c.defaults.plan={mode:'attached',evidence_id:'',page:1,annotations:[],pending:null};
+  const raw=copy(c.state.data);raw.plan.pending={tool:'boundary',points:[{x:.2,y:.3}]};
+  const frozen=c.restoreData(raw,true);assert.equal(Object.hasOwn(frozen.plan,'mode'),false);assert.deepEqual(copy(frozen.plan),raw.plan);
+  const editable=c.restoreData(raw,false);assert.equal(editable.plan.mode,'draw');assert.deepEqual(copy(editable.plan.pending),raw.plan.pending);
+});
+
+test('restoring a frozen completed legacy plan never invents pending or removes an explicitly stored empty mode',()=>{
+  const c=harness();load(c,'merge','restoreData');c.defaults.plan={mode:'attached',evidence_id:'',page:1,annotations:[],pending:null};
+  for(const mode of [undefined,'']){
+    const raw=copy(c.state.data);delete raw.plan.pending;if(mode!==undefined)raw.plan.mode=mode;
+    const restored=c.restoreData(raw,true);assert.deepEqual(copy(restored.plan),raw.plan);
+  }
+});
+
+test('the actual artwork export renders the selected page without marks and cleans its temporary editor',async()=>{
+  const c=harness(),before=copy(c.state.data);let destroyed=0;
+  c.state.data.plan={mode:'attached',evidence_id:'ready-pdf',page:4,annotations:[],pending:null};const selected=copy(c.state.data.plan);
+  c.window.AuditPlanEditor={mount(host,options){assert.equal(options.artworkOnly,true);assert.deepEqual(copy(options.getState()),selected);return{refresh:async()=>{},exportPreview:async()=>({name:'Готовый план.png',mime:'image/png',data:'synthetic-page-4'}),destroy(){destroyed++;}};}};
+  load(c,'exportGraphic');const result=await c.exportGraphic(c.state.data.plan,'plan','annotation');
+  assert.equal(result.mime,'image/png');assert.equal(result.subject_id,'annotation');assert.equal(destroyed,1);assert.deepEqual(copy(c.state.data.plan),selected);
+  assert.equal(c.calls.filter(call=>call[0]==='host-removed').length,1);assert.deepEqual(copy(c.state.data.inspection),before.inspection);
+});
+
 for(const cancelled of [false,true])test('PDF '+(cancelled?'chooser cancellation':'worker deadline')+' releases the actual upload count and cannot apply a late original', {timeout:1000},async()=>{
   const c=harness(),tools=require('../src/web/audit-plan-editor').helpers,controller=new AbortController();let finish,destroyed=0,uploads=0;
   c.state.pendingUploads=0;const before=copy(c.state.data.plan);

@@ -48,7 +48,7 @@ test('master: manager originals become an annotated audit, private lawyer packag
     await a.locator('#step-content[aria-busy=false]').waitFor();await choice(a,'building_type','Нежилое').click();await choice(a,'workflow.territory_result','clear').click();
     await a.locator('[data-add-entrance]').click();await field(a,'entrances.0.label').fill('Главный вход с улицы');
     const entrance=await sampleImage(a,'image/jpeg');await a.locator('input[data-upload-role="entrance"]:not([capture])').first().setInputFiles({name:'Вход сквозной проверки.jpg',mimeType:'application/octet-stream',buffer:entrance});
-    await a.getByText('Вход сквозной проверки.jpg',{exact:true}).waitFor();await step(a,1);
+    await a.getByText('Вход сквозной проверки.jpg',{exact:true}).waitFor();await step(a,1);await choice(a,'plan.mode','draw').click();
     await a.getByText('Выбрать документ из заявки',{exact:true}).click();const planId=material.find(f=>f.sha256===hash(plan)).id;await a.locator('[data-use-plan="'+planId+'"]').click();
     const editor=a.locator('#plan-editor');await editor.locator('.ape-source').getByText(/лист 1/).waitFor();
     await editor.getByRole('button',{name:'Выбрать лист PDF / изображение',exact:true}).click();const dialog=editor.locator('dialog'),use=dialog.getByRole('button',{name:'Использовать этот лист',exact:true});

@@ -115,3 +115,11 @@ test('map measurement badges sit halfway along rendered segments without coverin
   text.length=0;H.renderScene(canvas,source,state,{kind:'plan'});assert.equal(text.find(t=>t[0]==='М1')[1],entrance[1],'The plan renderer retains its existing anchor');
  }
 });
+
+
+test('ready artwork preview retains page dimensions and adds no artificial legend',()=>{
+ const source={width:800,height:600},texts=[];
+ const ctx={font:'',measureText:t=>({width:String(t).length*8}),fillText:t=>texts.push(t),drawImage(){},fillRect(){},save(){},restore(){},beginPath(){},rect(){},clip(){}};
+ const canvas={getContext:()=>ctx};const out=H.renderScene(canvas,source,{annotations:[]},{kind:'plan',artifact:true,plain:true});
+ assert.equal(out.height,600);assert.equal(out.width,800);assert.deepEqual(texts,[]);
+});

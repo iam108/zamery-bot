@@ -1,19 +1,19 @@
 'use strict';
 const test=require('node:test'),assert=require('node:assert/strict');
 const Editor=require('../src/web/audit-plan-editor');
-function domHarness(t){
+function domHarness(t,options={}){
  const ctx={font:'',measureText:s=>({width:String(s).length*8}),fillText(){},drawImage(){},fillRect(){},clearRect(){},save(){},restore(){},beginPath(){},rect(){},clip(){},moveTo(){},lineTo(){},closePath(){},fill(){},stroke(){},setLineDash(){},arc(){},strokeRect(){}};
  class Node{
   constructor(tag){this.tagName=tag.toUpperCase();this.children=[];this.dataset={};this.style={};this.attributes={};this.events={};this.hidden=false;this.className='';this.textContent='';this.value='';this.width=800;this.height=600;this.clientWidth=640;this.clientHeight=450;this.scrollTop=this.scrollLeft=0;this.capture=new Set();this.open=false;this.classList={contains:c=>this.className.split(' ').includes(c),toggle:(c,on)=>{const values=new Set(this.className.split(' ').filter(Boolean));if(on===undefined)on=!values.has(c);on?values.add(c):values.delete(c);this.className=[...values].join(' ');},add:c=>this.classList.toggle(c,true),remove:c=>this.classList.toggle(c,false)};}
   append(...nodes){nodes.forEach(n=>{n.parentElement=this;this.children.push(n);});}prepend(...nodes){nodes.forEach(n=>{n.parentElement=this;});this.children.unshift(...nodes);}replaceChildren(...nodes){this.children=[];this.append(...nodes);}setAttribute(k,v){this.attributes[k]=String(v);}getAttribute(k){return this.attributes[k];}addEventListener(name,fn){(this.events[name]||=[]).push(fn);}emit(name,e={}){for(const fn of this.events[name]||[])fn({target:this,preventDefault(){},...e});}focus(){document.activeElement=this;}scrollIntoView(options){this.scrolled=true;this.scrollOptions=options;}getContext(){return ctx;}getBoundingClientRect(){return{left:0,top:0,width:600,height:400};}setPointerCapture(id){this.capture.add(id);}hasPointerCapture(id){return this.capture.has(id);}releasePointerCapture(id){this.capture.delete(id);}showModal(){this.open=true;}close(){this.open=false;this.emit('close');}
-  descendants(){return this.children.flatMap(n=>[n,...n.descendants()]);}querySelectorAll(s){if(s==='[data-endpoint]')return this.descendants().filter(n=>n.dataset.endpoint);return[];}querySelector(s){if(s==='.ape-mark-row input')return this.descendants().find(n=>n.tagName==='INPUT'&&n.parentElement?.className==='ape-mark-row');return this.querySelectorAll(s)[0]||null;}get options(){return this.children;}toDataURL(){return'data:image/png;base64,AAAA';}
+  descendants(){return this.children.flatMap(n=>[n,...n.descendants()]);}querySelectorAll(s){if(s==='[data-endpoint]')return this.descendants().filter(n=>n.dataset.endpoint);if(s==='[data-issue-field]')return this.descendants().filter(n=>n.dataset.issueField);if(s==='input,select,textarea')return this.descendants().filter(n=>['INPUT','SELECT','TEXTAREA'].includes(n.tagName));return[];}querySelector(s){if(s==='.ape-mark-row input')return this.descendants().find(n=>n.tagName==='INPUT'&&n.parentElement?.className==='ape-mark-row');return this.querySelectorAll(s)[0]||null;}get options(){return this.children;}toDataURL(){return'data:image/png;base64,AAAA';}
  }
  const saved={};for(const key of ['document','Image','Option','requestAnimationFrame','fetch'])saved[key]=Object.getOwnPropertyDescriptor(global,key);
  const document={createElement:tag=>new Node(tag),body:new Node('body')};
  Object.assign(global,{document,Image:class{constructor(){this.naturalWidth=800;this.naturalHeight=600;}set src(v){queueMicrotask(()=>this.onload());}},Option:class extends Node{constructor(text,value){super('option');this.textContent=text;this.value=value;}},requestAnimationFrame:fn=>fn(),fetch:async()=>({ok:true,arrayBuffer:async()=>new Uint8Array([1,2,3]).buffer})});
  t.after(()=>{for(const[key,value]of Object.entries(saved))value?Object.defineProperty(global,key,value):delete global[key];});
- const container=new Node('div'),find=(predicate)=>container.descendants().find(predicate),button=name=>find(n=>n.tagName==='BUTTON'&&n.textContent===name),canvas=()=>find(n=>n.tagName==='CANVAS'&&n.getAttribute('aria-label')==='Схема территории для разметки');
- let state={evidence_id:'map-original',page:1,annotations:[]},writes=0;const api=Editor.mount(container,{kind:'map',getState:()=>state,onChange:async value=>{state=structuredClone(value);writes++;},evidence:[{id:'map-original',name:'map.png',mime:'image/png',role:'map-source'}],evidenceUrl:async()=> 'blob:test'});
+ const container=new Node('div'),find=(predicate)=>container.descendants().find(predicate),button=name=>find(n=>n.tagName==='BUTTON'&&n.textContent===name),canvas=()=>find(n=>n.tagName==='CANVAS'&&n.getAttribute('aria-label')===(options.kind==='plan'?'План помещения для разметки':'Схема территории для разметки'));
+ let state=structuredClone(options.state||{evidence_id:'map-original',page:1,annotations:[]}),writes=0;const api=Editor.mount(container,{kind:options.kind||'map',artworkOnly:!!options.artworkOnly,getState:()=>state,onChange:async value=>{state=structuredClone(value);writes++;},evidence:[{id:'map-original',name:'map.png',mime:'image/png',role:'map-source'}],evidenceUrl:async()=> 'blob:test'});
  const event=(x,y,extra={})=>({pointerId:1,button:0,pointerType:'touch',clientX:x,clientY:y,...extra}),tap=(x,y)=>{canvas().emit('pointerdown',event(x,y));canvas().emit('pointerup',event(x,y));};
  return{api,container,find,button,canvas,event,tap,get state(){return state;},get writes(){return writes;},document};
 }
@@ -70,4 +70,43 @@ test('cancelling the active touch after another finger restores the original mar
  h.canvas().emit('pointerdown',h.event(100,100,{pointerId:1}));h.canvas().emit('pointermove',h.event(160,120,{pointerId:1}));
  h.canvas().emit('pointerdown',h.event(400,250,{pointerId:2,isPrimary:false}));h.canvas().emit('pointercancel',h.event(400,250,{pointerId:2,isPrimary:false}));
  h.canvas().emit('pointercancel',h.event(160,120,{pointerId:1}));await h.api.flush();assert.deepEqual(h.state,before);assert.equal(h.writes,writes);h.api.destroy();
+});
+
+
+test('ready artwork remains unmarked after touch and exports without an editor legend',async t=>{
+ const h=domHarness(t,{kind:'plan',artworkOnly:true,state:{mode:'attached',evidence_id:'map-original',page:1,annotations:[],pending:null}});
+ await h.api.refresh();h.tap(120,150);await h.api.flush();
+ assert.equal(h.state.pending,null);assert.equal(h.state.annotations.length,0);
+ assert.equal(h.find(n=>n.getAttribute('aria-label')==='Инструмент разметки'),undefined);
+ assert.ok(h.find(n=>n.getAttribute('aria-label')==='Увеличить масштаб'));
+ assert.equal(h.find(n=>n.className==='ape-actions').hidden,true);
+ assert.ok(h.button('Прикрепить готовый план'));assert.ok(h.button('Сохранить план'));
+ const file=await h.api.exportPreview();assert.ok(file);assert.match(file.name,/План-/);h.api.destroy();
+});
+
+test('returning to a completed plan selects existing marks instead of starting an accidental contour',async t=>{
+ const mark={id:'boundary-1',tool:'boundary',code:'Г1',points:[{x:.1,y:.1},{x:.8,y:.1},{x:.5,y:.8}]};
+ const h=domHarness(t,{kind:'plan',state:{evidence_id:'map-original',page:1,annotations:[mark],pending:null}});
+ await h.api.refresh();h.tap(60,40);await h.api.flush();assert.equal(h.state.pending,null);assert.deepEqual(h.state.annotations,[mark]);h.api.destroy();
+});
+
+test('unfinished plan recovery exposes completion or reversible cancellation without clearing other marks',async t=>{
+ const pending={tool:'cadastral',points:[{x:.1,y:.1},{x:.8,y:.1},{x:.5,y:.8}]};
+ const h=domHarness(t,{kind:'plan',state:{evidence_id:'map-original',page:1,annotations:[],pending}});
+ await h.api.refresh();await h.api.focusIssue('plan.pending');assert.equal(h.document.activeElement,h.button('Замкнуть контур'));
+ h.button('Отменить незавершённый контур').emit('click');await h.api.flush();assert.equal(h.state.pending,null);
+ h.find(n=>n.getAttribute('aria-label')==='Отменить действие').emit('click');await h.api.flush();assert.deepEqual(h.state.pending,pending);
+ h.button('Замкнуть контур').emit('click');await h.api.flush();assert.equal(h.state.pending,null);assert.equal(h.state.annotations[0].tool,'cadastral');h.api.destroy();
+});
+
+
+test('confirmed organization exposes the missing basis and issue navigation focuses that exact note',async t=>{
+ const h=domHarness(t);await h.api.refresh();h.button('+ Организация').emit('click');h.tap(400,250);await h.api.flush();
+ const mark=h.state.annotations[0],result=h.find(n=>n.getAttribute('aria-label')==='Результат проверки '+mark.code);
+ result.value='confirmed';result.emit('change');await h.api.flush();
+ await h.api.focusIssue('zones.'+mark.id+'.resolution');
+ const note=h.find(n=>n.getAttribute('aria-label')==='Основание ограничения '+mark.code);
+ assert.ok(note);assert.equal(h.document.activeElement,note);assert.equal(note.parentElement.hidden,false);
+ note.value='Школа, замер 45 м от входа';note.emit('input');await h.api.flush();
+ assert.equal(h.state.annotations[0].status,'confirmed');assert.equal(h.state.annotations[0].note,'Школа, замер 45 м от входа');h.api.destroy();
 });

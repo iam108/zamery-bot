@@ -32,6 +32,7 @@ async function attach(page, name, buffer) {
   await page.getByText(name, { exact: true }).first().waitFor();
 }
 async function choosePdf(page, pdf, number = 4) {
+  await choice(page, 'plan.mode', 'draw').click();
   const editor = page.locator('#plan-editor');
   await editor.getByRole('button', { name: 'Выбрать лист PDF / изображение', exact: true }).click();
   const dialog = editor.locator('dialog'); await dialog.locator('input[type=file]').setInputFiles({ name: 'Synthetic-plan.pdf', mimeType: 'application/octet-stream', buffer: pdf });

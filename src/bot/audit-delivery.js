@@ -121,7 +121,7 @@ function archiveName(file, description) {
   return shortText(name.slice(0, extension ? -extension.length : undefined), 180 - extension.length) + extension;
 }
 function publicAnswers(data) {
-  const rootBlocked = new Set(['documents', 'photos', 'evidence', 'submit_id', 'draft_id']);
+  const rootBlocked = new Set(['documents', 'photos', 'evidence', 'submit_id', 'draft_id', 'plan_modes']);
   const blocked = new Set(['buffer', 'content', 'base64', 'object_key', 'storage']);
   function clean(value, depth = 0) {
     if (depth > 40 || Buffer.isBuffer(value) || value instanceof Uint8Array) return undefined;
@@ -165,7 +165,8 @@ function presentationMedia(data, options = {}) {
   function entries(part, index, count) {
     const lines = ['ОТЧЁТ АУДИТОРА' + (data.order_id ? ' · заявка #' + data.order_id : ''), 'Часть ' + index + ' из ' + count, '', summary, '', 'ФАЙЛЫ ЭТОЙ ЧАСТИ', 'Оригинальные байты сохранены без изменения качества.'];
     part.forEach((item, i) => {
-      lines.push('', String(i + 2).padStart(2, '0') + '-' + originalName(item.name), 'Исходное имя: ' + originalName(item.file.name), 'Назначение: ' + (ROLE_TITLES[item.file.role] || 'Материал объекта'), item.description.title, ...item.description.details, 'Размер: ' + item.buffer.length + ' байт', 'SHA-256: ' + item.sha256);
+      const purpose = item.file.role === 'plan' && item.file.subject_id === 'annotation' && data.plan?.mode === 'attached' ? 'Готовый план помещения' : ROLE_TITLES[item.file.role] || 'Материал объекта';
+      lines.push('', String(i + 2).padStart(2, '0') + '-' + originalName(item.name), 'Исходное имя: ' + originalName(item.file.name), 'Назначение: ' + purpose, item.description.title, ...item.description.details, 'Размер: ' + item.buffer.length + ' байт', 'SHA-256: ' + item.sha256);
     });
     lines.push('', 'ПОЛНЫЕ ОТВЕТЫ И МЕТАДАННЫЕ ЗАЯВКИ', answers);
     return [{ name: 'Содержание отчёта.txt', buffer: Buffer.from(lines.join('\r\n') + '\r\n', 'utf8') }, ...part.map(item => ({ name: item.name, buffer: item.buffer }))];

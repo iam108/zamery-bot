@@ -252,6 +252,21 @@ function activeDraftEvidence(draft) {
   const territoryResult = input?.ui_version === 5 && input.workflow?.territory_result;
   const explicitTerritory = territoryResult === 'clear' || territoryResult === 'findings';
   let files = draft.evidence || [];
+  // Mode switching retains the inactive drawing in the editable draft, not
+  // in the delivered report. Shared manager/additional-plan originals remain.
+  if (['draw', 'attached'].includes(input?.plan?.mode)) {
+    const additional = Array.isArray(input.additional_plans) ? input.additional_plans : [];
+    // selectSource stores a flat versions array of former source snapshots.
+    // Visit that known shape once; never recursively walk arbitrary draft data.
+    const versions = plan => [plan, ...(Array.isArray(plan?.versions) ? plan.versions : [])];
+    const active = new Set([input.plan, ...additional].flatMap(versions).flatMap(plan => [plan?.evidence_id, plan?.preview_evidence_id]).filter(Boolean));
+    for (const key of ['materials', 'egrn_links']) for (const file of Array.isArray(input.request_packet?.[key]) ? input.request_packet[key] : []) active.add(file.id);
+    const inactive = new Set(['draw', 'attached'].flatMap(mode => versions(input.plan_modes?.[mode])).map(plan => plan?.evidence_id).filter(Boolean));
+    files = files.filter(file => {
+      if (file.role === 'plan' && file.subject_id === 'annotation' && input.plan.preview_evidence_id) return file.id === input.plan.preview_evidence_id;
+      return !['plan-source', 'egrn', 'archive'].includes(file.role) || !inactive.has(file.id) || active.has(file.id);
+    });
+  }
   if (explicitTerritory) {
     const entrances = Array.isArray(input.entrances) ? input.entrances : [];
     const zones = Array.isArray(input.zones) ? input.zones : [];
@@ -345,6 +360,13 @@ function compactReportIssues(data) {
   const drawing = (value, type, subject, requireMarks) => {
     const step = type === 'map' ? 0 : 1, name = type === 'map' ? 'схемы территории' : 'плана помещения';
     if (!value || !evidence.some(file => file?.id === value.evidence_id && (type === 'map' ? ['map-source'] : ['plan-source', 'egrn', 'archive']).includes(file.role))) missing(type + '.evidence_id', 'Выберите исходный файл ' + name + '.', step);
+    if (type === 'plan' && value?.mode === 'attached') {
+      if (!Number.isInteger(value.page) || value.page < 1 || value.page > 10000) missing('plan.page', 'Укажите номер выбранной страницы плана.', step);
+      if (!evidence.some(file => file?.id === value.evidence_id && (/^image\//.test(file.mime || '') || file.mime === 'application/pdf'))) missing('plan.evidence_id', 'Выберите изображение или PDF готового плана.', step);
+      if (!value.preview_evidence_id || !evidence.some(file => file?.id === value.preview_evidence_id && file.role === 'plan' && file.subject_id === subject && file.mime === 'image/png')) missing('plan.preview_evidence_id', 'Сохраните изображение выбранного листа готового плана.', step);
+      if (!Array.isArray(value.annotations) || value.annotations.length || value.pending && (!Array.isArray(value.pending.points) || value.pending.points.length)) missing('plan.annotations', 'Для готового плана переключите режим или уберите активную разметку.', step);
+      return;
+    }
     if (requireMarks && (!Array.isArray(value?.annotations) || !value.annotations.length)) missing(type + '.annotations', 'Сохраните разметку ' + name + '.', step);
     if (value?.pending?.points?.length) missing(type + '.pending', 'Завершите незамкнутую разметку ' + name + '.', step);
     if (value?.annotations?.length && !evidence.some(file => file?.role === type && file.subject_id === subject && /^image\//.test(file.mime || '') && (!value.preview_evidence_id || value.preview_evidence_id === file.id))) missing(type + '.preview_evidence_id', 'Сохраните изображение размеченного ' + (type === 'map' ? 'плана территории' : 'плана помещения') + '.', step);
@@ -373,6 +395,13 @@ function validateCompactDrawing(drawing, type, evidence, subject, requireMarks) 
   const sourceRoles = type === 'map' ? ['map-source'] : ['plan-source', 'egrn', 'archive'];
   if (!source || !sourceRoles.includes(source.role)) throw new Error(type === 'map' ? 'Исходный скриншот схемы не найден в материалах. Загрузите его снова.' : 'Исходный файл выбранного плана не найден в материалах. Загрузите его снова.');
   if (!Number.isInteger(drawing.page) || drawing.page < 1 || drawing.page > 10000) throw new Error('Укажите номер выбранной страницы плана или схемы.');
+  if (type === 'plan' && drawing.mode != null && (!['draw', 'attached'].includes(drawing.mode) || drawing.mode === 'attached' && subject !== 'annotation')) throw new Error('Выберите способ оформления плана помещения.');
+  if (type === 'plan' && drawing.mode === 'attached') {
+    if (!/^image\//.test(source.mime || '') && source.mime !== 'application/pdf') throw new Error('Для готового плана выберите изображение или PDF.');
+    if (!Array.isArray(drawing.annotations) || drawing.annotations.length || drawing.pending && (!Array.isArray(drawing.pending.points) || drawing.pending.points.length)) throw new Error('Для готового плана переключите режим или уберите активную разметку.');
+    if (!drawing.preview_evidence_id || !evidence.some(file => file.id === drawing.preview_evidence_id && file.role === 'plan' && file.subject_id === subject && file.mime === 'image/png')) throw new Error('Сохраните изображение выбранного листа готового плана перед отправкой.');
+    return;
+  }
   if (!Array.isArray(drawing.annotations) || drawing.annotations.length > 200) throw new Error('Проверьте список отметок на плане или схеме.');
   if (requireMarks && !drawing.annotations.length) throw new Error(type === 'map' ? 'Отметьте входы и проверенные организации на схеме.' : 'Отметьте границы помещения на плане.');
   if (drawing.pending && Array.isArray(drawing.pending.points) && drawing.pending.points.length) throw new Error('Завершите незамкнутую разметку или отмените её перед отправкой.');
@@ -514,7 +543,7 @@ function buildCompactWorkflowReport(data) {
   };
   field('Контакт', contactText(packet.contacts)); field('Задача менеджера', packet.zones_info);
   const name = drawing => evidence.find(file => file.id === drawing.evidence_id)?.name || 'Выбранный файл';
-  field('План', name(data.plan) + ' · лист ' + data.plan.page + ' · разметка приложена');
+  field('План', name(data.plan) + ' · лист ' + data.plan.page + (data.plan.mode === 'attached' ? ' · готовый план приложен' : ' · разметка приложена'));
   for (const plan of data.additional_plans || []) field('Дополнительный план', name(plan) + ' · лист ' + plan.page + (plan.annotations.length ? ' · разметка приложена' : ' · исходник'));
   if (w.territory_result === 'clear') plain.push(TERRITORY_CLEAR_LABEL);
   else field('Схема территории', w.territory_result === 'findings' && data.map.mode === 'attached' ? 'Готовая схема приложена' : 'Размеченное изображение приложено');

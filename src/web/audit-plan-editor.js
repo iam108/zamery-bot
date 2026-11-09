@@ -148,12 +148,12 @@
     return points[0];
   }
   function renderScene(canvas, source, state, opts) {
-    const settings = { kind: 'plan', scale: 1, artifact: false, selection: null, vertex: -1, ...opts };
+    const settings = { kind: 'plan', scale: 1, artifact: false, plain: false, selection: null, vertex: -1, ...opts };
     const w = source.naturalWidth || source.width, h = source.naturalHeight || source.height;
     const unit = 1 / Math.max(.01, settings.scale), ctx = canvas.getContext('2d'), entries = legendEntries(state, settings.kind), font = 13 * unit, rowHeight = 19 * unit, pad = 16 * unit;
     ctx.font = font + 'px sans-serif';
-    const rows = settings.artifact ? entries.flatMap(e => wrapText(ctx, e.code + ' — ' + e.text, Math.max(40, w - pad * 2)).map(text => ({ text, color: e.color }))) : [];
-    const footer = settings.artifact ? pad * 2 + rowHeight * (rows.length + 1) : 0;
+    const rows = settings.artifact && !settings.plain ? entries.flatMap(e => wrapText(ctx, e.code + ' — ' + e.text, Math.max(40, w - pad * 2)).map(text => ({ text, color: e.color }))) : [];
+    const footer = settings.artifact && !settings.plain ? pad * 2 + rowHeight * (rows.length + 1) : 0;
     canvas.width = w; canvas.height = Math.ceil(h + footer);
     ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height); ctx.drawImage(source, 0, 0, w, h);
     ctx.save(); ctx.beginPath(); ctx.rect(0, 0, w, h); ctx.clip();
@@ -186,7 +186,7 @@
       state.pending.points.forEach(p => { ctx.beginPath(); ctx.arc(p.x * w, p.y * h, 3 * unit, 0, Math.PI * 2); ctx.fill(); });
     }
     ctx.restore();
-    if (settings.artifact) { ctx.font = font + 'px sans-serif'; ctx.fillStyle = '#3a536d'; ctx.fillText('Легенда ' + (settings.kind === 'map' ? 'схемы' : 'плана'), pad, h + pad + font); rows.forEach((r, i) => { ctx.fillStyle = r.color; ctx.fillText(r.text, pad, h + pad + font + (i + 1) * rowHeight); }); }
+    if (settings.artifact && !settings.plain) { ctx.font = font + 'px sans-serif'; ctx.fillStyle = '#3a536d'; ctx.fillText('Легенда ' + (settings.kind === 'map' ? 'схемы' : 'плана'), pad, h + pad + font); rows.forEach((r, i) => { ctx.fillStyle = r.color; ctx.fillText(r.text, pad, h + pad + font + (i + 1) * rowHeight); }); }
     return { width: canvas.width, height: canvas.height, drawingHeight: h };
   }
   function hitTest(state, p, width, height, tolerance) {
@@ -269,10 +269,10 @@
   }
   function mount(container, options) {
     if (!G) throw new Error('Не загружен модуль геометрии редактора.');
-    const kind = options.kind === 'map' ? 'map' : 'plan', service = options.service || 'alcohol';
+    const kind = options.kind === 'map' ? 'map' : 'plan', service = options.service || 'alcohol', artworkOnly = kind === 'plan' && options.artworkOnly === true;
     const controller = new AbortController(), signal = controller.signal;
     let state = normalise(options.getState?.()), image = null, alive = true, loadToken = 0, sourceLoading = false;
-    let activeTool = kind === 'map' ? 'edit' : 'boundary', selected = null, selectedVertex = -1, zoom = 1, fitScale = 1;
+    let activeTool = artworkOnly ? 'pan' : state.pending?.tool && TOOLS[state.pending.tool] ? state.pending.tool : kind === 'map' || state.annotations.length ? 'edit' : 'boundary', selected = null, selectedVertex = -1, zoom = 1, fitScale = 1;
     let choosing = false;
     let past = [], future = [], saveTail = Promise.resolve(), saveError = null, revision = 0, pointer = null;
     let chooserToken = 0, chooserIntent = 0, candidate = null, renderTask = null;
@@ -282,7 +282,7 @@
     const button = (text, cls, fn) => { const b = el('button', text, 'ape-button ' + (cls || '')); b.type = 'button'; if (fn) on(b, 'click', fn); return b; };
     const panel = el('section', null, 'ape-editor'); panel.dataset.kind = kind;
     const top = el('div', null, 'ape-top'), sourceLabel = el('span', '', 'ape-source');
-    const chooseSource = button(kind === 'map' ? 'Выбрать скриншот' : 'Выбрать лист PDF / изображение', 'ape-secondary', () => openChooser());
+    const chooseSource = button(kind === 'map' ? 'Выбрать скриншот' : artworkOnly ? 'Прикрепить готовый план' : 'Выбрать лист PDF / изображение', 'ape-secondary', () => openChooser());
     top.append(sourceLabel, chooseSource);
     const toolbar = el('div', null, 'ape-toolbar'); toolbar.setAttribute('role', 'toolbar'); toolbar.setAttribute('aria-label', 'Инструменты разметки');
     const toolSelect = el('select'); toolSelect.setAttribute('aria-label', 'Инструмент разметки'); toolNames(kind, service).forEach(([value, text]) => { const o = el('option', text); o.value = value; toolSelect.append(o); });
@@ -295,24 +295,25 @@
     const pan = button(kind === 'map' ? 'Двигать карту' : 'Переместить', '', () => setTool('pan'));
     const minus = button('−', '', () => setZoom(zoom / 1.25)), plus = button('+', '', () => setZoom(zoom * 1.25)), fit = button('Вписать', '', () => fitImage());
     minus.setAttribute('aria-label', 'Уменьшить масштаб'); plus.setAttribute('aria-label', 'Увеличить масштаб');
-    const zoomText = el('span', '100%', 'ape-zoom-value'), zoomGroup = el('div', null, 'ape-zoom'); zoomGroup.append(minus, zoomText, plus, fit); if (kind === 'map') toolbar.append(mapActions, pan, moreTools, zoomGroup); else toolbar.append(toolSelect, pan, zoomGroup);
+    const zoomText = el('span', '100%', 'ape-zoom-value'), zoomGroup = el('div', null, 'ape-zoom'); zoomGroup.append(minus, zoomText, plus, fit); if (kind === 'map') toolbar.append(mapActions, pan, moreTools, zoomGroup); else if (artworkOnly) toolbar.append(zoomGroup); else toolbar.append(toolSelect, pan, zoomGroup);
     const guidance = el('div', null, 'ape-guidance'), message = el('span', '', 'ape-message'); message.setAttribute('role', 'status'); message.setAttribute('aria-live', 'polite');
     const undo = button('↶', '', () => undoChange()), redo = button('↷', '', () => redoChange()); undo.setAttribute('aria-label', 'Отменить действие'); redo.setAttribute('aria-label', 'Вернуть действие');
     guidance.append(message, undo, redo);
     const actionSlot = el('div', null, 'ape-actions'), actionText = el('span');
     const removePoint = button('Отменить точку', '', () => { if (!state.pending) return; mutate(next => { next.pending.points.pop(); if (!next.pending.points.length) next.pending = null; }); });
     const finish = button('Замкнуть контур', 'ape-primary', () => finishPending());
+    const cancelPending = button('Отменить незавершённый контур', '', () => { if (!state.pending) return; mutate(next => { next.pending = null; }); notice('Незавершённые точки убраны. Их можно вернуть кнопкой отмены действия.'); });
     const addVertex = button('Добавить угол', '', () => { const m = state.annotations.find(m => m.id === selected); if (!m || !TOOLS[m.tool]?.polygon) return; const at = selectedVertex < 0 ? 0 : selectedVertex, a = m.points[at], b = m.points[(at + 1) % m.points.length]; mutate(next => { next.annotations.find(m => m.id === selected).points.splice(at + 1, 0, { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }); }); selectedVertex = at + 1; draw(); });
     const deleteVertex = button('Удалить угол', '', () => { const m = state.annotations.find(m => m.id === selected); if (!m || selectedVertex < 0) return; try { const next = G.removeVertex({ ...m, isClosed: !!TOOLS[m.tool]?.polygon }, selectedVertex); mutate(s => { s.annotations[s.annotations.findIndex(m => m.id === selected)] = next; }); selectedVertex = -1; } catch (_) { notice('В замкнутом контуре должны оставаться хотя бы три угла.', true); } });
-    const deleteMark = button('Удалить отметку', '', () => removeMark(selected)); actionSlot.append(actionText, removePoint, finish, addVertex, deleteVertex, deleteMark);
+    const deleteMark = button('Удалить отметку', '', () => removeMark(selected)); actionSlot.append(actionText, removePoint, finish, cancelPending, addVertex, deleteVertex, deleteMark);
     const viewport = el('div', null, 'ape-viewport'); viewport.tabIndex = 0; viewport.setAttribute('aria-label', 'Рабочая область графики');
     const canvas = el('canvas'); canvas.setAttribute('aria-label', kind === 'map' ? 'Схема территории для разметки' : 'План помещения для разметки'); viewport.append(canvas);
     const legend = el('div', null, 'ape-legend'); legend.setAttribute('aria-label', kind === 'map' ? 'Отметки на схеме' : 'Легенда графики');
     const selectedPanel = el('section', null, 'ape-selected-panel'); selectedPanel.setAttribute('aria-label', 'Выбранная отметка'); selectedPanel.hidden = true;
     const drawer = el('details', null, 'ape-drawer'), drawerSummary = el('summary', 'Отметки и названия'), markList = el('div', null, 'ape-marks'); drawer.append(drawerSummary, markList);
-    const footer = el('div', null, 'ape-footer'), saveStatus = el('span', 'Черновик'), retry = button('Повторить', '', () => persist()), download = button('Скачать PNG', 'ape-secondary', () => downloadPreview()), save = button('Сохранить разметку', 'ape-primary', async () => { try { assertExportable(state); await flush(); notice('Разметка сохранена.'); } catch (e) { notice(e.message, true); } });
+    const footer = el('div', null, 'ape-footer'), saveStatus = el('span', 'Черновик'), retry = button('Повторить', '', () => persist()), download = button('Скачать PNG', 'ape-secondary', () => downloadPreview()), save = button(artworkOnly ? 'Сохранить план' : 'Сохранить разметку', 'ape-primary', async () => { try { assertExportable(state); await flush(); notice(artworkOnly ? 'Готовый план сохранён.' : 'Разметка сохранена.'); } catch (e) { notice(e.message, true); } });
     retry.hidden = true; footer.append(saveStatus, retry, download, save);
-    const sourceNote = el('p', kind === 'map' ? 'Расстояние в метрах вводится вручную.' : 'Оригинал хранится отдельно. Полные подписи — в легенде под планом.', 'ape-note');
+    const sourceNote = el('p', kind === 'map' ? 'Расстояние в метрах вводится вручную.' : artworkOnly ? 'Прикрепите план, который уже разметили. JPG, PNG или нужный лист PDF — обводить заново не нужно.' : 'Оригинал хранится отдельно. Полные подписи — в легенде под планом.', 'ape-note');
     panel.append(top, sourceNote, toolbar, guidance, actionSlot, viewport, legend, selectedPanel, drawer, footer); container.replaceChildren(panel);
     const chooser = el('dialog', null, 'ape-sheet-dialog'), chooserHead = el('div', null, 'ape-sheet-head'); chooserHead.append(el('strong', kind === 'map' ? 'Скриншот территории' : 'Страница исходного документа'), button('Закрыть', '', () => chooser.close()));
     const sourceSelect = el('select'); sourceSelect.setAttribute('aria-label', 'Исходный документ');
@@ -324,7 +325,7 @@
     const preview = el('div', null, 'ape-sheet-preview'), previewCanvas = el('canvas'); preview.append(previewCanvas);
     const chooserFoot = el('div', null, 'ape-sheet-foot'), selectPage = button('Использовать этот лист', 'ape-primary', async () => { await useCandidate(); }); selectPage.disabled = true; chooserFoot.append(selectPage);
     chooser.append(chooserHead, chooserControls, pageControls, chooserStatus, preview, chooserFoot); container.append(chooser);
-    function notice(text, error) { if (!alive) return; message.textContent = text; message.classList.toggle('ape-error', !!error); }
+    function notice(text, error) { if (!alive) return; message.textContent = text; message.classList.toggle('ape-error', !!error); if (artworkOnly) guidance.hidden = !error; }
     function snapshot() { return { annotations: copy(state.annotations), pending: copy(state.pending), sequence: copy(state.sequence) }; }
     function pushHistory(before) { past.push(before); if (past.length > 60) past.shift(); future = []; }
     function mutate(fn, refreshList = true) { const before = snapshot(); fn(state); pushHistory(before); persist(); draw(refreshList); }
@@ -352,12 +353,12 @@
     function updateControls() {
       const ready = !!image && !sourceLoading, pending = state.pending?.points?.length || 0, mark = state.annotations.find(m => m.id === selected);
       toolSelect.value = activeTool; pan.classList.toggle('selected', activeTool === 'pan'); canvas.dataset.tool = activeTool;
-      toolbar.hidden = !ready; actionSlot.hidden = !ready || kind === 'map'; viewport.hidden = !ready; legend.hidden = !ready; drawer.hidden = !ready || kind === 'map' && !state.versions?.length;
+      toolbar.hidden = !ready; guidance.hidden = artworkOnly && !message.classList.contains('ape-error'); actionSlot.hidden = !ready || kind === 'map' || artworkOnly; viewport.hidden = !ready; legend.hidden = !ready || artworkOnly; drawer.hidden = !ready || artworkOnly || kind === 'map' && !state.versions?.length;
       selectedPanel.hidden = kind !== 'map' || !ready || !mark || activeTool !== 'edit';
       mapActionButtons.forEach((control, tool) => { control.classList.toggle('selected', activeTool === tool); control.setAttribute('aria-pressed', String(activeTool === tool)); });
       undo.disabled = !past.length; redo.disabled = !future.length; download.disabled = save.disabled = !ready;
-      removePoint.hidden = finish.hidden = !pending; finish.disabled = pending < 3; addVertex.hidden = deleteVertex.hidden = !mark || !TOOLS[mark.tool]?.polygon || !!pending; deleteVertex.disabled = selectedVertex < 0; deleteMark.hidden = !mark || !!pending;
-      actionText.textContent = pending ? 'Углов: ' + pending : mark ? mark.code : kind === 'map' ? 'Короткие коды на схеме, полные названия ниже' : 'Отметьте углы помещения';
+      removePoint.hidden = finish.hidden = cancelPending.hidden = !pending; finish.disabled = pending < 3 || !TOOLS[state.pending?.tool]?.polygon; addVertex.hidden = deleteVertex.hidden = !mark || !TOOLS[mark.tool]?.polygon || !!pending; deleteVertex.disabled = selectedVertex < 0; deleteMark.hidden = !mark || !!pending;
+      actionText.textContent = pending ? 'Незавершённый контур · точек: ' + pending : mark ? mark.code : kind === 'map' ? 'Короткие коды на схеме, полные названия ниже' : 'Отметьте углы помещения';
       if (!message.classList.contains('ape-error')) message.textContent = kind === 'map' ? ({ entrance: 'Нажмите на карте в месте входа.', hazard: 'Нажмите на карте в месте проверенной организации.', route: 'Проведите путь от входа до организации. Метры укажите после.', straight: 'Проведите прямую от входа до организации. Метры укажите после.', edit: state.annotations.length ? 'Нажмите на метку, чтобы изменить её. Метку можно перетащить.' : 'Добавьте вход или организацию кнопками над картой.', pan: 'Перетаскивайте карту; отметки останутся на месте.', text: 'Нажмите там, где нужна подпись.' }[activeTool] || 'Выберите действие.') : activeTool === 'pan' ? 'Перетаскивайте лист для перемещения.' : activeTool === 'edit' ? 'Выберите отметку. Точки можно перетаскивать.' : TOOLS[activeTool]?.polygon ? 'Нажимайте на углы, затем замкните контур.' : 'Нанесите отметку на изображение.';
       zoomText.textContent = Math.round(fitScale * zoom * 100) + '%';
       sourceLabel.textContent = state.evidence_id ? ((options.evidence || []).find(e => String(e.id) === String(state.evidence_id))?.name || 'Исходный файл') + ' · лист ' + state.page : 'Исходник не выбран';
@@ -366,7 +367,7 @@
     function setZoom(value) { if (!image) return; const old = zoom, cx = viewport.scrollLeft + viewport.clientWidth / 2, cy = viewport.scrollTop + viewport.clientHeight / 2; zoom = Math.max(.5, Math.min(8, value)); draw(false); viewport.scrollLeft = cx * zoom / old - viewport.clientWidth / 2; viewport.scrollTop = cy * zoom / old - viewport.clientHeight / 2; }
     function draw(refreshList = true) {
       if (!alive) return; updateControls(); if (!image) return;
-      const scale = fitScale * zoom; renderScene(canvas, image, state, { kind, scale, selection: selected, vertex: selectedVertex }); canvas.style.width = Math.round(canvas.width * scale) + 'px'; canvas.style.height = Math.round(canvas.height * scale) + 'px';
+      const scale = fitScale * zoom; renderScene(canvas, image, state, { kind, scale, selection: selected, vertex: selectedVertex, plain: artworkOnly }); canvas.style.width = Math.round(canvas.width * scale) + 'px'; canvas.style.height = Math.round(canvas.height * scale) + 'px';
       legend.replaceChildren(); legendEntries(state, kind).forEach((entry, i) => {
         if (kind === 'map') { const mark = state.annotations[i], chip = button(entry.code + ' · ' + (mark.label || TOOLS[mark.tool]?.label || 'Отметка'), 'ape-mark-chip', () => { selected = mark.id; selectedVertex = -1; activeTool = 'edit'; draw(); }); chip.title = entry.text; chip.classList.toggle('selected', selected === mark.id); chip.setAttribute('aria-label', 'Открыть ' + entry.code + ' · ' + (mark.label || TOOLS[mark.tool]?.label || 'Отметка')); legend.append(chip); }
         else { const row = el('div'), code = el('b', entry.code), text = el('span', entry.text); code.style.color = entry.color; row.append(code, text); legend.append(row); }
@@ -375,7 +376,7 @@
       if (refreshList) renderMarks();
     }
     function editField(id, key, value) { mutate(next => { const m = next.annotations.find(m => m.id === id); if (m) m[key] = value; }, false); }
-    function field(labelText, tag, value, handler) { const label = el('label', labelText), input = el(tag); input.setAttribute('aria-label', labelText); input.value = value || ''; on(input, tag === 'select' ? 'change' : 'input', e => handler(e.target.value)); label.append(input); return { label, input }; }
+    function field(labelText, tag, value, handler) { const label = el('label'), caption = el('span', labelText), input = el(tag); input.setAttribute('aria-label', labelText); input.value = value || ''; on(input, tag === 'select' ? 'change' : 'input', e => handler(e.target.value)); label.append(caption, input); return { label, input, caption }; }
     function renderMarks() {
       markList.replaceChildren(); selectedPanel.replaceChildren();
       const visibleMarks = kind === 'map' ? state.annotations.filter(m => m.id === selected) : state.annotations;
@@ -394,10 +395,11 @@
           } item.append(links, hint);
         }
         if (kind === 'map' && m.tool === 'hazard') {
-          const result = field('Результат проверки ' + m.code, 'select', m.status, v => { editField(m.id, 'status', v); source.label.hidden = v !== 'licensed'; });
+          const result = field('Результат проверки ' + m.code, 'select', m.status, v => { editField(m.id, 'status', v); source.label.hidden = v !== 'licensed'; note.input.setAttribute('aria-label', (v === 'confirmed' ? 'Основание ограничения ' : 'Наблюдение по организации ') + m.code); note.caption.textContent = (v === 'confirmed' ? 'Основание ограничения ' : 'Наблюдение по организации ') + m.code; note.input.placeholder = v === 'confirmed' ? 'Что проверили и почему есть ограничение' : ''; });
           [['pending', 'Выберите результат'], ['clear', 'Без замечаний'], ['licensed', 'Есть сведения о лицензии'], ['disputed', 'Спорный результат'], ['confirmed', 'Подтверждённый риск']].forEach(([value, text]) => result.input.append(new Option(text, value))); result.input.value = m.status === 'checked' ? 'clear' : m.status || 'pending';
           const source = field('Источник сведений о лицензии ' + m.code, 'input', m.source || m.sourceUrl, v => editField(m.id, 'source', v)); source.label.hidden = m.status !== 'licensed';
-          const note = field('Наблюдение по организации ' + m.code, 'textarea', m.note, v => editField(m.id, 'note', v)); item.append(result.label, source.label, note.label);
+          const note = field((m.status === 'confirmed' ? 'Основание ограничения ' : 'Наблюдение по организации ') + m.code, 'textarea', m.note, v => editField(m.id, 'note', v)); note.input.placeholder = m.status === 'confirmed' ? 'Что проверили и почему есть ограничение' : '';
+          result.input.dataset.issueField = 'status'; source.input.dataset.issueField = 'source'; note.input.dataset.issueField = 'resolution'; item.dataset.markId = m.id; item.append(result.label, source.label, note.label);
         }
         (kind === 'map' ? selectedPanel : markList).append(item);
       });
@@ -538,13 +540,30 @@
       catch (error) { state.pending = gesture.before.pending; draw(); notice(error.message, true); }
     }
     on(canvas, 'pointerup', e => endPointer(e, false)); on(canvas, 'pointercancel', e => endPointer(e, true));
-    async function exportPreview() { assertExportable(state); await flush(); if (sourceLoading) await ready; if (!image || !state.evidence_id) return null; const output = document.createElement('canvas'), w = image.naturalWidth || image.width; renderScene(output, image, state, { kind, artifact: true, scale: Math.min(1, 900 / w) }); const original = (options.evidence || []).find(e => String(e.id) === String(state.evidence_id)); return { name: (kind === 'map' ? 'Схема-' : 'План-') + (original?.name || 'объект').replace(/\.[^.]+$/, '') + '-лист-' + state.page + '.png', mime: 'image/png', data: output.toDataURL('image/png').split(',')[1], role: kind, subject_id: 'annotation' }; }
+    async function exportPreview() { assertExportable(state); await flush(); if (sourceLoading) await ready; if (!image || !state.evidence_id) return null; const output = document.createElement('canvas'), w = image.naturalWidth || image.width; renderScene(output, image, state, { kind, artifact: true, plain: artworkOnly, scale: Math.min(1, 900 / w) }); const original = (options.evidence || []).find(e => String(e.id) === String(state.evidence_id)); return { name: (kind === 'map' ? 'Схема-' : 'План-') + (original?.name || 'объект').replace(/\.[^.]+$/, '') + '-лист-' + state.page + '.png', mime: 'image/png', data: output.toDataURL('image/png').split(',')[1], role: kind, subject_id: 'annotation' }; }
     async function downloadPreview() { try { const result = await exportPreview(); if (!result) return; const binary = atob(result.data), bytes = Uint8Array.from(binary, c => c.charCodeAt(0)), url = URL.createObjectURL(new Blob([bytes], { type: result.mime })), a = document.createElement('a'); a.href = url; a.download = result.name; document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 30000); } catch (e) { notice(e.message, true); } }
+    async function focusIssue(control) {
+      await ready;
+      let target = null;
+      if (kind === 'plan' && /^plan\./.test(control)) target = state.pending?.points?.length ? (!finish.disabled ? finish : cancelPending) : chooseSource;
+      if (kind === 'map' && /^zones\./.test(control)) {
+        const mark = state.annotations.find(m => m.tool === 'hazard' && control.startsWith('zones.' + m.id + '.'));
+        if (mark) {
+          selected = mark.id; selectedVertex = -1; activeTool = 'edit'; draw();
+          const key = control.slice(('zones.' + mark.id + '.').length);
+          target = Array.from(selectedPanel.querySelectorAll('[data-issue-field]')).find(n => n.dataset.issueField === (key === 'note' ? 'resolution' : key));
+          if (target?.parentElement.hidden) target = null;
+          target ||= selectedPanel.querySelector('input,select,textarea');
+        }
+      }
+      if (target) { target.scrollIntoView({ block: 'center', behavior: 'auto' }); target.focus({ preventScroll: true }); }
+      return target;
+    }
     let ready = loadSelected();
     return {
       updateEvidence(files) { options.evidence = files; },
       refresh(nextOptions) { if (nextOptions) Object.assign(options, nextOptions); return ready = saveTail.catch(() => {}).then(() => { state = normalise(options.getState?.() || state); return loadSelected(); }); },
-      flush, exportPreview,
+      flush, exportPreview, focusIssue,
       destroy() { alive = false; loadToken++; chooserIntent++; chooserToken++; selectedLoad?.abort(); candidateLoad?.abort(); uploadController?.abort(); renderTask?.cancel(); releasePdf(candidate); controller.abort(); if (chooser.open) chooser.close(); container.replaceChildren(); image = null; },
     };
   }

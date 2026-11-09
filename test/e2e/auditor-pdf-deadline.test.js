@@ -17,6 +17,7 @@ test('a stalled PDF worker releases source upload, preserves the selected origin
   const visit = await openPage(browser, service), { page } = visit; let worker;
   try {
     await page.locator('#step-content[aria-busy=false]').waitFor(); await page.locator('#steps [data-step="1"]').click();
+    await page.locator('[data-choice="plan.mode"][data-value="draw"]').click();
     const editor = page.locator('#plan-editor'), dialog = editor.locator('dialog');
     const choose = () => editor.getByRole('button', { name: 'Выбрать лист PDF / изображение', exact: true }).click();
     const use = dialog.getByRole('button', { name: 'Использовать этот лист', exact: true });

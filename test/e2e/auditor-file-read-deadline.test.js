@@ -52,6 +52,7 @@ test('closing the sheet chooser cancels a stalled phone original without orphan 
   const visit = await openPage(browser, service, 1001, { pathname: '/audit?order_id=59' }), { page } = visit;
   try {
     await page.locator('#step-content[aria-busy=false]').waitFor(); await page.locator('#steps [data-step="1"]').click();
+    await page.locator('[data-choice="plan.mode"][data-value="draw"]').click();
     const editor = page.locator('#plan-editor'), dialog = editor.locator('dialog');
     const open = () => editor.getByRole('button', { name: 'Выбрать лист PDF / изображение', exact: true }).click();
     const original = await sampleImage(page, 'image/png'); await holdPhoneReads(page);

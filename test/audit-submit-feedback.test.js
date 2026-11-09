@@ -247,3 +247,79 @@ test('tobacco report supports the task emitted by the manager form without an al
   assert.equal(c.state.completed,true);
   assert.equal(c.state.data.inspection.service,'');
 });
+
+function schoolReport() {
+  const data=addOrganization(compactVisit('tobacco'),{name:'Школа',status:'confirmed'});
+  data.workflow.conclusion_status='obstacle';data.workflow.territory_result='findings';data.map.mode='draw';data.inspection.tobacco_display='Открытая';
+  data.map.annotations.push({id:'measurement',tool:'straight',code:'М1',distance:'70',fromEntranceId:data.entrances[0].id,toObjectId:data.zones[0].id,points:[{x:.2,y:.3},{x:.8,y:.4}]});
+  Object.assign(data.zones[0],{entrance_id:data.entrances[0].id,dist:'70'});return data;
+}
+
+test('an obstacle report separates genuinely missing school evidence and unfinished work from recorded adverse facts', async()=>{
+  const data=schoolReport();data.plan.pending={tool:'boundary',points:[{x:.2,y:.2}]};
+  const {c,calls}=harness(data),before=copy(c.state.data),html=c.reportFeedback(c.issues());
+  const requiredAt=html.indexOf('data-report-group="required"'),observationsAt=html.indexOf('data-report-group="observations"');
+  assert.ok(requiredAt>=0&&observationsAt>requiredAt,'Required fixes and recorded findings need distinct groups');
+  const required=html.slice(requiredAt,observationsAt),observations=html.slice(observationsAt);
+  assert.match(required,/укажите основание ограничения/);assert.match(required,/Завершите контур/);
+  assert.doesNotMatch(required,/ограничение отмечено аудитором|открытая выкладка/i);
+  assert.match(observations,/ограничение отмечено аудитором/);assert.match(observations,/открытая выкладка/i);
+  assert.match(observations,/не мешают отправке/);
+  await c.submit();assert.equal(c.state.completed,false);assert.deepEqual(copy(c.state.data),before);
+  assert.equal(calls.some(([name])=>name==='request'),false);
+});
+
+test('school restriction and tobacco findings do not block an explicit obstacle once its factual basis is recorded',async()=>{
+  const data=schoolReport();data.zones[0].resolution='Действующая школа, вход и расстояние зафиксированы на схеме.';
+  const {c,calls}=harness(data);assert.equal(c.requiredIssues(c.issues()).length,0);
+  await c.submit();assert.equal(c.state.completed,true);assert.equal(calls.filter(([name,url])=>name==='request'&&url==='/api/audit').length,1);
+  assert.equal(c.state.data.workflow.conclusion_status,'obstacle');assert.equal(c.state.data.zones[0].status,'confirmed');assert.equal(c.state.data.inspection.tobacco_display,'Открытая');
+});
+
+test('an unchanged map snapshot preserves separately recorded school resolution and reads the editor legacy source alias',()=>{
+  const data=schoolReport();data.zones[0].resolution='Основание, записанное в карточке организации.';
+  const mark=data.map.annotations.find(mark=>mark.tool==='hazard');mark.sourceUrl='Проверенный источник сведений';
+  const {c}=harness(data);c.$=()=>null;vm.runInContext(actualFunction('syncMapCards'),c);
+  c.syncMapCards(copy(c.state.data.map));
+  assert.equal(c.state.data.zones[0].resolution,'Основание, записанное в карточке организации.');
+  assert.equal(c.state.data.zones[0].source,'Проверенный источник сведений');
+});
+
+test('an explicit change or removal of the map basis updates every mirrored field and never keeps an erased justification',()=>{
+  const data=schoolReport();data.map.annotations.find(mark=>mark.tool==='hazard').note='Старая запись';Object.assign(data.zones[0],{note:'Старая запись',resolution:'Старая запись'});
+  const {c}=harness(data);c.$=()=>null;vm.runInContext(actualFunction('syncMapCards'),c);
+  for(const next of ['Проверенное основание','']){
+    const before=copy(c.state.data.map);c.state.data.map.annotations.find(mark=>mark.tool==='hazard').note=next;c.syncMapCards(before);
+    for(const key of ['resolution','note','info'])assert.equal(c.state.data.zones[0][key],next);
+  }
+  assert.equal(c.requiredIssues(c.issues()).some(task=>task.key==='resolution-org-4'),true);
+});
+
+test('main-plan issue navigation leaves an additional sheet before asking the editor to focus the actual control',async()=>{
+  const {c}=harness();c.activePlanId='extra-sheet';let focused=false;
+  c.go=async()=>{assert.equal(c.activePlanId,'main');c.state.data.workflow.step=1;};c.step=()=>c.state.data.workflow.step;
+  c.root.querySelectorAll=()=>[];c.root.querySelector=()=>null;
+  c.editor={async focusIssue(control){assert.equal(control,'plan.annotations');focused=true;return null;}};
+  await c.goIssue('plan.annotations',1);assert.equal(focused,true);
+});
+
+test('an attached main plan needs no new internal contour and sends the same obstacle facts with a generated PNG preview',async()=>{
+  const data=schoolReport();data.zones[0].resolution='Действующая школа, данные зафиксированы аудитором.';
+  data.plan={mode:'attached',evidence_id:data.plan.evidence_id,page:2,annotations:[],pending:null};
+  const {c}=harness(data);assert.equal(c.requiredIssues(c.issues()).length,0);
+  await c.submit();assert.equal(c.state.completed,true);assert.equal(c.state.data.plan.mode,'attached');assert.deepEqual(copy(c.state.data.plan.annotations),[]);
+  assert.ok(c.state.evidence.some(file=>file.role==='plan'&&file.subject_id==='annotation'&&file.mime==='image/png'&&file.id===c.state.data.plan.preview_evidence_id));
+  assert.equal(c.state.data.workflow.conclusion_status,'obstacle');assert.equal(c.state.data.zones[0].status,'confirmed');
+});
+
+test('the school basis issue opens the actual map annotation field rather than only focusing the map viewport',async()=>{
+  const {c,calls}=harness(schoolReport());
+  function target(label){return{closest:()=>null,matches:()=>true,setAttribute(){},scrollIntoView(){},focus(){calls.push(['field-focus',label]);}};}
+  const note=target('basis'),viewport=target('viewport');c.go=async index=>{c.state.data.workflow.step=index;};c.step=()=>c.state.data.workflow.step;
+  c.root.querySelectorAll=()=>[];c.root.querySelector=selector=>selector==='#map-editor .ape-viewport'?viewport:null;
+  c.editor={async focusIssue(control){calls.push(['editor-issue',control]);return note;}};
+  await c.goIssue('zones.org-4.resolution',0);
+  assert.ok(calls.some(call=>call[0]==='editor-issue'&&call[1]==='zones.org-4.resolution'));
+  assert.ok(calls.some(call=>call[0]==='field-focus'&&call[1]==='basis'));
+  assert.equal(c.requiredIssues(c.issues()).some(task=>task.key==='resolution-org-4'),true,'Navigation cannot waive the actual missing basis');
+});

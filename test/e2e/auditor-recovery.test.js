@@ -19,7 +19,7 @@ test('a delayed manager PDF import retains the newer selected page and exposes t
   await service.pool.query('INSERT INTO order_materials(order_id,id,name,mime,role,bytes,sha256,content) VALUES(58,$1,$2,\'application/pdf\',\'plan\',$3,$4,$5)', [material, name, pdf.length, hash(pdf), pdf]);
   const visit = await openPage(browser, service), { page } = visit; let release;
   try {
-    await page.locator('#step-content[aria-busy=false]').waitFor(); await step(page, 1);
+    await page.locator('#step-content[aria-busy=false]').waitFor(); await step(page, 1);await choice(page,'plan.mode','draw');
     const editor = page.locator('#plan-editor'), dialog = editor.locator('dialog');
     const choose = () => editor.getByRole('button', { name: 'Выбрать лист PDF / изображение', exact: true }).click();
     const use = dialog.getByRole('button', { name: 'Использовать этот лист', exact: true });
@@ -99,7 +99,7 @@ test('an accepted photo album with a lost Telegram acknowledgement survives reop
     await page.locator('#step-content[aria-busy=false]').waitFor();await choice(page,'building_type','Нежилое');await choice(page,'workflow.territory_result','clear');
     await page.locator('[data-add-entrance]').click();
     await page.locator('input[data-upload-role="entrance"]:not([capture])').setInputFiles({name:'Synthetic-unknown-album.jpg',mimeType:'image/jpeg',buffer:await sampleImage(page,'image/jpeg')});
-    await page.getByText('Synthetic-unknown-album.jpg',{exact:true}).waitFor();await step(page,1);
+    await page.getByText('Synthetic-unknown-album.jpg',{exact:true}).waitFor();await step(page,1);await choice(page,'plan.mode','draw');
     const editor=page.locator('#plan-editor'),dialog=editor.locator('dialog');
     await editor.getByRole('button',{name:'Выбрать лист PDF / изображение',exact:true}).click();
     await dialog.locator('input[type=file]').setInputFiles({name:'Synthetic-unknown-plan.pdf',mimeType:'application/pdf',buffer:multiPagePdf()});
