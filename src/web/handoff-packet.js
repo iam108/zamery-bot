@@ -125,9 +125,12 @@ function verifyFile(expected, row) {
     fail(409, 'REPORT_FILE_CHANGED', 'Оригинал не совпадает с материалом сохранённого отчёта.');
   }
 }
-function telegramUrl(row) {
+function telegramUrl(row, source) {
   const chat = String(row.chat_id || ''), ids = (row.msg_ids || []).map(Number).filter(id => Number.isSafeInteger(id) && id > 0);
-  return /^-100\d+$/.test(chat) && ids.length ? 'https://t.me/c/' + chat.slice(4) + '/' + Math.min(...ids) : '';
+  // Structured audits store their summary first, independently of physical
+  // delivery order (v3 sends its photos before that summary). Legacy imported
+  // reply trees retain their chronological entry point.
+  return /^-100\d+$/.test(chat) && ids.length ? 'https://t.me/c/' + chat.slice(4) + '/' + (source === 'a' ? ids[0] : Math.min(...ids)) : '';
 }
 function reportAddress(data, savedText) {
   return text(data.inspection?.address) || text((String(savedText || '').match(/(?:^|\n)Адрес\s*:\s*([^\n]+)/i) || [])[1]);
@@ -209,7 +212,7 @@ function createPacketService(options = {}) {
         status: text(data.workflow?.conclusion_status), actor: text(data.actor) || text((String(selected.text || '').match(/(?:^|\n)Аудитор\s*:\s*([^\n]+)/i) || [])[1]) || text(selected.author),
         inspection: Object.fromEntries(Object.entries(object(data.inspection)).filter(([key,value]) => INSPECTION_KEYS.has(key) && (value == null || ['string','number','boolean'].includes(typeof value)))),
         address: reportAddress(data, selected.text), video_url: https(Object.hasOwn(object(data.workflow), 'video_url') ? data.workflow.video_url : data.video_url),
-        telegram_url: telegramUrl(selected), media: [], linked: Number(selected.linked || 0) } : null;
+        telegram_url: telegramUrl(selected, reportId ? src : 'a'), media: [], linked: Number(selected.linked || 0) } : null;
       if (report?.src === 'a') {
         const { photoCaption } = require('../bot/audit-delivery');
         report.media = (await media(selected)).map(({ expected, raw }) => ({ id: expected.id, name: expected.name, mime: expected.mime, role: expected.role, subject_id: expected.subject_id,
@@ -267,9 +270,14 @@ function setupHandoffPacket(app, options = {}) {
         fail(403,'CASE_FORBIDDEN','Этот отчёт не входит в доступный вам комплект клиента.');
       return canManageCases(record,req.tgUser&&req.tgUser.id);
     }
-    if (canManageCases(req.staff, req.tgUser && req.tgUser.id)) return true;
-    const row = (await pool.query('SELECT * FROM cases WHERE order_id=$1 AND lawyer_tg_id=$2 ORDER BY id DESC LIMIT 1', [orderId, req.tgUser && req.tgUser.id])).rows[0];
-    if (!canAccessCase(req.staff, req.tgUser && req.tgUser.id, row)) fail(403, 'CASE_FORBIDDEN', 'Этот клиент недоступен вашему аккаунту.');
+    // Storage and packet reads can outlive middleware authorization. Resolve
+    // the current staff role and current assignment in the same SQL snapshot.
+    const record = (await pool.query(`SELECT s.tg_id,s.role,s.approved,to_jsonb(c) AS access_case FROM staff s
+      LEFT JOIN LATERAL (SELECT * FROM cases WHERE order_id=$1 AND lawyer_tg_id=$2 ORDER BY id DESC LIMIT 1) c ON true
+      WHERE s.tg_id=$2`, [orderId, req.tgUser && req.tgUser.id])).rows[0];
+    if (canManageCases(record, req.tgUser && req.tgUser.id)) return true;
+    const row = record?.access_case;
+    if (!canAccessCase(record, req.tgUser && req.tgUser.id, row)) fail(403, 'CASE_FORBIDDEN', 'Этот клиент недоступен вашему аккаунту.');
     if (report && (!report.order_id || Number(report.order_id) !== Number(orderId))) {
       // A manager may explicitly attach a historical unlinked report to a
       // case. Its saved handoff selection is the authority, not a caller's
@@ -302,7 +310,7 @@ function setupHandoffPacket(app, options = {}) {
     const caseId=integer(req.query.case_id,true);
     await authorize(req, packet.order && packet.order.id, packet.report,caseId);
     const file = await service.file(req.params.auditId,req.params.fileId);
-    if(caseId)await authorize(req,packet.order&&packet.order.id,packet.report,caseId);
+    await authorize(req,packet.order&&packet.order.id,packet.report,caseId);
     res.set('Content-Type',file.mime).set('Content-Length',String(file.buffer.length)).set('Content-Disposition',disposition(file.name,req.query.download === '1')).send(file.buffer);
   }));
   return service;

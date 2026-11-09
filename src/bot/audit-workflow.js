@@ -1,7 +1,7 @@
 const { esc } = require('./formatter');
 const { validateInspection, compactInspectionIssues } = require('./audit-inspection');
 const { isGenericAudit, validateGenericAudit, buildGenericAuditSummary } = require('./audit-generic');
-const { describe: describeReportIssue } = require('../../public/audit-report-issues');
+const { describe: describeReportIssue, isUnverifiedFloor } = require('../../public/audit-report-issues');
 
 const CONCLUSIONS = { ready: 'Соответствует по проверенным пунктам', actions: 'Нужны действия', insufficient: 'Недостаточно данных', obstacle: 'Выявлено препятствие' };
 const ZONE_STATUS = { pending: 'Требует уточнения', confirmed: 'Ограничение подтверждено аудитором', excluded: 'Ограничение исключено с основанием' };
@@ -360,10 +360,10 @@ function compactReportIssues(data) {
   const tasks = compactFollowupTasks({ ...data, inspection: p, workflow: w, entrances, zones });
   for (const task of tasks) {
     const issue = describeReportIssue(data, task);
-    if (!issue || required.has(issue.control) || task.id === 'floor-mismatch' && (!nonempty(p.floor_plan) || !nonempty(p.floor_actual) || p.floor_plan === 'Не проверено' || p.floor_actual === 'Не проверено')) continue;
+    if (!issue || required.has(issue.control) || task.id === 'floor-mismatch' && (!nonempty(p.floor_plan) || !nonempty(p.floor_actual) || isUnverifiedFloor(p.floor_plan) || isUnverifiedFloor(p.floor_actual))) continue;
     issues.push(issue);
   }
-  for (const key of ['floor_plan', 'floor_actual']) if (p[key] === 'Не проверено') issues.push(describeReportIssue(data, { id: 'unverified:' + key }));
+  for (const key of ['floor_plan', 'floor_actual']) if (isUnverifiedFloor(p[key])) issues.push(describeReportIssue(data, { id: 'unverified:' + key }));
   return issues;
 }
 

@@ -450,6 +450,7 @@
 
   function issues(){
     var out=[],p=state.data.inspection,packet=state.packet||{};function add(key,title,view,detail){out.push({key:key,title:title,detail:detail||'',step:view});}
+    var unverifiedFloor=window.AuditReportIssues&&window.AuditReportIssues.isUnverifiedFloor||function(value){return typeof value==='string'&&value.trim().replace(/\s+/g,' ').toLowerCase()==='не проверено';};
     if(state.data.object_category==='other'){
       if(!p.org||!p.address)add('packet','Менеджеру нужно дополнить объект и адрес в заявке',0);
       if(!String(state.data.conclusion||'').trim())add('conclusion','Укажите итог аудитора',2);
@@ -463,8 +464,8 @@
     territoryIssues(add,false);
     [['floor_plan','Этаж на плане'],['floor_actual','Фактический этаж'],['cadastral_count','Количество кадастров'],['rooms_complete','Входит ли вся площадь по плану в объект'],['within_cadastral','Границы помещения'],['kkt_count','Количество касс'],['kkt_ip','Наличие кассы ИП']].forEach(function(pair){if(!p[pair[0]])add(pair[0],'Укажите: '+pair[1].toLowerCase(),1);});
     if(p.cadastral_count&&!/^[1-9]\d?$/.test(p.cadastral_count))add('cadastral_count','Количество кадастров: целое число от 1 до 99',1);
-    if(p.floor_plan&&p.floor_actual&&p.floor_plan!=='Не проверено'&&p.floor_actual!=='Не проверено'&&String(p.floor_plan).trim().toLowerCase().replace(/этаж/g,'').replace(/\s+/g,' ').trim()!==String(p.floor_actual).trim().toLowerCase().replace(/этаж/g,'').replace(/\s+/g,' ').trim())add('floor-mismatch','Этаж на плане и фактический этаж отличаются',1);
-    ['floor_plan','floor_actual'].forEach(function(key){if(p[key]==='Не проверено')add('unverified:'+key,key==='floor_plan'?'Этаж на плане не проверен':'Фактический этаж не проверен',1);});
+    if(p.floor_plan&&p.floor_actual&&!unverifiedFloor(p.floor_plan)&&!unverifiedFloor(p.floor_actual)&&String(p.floor_plan).trim().toLowerCase().replace(/этаж/g,'').replace(/\s+/g,' ').trim()!==String(p.floor_actual).trim().toLowerCase().replace(/этаж/g,'').replace(/\s+/g,' ').trim())add('floor-mismatch','Этаж на плане и фактический этаж отличаются',1);
+    ['floor_plan','floor_actual'].forEach(function(key){if(unverifiedFloor(p[key]))add('unverified:'+key,key==='floor_plan'?'Этаж на плане не проверен':'Фактический этаж не проверен',1);});
     if(isRenewal()&&state.data.workflow.archive_skipped!=='Да'){
       if(p.archive_match==='Нет')add('archive-mismatch','Есть расхождения с архивом',1);
       if(!p.archive_match||p.archive_match==='Не проверено')add('archive-unchecked','Сверка с архивом не выполнена',1);

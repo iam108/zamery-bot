@@ -5,16 +5,21 @@ const assert = require('node:assert/strict');
 const { chromium } = require('playwright');
 const { createService, openPage, until, LAWYER } = require('./helpers');
 
-test('checklist: a newer note survives an older save ACK and close/reopen, and printing waits for the latest edit', { timeout: 90000 }, async () => {
+test('checklist: a newer note survives an older ACK, failed database write and close/reopen; printing waits for the latest edit', { timeout: 90000 }, async () => {
   let browser, service, visit;
   const releases = [];
   const gate = () => { let release; const promise = new Promise(resolve => { release = resolve; }); releases.push(release); return { promise, release }; };
   try {
     service = await createService({ master: true }); process.env.WEBAPP_URL = service.origin; browser = await chromium.launch();
-    let unavailableNote = 'B typed during A';
+    let unavailableNote = 'B typed during A', rejectedWrites = 0;
     const query = service.pool.query;
     service.pool.query = async function (sql, args) {
-      if (String(sql).startsWith('UPDATE cases SET data=') && args?.[0]?._comment === unavailableNote) throw new Error('Synthetic connection failure before committing B');
+      // The production mutation starts with a locking CTE. Reject the actual
+      // write, including close-time retries, rather than depending on whether
+      // a page-level network interceptor survives closing the tab.
+      if (/\bUPDATE\s+cases\s+SET\s+data\s*=/i.test(String(sql)) && args?.[0]?._comment === unavailableNote) {
+        rejectedWrites++; throw new Error('Synthetic connection failure before committing B');
+      }
       return query.call(this, sql, args);
     };
     const row = (await service.pool.query(`INSERT INTO cases(order_id,lawyer_tg_id,lawyer_name,org,address,region,kind,service,checklist_key,created_by,data)
@@ -27,7 +32,6 @@ test('checklist: a newer note survives an older save ACK and close/reopen, and p
     await page.route('**/api/checklist/save', async route => {
       const number = ++saves;
       if (number === 1) await first.promise;
-      if (number >= 2) { await route.abort('internetdisconnected'); return; }
       try { await route.continue(); } catch (_) { /* Closing the old tab cancels its pending save. */ }
     });
     await page.locator('#lawyer-note').fill('A acknowledged note'); await page.locator('#st').click();
@@ -39,8 +43,8 @@ test('checklist: a newer note survives an older save ACK and close/reopen, and p
     }, row.id), 'The newer note backup retains the acknowledged baseline');
     assert.notEqual(await page.locator('#st').innerText(), 'Сохранено');
     await page.evaluate(() => window.dispatchEvent(new Event('pagehide')));
-    await until(() => saves === 2, 'Pagehide attempts to save B over the interrupted connection'); await page.close();
-    assert.equal(await storedNote(), 'A acknowledged note', 'The interrupted request did not deliver B before reopening');
+    await until(() => saves >= 2 && rejectedWrites > 0, 'Pagehide reaches the injected database failure before committing B'); await page.close();
+    assert.equal(await storedNote(), 'A acknowledged note', 'The failed database write did not deliver B before reopening');
 
     const reopened = await visit.context.newPage(); const errors = [];
     reopened.on('pageerror', error => errors.push(error.message));

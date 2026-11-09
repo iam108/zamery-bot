@@ -24,7 +24,7 @@ async function readBudgetText() {
   try { return budget().describe(await budget().snapshot()); }
   catch (_) { return 'Учёт заказов временно недоступен; остаток не сверён.'; }
 }
-function isMeasurementsChat(chat) { return !!process.env.GROUP_CHAT_ID && String(chat) === String(process.env.GROUP_CHAT_ID); }
+function isMeasurementsChat(chat) { return !!process.env.GROUP_CHAT_ID && String(chat).toLowerCase() === String(process.env.GROUP_CHAT_ID).toLowerCase(); }
 function budgetSuffix(chat, text) { return !isMeasurementsChat(chat) && text ? '\n' + text : ''; }
 async function messageBudgetText(chat) { return isMeasurementsChat(chat) ? '' : 'Учёт на момент сообщения: ' + await readBudgetText(); }
 async function budgetText(order) {

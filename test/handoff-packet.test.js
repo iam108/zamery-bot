@@ -78,6 +78,17 @@ async function database(run) {
   } finally { await db.close(); }
 }
 const pg = {skip:!process.env.PGLITE_TEST_MODULE};
+test('a v3 audit link follows its logical summary even when the photo album was sent first', pg, async () => database(async h => {
+  const logicalIds = [1004,1001,1002,1003,1005,1006];
+  await h.db.query('UPDATE audits SET msg_ids=$1 WHERE id=15', [logicalIds]);
+  const selected = await h.service.packet({ order_id:60,report_src:'a',report_id:15 });
+  assert.equal(selected.report.telegram_url,'https://t.me/c/1234567890/1004');
+  const latest = await h.service.packet({ order_id:60 });
+  assert.equal(latest.report.id,15);
+  assert.equal(latest.report.telegram_url,selected.report.telegram_url);
+  assert.deepEqual((await h.db.query('SELECT msg_ids FROM audits WHERE id=15')).rows[0].msg_ids,logicalIds,
+    'Resolving the report link must not reorder the persisted delivery receipts');
+}));
 test('saved audit 15 resolves original source_draft_id, exposes full immutable report, and downloads private S3 / old PostgreSQL originals exactly', pg, async () => database(async h => {
   const packet = await h.service.packet({order_id:60,report_src:'a',report_id:15});
   assert.equal(packet.order.org,'ООО «ЧООКДИ»'); assert.equal(packet.order.address,'Москва, Лесная, 5');
@@ -86,7 +97,7 @@ test('saved audit 15 resolves original source_draft_id, exposes full immutable r
   assert.equal(packet.order.contacts[0].name,'Карина'); assert.equal(packet.order.contacts.length,1);
   assert.equal(packet.report.text,h.completeText); assert.equal(packet.report.actor,'Саша Я.'); assert.equal(packet.report.inspection.rooms_complete,'Нет');
   assert.deepEqual(packet.report.historical_address_difference,{report:'Москва, Мясницкая, 15',order:'Москва, Лесная, 5'});
-  assert.equal(packet.report.telegram_url,'https://t.me/c/1234567890/100'); assert.equal(packet.report.video_url,'https://disk.yandex.ru/i/video');
+  assert.equal(packet.report.telegram_url,'https://t.me/c/1234567890/102'); assert.equal(packet.report.video_url,'https://disk.yandex.ru/i/video');
   assert.equal(packet.archive_url,''); assert.equal(packet.order.archive_url,''); assert.equal(packet.report.media.length,2);
   assert.doesNotMatch(JSON.stringify(packet),/object_key|storage_key|audit-originals|secret|"content"|"buffer"|DO NOT USE|79990000000/);
   for (const file of h.files) {
@@ -134,6 +145,7 @@ test('legacy report keeps every saved / reply text, honestly exposes no fabricat
   await h.db.query('INSERT INTO reports(id,text,author,chat_id,msg_ids,reply_to,first_id) VALUES(9,$1,$2,$3,$4,50,90)', ['Legacy full report','Мария','-1001234567890',[90]]);
   await h.db.query('INSERT INTO reports(id,text,author,chat_id,msg_ids,reply_to,first_id) VALUES(10,$1,$2,$3,$4,90,91)', ['Saved reply notes','Мария','-1001234567890',[91]]);
   const packet=await h.service.packet({order_id:60,report_src:'r',report_id:9});
+  assert.equal(packet.report.telegram_url,'https://t.me/c/1234567890/90');
   assert.equal(packet.report.text,'Legacy full report\n\nSaved reply notes'); assert.equal(packet.report.actor,'Мария'); assert.deepEqual(packet.report.media,[]); assert.equal(packet.report.linked,1);
   assert.equal(packet.archive_url,'');
   await h.db.query("UPDATE orders SET archive_url='https://disk.yandex.ru/d/actual-archive' WHERE id=60");
@@ -203,7 +215,7 @@ test('required group notice projects only safe delivery state while private comp
 
 test('packet route grants group-only resume to managers for safe pending states and keeps private completion truthful',async()=>{
   const routes=new Map();let assignment,role='manager';
-  setupHandoffPacket({get(path,run){routes.set(path,run);}},{pool:{async query(){return{rows:[{id:75,order_id:60,lawyer_tg_id:101,data:{}}]};}},service:{async packet(){return{order:{id:60},assignment:JSON.parse(JSON.stringify(assignment))};}}});
+  setupHandoffPacket({get(path,run){routes.set(path,run);}},{pool:{async query(){return{rows:[{tg_id:101,role,approved:true,access_case:{id:75,order_id:60,lawyer_tg_id:101,data:{}}}]};}},service:{async packet(){return{order:{id:60},assignment:JSON.parse(JSON.stringify(assignment))};}}});
   const read=async()=>{let result;const res={set(){return this;},status(){return this;},json(value){result=value;}};await routes.get('/api/handoff/packet')({staff:{approved:true,role},tgUser:{id:101},query:{}},res);return result.assignment;};
   for(const status of ['pending','rejected','blocked','unknown','confirmed']){
     assignment={case_id:75,delivery_complete:true,group_notice:{status,manual_review:status==='unknown',retry:['pending','rejected','blocked'].includes(status)}};
@@ -217,7 +229,7 @@ test('packet route grants group-only resume to managers for safe pending states 
 test('HTTP files inherit the /api/handoff staff guard, preserve UTF-8 filenames and bytes, and hide unexpected storage errors', async () => {
   const express=require('express'),app=express(),calls=[],bytes=Buffer.from('exact original');
   app.use('/api/handoff',(req,res,next)=>{if(req.get('X-Test-Staff')!=='approved')return res.status(403).json({ok:false});req.staff={role:'manager',approved:true};req.tgUser={id:101};next();});
-  setupHandoffPacket(app,{service:{ async packet() {calls.push('packet');return {ok:true};}, async file(id) {calls.push('file');if(id==='99')throw new Error('secret storage key and credentials');return {name:'План «Лесная, 5».pdf',mime:'application/pdf',buffer:bytes};} }});
+  setupHandoffPacket(app,{pool:{async query(){return{rows:[{tg_id:101,role:'manager',approved:true,access_case:null}]};}},service:{ async packet() {calls.push('packet');return {ok:true};}, async file(id) {calls.push('file');if(id==='99')throw new Error('secret storage key and credentials');return {name:'План «Лесная, 5».pdf',mime:'application/pdf',buffer:bytes};} }});
   const server=app.listen(0,'127.0.0.1'); await once(server,'listening');
   const origin='http://127.0.0.1:'+server.address().port;
   try {
@@ -250,7 +262,7 @@ test('an assigned lawyer cannot combine their order with an unrelated unlinked r
   let manager = false;
   const assigned = { id: 5, order_id: 60, lawyer_tg_id: 101, data: {} };
   app.use((req, res, next) => { req.staff = { approved: true, role: manager ? 'manager' : 'lawyer' }; req.tgUser = { id: 101 }; next(); });
-  const pool = { async query() { return { rows: [assigned] }; } };
+  const pool = { async query() { return { rows: [{tg_id:101,role:manager?'manager':'lawyer',approved:true,access_case:assigned}] }; } };
   setupHandoffPacket(app, { pool, service: {
     async packet(query) { return { order: { id: 60 }, report: { id: Number(query.report_id), src: query.report_src || 'a', order_id: query.report_id === '15' ? 60 : null } }; },
   } });
@@ -271,6 +283,7 @@ test('an assigned lawyer cannot combine their order with an unrelated unlinked r
 });
 
 test('the assigned lawyer can download media from the exact unlinked historical audit a manager handed off', pg, async () => database(async h => {
+  await h.db.exec("CREATE TABLE staff(tg_id BIGINT PRIMARY KEY,role TEXT,approved BOOLEAN);INSERT INTO staff VALUES(101,'lawyer',true)");
   await h.db.query('UPDATE audits SET order_id=NULL WHERE id=15');
   await h.db.query('INSERT INTO cases(id,order_id,lawyer_tg_id,data) VALUES(800,60,101,$1)', [JSON.stringify({ _handoff: { body: { report_id: 15, report_src: 'a' } } })]);
   const express = require('express'), app = express();
@@ -316,4 +329,40 @@ test('a no-order original download rechecks its case after the private object re
   const read=h.store.read;h.store.read=async row=>{const result=await read(row);await h.db.exec('UPDATE cases SET lawyer_tg_id=102 WHERE id=800');return result;};
   const express=require('express'),app=express();app.use((req,res,next)=>{req.staff={role:'lawyer',approved:true};req.tgUser={id:101};next();});setupHandoffPacket(app,{service:h.service,pool:h.pool});const server=app.listen(0,'127.0.0.1');await once(server,'listening');
   try{const r=await fetch('http://127.0.0.1:'+server.address().port+'/api/handoff/reports/15/files/'+h.files[0].id+'?case_id=800');assert.equal(r.status,403);assert.equal((await r.json()).code,'CASE_FORBIDDEN');}finally{server.close();await once(server,'close');}
+}));
+
+for (const change of ['approval','role','assignment']) test('an order-bound original rechecks current '+change+' after storage and remains accessible after restoration',pg,async()=>database(async h=>{
+  const previousAdmins=process.env.ADMIN_TG_IDS;process.env.ADMIN_TG_IDS='';
+  await h.db.exec("CREATE TABLE staff(tg_id BIGINT PRIMARY KEY,role TEXT,approved BOOLEAN);INSERT INTO staff VALUES(101,'lawyer',true),(102,'lawyer',true);INSERT INTO cases(id,order_id,lawyer_tg_id,data) VALUES(800,60,101,'{}')");
+  const read=h.store.read;
+  h.store.read=async row=>{
+    const original=await read(row);
+    await h.db.exec(change==='approval'?'UPDATE staff SET approved=false WHERE tg_id=101':change==='role'?"UPDATE staff SET role='auditor' WHERE tg_id=101":'UPDATE cases SET lawyer_tg_id=102 WHERE id=800');
+    return original;
+  };
+  const express=require('express'),app=express();
+  app.use(async(req,res,next)=>{req.tgUser={id:101};req.staff=(await h.db.query('SELECT * FROM staff WHERE tg_id=101')).rows[0];next();});
+  setupHandoffPacket(app,{service:h.service,pool:h.pool});
+  const file=h.files[change==='approval'?1:0];
+  const server=app.listen(0,'127.0.0.1');await once(server,'listening');const url='http://127.0.0.1:'+server.address().port+'/api/handoff/reports/15/files/'+file.id;
+  try {
+    const denied=await fetch(url);assert.equal(denied.status,403);assert.equal((await denied.json()).code,'CASE_FORBIDDEN');
+    h.store.read=read;await h.db.exec("UPDATE staff SET approved=true,role='lawyer' WHERE tg_id=101;UPDATE cases SET lawyer_tg_id=101 WHERE id=800");
+    const restored=await fetch(url);assert.equal(restored.status,200);assert.deepEqual(Buffer.from(await restored.arrayBuffer()),file.content);
+    if(change==='approval')assert.equal(h.gets.length,2,'The S3 fixture was read before each final authorization; its bytes were withheld from the denied HTTP response');
+  } finally {server.close();await once(server,'close');if(previousAdmins===undefined)delete process.env.ADMIN_TG_IDS;else process.env.ADMIN_TG_IDS=previousAdmins;}
+}));
+
+for (const role of ['manager','configured admin']) test('a current '+role+' retains original access without an assignment but still needs approval after storage',pg,async()=>database(async h=>{
+  const previousAdmins=process.env.ADMIN_TG_IDS,actor=role==='manager'?101:103;process.env.ADMIN_TG_IDS=role==='manager'?'':'103';
+  await h.db.exec("CREATE TABLE staff(tg_id BIGINT PRIMARY KEY,role TEXT,approved BOOLEAN);INSERT INTO staff VALUES(101,'manager',true),(103,'auditor',true)");
+  const express=require('express'),app=express();
+  app.use(async(req,res,next)=>{req.tgUser={id:actor};req.staff=(await h.db.query('SELECT * FROM staff WHERE tg_id=$1',[actor])).rows[0];next();});
+  setupHandoffPacket(app,{service:h.service,pool:h.pool});const server=app.listen(0,'127.0.0.1');await once(server,'listening');
+  const url='http://127.0.0.1:'+server.address().port+'/api/handoff/reports/15/files/'+h.files[0].id,read=h.store.read;
+  try {
+    const allowed=await fetch(url);assert.equal(allowed.status,200);assert.deepEqual(Buffer.from(await allowed.arrayBuffer()),h.files[0].content);
+    h.store.read=async row=>{const original=await read(row);await h.db.query('UPDATE staff SET approved=false WHERE tg_id=$1',[actor]);return original;};
+    const denied=await fetch(url);assert.equal(denied.status,403);assert.equal((await denied.json()).code,'CASE_FORBIDDEN');
+  } finally {server.close();await once(server,'close');if(previousAdmins===undefined)delete process.env.ADMIN_TG_IDS;else process.env.ADMIN_TG_IDS=previousAdmins;}
 }));

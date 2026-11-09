@@ -535,6 +535,7 @@ async function managerFetch(url, options, consume, timeoutMs) {
     if(controller)controller.abort(error);reject(error);
   },timeoutMs);});
   try{return await Promise.race([Promise.resolve().then(function(){if(source&&source.aborted)throw source.reason;return fetch(url,requestOptions);}).then(consume),deadline,stopped]);}
+  catch(error){if(controller)controller.abort(error);throw error;}
   finally{clearTimeout(timer);if(source)source.removeEventListener('abort',onStop);}
 }
 function managerRetryDelay(ms, signal) {
@@ -558,10 +559,15 @@ function enablePacketEditing(enabled) {
 }
 async function downloadExistingFile(file, button) {
   var label = button.textContent; button.disabled=true;button.textContent='Скачиваем…';
+  function checkContentType(value) {
+    var type=String(value||'').split(';')[0].trim().toLowerCase();
+    if(type==='text/html'||type==='application/xhtml+xml'||type.endsWith('/json')||type.endsWith('+json'))throw new Error('Сервер вернул служебную страницу вместо документа. Повторите скачивание.');
+  }
   try {
     var blob=await managerFetch(file.url,undefined,async function(response){
       if(!response.ok){var failure=await response.json();throw new Error(failure.error||'Не удалось скачать документ.');}
-      return response.blob();
+      checkContentType(response.headers&&typeof response.headers.get==='function'?response.headers.get('Content-Type'):'');
+      var fileBlob=await response.blob();checkContentType(fileBlob.type);return fileBlob;
     },180000), url=URL.createObjectURL(blob), link=document.createElement('a');
     link.href=url;link.download=file.name;document.body.appendChild(link);link.click();link.remove();setTimeout(function(){URL.revokeObjectURL(url);},60000);
   } catch(e) { tg.showAlert(e.message); }

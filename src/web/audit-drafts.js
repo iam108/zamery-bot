@@ -334,6 +334,13 @@ function createDraftStore(pool = defaultPool, configuredLimits = LIMITS, options
       });
       return Object.assign(evidenceMetadata(file), { buffer: await originals.read(file) });
     },
+    async assertCurrentApproval(owner) {
+      const actor = ownerId(owner);
+      let access;
+      try { access = await pool.query('SELECT tg_id FROM staff WHERE tg_id=$1 AND approved IS TRUE', [actor]); }
+      catch (_) { fail(503, 'AUDIT_ACCESS_UNAVAILABLE', 'Не удалось проверить действующий доступ к материалам проверки. Повторите после восстановления связи.'); }
+      if (!access.rows.length) fail(403, 'AUDIT_FORBIDDEN', 'Доступ к материалам проверки изменился. Проверьте одобрение сотрудника.');
+    },
     async loadDraftForSubmit(owner, id, expected) {
       const loaded = await transaction(async client => {
         const row = await find(client, owner, id, true); checkRevision(row, expected);
@@ -423,6 +430,7 @@ function setupAuditDrafts(app, draftStore = store) {
   app.delete('/api/audit/drafts/:id/evidence/:fileId', route(async (req, res) => res.json(Object.assign({ ok: true }, await draftStore.removeEvidence(req.tgUser.id, req.params.id, req.params.fileId, req.body?.revision)))));
   app.get('/api/audit/drafts/:id/evidence/:fileId', route(async (req, res) => {
     const file = await draftStore.downloadEvidence(req.tgUser.id, req.params.id, req.params.fileId);
+    await draftStore.assertCurrentApproval(req.tgUser.id);
     const encoded = encodeURIComponent(file.name).replace(/['()*]/g, char => '%' + char.charCodeAt(0).toString(16).toUpperCase());
     res.set('X-Content-Type-Options', 'nosniff').set('Content-Disposition', "attachment; filename=\"document\"; filename*=UTF-8''" + encoded).type(file.mime).send(file.buffer);
   }));

@@ -25,7 +25,11 @@ async function fixture(run) {
   const api = context.module.exports.qa;
   try {
     await api.ensureTables(); await api.ensureReports(); await api.ensureRequests();
-    await db.exec(`CREATE TABLE orders(id INT PRIMARY KEY,address TEXT,object_name TEXT,telegram_msg_id BIGINT,owner_name TEXT);
+    // Production requireStaff creates the approval column and loads this actor
+    // from SQL. The direct route fixture must supply the same durable identity.
+    await db.exec(`ALTER TABLE staff ADD COLUMN IF NOT EXISTS approved BOOLEAN DEFAULT false;
+      INSERT INTO staff(tg_id,name,role,approved) VALUES(808,'Synthetic assigned lawyer','lawyer',true);
+      CREATE TABLE orders(id INT PRIMARY KEY,address TEXT,object_name TEXT,telegram_msg_id BIGINT,owner_name TEXT);
       INSERT INTO orders(id,address,object_name,telegram_msg_id) VALUES(60,'Москва, Synthetic, 5','ООО Synthetic',50),(61,'Москва, Other object','ООО Other',51);
       INSERT INTO reports(id,chat_id,first_id,msg_ids,text,author,reply_to) VALUES
       (100,-100200,1000,'{1000,1001}','Заявка #60','manager',NULL),
