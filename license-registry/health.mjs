@@ -52,6 +52,12 @@ export function createReadiness({now=()=>new Date(),telegramMaxAgeMs=90_000,work
     },
     stage(value){phase=value;},
     success(name){Object.assign(dependency(name),{ok:true,lastSuccessAt:stamp(),lastError:null});},
+    restore(name,{lastSuccessAt=null,lastFailureAt=null,lastError=null}={}){
+      const valid=(value)=>value===null||(typeof value==='string'&&Number.isFinite(Date.parse(value))&&Date.parse(value)<=+new Date(now()));
+      if(!valid(lastSuccessAt)||!valid(lastFailureAt))throw new Error('invalid_health_observation');
+      Object.assign(dependency(name),{ok:Boolean(lastSuccessAt)&&lastError===null,lastSuccessAt,lastFailureAt,
+        lastError:lastError===null?null:safeErrorCode(lastError,`${name}_failed`,secrets)});
+    },
     failure(name,error,fallback=`${name}_failed`){Object.assign(dependency(name),{
       ok:false,lastFailureAt:stamp(),lastError:safeErrorCode(error,fallback,secrets)});},
     startupFailure(error,{delayMs=0}={}){

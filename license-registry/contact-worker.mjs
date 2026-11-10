@@ -7,6 +7,24 @@ const clone=(value)=>structuredClone(value);
 const clean=(value)=>String(value??'').trim();
 const stamp=(now)=>new Date(now()).toISOString();
 const failure=(code)=>Object.assign(new Error(code),{code});
+// Preserve only this component's known operational identifiers. Provider text,
+// arbitrary code prefixes and SQL details must never reach state or diagnostics.
+const googleErrorCodes=new Set(['google_request_limit_invalid','google_credentials_missing_or_invalid',
+  'google_token_unavailable','google_authentication_failed','google_network_error','google_rate_limited',
+  'google_access_denied','google_request_failed']);
+const sourceErrorCodes=new Set(['contact_source_unavailable','contacts_source_unavailable',
+  'contacts_source_bootstrap_invalid','contacts_source_chat_invalid','contacts_source_closed',
+  'contacts_source_connection_invalid','contacts_source_connection_mismatch',
+  'contacts_source_credentials_invalid','contacts_source_credentials_missing',
+  'contacts_source_directory_invalid','contacts_source_invalid_inns','contacts_source_invalid_response',
+  'contacts_source_case_overflow','contacts_source_report_overflow',
+  'contacts_source_permissions_invalid','contacts_source_role_conflict','contacts_source_schema_conflict',
+  'contacts_source_schema_missing']);
+function safeFailureCode(error,codes,fallback){
+  const code=error?.code;
+  return code==='state_locked'||codes.has(code)?code:fallback;
+}
+const operationalErrorCodes=new Set([...googleErrorCodes,...sourceErrorCodes]);
 const definite=new Set(['contact_plan_invalid','contact_identity_changed','contact_row_moved','contact_row_ambiguous',
   'contact_cell_protected','contact_cell_conflict','contact_readback_mismatch']);
 const accepted=(result)=>result==null||['sent','pending','duplicate','log_only'].includes(result.delivery);
@@ -108,7 +126,8 @@ export class ContactWorker{
           }else remaining=true;
         }
       }
-      let context;try{context=await this.google.context();}catch{throw failure('contact_read_failed');}
+      let context;try{context=await this.google.context();}
+      catch(error){throw failure(safeFailureCode(error,googleErrorCodes,'contact_read_failed'));}
       const rows=parseSheetRows(context.values,{startRow:context.startRow??1}).filter((row)=>active(row,today));
       const groups=new Map();for(const row of rows){const key=groupKey(row);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(row);}
       const candidates=rows.filter(gap);summary.scanned=candidates.length;
@@ -124,7 +143,7 @@ export class ContactWorker{
             if(!Array.isArray(found?.cases)||!Array.isArray(found?.reviews))throw failure('contact_source_unavailable');
             sourceCases.push(...found.cases);sourceReviews.push(...found.reviews);
           }
-        }catch{throw failure('contact_source_unavailable');}
+        }catch(error){throw failure(safeFailureCode(error,sourceErrorCodes,'contact_source_unavailable'));}
       }
       const hasSource=(row)=>sourceReviews.some((item)=>item?.inn===row.inn)||sourceCases.some((item)=>clean(item?.inn)===row.inn&&normalizeAddress(item?.address)===normalizeAddress(row.address));
       const sourceAmbiguous=(row)=>sourceReviews.some((item)=>item?.inn===row.inn);
@@ -181,8 +200,8 @@ export class ContactWorker{
       await this.store.update((state)=>{Object.assign(initialize(state),{nextSyncAt,retryAt:null,lastSuccessAt:stamp(this.now),lastError:null});});
       summary.nextSyncAt=nextSyncAt;this.log({at:stamp(this.now),type:'contact_sync_summary',...summary});return summary;
     }catch(error){
-      const code=error.code==='contact_source_unavailable'?'contact_source_unavailable':error.code==='state_locked'?'state_locked':'contact_read_failed';
-      const retryAt=new Date(+new Date(this.now())+(code==='contact_source_unavailable'?300_000:60_000)).toISOString();
+      const code=safeFailureCode(error,operationalErrorCodes,'contact_read_failed');
+      const retryAt=new Date(+new Date(this.now())+(sourceErrorCodes.has(code)?300_000:60_000)).toISOString();
       await this.store.update((state)=>{Object.assign(initialize(state),{retryAt,lastError:code});}).catch(()=>{});
       this.log({at:stamp(this.now),type:'contact_sync_error',code,retryAt});throw failure(code);
     }finally{

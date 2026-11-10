@@ -133,6 +133,90 @@ test('separate Telegram incidents alert again and each explicit recovery is deli
     .every((item) => item.status === 'sent' && !item.supersededAt));
 });
 
+test('contact errors retain Google and database causes without exposing provider details',async(t)=>{
+  const f=await fixture(t);
+  for(const [code,expected] of [
+    ['google_network_error',/связаться с Google/u],
+    ['contact_read_failed',/Google-реестр/u],
+    ['contact_source_unavailable',/источник контактов/u],
+    ['contacts_source_unavailable',/базе заявок/u],
+    ['contacts_source_credentials_missing',/сохранённый доступ/u],
+    ['contacts_source_permissions_invalid',/Права чтения/u],
+  ]){
+    await f.report({type:'contact_source_error',code,providerResponse:'secret-provider-url'});
+    const sent=f.calls.filter(call=>call.method==='sendMessage').at(-1);
+    assert.match(sent.params.text,expected);
+    assert.ok(!sent.params.text.includes('Нужна проверка состояния обработчика'));
+    assert.ok(!sent.params.text.includes('secret-provider-url'));
+  }
+  assert.deepEqual((await records(f.store)).map(item=>item.event.code),[
+    'google_network_error','contact_read_failed','contact_source_unavailable','contacts_source_unavailable',
+    'contacts_source_credentials_missing','contacts_source_permissions_invalid']);
+});
+
+test('separate contact incidents notify independently and recovery is durable across restarts',async(t)=>{
+  const f=await fixture(t);const first='c'.repeat(32),second='d'.repeat(32);
+  const error={type:'contact_source_error',code:'google_network_error'};
+  await f.report({...error,incidentId:first});
+  await f.report({type:'contact_source_recovered',incidentId:first});
+  const restarted=createNotifier(f.config);
+  assert.equal((await restarted({type:'contact_source_recovered',incidentId:first})).delivery,'duplicate');
+  await restarted({...error,incidentId:second});
+  await restarted({type:'contact_source_recovered',incidentId:second});
+  const sent=f.calls.filter(call=>call.method==='sendMessage');
+  assert.equal(sent.length,4);
+  assert.equal(sent.filter(call=>call.params.text.includes('контактов восстановлено')).length,2);
+  assert.ok(sent.every(call=>call.params.chat_id===owner));
+});
+
+test('contact recovery cancels its undelivered alert while leaving other incidents and Telegram intact',async(t)=>{
+  let down=true;
+  const f=await fixture(t,{call:async(method)=>{
+    if(method==='getChat')return {id:Number(owner),type:'private'};
+    if(down)throw Object.assign(new Error('unavailable'),{code:'network_error'});
+    return {message_id:77,chat:{id:Number(owner),type:'private'}};
+  }});
+  const first='a'.repeat(32),second='b'.repeat(32);
+  await f.report({type:'contact_source_error',code:'google_network_error',incidentId:first});
+  await f.report({type:'contact_source_error',code:'google_network_error',incidentId:second});
+  await f.report({type:'telegram_error',code:'timeout',incidentId:first});
+  down=false;
+  await f.report({type:'contact_source_recovered',incidentId:first});
+  const entries=await records(f.store);
+  assert.equal(entries[0].status,'superseded');
+  assert.equal(entries[1].status,'pending');assert.equal(entries[2].status,'pending');
+  assert.equal(entries[3].status,'sent');
+});
+
+test('explicit legacy contact recovery retires old pending notice once without consuming a new incident',async(t)=>{
+  let down=true;
+  const f=await fixture(t,{call:async(method)=>{
+    if(method==='getChat')return {id:Number(owner),type:'private'};
+    if(down)throw Object.assign(new Error('unavailable'),{code:'network_error'});
+    return {message_id:77,chat:{id:Number(owner),type:'private'}};
+  }});
+  await f.report({type:'contact_source_error',code:'unknown_error'});
+  await f.report({type:'contact_source_error',code:'google_network_error',incidentId:'e'.repeat(32)});
+  down=false;
+  const recovery={type:'contact_source_recovered',incidentId:'f'.repeat(32),legacy:true};
+  assert.equal((await f.report(recovery)).delivery,'sent');
+  const entries=await records(f.store);
+  assert.equal(entries[0].status,'superseded');assert.equal(entries[1].status,'pending');
+  assert.equal((await createNotifier(f.config)(recovery)).delivery,'duplicate');
+  assert.equal(f.calls.filter(call=>call.method==='sendMessage'&&call.params.text.includes('восстановлено')).length,1);
+});
+
+test('contact recovery requires a valid explicit incident and unsafe cause codes stay redacted',async(t)=>{
+  const f=await fixture(t);
+  for(const incidentId of [undefined,'','private-provider-url']){
+    assert.equal((await f.report({type:'contact_source_recovered',incidentId})).delivery,'ignored');
+  }
+  await f.report({type:'contact_source_error',code:'contacts_source_private_password_secret',raw:'private-credential'});
+  const entry=(await records(f.store))[0];assert.equal(entry.event.code,'unknown_error');
+  assert.ok(!JSON.stringify(f.calls).includes('private_password'));
+  assert.ok(!JSON.stringify(f.logs).includes('private-credential'));
+});
+
 test('an explicit recovery supersedes its unsent outage notice before transport recovery can deliver stale error text', async (t) => {
   let unavailable = true;
   const delivered = [];

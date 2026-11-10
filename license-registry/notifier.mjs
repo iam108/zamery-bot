@@ -2,11 +2,31 @@ import { createHash } from 'node:crypto';
 
 const TYPES = new Set(['write_verified', 'processing_error', 'telegram_error', 'telegram_recovered', 'worker_error',
   'startup_failed', 'runtime_failed', 'api_blocked', 'review_required', 'runtime_initialized',
-  'contact_write_verified','contact_review_required','contact_source_error']);
+  'contact_write_verified','contact_review_required','contact_source_error','contact_source_recovered']);
 const COLUMNS = Object.freeze({ E: 'организация', G: 'ИНН', H: 'номер лицензии', I: 'дата выдачи',
   J: 'дата окончания', K: 'вид деятельности', L: 'адрес объекта', M: 'имя контакта', N: 'телефон', O: 'Telegram', P: 'email' });
 const REASONS = Object.freeze({
   contacts_source_failed: 'Не удалось прочитать заявки бота замеров. Обработчик повторит попытку.',
+  contact_source_unavailable: 'Не удалось прочитать источник контактов бота замеров.',
+  contact_read_failed: 'Не удалось прочитать Google-реестр для проверки контактов.',
+  contacts_source_unavailable: 'Не удалось подключиться к базе заявок бота замеров.',
+  contacts_source_connection_error: 'Соединение с базой заявок прервалось.',
+  contacts_source_credentials_missing: 'Не найден сохранённый доступ к базе заявок.',
+  contacts_source_credentials_invalid: 'Сохранённый доступ к базе заявок не прошёл проверку.',
+  contacts_source_permissions_invalid: 'Права чтения источника контактов не прошли проверку.',
+  contacts_source_schema_conflict: 'Структура источника контактов не прошла проверку.',
+  contacts_source_schema_missing: 'В базе заявок отсутствуют необходимые поля.',
+  contacts_source_role_conflict: 'Техническая учётная запись источника контактов не прошла проверку.',
+  contacts_source_connection_invalid: 'Настройки подключения к базе заявок не прошли проверку.',
+  contacts_source_connection_mismatch: 'Сохранённое подключение указывает на другую базу заявок.',
+  contacts_source_directory_invalid: 'Не удалось подтвердить каталог сохранённых настроек контактов.',
+  contacts_source_chat_invalid: 'Не настроена целевая группа клиентских заявок.',
+  contacts_source_bootstrap_invalid: 'Первоначальная настройка источника контактов не прошла проверку.',
+  contacts_source_closed: 'Соединение с источником контактов уже закрыто.',
+  contacts_source_invalid_inns: 'Список организаций для проверки контактов не прошёл проверку.',
+  contacts_source_invalid_response: 'Источник контактов вернул неподтверждённые данные.',
+  contacts_source_case_overflow: 'Источник контактов вернул слишком много карточек одной организации.',
+  contacts_source_report_overflow: 'Источник контактов вернул слишком много клиентских форм.',
   contacts_source_report_review: 'В исходной заявке неоднозначные контактные данные.',
   contact_source_ambiguous: 'Для этого объекта найдены разные контакты.',
   contact_source_invalid: 'Контакт из заявки не прошёл проверку.',
@@ -43,6 +63,7 @@ const REASONS = Object.freeze({
   google_network_error: 'Не удалось связаться с Google.',
   google_request_failed: 'Google отклонил запрос к реестру.',
   google_rate_limited: 'Google временно ограничил частоту запросов. Очередь сохранена; проверка повторится автоматически.',
+  google_request_limit_invalid: 'Настройки ограничения запросов к Google не прошли проверку.',
   google_token_unavailable: 'Не удалось подтвердить серверный вход в Google.',
   google_write_failed: 'Запись в Google-реестре пока не подтверждена.',
   sheet_plan_stale: 'Строка реестра изменилась во время обработки.',
@@ -138,19 +159,20 @@ function normalizeEvent(event) {
   if (event.type === 'write_verified' && !['append', 'update'].includes(event.action)) return null;
   if (event.type === 'contact_write_verified' && event.action !== 'update') return null;
   const incidentId = safeIncidentId(event.incidentId);
-  // Recovery is an explicit event from the polling monitor, never inferred
+  // Recovery is an explicit event from a dependency monitor, never inferred
   // from a routine successful send, flush, or startup notification.
-  if (event.type === 'telegram_recovered' && !incidentId) return null;
+  if (['telegram_recovered','contact_source_recovered'].includes(event.type) && !incidentId) return null;
   return {
     type: event.type, jobId: safeJobId(event.jobId),
     ...(incidentId ? { incidentId } : {}),
+    ...(event.type === 'contact_source_recovered' && event.legacy === true ? { legacy: true } : {}),
     ...(['write_verified','contact_write_verified'].includes(event.type) ? {
       action: event.action,
       columns: [...new Set((Array.isArray(event.cells) ? event.cells : [])
         .filter((value) => typeof value === 'string' && /^[A-Q][1-9]\d{0,7}$/u.test(value))
         .map((value) => value[0]).filter((column) => Object.hasOwn(COLUMNS, column)
           && (event.type!=='contact_write_verified'||['M','N','O'].includes(column))))].sort(),
-    } : ['runtime_initialized', 'telegram_recovered'].includes(event.type) ? {} : { code: safeCode(event.code) }),
+    } : ['runtime_initialized', 'telegram_recovered','contact_source_recovered'].includes(event.type) ? {} : { code: safeCode(event.code) }),
     organization: safeOrganization(event.organization),
   };
 }
@@ -162,6 +184,7 @@ function metadata(event, at) {
 }
 function messageOf(event) {
   if (event.type === 'telegram_recovered') return 'Получение сообщений Telegram восстановлено. Очередь сохранена.';
+  if (event.type === 'contact_source_recovered') return 'Автозаполнение контактов восстановлено. Проверка реестра завершена; очередь сохранена.';
   const organization = event.organization ? `Организация: ${event.organization}.` : '';
   const job = event.jobId ? `Событие: ${event.jobId}.` : '';
   if(event.type==='contact_write_verified')return ['Заполнен контакт в реестре лицензий.',organization,
@@ -170,7 +193,8 @@ function messageOf(event) {
   if(event.type==='contact_review_required')return ['Нужна проверка контакта в реестре лицензий.',organization,
     REASONS[event.code]??'Однозначное совпадение контакта не подтверждено.'].filter(Boolean).join('\n');
   if(event.type==='contact_source_error')return ['Автозаполнение контактов временно недоступно.',
-    REASONS[event.code]??REASONS.contacts_source_failed].join('\n');
+    REASONS[event.code]??REASONS.contacts_source_failed,
+    'Повторная проверка выполняется автоматически.'].join('\n');
   if (event.type === 'write_verified') {
     const action = event.action === 'append' ? 'Добавлена запись в реестр лицензий.' : 'Обновлена запись в реестре лицензий.';
     const columns = event.columns.length ? `Поля: ${event.columns.map((column) => COLUMNS[column]).join(', ')}.` : '';
@@ -278,12 +302,14 @@ export function createNotifier({ telegram, store, ownerChatId, now = () => new D
       ...(event.incidentId ? { incidentId: event.incidentId } : {}) });
     const created = await store.update((state) => {
       state.runtime ??= {}; state.runtime.notifications ??= {};
-      if (event.type === 'telegram_recovered') {
+      if (['telegram_recovered','contact_source_recovered'].includes(event.type)) {
         // Once recovery is durably queued, an unsent outage notice for this
         // incident must not appear later as though the outage were still live.
+        const errorType=event.type==='telegram_recovered'?'telegram_error':'contact_source_error';
         for (const item of Object.values(state.runtime.notifications)) {
           if (item.status === 'pending' && item.destinationHash === destinationHash
-            && item.event?.type === 'telegram_error' && item.event.incidentId === event.incidentId) {
+            && item.event?.type === errorType && (item.event.incidentId === event.incidentId
+              || (event.type==='contact_source_recovered' && event.legacy && !item.event.incidentId))) {
             item.status = 'superseded'; item.supersededAt = stamp(now);
             item.supersededBy = fingerprint;
           }

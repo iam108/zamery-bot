@@ -13,6 +13,7 @@ import {createPollingMonitor,pollOnce,safeNotification} from './polling.mjs';
 import {importOfficialLicenseEvidence} from './official-evidence.mjs';
 import {prepareContactSource} from './contact-source.mjs';
 import {ContactWorker,triggerContactSync} from './contact-worker.mjs';
+import {createContactsMonitor,contactSyncOnce} from './contacts-monitor.mjs';
 import {convertOwnerUpdate,contactReplyCoverage} from './contact-reply-input.mjs';
 import {ContactReplyWorker} from './contact-reply-worker.mjs';
 import {RegistryCompletionWorker} from './registry-completion.mjs';
@@ -141,6 +142,7 @@ async function initialize(){
 async function run({store,telegram,worker,contacts,contactReplies,registryCompletion,config,botId}){
   const log=(event)=>console.log(JSON.stringify({at:new Date().toISOString(),...event}));
   const monitor=createPollingMonitor({store,report,log});
+  const contactsMonitor=contacts?createContactsMonitor({store,report,log,secrets}):null;
   function wakeSignal(){
     let resolve=null;let notified=false;
     return {notify(){notified=true;resolve?.();},async wait(){
@@ -187,17 +189,8 @@ async function run({store,telegram,worker,contacts,contactReplies,registryComple
     }
   })();
   const enriching=contacts?(async()=>{
-    let verified=false;
     while(!stopping){
-      try{
-        if(!verified){const source=await contacts.sourceFactory();await source.close();health.success('contacts');verified=true;}
-        const result=await contacts.tick();
-        if(!result?.skipped)health.success('contacts');
-      }catch(error){
-        verified=false;
-        const code=safeErrorCode(error,'contacts_source_failed',secrets);
-        health.failure('contacts',code);await report({type:'contact_source_error',code});
-      }
+      await contactSyncOnce({contacts,monitor:contactsMonitor,health,signal:controller.signal,secrets,log});
       await sleep(60000,undefined,{signal:controller.signal}).catch(()=>{});
     }
   })():Promise.resolve();
@@ -228,8 +221,7 @@ async function run({store,telegram,worker,contacts,contactReplies,registryComple
             const last=[...journal].reverse().find((item)=>item.type==='registry_completion_write_verified');
             if(last?.planHash){
               await triggerContactSync(store,`registry-${last.planHash}`);
-              try{const contactResult=await contacts.tick();if(!contactResult?.skipped)health.success('contacts');}
-              catch(error){health.failure('contacts',safeErrorCode(error,'contacts_source_failed',secrets));}
+              await contactSyncOnce({contacts,monitor:contactsMonitor,health,signal:controller.signal,secrets,log});
             }
           }
         }

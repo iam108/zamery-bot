@@ -168,6 +168,19 @@ test('enabled contact source is independently visible without invalidating core 
   assert.equal(health.snapshot().dependencies.api.ok,true);
 });
 
+test('restored dependency observations preserve their age and a persisted failure stays unhealthy',()=>{
+  let at=Date.parse(INITIAL)+600000;
+  const health=createReadiness({contactsEnabled:true,now:()=>new Date(at)});
+  health.restore('contacts',{lastSuccessAt:INITIAL,lastError:null});
+  assert.equal(health.snapshot().dependencies.contacts.ok,true);
+  assert.equal(health.snapshot().dependencies.contacts.lastSuccessAt,INITIAL);
+  health.restore('contacts',{lastSuccessAt:INITIAL,lastFailureAt:new Date(at).toISOString(),lastError:'google_network_error'});
+  assert.equal(health.snapshot().dependencies.contacts.ok,false);
+  assert.equal(health.snapshot().dependencies.contacts.lastError,'google_network_error');
+  assert.throws(()=>health.restore('contacts',{lastSuccessAt:'not a date'}),/invalid_health_observation/u);
+  assert.throws(()=>health.restore('contacts',{lastSuccessAt:new Date(at+1).toISOString()}),/invalid_health_observation/u);
+});
+
 test('owner reply processing has independent readiness and stale detection',()=>{
   let at=Date.parse(INITIAL);
   const health=createReadiness({contactsEnabled:true,ownerRepliesEnabled:true,now:()=>new Date(at)});

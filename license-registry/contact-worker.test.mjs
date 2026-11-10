@@ -112,6 +112,71 @@ test('source failure stores a five-minute retry and exposes only a fixed code',a
   assert.equal(h.calls.sourceFactory,1);
 });
 
+test('Google read failures retain safe provider codes, retry in one minute and recover without duplicate writes',async(t)=>{
+  for(const code of ['google_network_error','google_rate_limited','google_access_denied'])await t.test(code,async(t)=>{
+    const h=await fixture(t);const context=h.google.context;
+    h.google.context=async()=>{throw Object.assign(new Error('private provider response with credentials'),{code});};
+    await assert.rejects(h.worker().tick(),{code});
+    const failed=await h.store.read();
+    assert.equal(failed.contacts.lastError,code);
+    assert.equal(failed.contacts.retryAt,'2026-11-05T09:01:00.000Z');
+    assert.equal(h.logs.at(-1).code,code);assert.equal(h.calls.sourceFactory,0);assert.equal(h.calls.batches.length,0);
+    assert.ok(!JSON.stringify([failed,h.logs]).includes('private provider response'));
+    h.google.context=context;h.advance(59_999);
+    assert.equal((await h.worker().tick()).skipped,'not_due');assert.equal(h.calls.sourceFactory,0);
+    h.advance(1);assert.equal((await h.worker().tick()).updated,1);
+    const recovered=await h.store.read();assert.equal(recovered.contacts.lastError,null);assert.equal(recovered.contacts.retryAt,null);
+    h.advance(900_001);await h.worker().tick();assert.equal(h.calls.batches.length,1);
+  });
+});
+
+test('source setup, verification and lookup failures retain known codes with a five-minute retry',async(t)=>{
+  for(const [stage,code]of [['setup','contacts_source_credentials_missing'],['verify','contacts_source_permissions_invalid'],
+    ['lookup','contacts_source_schema_conflict'],['lookup','contacts_source_unavailable'],
+    ['lookup','contacts_source_case_overflow'],['lookup','contacts_source_report_overflow']])await t.test(`${stage}: ${code}`,async(t)=>{
+    const h=await fixture(t);let closed=0;let opened=0;
+    const reject=()=>{throw Object.assign(new Error('private database connection and SQL'),{code});};
+    const worker=new ContactWorker({...h.config,sourceFactory:async()=>{
+      opened++;if(stage==='setup')reject();
+      return {async verify(){if(stage==='verify')reject();},async lookup(){reject();},async close(){closed++;}};
+    }});
+    await assert.rejects(worker.tick(),{code});
+    const failed=await h.store.read();assert.equal(failed.contacts.lastError,code);
+    assert.equal(failed.contacts.retryAt,'2026-11-05T09:05:00.000Z');assert.equal(h.logs.at(-1).code,code);
+    assert.equal(closed,stage==='setup'?0:1);assert.equal(h.calls.batches.length,0);
+    assert.ok(!JSON.stringify([failed,h.logs]).includes('private database'));
+    h.advance(299_999);assert.equal((await worker.tick()).skipped,'not_due');assert.equal(opened,1);
+    h.advance(1);await assert.rejects(worker.tick(),{code});assert.equal(opened,2);
+  });
+});
+
+test('state lock codes survive both dependency stages and use the one-minute storage retry',async(t)=>{
+  for(const stage of ['google','source'])await t.test(stage,async(t)=>{
+    const h=await fixture(t);const reject=()=>{throw Object.assign(new Error('private storage path'),{code:'state_locked'});};
+    if(stage==='google')h.google.context=async()=>reject();
+    const worker=new ContactWorker({...h.config,...(stage==='source'?{sourceFactory:async()=>reject()}:{} )});
+    await assert.rejects(worker.tick(),{code:'state_locked'});
+    const failed=await h.store.read();assert.equal(failed.contacts.lastError,'state_locked');
+    assert.equal(failed.contacts.retryAt,'2026-11-05T09:01:00.000Z');
+    assert.equal(h.logs.at(-1).code,'state_locked');assert.ok(!JSON.stringify([failed,h.logs]).includes('private storage'));
+  });
+});
+
+test('unrecognized codes and error messages never enter persisted contact diagnostics',async(t)=>{
+  for(const [stage,code]of [['google','google_private_provider_details'],['source','contacts_source_private_sql'],
+    ['source','postgres://private:secret@db'],['google',undefined]])await t.test(`${stage}: ${code??'message only'}`,async(t)=>{
+    const h=await fixture(t);const reject=()=>{throw Object.assign(new Error('google_network_error private secret and SQL'),code?{code}:{});};
+    if(stage==='google')h.google.context=async()=>reject();
+    const worker=new ContactWorker({...h.config,...(stage==='source'?{sourceFactory:async()=>reject()}:{} )});
+    const expected=stage==='source'?'contact_source_unavailable':'contact_read_failed';
+    await assert.rejects(worker.tick(),{code:expected});
+    const failed=await h.store.read();assert.equal(failed.contacts.lastError,expected);assert.equal(h.logs.at(-1).code,expected);
+    assert.equal(failed.contacts.retryAt,stage==='source'?'2026-11-05T09:05:00.000Z':'2026-11-05T09:01:00.000Z');
+    const diagnostic=JSON.stringify([failed,h.logs]);
+    for(const unsafe of ['private','secret','SQL',code].filter(Boolean))assert.ok(!diagnostic.includes(unsafe));
+  });
+});
+
 test('write limit retains remaining rows for the next minute',async(t)=>{
   const h=await fixture(t,{rows:[row(),row(INN,'Второй адрес')],cases:[source(),source(2,INN,'Второй адрес')],maxWrites:1});
   const first=await h.worker().tick();assert.equal(first.updated,1);assert.equal(first.nextSyncAt,'2026-11-05T09:01:00.000Z');
