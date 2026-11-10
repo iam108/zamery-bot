@@ -11,7 +11,7 @@ function actualFunction(name) {
   const rest = source.slice(start), next = rest.slice(1).search(/\n  (?:(?:async )?function |var )/);
   return next < 0 ? rest : rest.slice(0, next + 1);
 }
-function load(c, ...names) { if(names.includes('fetchAuditFile')||names.includes('request'))names=['requestWithDeadline',...names];if(names.includes('postEvidence')&&source.includes('async function recoverEvidenceUpload('))names=['recoverEvidenceUpload',...names];vm.runInContext(names.map(actualFunction).join('\n'), c); }
+function load(c, ...names) { if(names.includes('fetchAuditFile')||names.includes('request'))names=['requestWithDeadline',...names];if(names.some(name=>['removeGeneratedEvidence','deleteEvidence','recoverUnconfirmedWrite','reconcileDraft'].includes(name)))names=['removalApplied','forgetEvidence','removeEvidenceFile',...names];if(names.includes('postEvidence')&&source.includes('async function recoverEvidenceUpload('))names=['recoverEvidenceUpload',...names];vm.runInContext(names.map(actualFunction).join('\n'), c); }
 function harness() {
   const calls=[],nodes=new Map();
   const node=key=>{if(!nodes.has(key))nodes.set(key,{textContent:'',innerHTML:'',dataset:{},style:{},disabled:false,hidden:false,querySelector:()=>null,querySelectorAll:()=>[],remove(){calls.push(['host-removed']);}});return nodes.get(key);};
@@ -20,7 +20,7 @@ function harness() {
     $:node,root:node('#root'),calls,tail:Promise.resolve(),timer:null,pendingSave:null,queuedJobs:0,closingConfirmation:false,saveRetries:0,editor:null,activePlanId:'main',managerPlanIntents:new Map(),orderId:'123',localKey:'test-only',tg:null,
     clone:copy,clearTimeout,setTimeout,console,TextEncoder,URL,OUTCOME_LABELS:{ready:'Соответствует по проверенным пунктам',actions:'Нужны действия'},
     document:{body:{classList:{add(){},remove(){}},appendChild(){calls.push(['host-added']);}},createElement:()=>node('export-host')},
-    window:{},localStorage:{setItem(){},removeItem(){}},
+    window:{},blobUrls:new Map(),localStorage:{setItem(){},removeItem(){}},
     render(){calls.push(['render']);},refreshChrome(){},notify(text){calls.push(['notify',text]);},notice(){},status(text){calls.push(['status',text]);},timeLabel:()=> '12:00',localDate:()=> '2026-10-30',localSave(){},issues:()=>[],packetFiles:()=>[],
     changed(){c.state.dirty=true;c.state.version++;},syncMapCards(){},evidenceUrl:async id=>'blob:'+id,uploadEditorSource:async()=>{},
     flush:async()=>{calls.push(['flush']);c.state.dirty=false;},
@@ -761,4 +761,93 @@ test('uncertain evidence recovery verifies original bytes rather than trusting o
   load(c, 'postEvidence');
   await assert.rejects(c.postEvidence({ name: 'Phone.png', type: 'image/png' }, 'entrance', 'door-1', Buffer.from('Original').toString('base64')), /lost evidence ACK/);
   assert.equal(c.state.draft.revision, baseline); assert.equal(c.state.evidence.length, 0);
+}));
+
+test('a committed evidence removal with a lost ACK preserves in-flight text and permits the next draft save', { skip: !process.env.PGLITE_TEST_MODULE }, () => evidenceDatabase(async (store, db) => {
+  const c=harness(), fileId=require('node:crypto').randomUUID();
+  c.window.confirm=()=>true;c.blobUrls=new Map();
+  c.state.draft=await store.create(108,123,c.state.data);
+  const uploaded=await store.addEvidence(108,c.state.draft.id,{id:fileId,revision:c.state.draft.revision,name:'Phone.png',mime:'image/png',role:'interior',subject_id:'',data:Buffer.from('Original image').toString('base64')});
+  c.state.draft.revision=uploaded.revision;c.state.evidence=[uploaded.evidence];
+  c.request=async(url,options)=>{
+    if(!options)return{draft:await store.current(108,123)};
+    const input=JSON.parse(options.body);
+    if(options.method==='DELETE'){
+      await store.removeEvidence(108,c.state.draft.id,fileId,input.revision);
+      c.state.data.conclusion='Text typed while removal acknowledgement was lost';c.changed();
+      throw Object.assign(new Error('Synthetic lost removal ACK'),{retryable:true});
+    }
+    return{draft:await store.update(108,c.state.draft.id,input.revision,input.data)};
+  };
+  load(c,'deleteEvidence','flush','saveNow');
+  await c.deleteEvidence(fileId);await c.tail;
+  await c.saveNow();
+  assert.equal(!!c.state.conflict,false);
+  assert.equal(c.state.evidence.length,0);
+  assert.equal((await store.current(108,123)).data.conclusion,'Text typed while removal acknowledgement was lost');
+  assert.ok((await db.query('SELECT deleted_at FROM audit_evidence WHERE id=$1',[fileId])).rows[0].deleted_at);
+}));
+
+async function removalFixture(store,generated=false){
+  const c=harness(),fileId=require('node:crypto').randomUUID();c.window.confirm=()=>true;
+  if(generated)c.state.data.plan.preview_evidence_id=fileId;else c.state.data.plan.evidence_id=fileId;
+  c.state.draft=await store.create(108,123,c.state.data);
+  const uploaded=await store.addEvidence(108,c.state.draft.id,{id:fileId,revision:c.state.draft.revision,name:'Plan.png',mime:'image/png',role:generated?'plan':'plan-source',subject_id:generated?'annotation':'source',data:Buffer.from('Exact plan original').toString('base64')});
+  c.state.draft.revision=uploaded.revision;c.state.evidence=[uploaded.evidence];
+  c.request=async(url,options)=>{
+    if(!options)return{draft:await store.current(108,123)};
+    const input=JSON.parse(options.body);
+    if(options.method==='DELETE')return store.removeEvidence(108,c.state.draft.id,fileId,input.revision);
+    return{draft:await store.update(108,c.state.draft.id,input.revision,input.data)};
+  };
+  load(c,'deleteEvidence','flush','saveNow','merge','restoreData','reconcileDraft');return{c,fileId};
+}
+
+test('a removal lost during an outage is recovered after reopen without losing typed text or leaving a deleted source selected', { skip: !process.env.PGLITE_TEST_MODULE }, () => evidenceDatabase(async store=>{
+  const {c,fileId}=await removalFixture(store),request=c.request;let offline=false;
+  c.request=async(url,options)=>{
+    if(offline)throw Object.assign(new Error('Synthetic outage'),{retryable:true});
+    const result=await request(url,options);
+    if(options?.method==='DELETE'){offline=true;c.state.data.conclusion='Keep local notes through restart';c.changed();throw Object.assign(new Error('Lost deletion ACK'),{retryable:true});}
+    return result;
+  };
+  await c.deleteEvidence(fileId);await c.tail;assert.ok(c.state.attempt.remove_id);assert.equal(c.state.evidence.length,1);
+  const local={draft_id:c.state.draft.id,revision:c.state.draft.revision,data:copy(c.state.data),dirty:true,attempt:copy(c.state.attempt)};
+  const reopened=harness();load(reopened,'merge','restoreData','reconcileDraft','flush','saveNow');
+  reopened.state.data=copy(local.data);reopened.state.draft={id:local.draft_id,revision:local.revision};reopened.state.attempt=copy(local.attempt);reopened.state.dirty=true;reopened.request=request;
+  reopened.reconcileDraft(local,await store.current(108,123));
+  assert.equal(!!reopened.state.conflict,false);assert.equal(reopened.state.attempt,null);assert.equal(reopened.state.data.plan.evidence_id,'');assert.deepEqual(copy(reopened.state.data.plan.annotations),[]);
+  await reopened.saveNow();const saved=await store.current(108,123);assert.equal(saved.data.conclusion,local.data.conclusion);assert.equal(saved.data.plan.evidence_id,'');assert.equal(saved.evidence.length,0);
+}));
+
+test('removal recovery never adopts another window newer observation or advances its local baseline', { skip: !process.env.PGLITE_TEST_MODULE }, () => evidenceDatabase(async store=>{
+  const {c,fileId}=await removalFixture(store),request=c.request,baseline=c.state.draft.revision;
+  c.request=async(url,options)=>{
+    const result=await request(url,options);
+    if(options?.method==='DELETE'){
+      await store.update(108,c.state.draft.id,result.revision,{...copy(c.state.data),conclusion:'Other window latest observation'});
+      throw Object.assign(new Error('Lost deletion ACK'),{retryable:true});
+    }
+    return result;
+  };
+  await c.deleteEvidence(fileId);await c.tail;
+  assert.equal(c.state.conflict,true);assert.equal(c.state.draft.revision,baseline);assert.equal(c.state.evidence.length,1);
+  c.state.data.conclusion='Keep my local observation';c.changed();await assert.rejects(c.saveNow(),/конфликт/i);
+  assert.equal((await store.current(108,123)).data.conclusion,'Other window latest observation');assert.equal(c.state.data.conclusion,'Keep my local observation');
+}));
+
+test('an uncommitted removal cannot be mistaken for an absent file and the auditor can deliberately retry it', { skip: !process.env.PGLITE_TEST_MODULE }, () => evidenceDatabase(async store=>{
+  const {c,fileId}=await removalFixture(store),request=c.request;let fail=true;
+  c.request=async(url,options)=>{if(fail&&options?.method==='DELETE')throw Object.assign(new Error('Disconnected before deletion reached server'),{retryable:true});return request(url,options);};
+  await c.deleteEvidence(fileId);await c.tail;
+  assert.equal(c.state.evidence.length,1);assert.equal(c.state.data.plan.evidence_id,fileId);assert.equal(c.state.attempt,null);assert.equal(!!c.state.conflict,false);
+  fail=false;await c.deleteEvidence(fileId);await c.tail;
+  assert.equal(c.state.evidence.length,0);assert.equal(c.state.data.plan.evidence_id,'');assert.equal((await store.current(108,123)).data.plan.evidence_id,'');
+}));
+
+test('a generated-preview removal with a lost ACK recovers its revision and preserves the newer selected preview', { skip: !process.env.PGLITE_TEST_MODULE }, () => evidenceDatabase(async store=>{
+  const {c,fileId}=await removalFixture(store,true),request=c.request;c.state.data.plan.preview_evidence_id='new-current-preview';const before=copy(c.state.data.plan);
+  c.request=async(url,options)=>{const result=await request(url,options);if(options?.method==='DELETE')throw Object.assign(new Error('Lost generated deletion ACK'),{retryable:true});return result;};
+  await c.removeGeneratedEvidence(fileId);assert.deepEqual(copy(c.state.data.plan),before);assert.equal(c.state.evidence.length,0);assert.equal(c.state.attempt,null);
+  c.state.data.conclusion='After regenerating preview';c.changed();await c.saveNow();assert.equal((await store.current(108,123)).data.conclusion,'After regenerating preview');
 }));

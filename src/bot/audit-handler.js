@@ -19,6 +19,10 @@ function canonicalJson(value) {
     return Object.fromEntries(Object.keys(item).sort().map(name => [name, item[name]]));
   });
 }
+function deliveryDestination(value) {
+  const chat=String(value || '').trim();
+  return chat.startsWith('@') ? chat.toLowerCase() : chat;
+}
 
 // Telegram иногда просит подождать (429 Too Many Requests) — ждём указанное время и повторяем
 async function tgRetry(fn, beforeRequest) {
@@ -70,9 +74,16 @@ async function handleAuditReport(ctx, data) {
   // contract. Request fields cannot enable this path for a fresh report.
   const legacyDelivery = !!progress && progress.signature === signature && (progress.deliveryVersion == null || [1, 2].includes(progress.deliveryVersion));
   validateWorkflow(data, { legacyDelivery });
-  if (!progress) {
-    progress = { signature, ...(data.ui_version === 5 ? { deliveryVersion: 3 } : {}), textIds: [], photoIds: [], documentIds: [], saved: false, handoffSent: false, orderCardLinked: false, replied: false, job: null };
+  const destination=deliveryDestination(process.env.GROUP_CHAT_ID);
+  if (progress?.destination != null && deliveryDestination(progress.destination) !== destination) {
+    throw Object.assign(new Error('Рабочий чат отчёта изменён в настройках. Отправка остановлена: уже подтверждённые части не будут перенесены в другой чат. Восстановите прежнюю настройку чата и повторите отправку этой версии.'), { status:409, code:'AUDIT_DELIVERY_DESTINATION_CHANGED' });
   }
+  if (!progress) {
+    progress = { signature, destination, ...(data.ui_version === 5 ? { deliveryVersion: 3 } : {}), textIds: [], photoIds: [], documentIds: [], saved: false, handoffSent: false, orderCardLinked: false, replied: false, job: null };
+  }
+  // Former partial checkpoints contain only message IDs, with no trustworthy
+  // source chat. Keep their exact resume contract; do not guess or rewrite it.
+  else if (progress.destination == null && !progress.inflight && !progress.saved && !progress.handoffSent && !progress.textIds?.length && !progress.photoIds?.length && !progress.documentIds?.length) progress.destination=destination;
   if (progress.deliveryVersion != null && ![1, 2, 3].includes(progress.deliveryVersion)) throw new Error('Неизвестный формат доставки отчёта. Отправка остановлена, чтобы не потерять материалы.');
   if (key && !seenSubmits.has(key)) {
       seenSubmits.set(key, progress);
@@ -129,8 +140,8 @@ async function handleAuditReportInner(ctx, data, progress, validationOptions) {
   }
   async function checkpoint() {
     if (ctx.auditDelivery) {
-      const { signature, deliveryVersion, textIds, photoIds, documentIds, saved, handoffSent, orderCardLinked, orderCardLinkSkipped, replied, inflight, lastRiskRetryCursor } = progress;
-      await ctx.auditDelivery.save({ signature, ...(deliveryVersion != null ? { deliveryVersion } : {}), textIds, photoIds, documentIds, saved, handoffSent, orderCardLinked, ...(orderCardLinkSkipped ? { orderCardLinkSkipped } : {}), replied, ...(inflight ? { inflight } : {}), ...(lastRiskRetryCursor ? { lastRiskRetryCursor } : {}) });
+      const { signature, destination, deliveryVersion, textIds, photoIds, documentIds, saved, handoffSent, orderCardLinked, orderCardLinkSkipped, replied, inflight, lastRiskRetryCursor } = progress;
+      await ctx.auditDelivery.save({ signature, ...(destination != null ? { destination } : {}), ...(deliveryVersion != null ? { deliveryVersion } : {}), textIds, photoIds, documentIds, saved, handoffSent, orderCardLinked, ...(orderCardLinkSkipped ? { orderCardLinkSkipped } : {}), replied, ...(inflight ? { inflight } : {}), ...(lastRiskRetryCursor ? { lastRiskRetryCursor } : {}) });
     }
   }
   if (progress.inflight) throw unknownDelivery();

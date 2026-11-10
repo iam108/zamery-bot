@@ -170,6 +170,25 @@ test('metadata string, key and nesting limits fail without retaining provider re
   }
 });
 
+test('provider metadata cannot mutate prototypes and JSON comments are rejected by the strict parser', async t => {
+  const directory = await root(t);
+  const encoded = pdf().toString('base64');
+  const payload = '{"id_req":77,"__proto__":{"egrn_polluted":true},"constructor":{"prototype":{"egrn_polluted":true}},"status":[{"type":"processed","file":"' + encoded + '"}]}';
+  const result = await readStatusResponse(pieces(payload, 5), { idReq: 77, root: directory });
+  try {
+    assert.equal({}.egrn_polluted, undefined);
+    assert.equal(Object.getPrototypeOf(result.item), null);
+    assert.equal(Object.hasOwn(result.item, '__proto__'), true);
+    assert.equal(result.item.__proto__.egrn_polluted, true);
+    assert.equal((await result.documents()).length, 1);
+  } finally { await result.cleanup(); }
+  await empty(directory);
+  for (const comment of ['/* not JSON */', '// not JSON\n']) {
+    await assert.rejects(readStatusResponse(pieces(comment + payload, 5), { idReq: 77, root: directory }), error => error.code === 'EGRN_SOURCE_RESPONSE');
+    await empty(directory);
+  }
+});
+
 test('stored and deflated ZIP PDFs are extracted sequentially, with duplicate content and XML excluded', async t => {
   const directory = await root(t), first = pdf(289), second = pdf(293, 0x62);
   assert.equal(crc32(Buffer.from('123456789')), 0xcbf43926);

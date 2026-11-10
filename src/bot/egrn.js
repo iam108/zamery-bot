@@ -109,14 +109,17 @@ async function persistFileRecords(order, records) {
   if ((order.deliver || []).some(target => target?.order_id) && records.some(file => file.kind==='link' || Number(file.bytes) > 12 * 1024 * 1024)) await require('../web/order-egrn-links').registerOrderLinks(order, records);
 }
 
+function canonicalChat(value) { const text=String(value);return /^@[a-z][a-z0-9_]{4,31}$/i.test(text)?text.toLowerCase():text; }
+function fileReceiptKey(chat,key) { return JSON.stringify([canonicalChat(chat),key]); }
 function nativeDeliveryTargets(order, record) {
   const values = [{ chat: order.chat_id }, ...(Array.isArray(order.deliver) ? order.deliver : [])];
   if (order.ordered_by) values.push({ chat: order.ordered_by });
   const unique = new Map();
   for (const value of values) {
-    if (!value || !/^-?[1-9]\d*$/.test(String(value.chat || ''))) continue;
-    if (record.document_kind === 'xml' && String(value.chat) !== String(record.chat)) continue;
-    if (!unique.has(String(value.chat))) unique.set(String(value.chat), value);
+    if (!value || !/^(?:-?[1-9]\d*|@[a-z][a-z0-9_]{4,31})$/i.test(String(value.chat || ''))) continue;
+    const chat=canonicalChat(value.chat);
+    if (record.document_kind === 'xml' && chat !== canonicalChat(record.chat)) continue;
+    if (!unique.has(chat)) unique.set(chat, typeof value.chat==='string'&&value.chat.startsWith('@')?{...value,chat}:value);
   }
   return [...unique.values()];
 }
@@ -150,9 +153,9 @@ async function deliverNativeRecord(order, record, records) {
   const confirmed = {};
   const deliveries = Array.isArray(record.deliveries) ? record.deliveries : [];
   // Legacy native records already prove their delivery to the primary chat.
-  confirmed[JSON.stringify([String(record.chat), record.key || String(record.chat) + ':' + String(record.id)])] = true;
+  confirmed[fileReceiptKey(record.chat, record.key || String(record.chat) + ':' + String(record.id))] = true;
   for (const receipt of deliveries) {
-    if (receipt && receipt.id) confirmed[JSON.stringify([String(receipt.chat), record.key || String(record.chat) + ':' + String(record.id)])] = true;
+    if (receipt && receipt.id) confirmed[fileReceiptKey(receipt.chat, record.key || String(record.chat) + ':' + String(record.id))] = true;
   }
   let blocked;
   for (const target of nativeDeliveryTargets(order, record)) try { await copyFiles([record], [target], { strict: true, confirmed,
@@ -197,7 +200,7 @@ async function resumeLargeDelivery(order) {
 
 function documentRecord(message, chat, key, file) {
   const mime = message.document?.mime_type || (/\.pdf$/i.test(file.name) ? 'application/pdf' : /\.zip$/i.test(file.name) ? 'application/zip' : 'application/octet-stream');
-  const record = { chat: Number(chat), id: message.message_id, key, document_kind: file.kind || '', name: file.name, mime, bytes: file.buf.length, sha256: originalHash(file) };
+  const record = { chat: String(chat).startsWith('@')?canonicalChat(chat):Number(chat), id: message.message_id, key, document_kind: file.kind || '', name: file.name, mime, bytes: file.buf.length, sha256: originalHash(file) };
   if (message.document?.file_id) record.file_id = message.document.file_id;
   return record;
 }
@@ -1116,12 +1119,19 @@ async function copyFiles(fileMsgs, targets, options = {}) {
     return 0;
   }
   const confirmed = options.confirmed || {};
+  // Older receipts may retain the public chat's original letter case.
+  // Telegram usernames identify the same recipient in either case.
+  for (const [key,value] of Object.entries(confirmed)) if(value===true) try {
+    const pair=JSON.parse(key);
+    if(Array.isArray(pair)&&pair.length===2&&typeof pair[0]==='string'&&pair[0].startsWith('@'))confirmed[fileReceiptKey(pair[0],pair[1])]=true;
+  } catch (_) {}
   let n = 0;
-  for (const t of targets) {
+  for (const destination of targets) {
+    const t=typeof destination?.chat==='string'&&destination.chat.startsWith('@')?{...destination,chat:canonicalChat(destination.chat)}:destination;
     for (const fm of fileMsgs) {
       // A reply thread is not another recipient. Keep receipts stable when the
       // same case is resumed with a new card or a refreshed download URL.
-      const key = JSON.stringify([String(t.chat), fm.key || String(fm.chat) + ':' + String(fm.id)]);
+      const key = fileReceiptKey(t.chat, fm.key || String(fm.chat) + ':' + String(fm.id));
       if (confirmed[key] === true) continue;
       let stage = 'telegram';
       try {
@@ -1164,9 +1174,9 @@ async function deliverCachedCopy(order, targets, copyOptions = {}) {
   const confirmed = { ...copyOptions.confirmed };
   for (const record of records) {
     const key = sourceKey(record);
-    if (record.kind !== 'link' && record.chat && record.id) confirmed[JSON.stringify([String(record.chat), key])] = true;
+    if (record.kind !== 'link' && record.chat && record.id) confirmed[fileReceiptKey(record.chat, key)] = true;
     for (const receipt of Array.isArray(record.deliveries) ? record.deliveries : []) {
-      if (receipt?.id) confirmed[JSON.stringify([String(receipt.chat), key])] = true;
+      if (receipt?.id) confirmed[fileReceiptKey(receipt.chat, key)] = true;
     }
   }
   for (const target of targets) for (const record of records) {

@@ -23,9 +23,10 @@ function harness(options={}){
   events.push({method,args});await options.beforePost?.(method,args);
   if(method==='editMessageReplyMarkup')return true;
   const payloads=method==='sendMediaGroup'?args[1]:[args[1]],items=payloads.map(payload=>{const kind=method==='sendMessage'?'text':method==='sendPhoto'?'photo':method==='sendDocument'?'document':payload.type,file=method==='sendMediaGroup'?payload.media:payload;return{kind,payload,message_id:next++,chat:{id:Number(GROUP)},filename:file?.filename,buffer:kind==='text'?null:Buffer.from(file.source)};});
+  for(const item of items)item.chat=options.receiptChat||{id:Number(options.group||GROUP)};
   delivered.push(...items);const result=method==='sendMediaGroup'?items:items[0];await options.afterPost?.(method,args,result);return result;
  };
- const context={module:{exports:{}},Buffer,URL,process:{env:{GROUP_CHAT_ID:GROUP,WEBAPP_URL:'https://synthetic.example'}},console:{log(){},error(){}},setTimeout:()=>({unref(){}}),require(name){
+ const context={module:{exports:{}},Buffer,URL,process:{env:{GROUP_CHAT_ID:options.group||GROUP,WEBAPP_URL:'https://synthetic.example'}},console:{log(){},error(){}},setTimeout:()=>({unref(){}}),require(name){
   if(name==='../db/queries')return{getOrderById:async()=>({telegram_msg_id:options.orderCard===undefined?77:options.orderCard})};
   if(name==='../web/handoff')return{saveAudit:async(...args)=>{saves.push(args);events.push({method:'saveAudit',args});}};
   if(name==='../web/order-report-link')return{...require('../src/web/order-report-link'),syncOrderReportLink:async()=>({state:'linked'})};
@@ -51,6 +52,25 @@ test('fresh v3 sends the scheme/plans/photos before a short brief and preserves 
  assert.equal(h.saves.length,1);assert.equal(h.saves[0][1],full);assert.equal(data.conclusion,before);assert.equal(h.saves[0][3][0],summary.message_id);assert.ok(h.delivered[0].message_id<summary.message_id);
  assert.deepEqual(Array.from(h.saves[0][3]),[summary.message_id,...h.delivered.filter(item=>item.kind==='photo').map(item=>item.message_id),...documents.map(item=>item.message_id)]);
  const buttons=keyboard(h);assert.ok(buttons.some(button=>button.text==='📄 Полный отчёт'&&button.url.endsWith('/'+documents[0].message_id)));assert.ok(buttons.some(button=>button.text==='📎 Оригиналы'&&button.url.endsWith('/'+documents[1].message_id)));assert.ok(buttons.some(button=>button.url===data.workflow.video_url));assert.ok(buttons.some(button=>button.callback_data==='handoff:58'));
+});
+
+for(const beforeFirst of [false,true])test('a new frozen delivery binds its chat and refuses a changed destination after restart '+(beforeFirst?'before its first message':'after confirmed photos and summary'),async()=>{
+ const data=report(),holder={value:{}},saves=[];
+ const first=harness({holder,saves,beforePost(method,args){if(beforeFirst||method==='sendMediaGroup'&&args[1][0].type==='document')throw{response:{error_code:400,description:'Synthetic known rejection'}};}});
+ await assert.rejects(first.send(data));assert.equal(holder.value.destination,GROUP);assert.equal(holder.value.inflight,undefined);
+ const frozen=clone(holder.value),second=harness({holder,saves,group:'-1009876543210'});
+ await assert.rejects(second.send(data),error=>error.code==='AUDIT_DELIVERY_DESTINATION_CHANGED'&&error.status===409&&/чат/i.test(error.message));
+ assert.equal(second.events.length,0);assert.equal(second.delivered.length,0);assert.equal(saves.length,0);assert.deepEqual(holder.value,frozen);
+ const restored=harness({holder,saves});await restored.send(data);assert.equal(saves.length,1);assert.equal(saves[0][2],GROUP);
+ const all=first.delivered.concat(restored.delivered);assert.equal(all.filter(item=>item.kind==='text').length,1);assert.equal(all.filter(item=>item.kind==='photo').length,3);assert.equal(all.filter(item=>item.kind==='document').length,2);
+});
+
+test('a configured group username retains its case-insensitive identity without matching another username or numeric target',async()=>{
+ const data=report(),holder={value:{}},chat={id:-100321,username:'SyntheticGroup'};
+ const first=harness({holder,group:'@SyntheticGroup',receiptChat:chat,beforePost(){throw{response:{error_code:400,description:'Synthetic known rejection'}};}});
+ await assert.rejects(first.send(data));assert.equal(holder.value.destination,'@syntheticgroup');
+ for(const group of ['@OtherGroup','-100321']){const other=harness({holder,group,receiptChat:chat});await assert.rejects(other.send(data),error=>error.code==='AUDIT_DELIVERY_DESTINATION_CHANGED');assert.equal(other.delivered.length,0);}
+ const same=harness({holder,group:'@sYnThEtIcGrOuP',receiptChat:chat});await same.send(data);assert.ok(same.delivered.length>0);assert.equal(holder.value.destination,'@syntheticgroup');
 });
 
 test('Other without any originals still receives the mandatory complete TXT and never a broken originals button',async()=>{

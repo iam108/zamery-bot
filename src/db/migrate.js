@@ -125,6 +125,9 @@ async function migrate() {
         END IF;
         IF to_regclass('case_reminders') IS NOT NULL THEN
           ALTER TABLE case_reminders ADD COLUMN IF NOT EXISTS delivery JSONB NOT NULL DEFAULT '{}';
+          ALTER TABLE case_reminders ADD COLUMN IF NOT EXISTS request_id UUID;
+          ALTER TABLE case_reminders ADD COLUMN IF NOT EXISTS request_signature TEXT;
+          CREATE UNIQUE INDEX IF NOT EXISTS case_reminders_request ON case_reminders(case_id,created_by,request_id) WHERE request_id IS NOT NULL;
         END IF;
         IF to_regclass('egrn_orders') IS NOT NULL THEN
           ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS delivery_revision INT NOT NULL DEFAULT 0;

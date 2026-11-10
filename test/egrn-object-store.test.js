@@ -130,6 +130,29 @@ test('an unresponsive SDK cannot keep an upload pending beyond the configured de
   assert.equal(h.calls[0].input.Body.destroyed, true);
 });
 
+for(const failure of ['deadline','cancel','early-ack'])test('a '+failure+' during a stalled upload iterator settles without waiting for its return', {timeout:1000},async()=>{
+  let release,entered;
+  const blocked=new Promise(resolve=>{release=resolve;}),started=new Promise(resolve=>{entered=resolve;});
+  const controller=new AbortController();let consumed=0,heads=0;
+  const source=(async function*(){yield data.subarray(0,5);entered();await blocked;yield data.subarray(5);})();
+  const h=fixture({timeoutMs:15,async send(command){
+    if(command.operation==='PutObjectCommand') {
+      const consume=(async()=>{for await(const chunk of command.input.Body)consumed+=chunk.length;})();consume.catch(()=>{});
+      if(failure==='early-ack')return {};
+      await consume;return {};
+    }
+    heads++;return {};
+  }});
+  const result=h.store.put({...file(),body:source,signal:controller.signal}).then(()=>({ok:true}),error=>({error}));
+  try {
+    await started;if(failure==='cancel')controller.abort();
+    const outcome=await Promise.race([result,new Promise(resolve=>setTimeout(()=>resolve({stalled:true}),80))]);
+    assert.equal(outcome.stalled,undefined,'Cleanup must not wait for the stalled async iterator');
+    assert.equal(outcome.error?.code,failure==='cancel'?'EGRN_OBJECT_CANCELLED':'EGRN_OBJECT_TIMEOUT');assert.equal(heads,0);
+  } finally {release();await result;}
+  const after=consumed;await new Promise(resolve=>setImmediate(resolve));assert.equal(consumed,after,'A late source cannot restart the canceled PUT');
+});
+
 test('a stalled object download times out before headers and aborts the SDK request', {timeout:1000},async()=>{
   const h=fixture({timeoutMs:15,send:()=>new Promise(()=>{})});
   await assert.rejects(h.store.get({key,bytes:data.length,sha256}),error=>error.code==='EGRN_OBJECT_TIMEOUT');

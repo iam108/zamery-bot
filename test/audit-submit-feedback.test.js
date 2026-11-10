@@ -30,7 +30,7 @@ function harness(data = compactVisit()) {
   const c = {
     state: { data, evidence, packet: data.request_packet, draft: { id: randomUUID(), revision: 10 }, version: 0, dirty: false,
       pendingUploads: 0, submitting: false, frozen: false, completed: false },
-    URL,
+    URL, blobUrls: new Map(),
     window: { AuditReportIssues: require('../public/audit-report-issues') },
     root: { querySelector: node, querySelectorAll: () => [], innerHTML: '' },
     $: node, tail: Promise.resolve(), queuedJobs: 0, timer: null, clearTimeout, editor: null, tg: null, orderId: '58', localKey: 'synthetic-audit-submit-feedback', clone: copy,
@@ -60,7 +60,7 @@ function harness(data = compactVisit()) {
     },
   };
   vm.createContext(c);
-  vm.runInContext(['updateClosingConfirmation','setOutcome','queue','isRenewal','packetFiles','evidenceFor','adoptRevision','removeGeneratedEvidence','mapMode','rememberTerritory','switchTerritoryMode','chooseTerritory','hasEvidenceImage','validDistance','territoryIssues','issues','requiredIssues','tasksHtml',
+  vm.runInContext(['updateClosingConfirmation','setOutcome','queue','isRenewal','packetFiles','evidenceFor','adoptRevision','removalApplied','forgetEvidence','removeEvidenceFile','removeGeneratedEvidence','mapMode','rememberTerritory','switchTerritoryMode','chooseTerritory','hasEvidenceImage','validDistance','territoryIssues','issues','requiredIssues','tasksHtml',
     'taskDetails','goIssue','offersActions','reportFeedback','bindReportFeedback','refreshReportFeedback','chooseConclusion','showReportIssues','reportPreview','submit'].map(actualFunction).join('\n'), c);
   return { c, calls, node };
 }

@@ -64,12 +64,12 @@ function cancelled() { return error(499, 'EGRN_FILE_CANCELLED', 'Сохране�
 async function streamReader(input, bytes) {
   const signal = input.signal;
   if (signal && (typeof signal.addEventListener !== 'function' || typeof signal.removeEventListener !== 'function')) throw error(400, 'EGRN_FILE_STREAM', 'Некорректный сигнал отмены сохранения.');
-  let done = false, part = null, offset = 0, received = 0, produced = 0, rejectAbort;
+  let done = false, closed = false, part = null, offset = 0, received = 0, produced = 0, rejectAbort;
   const abortPromise = new Promise((_, reject) => { rejectAbort = reject; });
   abortPromise.catch(() => {});
   const abort = () => rejectAbort(cancelled());
   signal?.addEventListener('abort', abort, { once: true });
-  function check() { if (signal?.aborted) throw cancelled(); }
+  function check() { if (closed || signal?.aborted) throw cancelled(); }
   let source, iterator;
   try {
     check();
@@ -114,12 +114,16 @@ async function streamReader(input, bytes) {
       produced += written; return content;
     },
     async close() {
+      if (closed) return;
+      closed = true;
       signal?.removeEventListener('abort', abort);
       if (!done) {
         try { if (typeof source.destroy === 'function') source.destroy(); } catch (_) {}
         try {
-          const closing = Promise.resolve(iterator.return?.());
-          if (signal?.aborted) closing.catch(() => {}); else await closing.catch(() => {});
+          // An async generator may queue return() behind a stalled next().
+          // Request cleanup without restoring an unbounded wait after timeout;
+          // check() prevents any late chunk from reviving this reader.
+          Promise.resolve(iterator.return?.()).catch(() => {});
         } catch (_) {}
       }
     }

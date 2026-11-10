@@ -71,11 +71,16 @@ function createEgrnObjectStore(options = {}) {
       await Promise.race([connection.send(new sdk.PutObjectCommand({ Bucket: config.bucket, Key: file.key, Body: body,
         ContentLength: file.bytes, ContentType: file.mime,
         ChecksumSHA256: Buffer.from(file.sha256, 'hex').toString('base64'), Metadata: { sha256: file.sha256 } }), { abortSignal: controller.signal }), aborted]);
-      await completion;
+      // Readable.from may wait for an async iterator which ignores destroy.
+      // Its completion must share the PUT deadline, including an early SDK ACK.
+      await Promise.race([completion, aborted]);
       const stored = await Promise.race([connection.send(new sdk.HeadObjectCommand({ Bucket: config.bucket, Key: file.key, ChecksumMode: 'ENABLED' }), { abortSignal: controller.signal }), aborted]);
       verify(stored, file);
     } catch (error) {
-      body.destroy(); await completion.catch(() => {});
+      // Destruction requests iterator cleanup, but awaiting its return can
+      // defeat the deadline forever when the source is stalled. The rejection
+      // handler above keeps late cleanup failures observed.
+      controller.abort(); body.destroy();
       throw timedOut ? failure('EGRN_OBJECT_TIMEOUT') : failure('EGRN_OBJECT_WRITE', error);
     } finally { clearTimeout(timer); file.signal?.removeEventListener('abort', abort); }
   }

@@ -81,6 +81,21 @@ test('all approved staff roles retain audit submission access after a role chang
   }
 });
 
+test('the public submit route never moves a frozen partial report to a changed working chat and completed replay stays immutable', pg, async()=>{
+  const draft=await createDraft(),start=service.messages.length,tg=telegram(),sendDocument=tg.sendDocument,group=process.env.GROUP_CHAT_ID;
+  try{
+    tg.sendDocument=async()=>{throw{response:{error_code:400,description:'Synthetic known refusal before original'}};};
+    assert.equal((await submit(draft)).status,400);
+    const before=await row(draft);assert.equal(before.delivery.destination,group);assert.equal(before.delivery.textIds.length,1);assert.equal(before.delivery.documentIds.length,0);
+    tg.sendDocument=sendDocument;process.env.GROUP_CHAT_ID='-1009876543210';
+    const changed=await submit(draft);assert.equal(changed.status,409);assert.match(changed.body.error,/Рабочий чат.*изменён/);
+    assert.deepEqual((await row(draft)).delivery,before.delivery);assert.equal(physical(service.messages.slice(start)).length,1);
+    assert.equal((await service.pool.query('SELECT COUNT(*)::int AS n FROM audits WHERE order_id=$1',[draft.order])).rows[0].n,0);
+    process.env.GROUP_CHAT_ID=group;await completedOnce(draft,start);
+    process.env.GROUP_CHAT_ID='-1009876543210';const replay=await submit(draft);assert.equal(replay.status,200);assert.equal(replay.body.already_submitted,true);assert.equal(physical(service.messages.slice(start)).length,2);
+  }finally{tg.sendDocument=sendDocument;process.env.GROUP_CHAT_ID=group;}
+});
+
 test('a 429 retry rechecks current approval before the next physical request and clears a definitely unsent fresh intent', pg, async () => {
   const tg = telegram(), original = tg.sendMessage, nativeTimeout = global.setTimeout;
   const draft = await createDraft(), start = service.messages.length;

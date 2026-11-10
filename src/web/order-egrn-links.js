@@ -15,7 +15,7 @@ const DDL = `
     order_id INT NOT NULL REFERENCES orders(id),
     id UUID NOT NULL,
     egrn_order_id BIGINT NOT NULL,
-    chat_id BIGINT NOT NULL,
+    chat_id TEXT NOT NULL,
     message_id BIGINT NOT NULL,
     name TEXT NOT NULL,
     mime TEXT NOT NULL,
@@ -23,6 +23,11 @@ const DDL = `
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY(order_id,id)
   );
+  DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='order_egrn_telegram_links' AND column_name='chat_id' AND data_type='bigint') THEN
+      ALTER TABLE order_egrn_telegram_links ALTER COLUMN chat_id TYPE TEXT USING chat_id::text;
+    END IF;
+  END $$;
 `;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 function failure(message, status = 400) { return Object.assign(new Error(message), { status }); }
@@ -37,8 +42,9 @@ function originalId(value) {
 }
 function telegramMessage(value) {
   const chat = String(value.chat_id ?? value.chat ?? ''), message = Number(value.message_id ?? value.id);
-  return /^-100[1-9]\d+$/.test(chat) && Number.isSafeInteger(message) && message > 0
-    ? 'https://t.me/c/' + chat.slice(4) + '/' + message : '';
+  if (!Number.isSafeInteger(message) || message <= 0) return '';
+  if (/^-100[1-9]\d+$/.test(chat)) return 'https://t.me/c/' + chat.slice(4) + '/' + message;
+  return /^@[a-z][a-z0-9_]{4,31}$/i.test(chat) ? 'https://t.me/' + chat.slice(1) + '/' + message : '';
 }
 function telegramReferenceId(record) {
   let hex = createHash('sha1').update('egrn-telegram-reference:v1\n' + (record.reference_chat ?? record.chat) + ':' + (record.reference_id ?? record.id)).digest('hex').slice(0,32);

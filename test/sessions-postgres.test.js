@@ -36,11 +36,11 @@ test('migration and session persistence, expiry, touch and logout in PostgreSQL'
     try {
       await context.module.exports();
       await db.exec(`CREATE TABLE cases(id INT PRIMARY KEY, data JSONB DEFAULT '{}');
-        CREATE TABLE case_reminders(id INT PRIMARY KEY);
+        CREATE TABLE case_reminders(id INT PRIMARY KEY,case_id INT,created_by BIGINT);
         CREATE TABLE egrn_orders(id INT PRIMARY KEY);
         CREATE TABLE reports(id INT PRIMARY KEY);
         INSERT INTO cases VALUES(1,'{"answer":"kept"}');
-        INSERT INTO case_reminders VALUES(1);
+        INSERT INTO case_reminders(id) VALUES(1);
         INSERT INTO egrn_orders VALUES(1);
         INSERT INTO reports VALUES(1);`);
       await context.module.exports(); // Safe to rerun the deployed migration.
@@ -49,6 +49,9 @@ test('migration and session persistence, expiry, touch and logout in PostgreSQL'
       assert.deepEqual(upgraded.data, { answer: 'kept' }); assert.equal(upgraded.checklist_revision, 0);
       assert.deepEqual(upgraded.decision_reminder_delivery, {});
       assert.deepEqual((await db.query('SELECT delivery FROM case_reminders WHERE id=1')).rows[0].delivery, {});
+      assert.deepEqual((await db.query('SELECT request_id,request_signature FROM case_reminders WHERE id=1')).rows[0],{request_id:null,request_signature:null});
+      await db.exec("INSERT INTO case_reminders(id,case_id,created_by,request_id,request_signature) VALUES(2,1,808,'00000000-0000-4000-8000-000000000001','original')");
+      await assert.rejects(db.exec("INSERT INTO case_reminders(id,case_id,created_by,request_id,request_signature) VALUES(3,1,808,'00000000-0000-4000-8000-000000000001','duplicate')"),error=>error.code==='23505');
       assert.deepEqual((await db.query('SELECT delivery_revision,request_key,processing_token,processing_until FROM egrn_orders WHERE id=1')).rows[0],
         { delivery_revision: 0, request_key: null, processing_token: null, processing_until: null });
       assert.deepEqual((await db.query('SELECT delivery_state FROM egrn_orders WHERE id=1')).rows[0].delivery_state, {});

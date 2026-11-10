@@ -4,6 +4,28 @@ const { createOrderEgrnLinks, setupOrderEgrnLinks } = require('../src/web/order-
 const ID = '11111111-1111-4111-8111-111111111111';
 const OTHER = '22222222-2222-4222-8222-222222222222';
 
+test('public-group medium originals upgrade existing numeric references and keep exact order binding', {skip:!process.env.PGLITE_TEST_MODULE},async()=>{
+  const {PGlite}=require(process.env.PGLITE_TEST_MODULE),db=new PGlite(),pool={query:(sql,args)=>args?db.query(sql,args):db.exec(sql).then(results=>results.at(-1))};
+  try{
+    await db.exec(`CREATE TABLE orders(id INT PRIMARY KEY);INSERT INTO orders VALUES(1),(2);CREATE TABLE egrn_files(id UUID PRIMARY KEY,name TEXT,mime TEXT,bytes BIGINT,sha256 TEXT);
+      CREATE TABLE egrn_orders(id BIGINT PRIMARY KEY,file_msgs JSONB);
+      CREATE TABLE order_egrn_telegram_links(order_id INT NOT NULL REFERENCES orders(id),id UUID NOT NULL,egrn_order_id BIGINT NOT NULL,chat_id BIGINT NOT NULL,message_id BIGINT NOT NULL,name TEXT NOT NULL,mime TEXT NOT NULL,bytes BIGINT NOT NULL,created_at TIMESTAMPTZ DEFAULT NOW(),PRIMARY KEY(order_id,id));`);
+    await db.query('INSERT INTO order_egrn_telegram_links(order_id,id,egrn_order_id,chat_id,message_id,name,mime,bytes) VALUES(1,$1,19,-10012345,77,$2,$3,35000000)',[OTHER,'Old.pdf','application/pdf']);
+    const record={key:'native-original',chat:108,id:88,file_id:'SYNTHETIC_FILE',name:'Current.pdf',mime:'application/pdf',bytes:35*1024*1024,deliveries:[{chat:'@SyntheticMeasurements',id:99}]};
+    await db.query('INSERT INTO egrn_orders VALUES(19,$1)',[JSON.stringify([record])]);
+    const files={ensure:async()=>{},get:async()=>assert.fail('No paid/order/object operation')},service=createOrderEgrnLinks({pool,files});
+    await service.register({id:19,deliver:[{order_id:1,chat:'@SyntheticMeasurements'}]},[record]);
+    const refs=await service.list(1),current=refs.find(value=>value.name==='Current.pdf');assert.ok(current);assert.equal(refs.length,2);
+    assert.deepEqual(await service.link(1,OTHER),{ok:true,url:'https://t.me/c/12345/77'});
+    assert.deepEqual(await service.link(1,current.id),{ok:true,url:'https://t.me/SyntheticMeasurements/99'});
+    const delivery=await service.delivery(1,current.id,current);assert.equal(delivery.chat_id,'@SyntheticMeasurements');assert.equal(delivery.message_id,99);assert.equal(delivery.file_id,record.file_id);
+    await assert.rejects(service.link(2,current.id),error=>error.status===404);
+    const restarted=createOrderEgrnLinks({pool,files});await restarted.ensure();assert.deepEqual(await restarted.link(1,OTHER),{ok:true,url:'https://t.me/c/12345/77'});
+    await service.register({id:19,deliver:[{order_id:1}]},[{...record,deliveries:[{chat:'@bad/unsafe',id:99}]}]);
+    assert.equal((await service.list(1)).length,2);
+  }finally{await db.close();}
+});
+
 test('large originals are linked to every explicit request without copying their bytes', { skip: !process.env.PGLITE_TEST_MODULE }, async () => {
   const { PGlite } = require(process.env.PGLITE_TEST_MODULE);
   const db = new PGlite();

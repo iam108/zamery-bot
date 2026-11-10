@@ -306,6 +306,21 @@ test('S3 downloads verify actual content hash instead of trusting object metadat
   await assert.rejects(read(store, saved.id), error => error.code === 'EGRN_FILE_CORRUPT');
 });
 
+test('a stalled S3 upload releases its caller and SQL after the object deadline, before the source resumes', {timeout:2000},async()=>{
+  const {createEgrnObjectStore}=require('../src/bot/egrn-object-store');
+  let release,entered;const blocked=new Promise(resolve=>{release=resolve;}),started=new Promise(resolve=>{entered=resolve;});
+  const original=pdf(2*MiB),sdk=Object.fromEntries(['PutObjectCommand','HeadObjectCommand','DeleteObjectCommand'].map(name=>[name,class{constructor(input){this.input=input;this.operation=name;}}]));
+  const calls=[],objects=createEgrnObjectStore({env:{EGRN_S3_ENDPOINT:'https://synthetic.invalid',EGRN_S3_BUCKET:'synthetic-bucket',EGRN_S3_REGION:'auto',EGRN_S3_ACCESS_KEY_ID:'synthetic-key',EGRN_S3_SECRET_ACCESS_KEY:'synthetic-secret'},sdk,timeoutMs:15,client:{async send(command){calls.push(command.operation);if(command.operation==='PutObjectCommand'){for await(const chunk of command.input.Body){};}return {};}}});
+  const pool=memoryPool(),store=createEgrnFileStore(pool,{objectStore:objects});
+  const result=store.saveStream({egrn_order_id:1,source_key:'stalled-source',name:'Original.pdf',bytes:original.length,sha256:digest(original),open:async function*(){yield original.subarray(0,MiB);entered();await blocked;yield original.subarray(MiB);}}).then(()=>({ok:true}),error=>({error}));
+  try {
+    await started;const outcome=await Promise.race([result,new Promise(resolve=>setTimeout(()=>resolve({stalled:true}),100))]);
+    assert.equal(outcome.stalled,undefined,'File-store cleanup must not restore an unbounded iterator wait');assert.equal(outcome.error?.code,'EGRN_OBJECT_TIMEOUT');
+    assert.equal(pool.active,0);assert.equal((await store.listByOrder(1)).length,0);
+  }finally{release();await result;}
+  await new Promise(resolve=>setImmediate(resolve));assert.deepEqual(calls,['PutObjectCommand','DeleteObjectCommand']);
+});
+
 test('PostgreSQL schema, BYTEA copies, streaming, rollback and restart persistence', { skip: !process.env.PGLITE_TEST_MODULE }, async () => {
   const { PGlite } = require(process.env.PGLITE_TEST_MODULE);
   const db = new PGlite(); let tail = Promise.resolve();

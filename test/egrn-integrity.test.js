@@ -88,6 +88,37 @@ async function fixture(options = {}) {
 
 function retryContext(id, message_id, replies=[],actor=111) { return {from:{id:actor},chat:{type:'private',id:actor},message:{text:'/egrn_retry '+id,message_id},async reply(text){replies.push(text);}}; }
 
+test('native originals reach a configured public working group before completion and case-insensitive cached retry sends no duplicate',pg,async()=>{
+  const group='@SyntheticMeasurements',h=await fixture({groupChatId:group});
+  try{
+    await h.attach(111,{targets:[{chat:group}]});await h.poll();
+    const order=(await h.pool.query('SELECT * FROM egrn_orders')).rows[0];
+    assert.equal(h.calls.copies.filter(value=>String(value.chat_id).toLowerCase()===group.toLowerCase()).length,1);
+    assert.ok(order.files_sent>0);assert.equal(order.delivery_state.inflight,undefined);
+    assert.ok(order.file_msgs[0].deliveries.some(value=>String(value.chat).toLowerCase()===group.toLowerCase()));
+    const count=h.calls.copies.length,posts=h.calls.documents.length,paid=h.calls.paid;
+    const result=await h.attach(111,{targets:[{chat:group.toUpperCase()}]});assert.equal(result.result,'attached');
+    assert.equal(h.calls.copies.length,count);assert.equal(h.calls.documents.length,posts);assert.equal(h.calls.paid,paid);
+  }finally{await h.close();}
+});
+
+test('a public working group can hold the original when the old private primary loses approval',pg,async()=>{
+  const group='@SyntheticMeasurements',h=await fixture({groupChatId:group});
+  try{
+    const order=await h.add({targets:[{chat:group}]});await h.pool.query('UPDATE egrn_orders SET chat_id=222,ordered_by=222 WHERE id=$1',[order.id]);
+    await h.pool.query('UPDATE staff SET approved=false WHERE tg_id=222');await h.poll();
+    const row=await h.row(order.id);assert.equal(h.calls.documents.length,1);assert.equal(String(h.calls.documents[0].chat).toLowerCase(),group.toLowerCase());
+    assert.equal(String(row.file_msgs[0].chat).toLowerCase(),group.toLowerCase());assert.equal(row.delivery_state.inflight,undefined);
+    assert.equal(h.calls.documents.some(value=>String(value.chat)==='222'),false);
+    // The unavailable original requester stays pending rather than receiving
+    // client information or making the successful group receipt disappear.
+    assert.equal(row.files_sent,0);const posts=h.calls.documents.length;
+    await h.pool.query('UPDATE staff SET approved=true WHERE tg_id=222');await h.pool.query('UPDATE egrn_orders SET retry_at=NULL WHERE id=$1',[order.id]);await h.poll();
+    assert.equal(h.calls.documents.length,posts);assert.ok((await h.row(order.id)).files_sent>0);
+    assert.equal(h.calls.copies.filter(value=>String(value.chat_id)==='222').length,1);
+  }finally{await h.close();}
+});
+
 const measurementsChat='-100456';
 const accountingPattern=/Заказано выписок|Расчётно осталось|По учтённым пополнениям|Учёт на момент|Остаток не сверён/i;
 test('new EGRN delivery retains accounting in the EGRN chat and private receipts but strips it from the measurements destination',pg,async()=>{

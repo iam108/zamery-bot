@@ -829,6 +829,9 @@ function ensureDeadlines() {
       created_at   TIMESTAMPTZ DEFAULT NOW()
     );
     ALTER TABLE case_reminders ADD COLUMN IF NOT EXISTS delivery JSONB NOT NULL DEFAULT '{}';
+    ALTER TABLE case_reminders ADD COLUMN IF NOT EXISTS request_id UUID;
+    ALTER TABLE case_reminders ADD COLUMN IF NOT EXISTS request_signature TEXT;
+    CREATE UNIQUE INDEX IF NOT EXISTS case_reminders_request ON case_reminders(case_id,created_by,request_id) WHERE request_id IS NOT NULL;
   `).catch(function (error) { deadlinesReady = null; throw error; });
   return deadlinesReady;
 }
@@ -1593,7 +1596,7 @@ function setupHandoff(app) {
     var c = (await pool.query('SELECT * FROM cases WHERE id=$1', [parseInt(req.query.case_id) || 0])).rows[0];
     if (!requireCase(req, res, c)) return;
     if (!c.checklist_key) return res.status(404).send('Чек-лист не найден');
-    res.send(checklistPage(c, LISTS[c.checklist_key]));
+    res.send(checklistPage(c, LISTS[c.checklist_key], req.tgUser.id));
   }));
 
   app.get('/api/checklist/reminders', async function (req, res) {
@@ -1618,17 +1621,37 @@ function setupHandoff(app) {
     } catch (e) { console.error(e); res.json({ ok: false, error: e.message }); }
   });
   app.post('/api/checklist/reminders', async function (req, res) {
+    var connection;
     try {
       await ensureTables(); await ensureDeadlines();
       var id = parseInt(req.body.case_id) || 0, date = String(req.body.date || ''), text = String(req.body.text || '').trim().slice(0, 300);
-      if (!validCalendarDate(date)) return res.json({ ok: false, error: 'Укажите дату' });
-      if (!text) return res.json({ ok: false, error: 'Напишите, о чём напомнить' });
+      var requestId = req.body.request_id;
+      if (typeof requestId !== 'string' || !/^[a-f\d]{8}-[a-f\d]{4}-[1-8][a-f\d]{3}-[89ab][a-f\d]{3}-[a-f\d]{12}$/i.test(requestId))
+        return res.status(409).json({ok:false,code:'REMINDER_REQUEST_REQUIRED',error:'Скопируйте текст напоминания и обновите форму перед сохранением.'});
+      if (!validCalendarDate(date)) return res.status(400).json({ ok: false, error: 'Укажите дату' });
+      if (!text) return res.status(400).json({ ok: false, error: 'Напишите, о чём напомнить' });
       var client = (await pool.query('SELECT * FROM cases WHERE id=$1', [id])).rows[0];
       if (!requireCase(req, res, client)) return;
-      var r = (await pool.query('INSERT INTO case_reminders (case_id, remind_on, text, created_by, created_name) VALUES ($1,$2,$3,$4,$5) RETURNING id',
-        [id, date, text, req.tgUser.id, req.staff.name])).rows[0];
-      res.json({ ok: true, id: r.id });
-    } catch (e) { console.error(e); res.json({ ok: false, error: e.message }); }
+      connection = await pool.connect(); await connection.query('BEGIN');
+      // Hold the current assignment and approval through the short mutation.
+      // PostgreSQL rechecks rows if this read waits behind a role/owner change.
+      var actor = (await connection.query(`SELECT c.id,actor.name FROM cases c JOIN staff actor ON actor.tg_id=$2
+        WHERE c.id=$1 AND actor.approved IS TRUE
+          AND (actor.role='manager' OR $3::boolean OR actor.role='lawyer' AND c.lawyer_tg_id=actor.tg_id)
+        FOR SHARE OF c,actor`, [id,req.tgUser.id,canManageCases({approved:true,role:'auditor'},req.tgUser.id)])).rows[0];
+      if (!actor) { await connection.query('ROLLBACK'); return res.status(403).json({ok:false,code:'CASE_FORBIDDEN',error:'Этот клиент недоступен вашему аккаунту.'}); }
+      var signature = require('node:crypto').createHash('sha256').update(JSON.stringify([date,text])).digest('hex');
+      var r = (await connection.query(`INSERT INTO case_reminders(case_id,remind_on,text,created_by,created_name,request_id,request_signature)
+        VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(case_id,created_by,request_id) WHERE request_id IS NOT NULL DO NOTHING RETURNING id,done`,
+      [id,date,text,req.tgUser.id,actor.name,requestId.toLowerCase(),signature])).rows[0];
+      var replayed = !r;
+      if (!r) {
+        r = (await connection.query('SELECT id,request_signature,done FROM case_reminders WHERE case_id=$1 AND created_by=$2 AND request_id=$3',[id,req.tgUser.id,requestId.toLowerCase()])).rows[0];
+        if (!r || r.request_signature !== signature) { await connection.query('ROLLBACK'); return res.status(409).json({ok:false,code:'REMINDER_REQUEST_CHANGED',error:'Этот номер сохранения уже использован с другим напоминанием. Продолжите исходное сохранение без изменения текста и даты.'}); }
+      }
+      await connection.query('COMMIT'); res.json({ ok: true, id: r.id, replayed, done: r.done === true });
+    } catch (e) { if(connection)await connection.query('ROLLBACK').catch(()=>{});console.error(e);res.status(500).json({ok:false,error:'Не удалось подтвердить сохранение напоминания. Повторите проверку без изменения исходной отправки.'}); }
+    finally {if(connection)connection.release();}
   });
   app.post('/api/checklist/reminders/done', async function (req, res) {
     try {
@@ -2043,6 +2066,21 @@ function checklistClient() {
     : CASE.lawyer;
   var root = document.getElementById('list');
   var REM = null; // напоминания по клиенту (с сервера)
+  var REM_DRAFT = { text: '', date: null }, REM_PENDING = null, REM_ATTEMPT = null;
+  var reminderDraftKey = 'zamery_reminder_' + CASE.id + '_' + String(CFG.viewer || '');
+  var reminderUUID = /^[a-f\d]{8}-[a-f\d]{4}-[1-8][a-f\d]{3}-[89ab][a-f\d]{3}-[a-f\d]{12}$/i;
+  try {
+    var reminderBackup = JSON.parse(localStorage.getItem(reminderDraftKey) || 'null');
+    if (reminderBackup && typeof reminderBackup.draft?.text === 'string' && reminderBackup.draft.text.length <= 300 &&
+        (reminderBackup.draft.date === null || typeof reminderBackup.draft.date === 'string' && /^(?:\d{4}-\d{2}-\d{2})?$/.test(reminderBackup.draft.date))) REM_DRAFT = reminderBackup.draft;
+    var remembered = reminderBackup?.attempt, original = remembered?.body;
+    if (original && Number(original.case_id) === Number(CASE.id) && typeof original.request_id === 'string' && reminderUUID.test(original.request_id) &&
+        typeof original.text === 'string' && original.text.length > 0 && original.text.length <= 300 && typeof original.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(original.date))
+      REM_ATTEMPT = { body: { case_id: CASE.id, request_id: original.request_id, text: original.text, date: original.date }, uncertain: remembered.uncertain === true };
+  } catch (_) {}
+  function backupReminder() {
+    try { if (REM_ATTEMPT || REM_DRAFT.text) localStorage.setItem(reminderDraftKey,JSON.stringify({draft:REM_DRAFT,attempt:REM_ATTEMPT})); else localStorage.removeItem(reminderDraftKey); } catch (_) {}
+  }
   var DECISION_DELIVERY = null;
   var REM_PRESETS = [
     ['Проверить регистрацию договора аренды в Росреестре', 7],
@@ -2156,32 +2194,59 @@ function checklistClient() {
         rg.body.appendChild(row);
       });
       var add = el('div', 'row col');
+      if (REM_DRAFT.date === null) REM_DRAFT.date = isoPlus(1);
       var chips = el('div', 'seg wrap');
-      var txt = el('input', 'inp'); txt.placeholder = 'О чём напомнить'; txt.maxLength = 300;
-      var dt = el('input', 'inp'); dt.type = 'date'; dt.min = mskToday(); dt.value = isoPlus(1);
+      var txt = el('input', 'inp'); txt.placeholder = 'О чём напомнить'; txt.maxLength = 300; txt.value = REM_DRAFT.text;
+      var dt = el('input', 'inp'); dt.type = 'date'; dt.min = mskToday(); dt.value = REM_DRAFT.date;
+      var draftHint = el('div', 'meta remdraft');
+      function showReminderDraft() {
+        var newer = REM_PENDING && (REM_DRAFT.text.trim() !== REM_PENDING.text || REM_DRAFT.date !== REM_PENDING.date);
+        draftHint.textContent = REM_ATTEMPT && !REM_PENDING ? 'Сохранение прежнего напоминания не подтверждено. Проверьте его без повторного создания; новый текст останется в форме.'
+          : newer || !REM_PENDING && REM_DRAFT.text.trim() ? 'Напоминание ещё не сохранено.' : REM_PENDING ? 'Сохраняю напоминание…' : '';
+      }
+      txt.oninput = function () { REM_DRAFT.text = txt.value; backupReminder(); showReminderDraft(); };
+      dt.oninput = dt.onchange = function () { REM_DRAFT.date = dt.value; backupReminder(); showReminderDraft(); };
+      showReminderDraft();
       REM_PRESETS.forEach(function (pr) {
         var b = el('button', 'sg', pr[0].replace(/^(Проверить|Уточнить у клиента) /, '').replace(/:.*$/, '')); b.type = 'button';
-        b.onclick = function () { txt.value = pr[0]; dt.value = isoPlus(pr[1]); haptic(); };
+        b.onclick = function () { txt.value = REM_DRAFT.text = pr[0]; dt.value = REM_DRAFT.date = isoPlus(pr[1]); backupReminder(); showReminderDraft(); haptic(); };
         chips.appendChild(b);
       });
       add.appendChild(chips);
       var two = el('div', 'two remadd');
       two.appendChild(txt); two.appendChild(dt);
       add.appendChild(two);
-      var go = el('button', 'sign', '+ Напомнить'); go.type = 'button';
+      add.appendChild(draftHint);
+      var go = el('button', 'sign', REM_PENDING ? 'Сохраняю…' : REM_ATTEMPT ? 'Проверить сохранение' : '+ Напомнить'); go.type = 'button'; go.disabled = !!REM_PENDING;
       go.onclick = function () {
-        if (!txt.value.trim()) { txt.focus(); return; }
-        if (!dt.value) { dt.focus(); return; }
-        go.disabled = true; go.textContent = 'Сохраняю…';
-        fetch('/api/checklist/reminders', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ case_id: CASE.id, date: dt.value, text: txt.value.trim() }) })
-          .then(function (q) { return q.json(); })
-          .then(function (j) {
-            if (!j.ok) throw new Error(j.error || 'Ошибка');
-            REM.push({ id: j.id, date: dt.value, text: txt.value.trim(), by: ME, sent: false });
+        if (REM_PENDING) return;
+        if (!REM_ATTEMPT) {
+          if (!txt.value.trim()) { txt.focus(); return; }
+          if (!dt.value) { dt.focus(); return; }
+          var random = window.crypto;
+          if (!random?.getRandomValues) { alertMsg('Не удалось подготовить сохранение. Скопируйте текст и обновите форму.'); return; }
+          var uuid = random.randomUUID ? random.randomUUID() : '10000000-1000-4000-8000-100000000000'.replace(/[018]/g,function(c){return (Number(c)^random.getRandomValues(new Uint8Array(1))[0]&15>>Number(c)/4).toString(16);});
+          REM_ATTEMPT = { body: { case_id: CASE.id, date: dt.value, text: txt.value.trim(), request_id: uuid }, uncertain: false };
+        }
+        var posted = REM_ATTEMPT.body;
+        REM_PENDING = posted; backupReminder(); go.disabled = true; go.textContent = 'Сохраняю…'; showReminderDraft();
+        checklistRequest('/api/checklist/reminders', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(posted) }, async function(q) { return {status:q.status,body:await q.json()}; })
+          .then(function (response) {
+            var j = response.body;
+            if (!j?.ok) throw Object.assign(new Error(j?.error || 'Ошибка'),{definite:response.status>=400&&response.status<500&&j?.code!=='REMINDER_REQUEST_CHANGED'});
+            if (!['number','string'].includes(typeof j.id) || !/^[1-9]\d*$/.test(String(j.id)) || !Number.isSafeInteger(Number(j.id)) || Number(j.id)>2147483647) throw new Error('Не удалось проверить номер сохранённого напоминания.');
+            REM_PENDING = null; REM_ATTEMPT = null;
+            if (j.done !== true && !REM.some(function(r){return Number(r.id)===Number(j.id);})) REM.push({ id: Number(j.id), date: posted.date, text: posted.text, by: ME, sent: false });
+            if (REM_DRAFT.text.trim() === posted.text && REM_DRAFT.date === posted.date) REM_DRAFT = { text: '', date: isoPlus(1) };
+            backupReminder();
             REM.sort(function (a, b) { return a.date < b.date ? -1 : a.date > b.date ? 1 : a.id - b.id; });
             haptic('ok'); render();
           })
-          .catch(function (e) { go.disabled = false; go.textContent = '+ Напомнить'; alertMsg('Не сохранилось: ' + e.message); });
+          .catch(function (e) {
+            REM_PENDING = null;
+            if (REM_ATTEMPT) { if (e.definite && !REM_ATTEMPT.uncertain) REM_ATTEMPT = null; else REM_ATTEMPT.uncertain = true; }
+            backupReminder(); render(); alertMsg(REM_ATTEMPT ? 'Сохранение не подтверждено. Нажмите «Проверить сохранение»: исходное напоминание не создастся повторно. ' + e.message : 'Не сохранилось: ' + e.message);
+          });
       };
       add.appendChild(go);
       add.appendChild(el('div', 'meta', 'Придёт в 9:00 по Москве в личку: юристу клиента и вам.'));
@@ -2709,7 +2774,7 @@ function checklistClient() {
   else setSt('ok', 'Сохранено');
 }
 
-function checklistPage(c, L) {
+function checklistPage(c, L, actorId) {
   var css = [
     ':root{--bg:#E8EEF6;--ink:#0E1A2B;--ink2:#5B6B82;--glass:rgba(255,255,255,.56);--glass2:rgba(255,255,255,.72);--edge:rgba(255,255,255,.85);--hair:rgba(14,26,43,.08);--well:rgba(14,26,43,.06);',
     ' --ok:#1FA971;--bad:#E5484D;--na:#8A94A6;--warn:#C27C0E;--accent:#2F6BFF;--o1:#8EC5FF;--o2:#C3B2FF;--o3:#9CEBD3;--shadow:0 10px 30px rgba(30,52,90,.12),0 1px 2px rgba(30,52,90,.06)}',
@@ -2836,7 +2901,7 @@ function checklistPage(c, L) {
   ].join('\n');
 
   var cfg = {
-    list: L, data: Object.fromEntries(Object.entries(c.data || {}).filter(function (entry) { return entry[0] !== '_handoff'; })), stages: STAGES,
+    list: L, viewer: actorId, data: Object.fromEntries(Object.entries(c.data || {}).filter(function (entry) { return entry[0] !== '_handoff'; })), stages: STAGES,
     caseInfo: { id: c.id, service: c.service, lawyer: c.lawyer_name, region: c.region, revision: Number(c.checklist_revision) || 0 }
   };
 

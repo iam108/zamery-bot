@@ -71,11 +71,16 @@ test('native folder ZIP remains the first choice and its original bytes are retu
   const result = await downloadArchive(archive, mock); assert.ok(result.buffer.equals(original)); assert.equal(mock.calls.length, 3);
 });
 
-test('ZIP transfer 5xx and native ZIP timeouts allow fallback, without consuming the parent deadline', async () => {
+test('ZIP transfer 5xx and native ZIP timeouts allow fallback, without consuming the parent deadline', { timeout: 5000 }, async t => {
   for (const mode of ['transfer-503', 'native-timeout']) {
     const mock = fixture({ respond({ url, path, init }) {
       if (path === root && url.pathname.endsWith('/download')) {
-        if (mode === 'native-timeout') return new Promise((resolve, reject) => init.signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true }));
+        if (mode === 'native-timeout') {
+          // An actual pending fetch owns a network handle. This fake must also
+          // keep Node 20 alive while the production unref'ed deadline fires.
+          const transfer = setInterval(() => {}, 1000); t.after(() => clearInterval(transfer));
+          return new Promise((resolve, reject) => init.signal.addEventListener('abort', () => { clearInterval(transfer); reject(new DOMException('Aborted', 'AbortError')); }, { once: true }));
+        }
         return json({ href: 'https://downloader.disk.yandex.ru/native' });
       }
       if (url.pathname === '/native') return new Response(null, { status: 503 });

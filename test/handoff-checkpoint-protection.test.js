@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const {randomUUID}=require('node:crypto');
 const source = fs.readFileSync(path.join(__dirname, '../src/web/handoff.js'), 'utf8');
 const pg = { skip: !process.env.PGLITE_TEST_MODULE };
 
@@ -13,18 +14,19 @@ const pg = { skip: !process.env.PGLITE_TEST_MODULE };
 async function fixture(run,options={}) {
   const { PGlite } = require(process.env.PGLITE_TEST_MODULE), db = new PGlite();
   const routes = new Map(), queries = [], initialization = [], telegram = [];
-  let beforeWrite = null, beforeAccess=null,writes = 0;
+  let beforeWrite = null, beforeAccess=null,beforeReminderWrite=null,writes = 0,loseCommit=false;
   const pool = { async query(sql, params) {
     queries.push(sql);
     if(beforeAccess&&sql.startsWith('SELECT to_jsonb(c) AS access_case'))await beforeAccess(db);
+    if(beforeReminderWrite&&(sql.includes('FOR SHARE OF c,actor')||sql.includes('INSERT INTO case_reminders')&&!sql.includes('request_signature')))await beforeReminderWrite(db);
     if (sql.includes('UPDATE cases SET data=')) {
       writes++;
       if (beforeWrite) await beforeWrite({ sql, params, number: writes, db });
     }
     const operation = !params && sql.split(';').filter(value => value.trim()).length > 1 ? db.exec(sql) : db.query(sql, params);
     initialization.push(operation);
-    return operation;
-  } };
+    const result=await operation;if(loseCommit&&sql==='COMMIT'){loseCommit=false;throw new Error('Synthetic lost COMMIT acknowledgement');}return result;
+  },async connect(){return{query:pool.query,release(){}};} };
   const environment={};const context = {
     module: { exports: {} }, URL,
     console: { log() {}, error() {} }, process: { env: environment }, setTimeout() {}, setInterval() {},
@@ -37,6 +39,7 @@ async function fixture(run,options={}) {
       if (name === './auth') return require('../src/web/auth');
       if (name === './reminder-recipients') return require('../src/web/reminder-recipients');
       if (name === './http-errors') return require('../src/web/http-errors');
+      if (name === 'node:crypto') return require(name);
       throw new Error('Unexpected dependency: ' + name);
     },
   };
@@ -63,6 +66,7 @@ async function fixture(run,options={}) {
       rawSave,
       async prefill(query,actor=808){let result,status=200;await routes.get('GET /api/handoff/prefill')({query,tgUser:{id:actor},staff:{name:'Сотрудник',role:actor===101?'manager':'lawyer',approved:true}},{json(value){result=value;},status(value){status=value;return this;}});return{status,result};},
       async requestDocuments(){let result,status=200;await routes.get('POST /api/checklist/request')({body:{case_id:17,missing:['Synthetic required document']},tgUser:{id:808},staff:{name:'Тестовый юрист',role:'lawyer',approved:true}},{json(value){result=value;},status(value){status=value;return this;}});return{status,result};},
+      async createReminder(actor={id:808,role:'lawyer'},extra={}){let result,status=200;await routes.get('POST /api/checklist/reminders')({body:{case_id:17,date:'2026-11-12',text:'Synthetic reminder',request_id:randomUUID(),...extra},tgUser:{id:actor.id},staff:{name:'Тестовый сотрудник',role:actor.role,approved:true}},{json(value){result=value;},status(value){status=value;return this;}});return{status,result};},
       async save(data, extra = {}) {
         const { result, status } = await rawSave(data, extra);
         assert.equal(status, 200); assert.equal(result?.ok, true, result?.error); return result;
@@ -70,11 +74,63 @@ async function fixture(run,options={}) {
       row: async () => (await db.query('SELECT * FROM cases WHERE id=17')).rows[0],
       interleave(fn) { beforeWrite = fn; },
       interleaveAccess(fn){beforeAccess=fn;},
+      interleaveReminder(fn){beforeReminderWrite=fn;},
+      async migrateReminders(){vm.runInContext('deadlinesReady=null',context);await vm.runInContext('ensureDeadlines()',context);},
+      loseCommit(){loseCommit=true;},
     });
   } finally { await db.close(); }
 }
 const checkpoint = generation => ({ version: 2, generation, completed: generation > 1, cards: { '808': 900 + generation }, materials: { confirmed: { '808': [1000 + generation] } }, egrn: { copies: { confirmed: true } } });
 const asDate = value => value instanceof Date ? value.toISOString().slice(0, 10) : String(value).slice(0, 10);
+
+for(const change of ['approval','role','assignment'])test('reminder creation uses current '+change+' at its final insert',pg,()=>fixture(async h=>{
+  await h.seed({answer:'Original',_handoff:checkpoint(2)});
+  h.interleaveReminder(db=>db.exec(change==='approval'?'UPDATE staff SET approved=false WHERE tg_id=808':change==='role'?"UPDATE staff SET role='auditor' WHERE tg_id=808":'UPDATE cases SET lawyer_tg_id=909 WHERE id=17'));
+  const response=await h.createReminder();assert.equal(response.status,403);assert.equal(response.result.code,'CASE_FORBIDDEN');
+  assert.equal((await h.db.query('SELECT * FROM case_reminders')).rows.length,0);assert.deepEqual((await h.row()).data._handoff,checkpoint(2));assert.equal(h.telegram.length,0);
+}));
+
+test('reminder creation retains current assigned lawyer, manager and approved configured administrator access',pg,()=>fixture(async h=>{
+  await h.seed({answer:'Original'});const before=process.env.ADMIN_TG_IDS;process.env.ADMIN_TG_IDS='999';
+  try{for(const actor of [{id:808,role:'lawyer'},{id:101,role:'manager'},{id:999,role:'auditor'}]){const response=await h.createReminder(actor);assert.equal(response.status,200);assert.equal(response.result.ok,true);assert.ok(Number(response.result.id)>0);}
+    assert.equal((await h.db.query('SELECT * FROM case_reminders')).rows.length,3);assert.equal(h.telegram.length,0);
+  }finally{if(before===undefined)delete process.env.ADMIN_TG_IDS;else process.env.ADMIN_TG_IDS=before;}
+}));
+
+test('reminder creation retries an accepted request exactly once and rejects changed intent for the same case and author',pg,()=>fixture(async h=>{
+  await h.seed({answer:'Original'});const request_id=randomUUID();
+  const first=await h.createReminder(undefined,{request_id}),replay=await h.createReminder(undefined,{request_id});
+  assert.equal(first.result.ok,true);assert.equal(replay.result.ok,true);assert.equal(replay.result.id,first.result.id);assert.equal((await h.db.query('SELECT * FROM case_reminders')).rows.length,1);
+  const changed=await h.createReminder(undefined,{request_id,text:'Changed retry'});assert.equal(changed.status,409);assert.equal(changed.result.code,'REMINDER_REQUEST_CHANGED');
+  assert.equal((await h.db.query('SELECT text FROM case_reminders')).rows[0].text,'Synthetic reminder');
+  const deliberateNew=await h.createReminder();assert.notEqual(deliberateNew.result.id,first.result.id);assert.equal((await h.db.query('SELECT * FROM case_reminders')).rows.length,2);
+}));
+
+test('reminder request IDs are scoped to case and author and current access is required even for a replay',pg,()=>fixture(async h=>{
+  await h.seed({});await h.db.exec("INSERT INTO cases(id,org,lawyer_tg_id) VALUES(18,'Other synthetic case',808)");const request_id=randomUUID();
+  const first=await h.createReminder(undefined,{request_id}),otherCase=await h.createReminder(undefined,{case_id:18,request_id}),otherActor=await h.createReminder({id:101,role:'manager'},{request_id});
+  assert.equal(new Set([first.result.id,otherCase.result.id,otherActor.result.id]).size,3);
+  await h.db.exec('UPDATE staff SET approved=false WHERE tg_id=808');const revoked=await h.createReminder(undefined,{request_id});assert.equal(revoked.status,403);assert.equal(revoked.result.id,undefined);
+}));
+
+test('an old reminder form without a valid request ID is refused visibly before creating a row',pg,()=>fixture(async h=>{
+  await h.seed({});for(const request_id of [undefined,'',true,'not-a-uuid']){const response=await h.createReminder(undefined,{request_id});assert.equal(response.status,409);assert.equal(response.result.code,'REMINDER_REQUEST_REQUIRED');assert.match(response.result.error,/обновите|откройте/i);}
+  assert.equal((await h.db.query('SELECT * FROM case_reminders')).rows.length,0);
+}));
+
+test('a lost reminder COMMIT acknowledgement replays its durable request without changing delivery or completed state',pg,()=>fixture(async h=>{
+  await h.seed({});const request_id=randomUUID();h.loseCommit();const uncertain=await h.createReminder(undefined,{request_id});assert.equal(uncertain.status,500);
+  const row=(await h.db.query('SELECT * FROM case_reminders')).rows[0];assert.ok(row.id);await h.db.query("UPDATE case_reminders SET done=true,sent_at=NOW(),delivery=$1 WHERE id=$2",[{808:901,_attempts:{808:{state:'confirmed',message_id:901}}},row.id]);
+  const before=(await h.db.query('SELECT * FROM case_reminders')).rows[0],replay=await h.createReminder(undefined,{request_id});assert.equal(replay.result.ok,true);assert.equal(replay.result.replayed,true);assert.equal(replay.result.id,row.id);assert.equal(replay.result.done,true);
+  assert.deepEqual((await h.db.query('SELECT * FROM case_reminders')).rows,[before]);
+}));
+
+test('adding durable reminder requests preserves old schedules, completion and delivery receipts without assigning invented IDs',pg,()=>fixture(async h=>{
+  await h.seed({});await h.migrateReminders();await h.db.exec('ALTER TABLE case_reminders DROP COLUMN request_id;ALTER TABLE case_reminders DROP COLUMN request_signature');
+  await h.db.query("INSERT INTO case_reminders(id,case_id,remind_on,text,created_by,created_name,done,sent_at,delivery) VALUES(99,17,'2026-11-12','Legacy unchanged',808,'Original author',true,NOW(),$1)",[{808:903}]);
+  const old=(await h.db.query('SELECT * FROM case_reminders WHERE id=99')).rows[0];await h.migrateReminders();const migrated=(await h.db.query('SELECT * FROM case_reminders WHERE id=99')).rows[0];
+  assert.deepEqual(migrated,{...old,request_id:null,request_signature:null});assert.equal((await h.createReminder()).result.ok,true);assert.equal((await h.db.query('SELECT * FROM case_reminders')).rows.length,2);
+}));
 
 test('concurrent identical checklist transitions notify each destination once while accepting exact save replay',pg,async()=>fixture(async h=>{
   h.environment.CLIENTS_CHAT_ID='-100222';await h.seed({_stage:'Сбор документов',_handoff:checkpoint(2)});

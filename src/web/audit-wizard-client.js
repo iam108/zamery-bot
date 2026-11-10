@@ -151,12 +151,13 @@
     if(!attempt)return;
     var result=await request('/api/audit/drafts/current?order_id='+encodeURIComponent(orderId)), remote=result.draft;
     var sameVersion=remote&&state.draft&&String(remote.id)===String(state.draft.id)&&Number(remote.revision)===Number(state.draft.revision);
-    var matched=remote&&!remote.submitting&&(!attempt.draft_id||String(attempt.draft_id)===String(remote.id))&&sameData(attempt.data,remote.data);
-    if(matched){adoptRevision(result);state.dirty=!sameData(state.data,remote.data);}
-    else if(!(sameVersion&&!remote.submitting)&&!(!remote&&!state.draft)){
+    var removal=!!attempt.remove_id;
+    var matched=remote&&!remote.submitting&&(!attempt.draft_id||String(attempt.draft_id)===String(remote.id))&&sameData(attempt.data,remote.data)&&(!removal||removalApplied(attempt,remote));
+    if(matched){adoptRevision(result);state.dirty=!sameData(state.data,remote.data);if(removal)forgetEvidence(attempt.remove_id);}
+    else if(!(sameVersion&&!remote.submitting&&(!removal||Number(remote.revision)===attempt.revision))&&!(!remote&&!state.draft)){
       var conflict=new Error('Черновик изменился в другом окне. Ваши правки остались на устройстве.');conflict.status=409;throw conflict;
     }
-    state.attempt=null;localSave();
+    state.attempt=null;localSave();return matched;
   }
   async function flush() {
     if(state.frozen)throw new Error('Версия отчёта зафиксирована. Повторите отправку без изменений.');
@@ -1039,27 +1040,42 @@
     }else state.data.map=Object.assign({},clone(defaults.map),{mode:'attached',evidence_id:saved[0].id});
     changed();render();
   }
+  function removalApplied(attempt,remote){return !!remote&&String(attempt.draft_id)===String(remote.id)&&Number(remote.revision)===attempt.revision+1&&sameData(attempt.data,remote.data)&&!(remote.evidence||[]).some(function(e){return String(e.id)===String(attempt.remove_id);});}
+  function forgetEvidence(eid){
+    state.evidence=state.evidence.filter(function(e){return String(e.id)!==String(eid);});
+    var removedReference=false;
+    [state.data.plan,state.data.map].concat(state.data.additional_plans).forEach(function(plan){
+      if(String(plan.evidence_id)===String(eid)){plan.evidence_id='';plan.annotations=[];plan.pending=null;delete plan.preview_evidence_id;removedReference=true;}
+      else if(String(plan.preview_evidence_id)===String(eid)){delete plan.preview_evidence_id;removedReference=true;}
+    });
+    if(removedReference){state.dirty=true;state.version++;}
+    if(blobUrls.has(String(eid))){URL.revokeObjectURL(blobUrls.get(String(eid)));blobUrls.delete(String(eid));}
+  }
+  async function removeEvidenceFile(eid){
+    var attempt={draft_id:state.draft.id,revision:Number(state.draft.revision),data:clone(state.draft.data||state.data),remove_id:eid};
+    state.attempt=attempt;localSave();
+    try{
+      var result=await request('/api/audit/drafts/'+encodeURIComponent(attempt.draft_id)+'/evidence/'+encodeURIComponent(eid),{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({revision:attempt.revision})});
+      adoptRevision(result);state.attempt=null;forgetEvidence(eid);localSave();
+    }catch(error){
+      if(error.retryable||error.status>=500){try{if(await recoverUnconfirmedWrite())return;}catch(recoveryError){if(recoveryError.status===409)throw recoveryError;}}
+      else if(state.attempt===attempt){state.attempt=null;localSave();}
+      throw error;
+    }
+  }
   async function deleteEvidence(eid){
     if(state.submitting||state.frozen||state.conflict)return;
     var evidence=state.evidence.find(function(e){return String(e.id)===String(eid);});
     if(!evidence||!window.confirm('Убрать файл «'+(evidence.name||'документ')+'» из этой проверки?'))return;
     queue(async function(){try{
       await flush();
-      var result=await request('/api/audit/drafts/'+encodeURIComponent(state.draft.id)+'/evidence/'+encodeURIComponent(eid),{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({revision:state.draft.revision})});
-      adoptRevision(result);state.evidence=state.evidence.filter(function(e){return String(e.id)!==String(eid);});
-      var removedReference=false;
-      [state.data.plan,state.data.map].concat(state.data.additional_plans).forEach(function(plan){
-        if(String(plan.evidence_id)===String(eid)){plan.evidence_id='';plan.annotations=[];plan.pending=null;delete plan.preview_evidence_id;removedReference=true;}
-        else if(String(plan.preview_evidence_id)===String(eid)){delete plan.preview_evidence_id;removedReference=true;}
-      });
-      if(removedReference){state.dirty=true;state.version++;}
-      if(blobUrls.has(String(eid))){URL.revokeObjectURL(blobUrls.get(String(eid)));blobUrls.delete(String(eid));}
+      await removeEvidenceFile(eid);
       localSave();render();
-      if(removedReference)await flush();
+      if(state.dirty)await flush();
       notify('Файл убран из проверки.');
     }catch(error){if(error.status===409){state.conflict=true;localSave();$('#conflict-panel').hidden=false;}notify(error.message);}});
   }
-  async function removeGeneratedEvidence(eid){var result=await request('/api/audit/drafts/'+encodeURIComponent(state.draft.id)+'/evidence/'+encodeURIComponent(eid),{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({revision:state.draft.revision})});adoptRevision(result);state.evidence=state.evidence.filter(function(e){return e.id!==eid;});}
+  async function removeGeneratedEvidence(eid){await removeEvidenceFile(eid);}
   async function exportGraphic(plan,kind,subject){if(!window.AuditPlanEditor||!plan.evidence_id||!plan.annotations.length&&!(kind==='plan'&&plan.mode==='attached'))return null;var host=document.createElement('div');host.className='export-shell';document.body.appendChild(host);var api;try{api=window.AuditPlanEditor.mount(host,{kind:kind,artworkOnly:kind==='plan'&&plan.mode==='attached',service:state.data.object_category==='tobacco'?'tobacco':'alcohol',getState:function(){return plan;},onChange:function(){},evidenceUrl:evidenceUrl,evidence:state.evidence});await api.refresh();var result=await api.exportPreview();if(!result)throw new Error('Не удалось подготовить актуальное изображение '+(kind==='map'?'схемы':'плана')+'. Повторите загрузку исходника и отправку отчёта.');result.subject_id=subject;return result;}finally{if(api)api.destroy();host.remove();}}
   async function exportPlan(){return exportGraphic(state.data.plan,'plan','annotation');}
   function freezeControls(){
@@ -1286,19 +1302,21 @@
   }
   function reconcileDraft(local,remote) {
     state.draft=remote;state.evidence=remote.evidence||[];
+    var appliedRemoval=local&&local.attempt&&local.attempt.remove_id&&removalApplied(local.attempt,remote);
     if(remote.submitting){
       state.pendingPacket=null;state.packetError='';
       if(local&&local.dirty&&!sameData(local.data,remote.data)){state.recoveryData=clone(local.data);state.conflict=true;}
       state.data=restoreData(remote.data,true);state.frozen=true;state.viewStep=2;state.dirty=false;
     }else if(local&&local.dirty){
       var sameId=String(local.draft_id||'')===String(remote.id);
-      var attempt=local.attempt,matchingAttempt=attempt&&(!attempt.draft_id||String(attempt.draft_id)===String(remote.id))&&sameData(attempt.data,remote.data);
+      var attempt=local.attempt,matchingAttempt=attempt&&(!attempt.draft_id||String(attempt.draft_id)===String(remote.id))&&sameData(attempt.data,remote.data)&&(!attempt.remove_id||appliedRemoval);
       if((sameId||!local.draft_id)&&sameData(local.data,remote.data)){state.data=restoreData(remote.data);state.dirty=false;state.attempt=null;}
       else if(!local.conflict&&(matchingAttempt||(sameId&&Number(local.revision)===Number(remote.revision)))){state.attempt=null;}
       else state.conflict=true;
     }else{
       state.data=restoreData(remote.data);state.dirty=Number(remote.data&&remote.data.ui_version)!==5;
     }
+    if(appliedRemoval&&!remote.submitting){state.attempt=null;forgetEvidence(local.attempt.remove_id);}
     state.packet=state.data.request_packet||null;
     $('#conflict-panel').hidden=!state.conflict;
   }
