@@ -75,6 +75,29 @@ function objectFixture(options = {}) {
   };
 }
 
+test('direct download signs only the selected S3 original while legacy PostgreSQL stays compatible', async () => {
+  const pool = memoryPool(), objects = objectFixture(), calls = [];
+  objects.downloadUrl = async (file, opts) => { calls.push({ file, opts }); return 'https://synthetic.storage.example/private'; };
+  const legacy = createEgrnFileStore(pool, { objectStore: null });
+  const old = await legacy.save(input());
+  const store = createEgrnFileStore(pool, { objectStore: objects });
+  assert.equal(await store.downloadUrl(old.id), null);
+  const saved = await store.save(input(pdf(50), { source_key: 'direct-s3' }));
+  const result = await store.downloadUrl(saved.id, { expiresIn: 33, expiresAt: 1800000000 });
+  assert.equal(result, 'https://synthetic.storage.example/private'); assert.equal(calls.length, 1);
+  assert.equal(calls[0].file.bytes, saved.bytes); assert.equal(calls[0].file.sha256, saved.sha256);
+  assert.equal(calls[0].file.mime, saved.mime); assert.equal(calls[0].file.name, saved.name);
+  assert.equal(calls[0].file.key, objects.writes[0]); assert.equal(calls[0].opts.expiresIn, 33);
+  assert.deepEqual(objects.reads, []);
+  await assert.rejects(store.downloadUrl('invalid'), { code: 'EGRN_FILE_NOT_FOUND' });
+  await assert.rejects(store.downloadUrl('00000000-0000-5000-8000-000000000000'), { code: 'EGRN_FILE_NOT_FOUND' });
+  const controller = new AbortController(); controller.abort();
+  await assert.rejects(store.downloadUrl(saved.id, { signal: controller.signal }), { code: 'EGRN_FILE_CANCELLED' });
+  objects.downloadUrl = async () => { throw new Error('storage unavailable'); };
+  await assert.rejects(store.downloadUrl(saved.id), /storage unavailable/);
+  assert.deepEqual(objects.reads, []);
+});
+
 test('invalid order, source credentials, empty/non-document and oversized files never touch PostgreSQL', async () => {
   const pool = memoryPool(), store = createEgrnFileStore(pool);
   assert.equal(MAX_BYTES, 2 * 1024 * MiB - 1);

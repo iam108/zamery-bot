@@ -72,6 +72,11 @@ function filesystemS3(directory, stats) {
       assert.equal((await fsp.stat(target.body)).size, file.bytes);
       return fs.createReadStream(target.body, { highWaterMark: MiB });
     },
+    async downloadUrl(file) {
+      const target = files(file.key), saved = JSON.parse(await fsp.readFile(target.metadata, 'utf8'));
+      assert.equal(saved.bytes, file.bytes); assert.equal(saved.sha256, file.sha256);
+      return 'https://synthetic-storage.example/files/' + path.basename(target.body);
+    },
     async remove(key) { stats.removals++; const target = files(key); await Promise.all([fsp.rm(target.body, { force: true }), fsp.rm(target.metadata, { force: true })]); }
   };
 }
@@ -105,7 +110,7 @@ function download(port, url, method = 'GET') {
 
 test('300 MiB provider JSON reaches private object storage, metadata-only PostgreSQL and three recipients before an exact signed HTTP download',
   { skip: !process.env.PGLITE_TEST_MODULE, timeout: 240000 }, async () => {
-    let server, db, directory, bundle;
+    let server, storageServer, db, directory, bundle;
     try {
       // Test local listening before generating or writing the large fixture.
       const app = express(); server = http.createServer(app);
@@ -115,6 +120,13 @@ test('300 MiB provider JSON reaches private object storage, metadata-only Postgr
       directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'zamery-private-s3-e2e-'));
       const spool = path.join(directory, 'spool'), bucket = path.join(directory, 'private-bucket');
       await fsp.mkdir(spool, { mode: 0o700 }); await fsp.mkdir(bucket, { mode: 0o700 });
+      storageServer = http.createServer((req, res) => {
+        const name = req.url.slice('/files/'.length);
+        if (!/^\/files\/[0-9a-f]{64}\.bin$/.test(req.url)) return res.writeHead(404).end();
+        res.setHeader('Content-Length', String(BYTES));
+        fs.createReadStream(path.join(bucket, name)).pipe(res);
+      });
+      await new Promise(resolve => storageServer.listen(0, '127.0.0.1', resolve));
       const stats = { puts: 0, gets: 0, removals: 0, storedBytes: 0, maxWriteChunk: 0 };
       const objects = filesystemS3(bucket, stats), store = createEgrnFileStore(pool, { objectStore: objects });
       const generated = { bytes: 0 }, order = { id: 901, id_req: 77001, cad_num: '77:01:0000000:901', label: 'Synthetic S3 fixture',
@@ -159,10 +171,12 @@ test('300 MiB provider JSON reaches private object storage, metadata-only Postgr
       assert.equal(url.pathname, '/egrn-files/' + id + '/download'); assert.equal(url.href.includes(SECRET), false);
       const beforeHead = stats.gets, head = await download(port, url, 'HEAD');
       assert.equal(head.status, 200); assert.equal(head.bytes, 0); assert.equal(head.headers['content-length'], String(BYTES)); assert.equal(stats.gets, beforeHead);
-      const received = await download(port, url);
+      const redirect = await download(port, url);
+      assert.equal(redirect.status, 302); assert.equal(redirect.bytes, 0);
+      assert.equal(redirect.headers['cache-control'], 'private, no-store');
+      const received = await download(storageServer.address().port, new URL(redirect.headers.location));
       assert.equal(received.status, 200); assert.equal(received.bytes, BYTES); assert.equal(received.sha256, generated.sha256);
-      assert.equal(received.headers['cache-control'], 'private, no-store'); assert.match(received.headers['content-disposition'], /^attachment;/);
-      assert.equal(stats.gets, beforeHead + 1);
+      assert.equal(stats.gets, beforeHead, 'The bot must not GET original bytes for a direct download');
 
       // A wrong expected checksum cannot become a second durable object or a
       // notification; its partial attempt belongs only to the failed save.
@@ -175,6 +189,7 @@ test('300 MiB provider JSON reaches private object storage, metadata-only Postgr
     } finally {
       await bundle?.cleanup();
       if (server) await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); });
+      if (storageServer) await new Promise(resolve => { storageServer.closeAllConnections(); storageServer.close(resolve); });
       if (db) await db.close();
       if (directory) await fsp.rm(directory, { recursive: true, force: true });
     }

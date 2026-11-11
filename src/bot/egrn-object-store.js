@@ -112,6 +112,63 @@ function createEgrnObjectStore(options = {}) {
       return object.Body;
     } catch (error) { cleanup(); body?.destroy?.(); throw failure('EGRN_OBJECT_READ', error); }
   }
+  async function downloadUrl(file, { expiresIn = 300, expiresAt } = {}) {
+    validate(file, namespace);
+    const type = String(file.mime || '').toLowerCase().split(';')[0].trim();
+    if (namespace !== 'egrn-originals' || !['application/pdf', 'application/zip'].includes(type) ||
+        !Number.isSafeInteger(expiresIn) || expiresIn < 1 || expiresIn > 300 ||
+        expiresAt !== undefined && (!Number.isSafeInteger(expiresAt) || expiresAt < 1)) throw failure('EGRN_OBJECT_ARGUMENT');
+    function now() {
+      const value = typeof options.now === 'function' ? options.now() : Date.now();
+      if (!Number.isSafeInteger(value) || value < 0) throw failure('EGRN_OBJECT_ARGUMENT');
+      return value;
+    }
+    function remaining(at) {
+      const ttl = Math.min(expiresIn, expiresAt === undefined ? expiresIn : expiresAt - Math.floor(at / 1000));
+      if (ttl < 1) throw Object.assign(failure('EGRN_OBJECT_EXPIRED'), { status: 403 });
+      return ttl;
+    }
+    remaining(now());
+    const extension = type === 'application/pdf' ? 'pdf' : 'zip';
+    let name = Buffer.from(String(file.name || ''), 'utf8').toString('utf8').split(/[\\/]/).pop()
+      .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, '').trim();
+    name = Array.from(name).slice(0, 180).join('');
+    if (!name || name === '.' || name === '..') name = 'Выписка ЕГРН.' + extension;
+    else if (!name.toLowerCase().endsWith('.' + extension)) name += '.' + extension;
+    const encoded = encodeURIComponent(name).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+    const disposition = 'attachment; filename="egrn.' + extension + '"; filename*=UTF-8\'\'' + encoded;
+    const controller = new AbortController(); let timedOut = false, rejectAbort;
+    const aborted = new Promise((_, reject) => { rejectAbort = reject; }); aborted.catch(() => {});
+    const abort = () => { controller.abort(); rejectAbort(failure('EGRN_OBJECT_CANCELLED')); };
+    const timeout = Math.min(30000, Math.max(1, options.signingTimeoutMs || options.timeoutMs || 30000));
+    const timer = setTimeout(() => { timedOut = true; abort(); }, timeout);
+    file.signal?.addEventListener('abort', abort, { once: true });
+    try {
+      if (file.signal?.aborted) { abort(); throw failure('EGRN_OBJECT_CANCELLED'); }
+      const { config, connection, sdk } = client();
+      // A presigned GET transfers bytes directly from the private bucket. HEAD
+      // verifies the persisted original without reading it through the bot.
+      const stored = await Promise.race([connection.send(new sdk.HeadObjectCommand({ Bucket: config.bucket, Key: file.key,
+        ChecksumMode: 'ENABLED' }), { abortSignal: controller.signal }), aborted]);
+      verify(stored, file);
+      const signingDate = new Date(now()), ttl = remaining(signingDate.getTime());
+      if (controller.signal.aborted) throw failure('EGRN_OBJECT_CANCELLED');
+      const sign = options.getSignedUrl || require('@aws-sdk/s3-request-presigner').getSignedUrl;
+      const url = await Promise.race([sign(connection, new sdk.GetObjectCommand({ Bucket: config.bucket, Key: file.key,
+        ResponseContentType: type, ResponseContentDisposition: disposition, ResponseCacheControl: 'private, no-store' }), { expiresIn: ttl, signingDate }), aborted]);
+      remaining(now());
+      const parsed = new URL(url), endpoint = new URL(config.endpoint);
+      if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.port || parsed.hash ||
+          parsed.hostname !== config.bucket + '.' + endpoint.hostname || parsed.pathname !== '/' + file.key ||
+          parsed.searchParams.get('X-Amz-Algorithm') !== 'AWS4-HMAC-SHA256' ||
+          parsed.searchParams.get('X-Amz-Expires') !== String(ttl) ||
+          !/^[0-9a-f]{64}$/.test(parsed.searchParams.get('X-Amz-Signature') || '')) throw failure('EGRN_OBJECT_SIGN');
+      return parsed.href;
+    } catch (error) {
+      controller.abort();
+      throw timedOut ? failure('EGRN_OBJECT_TIMEOUT') : failure('EGRN_OBJECT_SIGN', error);
+    } finally { clearTimeout(timer); file.signal?.removeEventListener('abort', abort); }
+  }
   async function remove(key) {
     if (!validKey(key, namespace)) throw failure('EGRN_OBJECT_ARGUMENT');
     const controller = new AbortController(); let timedOut = false, rejectTimeout;
@@ -126,7 +183,7 @@ function createEgrnObjectStore(options = {}) {
     } catch (error) { throw timedOut ? failure('EGRN_OBJECT_TIMEOUT') : failure('EGRN_OBJECT_DELETE', error); }
     finally { clearTimeout(timer); }
   }
-  return { configured, put, get, remove };
+  return { configured, put, get, remove, downloadUrl };
 }
 
 module.exports = { createEgrnObjectStore };

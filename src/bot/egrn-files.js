@@ -303,6 +303,17 @@ function createEgrnFileStore(pool, options = {}) {
     id = orderId(id); await ensure();
     return (await pool.query(`SELECT ${COLUMNS} FROM egrn_files WHERE egrn_order_id=$1 ORDER BY created_at,id`, [id])).rows.map(metadata);
   }
+  async function downloadUrl(id, options = {}) {
+    if (!validId(id)) throw error(404, 'EGRN_FILE_NOT_FOUND', 'Файл выписки не найден.');
+    if (options.signal?.aborted) throw cancelled();
+    await ensure();
+    const row = (await pool.query(`SELECT ${COLUMNS} FROM egrn_files WHERE id=$1`, [id])).rows[0];
+    if (!row) throw error(404, 'EGRN_FILE_NOT_FOUND', 'Файл выписки не найден.');
+    // Old PostgreSQL originals keep their existing streaming download. An S3
+    // failure must not silently turn a direct download back into paid egress.
+    if (row.storage !== 's3') return null;
+    return objects.downloadUrl({ key: row.object_key, ...metadata(row), signal: options.signal }, options);
+  }
   async function* chunks(id, options = {}) {
     if (options.signal?.aborted) throw cancelled();
     if (!validId(id)) throw error(404, 'EGRN_FILE_NOT_FOUND', 'Файл выписки не найден.');
@@ -332,7 +343,7 @@ function createEgrnFileStore(pool, options = {}) {
     const extra = await pool.query('SELECT chunk_no FROM egrn_file_chunks WHERE file_id=$1 AND chunk_no >= $2 LIMIT 1', [id, index]);
     if (extra.rows.length || hash.digest('hex') !== file.sha256) throw error(500, 'EGRN_FILE_CORRUPT', 'Не удалось подтвердить целостность оригинала выписки.');
   }
-  return { ensure, save, saveStream, get, listByOrder, chunks };
+  return { ensure, save, saveStream, get, listByOrder, downloadUrl, chunks };
 }
 
 // Resolve the existing pool lazily: importing helpers does not open a connection.
@@ -342,4 +353,5 @@ module.exports = { MAX_BYTES, createEgrnFileStore,
   ensure: (...args) => store().ensure(...args), save: (...args) => store().save(...args),
   saveStream: (...args) => store().saveStream(...args),
   get: (...args) => store().get(...args), listByOrder: (...args) => store().listByOrder(...args),
+  downloadUrl: (...args) => store().downloadUrl(...args),
   chunks: (...args) => store().chunks(...args) };

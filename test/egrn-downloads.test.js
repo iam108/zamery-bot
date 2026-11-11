@@ -40,6 +40,49 @@ async function fixture(t, supplied = {}) {
   return { port: server.address().port, server, store, data, calls };
 }
 
+test('an existing seven-day link redirects directly to private storage without reading file bytes', async t => {
+  const target = 'https://synthetic-files.storage.example/egrn-originals/file?X-Amz-Signature=synthetic';
+  let signed;
+  const h = await fixture(t, {
+    async downloadUrl(id, opts) { signed = { id, opts }; return target; },
+    async *chunks() { assert.fail('Direct downloads must not stream through the bot'); }
+  });
+  const result = await request(h.port, routePath(url()));
+  assert.equal(result.status, 302); assert.equal(result.headers.location, target);
+  assert.equal(result.body.length, 0); assert.equal(result.headers['content-length'], '0');
+  assert.equal(result.headers['cache-control'], 'private, no-store'); assert.equal(result.headers['referrer-policy'], 'no-referrer');
+  assert.equal(result.headers['content-disposition'], undefined);
+  assert.equal(signed.id, ID); assert.equal(signed.opts.expiresIn, 300);
+  assert.equal(signed.opts.expiresAt, Number(url().searchParams.get('exp')));
+  assert.deepEqual(h.calls, ['ensure', ['get', ID]]);
+});
+
+test('direct storage cannot extend the original link expiry or run on invalid links and HEAD probes', async t => {
+  let calls = [];
+  const h = await fixture(t, { async downloadUrl(id, opts) { calls.push(opts); return 'https://storage.example/private?signature=synthetic'; } });
+  const short = url(ID, { ttlSeconds: 19 });
+  assert.equal((await request(h.port, routePath(short))).status, 302);
+  assert.equal(calls[0].expiresIn, 19); assert.equal(calls[0].expiresAt, NOW / 1000 + 19);
+  const forged = new URL(short); forged.searchParams.set('exp', String(NOW / 1000 + 40));
+  assert.equal((await request(h.port, routePath(forged))).status, 403);
+  assert.equal((await request(h.port, routePath(url()), 'HEAD')).status, 200);
+  assert.equal(calls.length, 1);
+});
+
+test('storage signing errors fail closed, never proxy bytes or expose a provider secret', async t => {
+  let chunks = 0;
+  for (const target of [new Error('private credential must remain hidden'), 'http://unsafe.example/file', 'https://user:secret@storage.example/file']) {
+    const h = await fixture(t, {
+      async downloadUrl() { if (target instanceof Error) throw target; return target; },
+      async *chunks() { chunks++; yield Buffer.alloc(1); }
+    });
+    const result = await request(h.port, routePath(url()));
+    assert.equal(result.status, 503); assert.equal(result.headers.location, undefined);
+    assert.doesNotMatch(result.body.toString(), /credential|secret|unsafe/);
+  }
+  assert.equal(chunks, 0);
+});
+
 test('links contain a per-file signature and seven-day expiry, without provider or bot credentials', () => {
   const link = url();
   assert.equal(link.origin, 'https://files.example.test');

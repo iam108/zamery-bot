@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { createHash } = require('node:crypto');
+const { createHash, createHmac } = require('node:crypto');
 const { Readable } = require('node:stream');
 const { createEgrnObjectStore } = require('../src/bot/egrn-object-store');
 
@@ -230,5 +230,156 @@ test('the real AWS SDK serializes streaming PUT/HEAD/GET with Content-Length and
     for await (const chunk of body) assert.deepEqual(chunk, data);
     await store.remove(key);
     assert.deepEqual(requests, ['PUT', 'HEAD', 'GET', 'DELETE']);
+  } finally { client.destroy(); }
+});
+
+const signedObjectUrl = async (_client, command, options) => {
+  const url = new URL('/' + command.input.Key, 'https://' + env.EGRN_S3_BUCKET + '.t3.storageapi.dev');
+  url.search = new URLSearchParams({ 'X-Amz-Algorithm': 'AWS4-HMAC-SHA256', 'X-Amz-Expires': String(options.expiresIn),
+    'X-Amz-Signature': 'a'.repeat(64) }).toString();
+  return url.href;
+};
+
+test('direct download verifies only HEAD, signs a private GET and uses a bounded TTL', async () => {
+  const signed = [], h = fixture({ getSignedUrl: async (...args) => { signed.push(args); return signedObjectUrl(...args); } });
+  await h.store.put(file()); h.calls.length = 0;
+  const result = new URL(await h.store.downloadUrl({ key, bytes: data.length, sha256, mime: 'application/pdf', name: '../план\r\n.pdf' }));
+  assert.deepEqual(h.calls.map(x => x.operation), ['HeadObjectCommand']);
+  assert.equal(h.calls[0].input.ChecksumMode, 'ENABLED');
+  assert.equal(result.hostname, env.EGRN_S3_BUCKET + '.t3.storageapi.dev');
+  assert.equal(result.searchParams.get('X-Amz-Expires'), '300');
+  const [, command, options] = signed[0];
+  assert.equal(command.operation, 'GetObjectCommand');
+  assert.equal(command.input.ResponseContentType, 'application/pdf');
+  assert.equal(command.input.ResponseCacheControl, 'private, no-store');
+  assert.equal(command.input.ResponseContentDisposition, 'attachment; filename="egrn.pdf"; filename*=UTF-8\'\'' + encodeURIComponent('план.pdf'));
+  assert.equal(options.expiresIn, 300);
+  assert.ok(options.signingDate instanceof Date);
+  assert.equal(command.input.ACL, undefined);
+});
+
+test('direct links reject unsupported namespaces, types and expiry before using S3', async () => {
+  const h = fixture({ getSignedUrl: signedObjectUrl });
+  const value = { key, bytes: data.length, sha256, mime: 'application/pdf' };
+  for (const expiresIn of [0, 301, 1.5, '300', NaN]) {
+    await assert.rejects(h.store.downloadUrl(value, { expiresIn }), { code: 'EGRN_OBJECT_ARGUMENT' });
+  }
+  for (const expiresAt of [0, -1, 1.5, '300', NaN]) {
+    await assert.rejects(h.store.downloadUrl(value, { expiresAt }), { code: 'EGRN_OBJECT_ARGUMENT' });
+  }
+  await assert.rejects(h.store.downloadUrl({ ...value, mime: 'image/png' }), { code: 'EGRN_OBJECT_ARGUMENT' });
+  await assert.rejects(h.store.downloadUrl({ ...value, key: '../another-file' }), { code: 'EGRN_OBJECT_ARGUMENT' });
+  const audit = fixture({ namespace: 'audit-originals', getSignedUrl: signedObjectUrl });
+  await assert.rejects(audit.store.downloadUrl({ ...value, key: key.replace('egrn-originals/', 'audit-originals/') }), { code: 'EGRN_OBJECT_ARGUMENT' });
+  assert.equal(h.calls.length + audit.calls.length, 0);
+});
+
+test('a direct link is never issued for a missing or changed stored original', async () => {
+  for (const changed of [{ ContentLength: 1 }, { Metadata: { sha256: '0'.repeat(64) } }, { ChecksumSHA256: 'wrong' }]) {
+    let signed = false;
+    const h = fixture({ send: async () => ({ ContentLength: data.length, Metadata: { sha256 }, ...changed }),
+      getSignedUrl: async () => { signed = true; } });
+    await assert.rejects(h.store.downloadUrl({ key, bytes: data.length, sha256, mime: 'application/pdf' }), { code: 'EGRN_OBJECT_VERIFY' });
+    assert.equal(signed, false);
+  }
+  const missing = fixture({ send: async () => { throw Object.assign(new Error('private object key'), { name: 'NotFound', $metadata: { httpStatusCode: 404 } }); } });
+  await assert.rejects(missing.store.downloadUrl({ key, bytes: data.length, sha256, mime: 'application/pdf' }), error => {
+    assert.equal(error.code, 'EGRN_OBJECT_SIGN'); assert.equal(error.provider_status, 404);
+    assert.equal(error.stack.includes('private object key'), false); return true;
+  });
+});
+
+test('the signed lifetime cannot outlive the outer link or grow during a delayed HEAD', async () => {
+  let now = 1800000000000, signedOptions;
+  const h = fixture({ now: () => now, send: async () => { now += 4000; return { ContentLength: data.length, Metadata: { sha256 } }; },
+    getSignedUrl: async (...args) => { signedOptions = args[2]; return signedObjectUrl(...args); } });
+  const link = await h.store.downloadUrl({ key, bytes: data.length, sha256, mime: 'application/pdf' }, { expiresAt: 1800000010 });
+  assert.equal(new URL(link).searchParams.get('X-Amz-Expires'), '6');
+  assert.equal(signedOptions.signingDate.getTime(), now);
+  assert.equal(signedOptions.signingDate.getTime() / 1000 + signedOptions.expiresIn, 1800000010);
+  now = 1800000010000;
+  const before = h.calls.length;
+  await assert.rejects(h.store.downloadUrl({ key, bytes: data.length, sha256, mime: 'application/pdf' }, { expiresAt: 1800000010 }), { code: 'EGRN_OBJECT_EXPIRED', status: 403 });
+  assert.equal(h.calls.length, before);
+});
+
+test('expiry during HEAD or signing does not produce a fresh direct link', async () => {
+  for (const stage of ['head', 'sign']) {
+    let now = 1800000000000, signed = false;
+    const h = fixture({ now: () => now,
+      send: async () => { if (stage === 'head') now += 3000; return { ContentLength: data.length, Metadata: { sha256 } }; },
+      getSignedUrl: async (...args) => { signed = true; now += 3000; return signedObjectUrl(...args); } });
+    await assert.rejects(h.store.downloadUrl({ key, bytes: data.length, sha256, mime: 'application/pdf' }, { expiresAt: 1800000002 }), { code: 'EGRN_OBJECT_EXPIRED' });
+    assert.equal(signed, stage === 'sign');
+  }
+});
+
+test('direct signing rejects unsafe URLs and never exposes provider secrets in errors', async () => {
+  for (const url of ['https://outside.example/private', 'http://' + env.EGRN_S3_BUCKET + '.t3.storageapi.dev/' + key,
+    'https://user:pass@' + env.EGRN_S3_BUCKET + '.t3.storageapi.dev/' + key]) {
+    const h = fixture({ getSignedUrl: async () => url }); await h.store.put(file());
+    await assert.rejects(h.store.downloadUrl({ key, bytes: data.length, sha256, mime: 'application/pdf' }), { code: 'EGRN_OBJECT_SIGN' });
+  }
+  const h = fixture({ getSignedUrl: async () => { throw new Error('https://private/?secret=' + env.EGRN_S3_SECRET_ACCESS_KEY); } }); await h.store.put(file());
+  await assert.rejects(h.store.downloadUrl({ key, bytes: data.length, sha256, mime: 'application/pdf' }), error =>
+    error.code === 'EGRN_OBJECT_SIGN' && !error.stack.includes(env.EGRN_S3_SECRET_ACCESS_KEY) && !error.stack.includes('https://private/'));
+});
+
+for (const stage of ['head', 'sign']) test('direct download signing has a deadline during ' + stage, { timeout: 1000 }, async () => {
+  const h = fixture({ signingTimeoutMs: 15,
+    send: async () => stage === 'head' ? new Promise(() => {}) : { ContentLength: data.length, Metadata: { sha256 } },
+    getSignedUrl: () => new Promise(() => {}) });
+  await assert.rejects(h.store.downloadUrl({ key, bytes: data.length, sha256, mime: 'application/pdf' }), { code: 'EGRN_OBJECT_TIMEOUT' });
+  assert.equal(h.calls[0].options.abortSignal.aborted, true);
+});
+
+for (const stage of ['head', 'sign']) test('direct signing aborts promptly during ' + stage + ' and a cancelled request does not contact S3', async () => {
+  let started;
+  const startedPromise = new Promise(resolve => { started = resolve; });
+  const h = fixture({ send: async () => {
+    if (stage === 'head') { started(); return new Promise(() => {}); }
+    return { ContentLength: data.length, Metadata: { sha256 } };
+  }, getSignedUrl: () => { started(); return new Promise(() => {}); } });
+  const controller = new AbortController(), value = { key, bytes: data.length, sha256, mime: 'application/pdf', signal: controller.signal };
+  const pending = h.store.downloadUrl(value); await startedPromise; controller.abort();
+  await assert.rejects(pending, { code: 'EGRN_OBJECT_CANCELLED' });
+  const count = h.calls.length;
+  await assert.rejects(h.store.downloadUrl(value), { code: 'EGRN_OBJECT_CANCELLED' });
+  assert.equal(h.calls.length, count);
+});
+
+test('the real AWS signer produces a canonical private download with Unicode filename and short expiry', async () => {
+  const { S3Client } = require('@aws-sdk/client-s3');
+  const now = Date.UTC(2026, 10, 11, 18, 30, 0), requests = [];
+  const client = new S3Client({ endpoint: env.EGRN_S3_ENDPOINT, region: 'auto', credentials: {
+    accessKeyId: env.EGRN_S3_ACCESS_KEY_ID, secretAccessKey: env.EGRN_S3_SECRET_ACCESS_KEY }, forcePathStyle: false,
+    requestChecksumCalculation: 'WHEN_REQUIRED', responseChecksumValidation: 'WHEN_REQUIRED',
+    requestHandler: { async handle(request) {
+      requests.push(request.method);
+      return { response: { statusCode: 200, headers: { 'content-length': String(data.length), 'x-amz-meta-sha256': sha256 }, body: Readable.from([]) } };
+    } } });
+  try {
+    const store = createEgrnObjectStore({ env, client, now: () => now });
+    const result = new URL(await store.downloadUrl({ key, bytes: data.length, sha256, mime: 'application/pdf', name: 'Выписка ЕГРН №75.pdf' }, { expiresAt: Math.floor(now / 1000) + 47 }));
+    assert.deepEqual(requests, ['HEAD']); // Signing never downloads the original through the bot.
+    assert.equal(result.origin, 'https://' + env.EGRN_S3_BUCKET + '.t3.storageapi.dev');
+    assert.equal(result.pathname, '/' + key);
+    assert.equal(result.searchParams.get('X-Amz-Date'), '20261111T183000Z');
+    assert.equal(result.searchParams.get('X-Amz-Expires'), '47');
+    assert.equal(result.searchParams.get('X-Amz-SignedHeaders'), 'host');
+    assert.equal(result.searchParams.get('response-content-type'), 'application/pdf');
+    assert.equal(result.searchParams.get('response-cache-control'), 'private, no-store');
+    assert.equal(result.searchParams.get('response-content-disposition'), 'attachment; filename="egrn.pdf"; filename*=UTF-8\'\'' + encodeURIComponent('Выписка ЕГРН №75.pdf'));
+    assert.equal(result.href.includes(env.EGRN_S3_SECRET_ACCESS_KEY), false);
+    const encode = value => encodeURIComponent(value).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+    const canonicalQuery = [...result.searchParams].filter(([name]) => name !== 'X-Amz-Signature')
+      .map(([name, value]) => encode(name) + '=' + encode(value)).sort().join('&');
+    const canonical = ['GET', result.pathname, canonicalQuery, 'host:' + result.host + '\n', 'host', 'UNSIGNED-PAYLOAD'].join('\n');
+    const scope = result.searchParams.get('X-Amz-Credential').split('/').slice(1).join('/');
+    const toSign = ['AWS4-HMAC-SHA256', result.searchParams.get('X-Amz-Date'), scope, createHash('sha256').update(canonical).digest('hex')].join('\n');
+    const hmac = (key, value) => createHmac('sha256', key).update(value).digest();
+    let signingKey = Buffer.from('AWS4' + env.EGRN_S3_SECRET_ACCESS_KEY);
+    for (const part of scope.split('/')) signingKey = hmac(signingKey, part);
+    assert.equal(createHmac('sha256', signingKey).update(toSign).digest('hex'), result.searchParams.get('X-Amz-Signature'));
   } finally { client.destroy(); }
 });

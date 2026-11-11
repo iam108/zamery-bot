@@ -90,32 +90,49 @@ function setupEgrnDownloads(app, options = {}) {
       const file = await store.get(id);
       if (!file) return res.status(404).type('text/plain').send('Файл выписки не найден.');
       const info = metadata(file);
-      res.set({ 'Content-Type': info.type, 'Content-Length': String(info.bytes), 'Content-Disposition': info.disposition, 'Accept-Ranges': 'none' });
-      if (req.method === 'HEAD') return res.end();
+      if (req.method === 'HEAD') {
+        res.set({ 'Content-Type': info.type, 'Content-Length': String(info.bytes), 'Content-Disposition': info.disposition, 'Accept-Ranges': 'none' });
+        return res.end();
+      }
       const controller = new AbortController(), abort = () => controller.abort();
       req.once('aborted', abort); res.once('close', abort);
-      async function* body() {
-        let sent = 0, tail;
-        for await (const chunk of store.chunks(id, { signal: controller.signal })) {
-          if (!(Buffer.isBuffer(chunk) || chunk instanceof Uint8Array) || sent + chunk.byteLength > info.bytes) throw new Error('Invalid stored file content');
-          sent += chunk.byteLength;
-          if (!chunk.byteLength) continue;
-          if (tail) yield tail;
-          tail = chunk;
+      try {
+        const remaining = Number(req.query.exp) - clock(options);
+        if (remaining < 1) return res.status(403).type('text/plain').send('Ссылка недействительна или устарела. Получите новую ссылку в боте.');
+        const direct = typeof store.downloadUrl === 'function' ? await store.downloadUrl(id, {
+          expiresIn: Math.min(300, remaining), expiresAt: Number(req.query.exp), signal: controller.signal
+        }) : null;
+        if (direct) {
+          const target = new URL(direct);
+          if (target.protocol !== 'https:' || target.username || target.password) throw new Error('Invalid storage download URL');
+          if (controller.signal.aborted || res.destroyed) return;
+          return res.status(302).set('Location', target.href).end();
         }
-        if (sent !== info.bytes) throw new Error('Incomplete stored file content');
-        // Store iterators validate their final checksum at EOF. Retain one
-        // bounded chunk so Content-Length cannot make a client accept all
-        // bytes before that validation (or a last metadata query) succeeds.
-        if (tail) yield tail;
+        res.set({ 'Content-Type': info.type, 'Content-Length': String(info.bytes), 'Content-Disposition': info.disposition, 'Accept-Ranges': 'none' });
+        async function* body() {
+          let sent = 0, tail;
+          for await (const chunk of store.chunks(id, { signal: controller.signal })) {
+            if (!(Buffer.isBuffer(chunk) || chunk instanceof Uint8Array) || sent + chunk.byteLength > info.bytes) throw new Error('Invalid stored file content');
+            sent += chunk.byteLength;
+            if (!chunk.byteLength) continue;
+            if (tail) yield tail;
+            tail = chunk;
+          }
+          if (sent !== info.bytes) throw new Error('Incomplete stored file content');
+          // Store iterators validate their final checksum at EOF. Retain one
+          // bounded chunk so Content-Length cannot make a client accept all
+          // bytes before that validation (or a last metadata query) succeeds.
+          if (tail) yield tail;
+        }
+        // pipeline destroys the source/async iterator on a disconnected client,
+        // and waits for response drain instead of collecting the file in RAM.
+        await pipeline(Readable.from(body(), { objectMode: false, highWaterMark: 64 * 1024 }), res);
       }
-      // pipeline destroys the source/async iterator on a disconnected client,
-      // and waits for response drain instead of collecting the file in RAM.
-      try { await pipeline(Readable.from(body(), { objectMode: false, highWaterMark: 64 * 1024 }), res); }
       finally { req.removeListener('aborted', abort); res.removeListener('close', abort); }
-    } catch (_) {
+    } catch (error) {
       if (res.headersSent || res.destroyed) { if (!res.destroyed) res.destroy(); return; }
       res.removeHeader('Content-Length'); res.removeHeader('Content-Disposition');
+      if (error.code === 'EGRN_OBJECT_EXPIRED') return res.status(403).type('text/plain').send('Ссылка недействительна или устарела. Получите новую ссылку в боте.');
       return res.status(503).type('text/plain').send('Скачивание выписки временно недоступно. Повторите попытку позднее.');
     }
   }
