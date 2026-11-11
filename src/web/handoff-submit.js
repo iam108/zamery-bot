@@ -112,9 +112,10 @@ function reportUrl(base,state,caseId) {
   url.search=new URLSearchParams(params).toString();return url.href;
 }
 function cardOptions(base,c,state) {
-  const keyboard=[],report=state.packet.report||{},url=reportUrl(base,state,c.id);
-  if(c.checklist_key)keyboard.push([{text:'📋 Чек-лист клиента',web_app:{url:new URL('/checklist?case_id='+c.id,base).href}}]);
-  if(url)keyboard.push([{text:'Отчёт и материалы',web_app:{url}}]);
+  const keyboard=[],navigation=[],report=state.packet.report||{},url=reportUrl(base,state,c.id);
+  if(c.checklist_key)navigation.push({text:'📋 Чек-лист клиента',web_app:{url:new URL('/checklist?case_id='+c.id,base).href}});
+  if(url)navigation.push({text:'Перейти к отчёту',web_app:{url}});
+  if(navigation.length)keyboard.push(navigation);
   const video=https(report.video_url),archive=https(state.packet.archive_url);
   if(video)keyboard.push([{text:'▶ Видео осмотра',url:video}]);
   if(archive)keyboard.push([{text:'Архив объекта',url:archive}]);
@@ -452,4 +453,4 @@ function createHandoffSubmitter(options={}) {
     }
   };
 }
-module.exports={createHandoffSubmitter,HandoffError,DDL,hasPendingLinkedEgrn};
+module.exports={createHandoffSubmitter,HandoffError,DDL,hasPendingLinkedEgrn,cardOptions};

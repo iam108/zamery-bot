@@ -31,6 +31,9 @@ async function main() {
     Promise.resolve().then(() => require('./bot/staff-menu').getStaffMenu(bot).syncApproved()).then(counts => {
       console.log('Staff menus checked:', counts.updated, 'updated,', counts.skipped, 'skipped,', counts.failed, 'failed');
     }).catch(() => console.error('Staff menu sync unavailable'));
+    Promise.resolve().then(() => require('./bot/case-card-sync').createCaseCardSync({pool,telegram:bot.telegram})()).then(counts => {
+      console.log('Client report buttons checked:', counts.updated, 'updated,', counts.unchanged, 'unchanged,', counts.skipped, 'skipped,', counts.failed, 'failed');
+    }).catch(() => console.error('Client report button sync unavailable'));
   }).catch(error => {
     console.error('Bot polling stopped:', error.code || error.response?.error_code || error.name || 'error');
     process.exit(1);

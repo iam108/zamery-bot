@@ -52,6 +52,10 @@ test('V2 delivers the complete packet only to the assigned lawyer even when a sh
   assert.equal(state.groupNotice.status,'confirmed');assert.equal(state.groupNotice.receipt.message_id,notices[0].id);
   for(const card of cards){assert.ok(card.text.length<2000);assert.doesNotMatch(card.text,/ПОЛНЫЙ ТЕКСТ АУДИТОРА|Контакт передала Ирина|Ответы и наблюдения/);assert.match(card.text,/Карина|Лесная/);}
   const lawyerButtons=cards[0].opts.reply_markup.inline_keyboard.flat();assert.ok(lawyerButtons.some(button=>button.web_app?.url.includes('/checklist?case_id='+c.id)));assert.ok(lawyerButtons.some(button=>button.web_app?.url.includes('view=report')));assert.ok(lawyerButtons.some(button=>button.url===h.packet.report.video_url));
+  assert.deepEqual(cards[0].opts.reply_markup.inline_keyboard[0].map(button=>button.text),['📋 Чек-лист клиента','Перейти к отчёту']);
+  const reportLink=new URL(cards[0].opts.reply_markup.inline_keyboard[0][1].web_app.url);
+  assert.equal(reportLink.searchParams.get('report_id'),'15');assert.equal(reportLink.searchParams.get('report_src'),'a');
+  assert.equal(reportLink.searchParams.get('order_id'),'60');assert.equal(reportLink.searchParams.has('k'),false);assert.equal(reportLink.searchParams.has('u'),false);
   for(const target of [String(LAWYER)]){
     const copies=h.events.filter(event=>event.type==='copy'&&event.chat===target);assert.deepEqual(copies.map(event=>event.payload.message_ids.length),[100,5]);assert.ok(copies.flatMap(event=>event.payload.message_ids).includes(204));
     const zip=h.events.filter(event=>event.type==='zip'&&event.chat===target);assert.equal(zip.length,1);assert.ok(zip[0].buffer.includes(h.files[1].buffer));assert.ok(!zip[0].buffer.includes(h.files[0].buffer));assert.equal(zip[0].opts.reply_to_message_id,state.cards[target]);

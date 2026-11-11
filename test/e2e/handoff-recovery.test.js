@@ -53,6 +53,17 @@ test('a known rejected handoff resumes its existing case after a fresh browser c
     await page.locator('#delivery-title').getByText(/Передано/).waitFor();
     const done=(await service.pool.query('SELECT * FROM cases WHERE order_id=58')).rows;assert.equal(done.length,1);assert.equal(Number(done[0].id),caseId);assert.equal(done[0].data._handoff.completed,true);
     const events=service.messages.slice(start);assert.equal(events.filter(event=>event.method==='sendMessage'&&String(event.args[0])===String(LAWYER)).length,1,'Existing private client card is not resent');
+    const card=events.find(event=>event.method==='sendMessage'&&String(event.args[0])===String(LAWYER));
+    const navigation=card.args[2].reply_markup.inline_keyboard[0];
+    assert.deepEqual(navigation.map(button=>button.text),['📋 Чек-лист клиента','Перейти к отчёту']);
+    const reportUrl=new URL(navigation[1].web_app.url);assert.equal(reportUrl.searchParams.get('report_id'),String(reportIds.get(58)));
+    const lawyer=await openPage(browser,service,LAWYER,{pathname:reportUrl.pathname+reportUrl.search,mobile:true});
+    try {
+      await lawyer.page.locator('#report-dialog').waitFor({state:'visible'});
+      assert.match(await lawyer.page.locator('#report-text').innerText(),/Synthetic complete auditor report for request #58/);
+      assert.equal(await lawyer.page.locator('#footer').isVisible(),false);
+      clean(lawyer);
+    } finally { await lawyer.context.close(); }
     assert.equal(events.filter(event=>event.method==='copyMessages').length,1,'Confirmed audit messages are not copied again');
     const privateItems=[...service.originals.values()].filter(item=>item.chat===String(LAWYER));
     for(const id of sourceIds.get(58))assert.equal(privateItems.filter(item=>item.copied_from?.chat===GROUP&&item.copied_from.id===id).length,1,'Each actual audit source message is delivered once');

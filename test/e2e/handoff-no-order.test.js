@@ -58,6 +58,7 @@ test('an unlinked report survives a lost handoff HTTP ACK and reopening, with on
     for(const id of sourceIds)assert.equal(delivered.filter(item=>item.copied_from?.chat===GROUP&&item.copied_from.id===id).length,1,'Each actual source message is copied once');
     for(const file of originals)assert.ok(delivered.some(item=>item.copied_from&&item.bytes?.equals(file.content)),'The selected lawyer receives the byte-exact original '+file.name);
     const reportButton=cards[0].args[2].reply_markup.inline_keyboard.flat().find(button=>button.web_app?.url.includes('view=report'));assert.ok(reportButton);
+    assert.deepEqual(cards[0].args[2].reply_markup.inline_keyboard[0].map(button=>button.text),['📋 Чек-лист клиента','Перейти к отчёту']);
     const reportUrl=new URL(reportButton.web_app.url);assert.equal(reportUrl.searchParams.get('case_id'),String(assigned.id));assert.equal(reportUrl.searchParams.has('order_id'),false);assert.equal(reportUrl.searchParams.has('u'),false);assert.equal(reportUrl.searchParams.has('k'),false);
     const lawyer=await openPage(browser,service,LAWYER,{pathname:reportUrl.pathname+reportUrl.search,mobile:false});visits.push(lawyer);const view=lawyer.page;
     await view.locator('#report-dialog').waitFor({state:'visible'});assert.equal(await view.locator('#report-text').innerText(),text);assert.equal(await view.locator('#report-originals [data-download]').count(),originals.length);assert.equal(await view.locator('#footer').isVisible(),false);
