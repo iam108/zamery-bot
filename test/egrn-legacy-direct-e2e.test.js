@@ -19,15 +19,19 @@ const ID = '00000000-0000-5000-8000-000000000011';
 const SECRET = 'synthetic-old-seven-day-download-signing-secret';
 const HOST = 'synthetic-legacy-files.storage.example.test';
 
-function request(port, url) {
+function request(port, url, stage) {
   return new Promise((resolve, reject) => {
-    const req = http.get({ host: '127.0.0.1', port, path: url.pathname + url.search, headers: { host: url.host } }, res => {
+    const failed = error => reject(Object.assign(new Error(stage + ': ' + error.message, { cause: error }), { code: error.code }));
+    // PGlite runs in this test's event loop. Its long synchronous work can
+    // delay processing a peer's idle close, making the global keep-alive agent
+    // reuse a stale socket. Use independent connections for these checkpoints.
+    const req = http.get({ host: '127.0.0.1', port, agent: false, path: url.pathname + url.search, headers: { host: url.host } }, res => {
       const hash = createHash('sha256'); let bytes = 0, prefix = Buffer.alloc(0);
       res.on('data', part => { hash.update(part); bytes += part.length; if (prefix.length < 5) prefix = Buffer.concat([prefix, part.subarray(0, 5 - prefix.length)]); });
-      res.on('error', reject); res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, bytes, sha256: hash.digest('hex'), prefix }));
+      res.on('error', failed); res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, bytes, sha256: hash.digest('hex'), prefix }));
     });
     req.setTimeout(60000, () => req.destroy(new Error('Synthetic legacy download timed out')));
-    req.on('error', reject);
+    req.on('error', failed);
   });
 }
 async function listen(server) { await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); }); return server.address().port; }
@@ -103,13 +107,13 @@ test('an old 100 MiB PostgreSQL original survives failed migrations and the same
 
     // A same-size corrupt original must not change the authoritative location.
     await pool.query('UPDATE egrn_files SET sha256=$1 WHERE id=$2', ['0'.repeat(64), ID]);
-    const corrupt = await request(appPort, oldLink); assert.equal(corrupt.status, 503); assert.equal(corrupt.headers.location, undefined);
+    const corrupt = await request(appPort, oldLink, 'Corrupt legacy migration'); assert.equal(corrupt.status, 503); assert.equal(corrupt.headers.location, undefined);
     assert.equal((await state()).storage, 'postgres'); assert.equal((await state()).object_key, null); assert.equal(await storedChunks(), 100);
     assert.equal(stats.completed, 0); assert.equal(objects.size, 0);
     await pool.query('UPDATE egrn_files SET sha256=$1 WHERE id=$2', [sha256, ID]);
 
     uploadFailure = true;
-    const failed = await request(appPort, oldLink); assert.equal(failed.status, 503); assert.equal(failed.headers.location, undefined);
+    const failed = await request(appPort, oldLink, 'Unavailable storage migration'); assert.equal(failed.status, 503); assert.equal(failed.headers.location, undefined);
     assert.equal((await state()).storage, 'postgres'); assert.equal(await storedChunks(), 100); assert.equal(stats.completed, 0);
     uploadFailure = false;
 
@@ -120,16 +124,16 @@ test('an old 100 MiB PostgreSQL original survives failed migrations and the same
     let inFlightBytes = 0;
     const first = await inFlight.next(); assert.equal(first.done, false);
     inFlightHash.update(first.value); inFlightBytes += first.value.length;
-    const migrated = await request(appPort, oldLink);
+    const migrated = await request(appPort, oldLink, 'Successful legacy migration');
     assert.equal(migrated.status, 302); assert.equal(migrated.bytes, 0); assert.equal(migrated.headers['cache-control'], 'private, no-store');
     const after = await state(); assert.equal(after.storage, 's3'); assert.equal(after.sha256, sha256); assert.ok(after.object_key);
     assert.equal(await storedChunks(), 100, 'Keep legacy chunks so downloads already in progress cannot lose their source');
-    const direct = await request(providerPort, new URL(migrated.headers.location));
+    const direct = await request(providerPort, new URL(migrated.headers.location), 'Direct object download');
     assert.equal(direct.status, 200); assert.equal(direct.bytes, BYTES); assert.equal(direct.sha256, sha256); assert.equal(direct.prefix.toString(), '%PDF-');
     for (let next = await inFlight.next(); !next.done; next = await inFlight.next()) { inFlightHash.update(next.value); inFlightBytes += next.value.length; }
     assert.equal(inFlightBytes, BYTES); assert.equal(inFlightHash.digest('hex'), sha256);
     const reads = chunkReads, attempts = stats.attempts;
-    const again = await request(appPort, oldLink); assert.equal(again.status, 302); assert.equal(again.headers.location, migrated.headers.location);
+    const again = await request(appPort, oldLink, 'Repeated old link after in-flight PostgreSQL read'); assert.equal(again.status, 302); assert.equal(again.headers.location, migrated.headers.location);
     assert.equal(chunkReads, reads, 'A repeated old link must not read PostgreSQL file chunks again');
     assert.equal(stats.attempts, attempts); assert.equal(stats.completed, 1); assert.equal(stats.gets, 0);
     assert.equal(objects.size, 1); assert.ok(stats.removals >= 1);
