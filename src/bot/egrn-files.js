@@ -2,6 +2,7 @@ const { createHash, randomUUID } = require('node:crypto');
 
 const MAX_BYTES = 2 * 1024 * 1024 * 1024 - 1; // PostgreSQL INTEGER upper bound.
 const CHUNK_BYTES = 1024 * 1024;
+const DIRECT_MIGRATION_BYTES = 50 * 1024 * 1024;
 const UUID_NAMESPACE = Buffer.from('6ba7b8109dad11d180b400c04fd430c8', 'hex');
 const COLUMNS = 'id,egrn_order_id,source_key,name,mime,bytes,sha256,storage,object_key';
 const DDL = `
@@ -303,14 +304,123 @@ function createEgrnFileStore(pool, options = {}) {
     id = orderId(id); await ensure();
     return (await pool.query(`SELECT ${COLUMNS} FROM egrn_files WHERE egrn_order_id=$1 ORDER BY created_at,id`, [id])).rows.map(metadata);
   }
+  async function migrateLegacyOriginal(original, request = {}) {
+    const controller = new AbortController(); let rejectAbort;
+    const interrupted = new Promise((_, reject) => { rejectAbort = reject; }); interrupted.catch(() => {});
+    const abort = () => {
+      controller.abort(); rejectAbort(cancelled());
+    };
+    const timeout = Math.min(20 * 60 * 1000, Math.max(1, options.migrationTimeoutMs || 20 * 60 * 1000));
+    const timer = setTimeout(() => {
+      controller.abort(); rejectAbort(error(503, 'EGRN_FILE_MIGRATION_TIMEOUT', 'Перенос оригинала выписки временно недоступен. Повторите попытку.'));
+    }, timeout);
+    request.signal?.addEventListener('abort', abort, { once: true });
+    const step = pending => Promise.race([pending, interrupted]);
+    const check = () => { if (controller.signal.aborted) throw cancelled(); };
+    const id = original.id, objectKey = 'egrn-originals/' + id + '/' + randomUUID();
+    let client, released = false, attempted = false, verified = false, commitAttempted = false, linked = false;
+    try {
+      if (request.signal?.aborted) { abort(); throw cancelled(); }
+      const acquiring = pool.connect();
+      acquiring.then(value => { if (controller.signal.aborted && !client) { released = true; value.release(true); } }, () => {});
+      client = await step(acquiring); check();
+      await step(client.query('BEGIN'));
+      await step(client.query("SET LOCAL lock_timeout = '30s'"));
+      await step(client.query("SET LOCAL statement_timeout = '60s'"));
+      // Other processes use the same per-file transaction lock. The winner
+      // copies once; waiters re-read the S3 mapping instead of re-uploading.
+      const compact = id.replace(/-/g, '');
+      await step(client.query('SELECT pg_advisory_xact_lock($1,$2)', [parseInt(compact.slice(0, 8), 16) | 0, parseInt(compact.slice(8, 16), 16) | 0]));
+      const row = (await step(client.query(`SELECT ${COLUMNS} FROM egrn_files WHERE id=$1`, [id]))).rows[0];
+      if (!row) throw error(404, 'EGRN_FILE_NOT_FOUND', 'Файл выписки не найден.');
+      if (!matches(row, Number(original.egrn_order_id), original.source_key, original.sha256, Number(original.bytes))) {
+        throw error(409, 'EGRN_FILE_CONFLICT', 'Не удалось подтвердить ранее сохранённый файл выписки.');
+      }
+      if (row.storage === 's3') {
+        await step(client.query('COMMIT')); return row;
+      }
+      async function* body() {
+        const hash = createHash('sha256'); let total = 0, index = 0;
+        while (total < Number(row.bytes)) {
+          check();
+          const part = (await step(client.query('SELECT content FROM egrn_file_chunks WHERE file_id=$1 AND chunk_no=$2', [id, index]))).rows[0];
+          if (!part) throw error(500, 'EGRN_FILE_INCOMPLETE', 'Оригинал выписки сохранён не полностью.');
+          const content = Buffer.from(part.content);
+          if (content.length !== Math.min(CHUNK_BYTES, Number(row.bytes) - total)) throw error(500, 'EGRN_FILE_INCOMPLETE', 'Размер сохранённой выписки не совпадает.');
+          if (!index && fileType(content).mime !== row.mime) throw error(500, 'EGRN_FILE_CORRUPT', 'Тип оригинала выписки не совпадает.');
+          hash.update(content); total += content.length; index++; yield content;
+        }
+        check();
+        const extra = await step(client.query('SELECT chunk_no FROM egrn_file_chunks WHERE file_id=$1 AND chunk_no >= $2 LIMIT 1', [id, index]));
+        if (extra.rows.length || hash.digest('hex') !== row.sha256) throw error(500, 'EGRN_FILE_CORRUPT', 'Не удалось подтвердить целостность оригинала выписки.');
+        check(); verified = true;
+      }
+      attempted = true;
+      await step(objects.put({ key: objectKey, ...metadata(row), body: body(), signal: controller.signal }));
+      if (!verified) throw error(409, 'EGRN_FILE_INCOMPLETE', 'Хранилище не подтвердило получение оригинала выписки.');
+      check();
+      const changed = (await step(client.query(`UPDATE egrn_files SET storage='s3',object_key=$2 WHERE id=$1 AND storage='postgres' AND object_key IS NULL AND bytes=$3 AND sha256=$4 RETURNING ${COLUMNS}`,
+        [id, objectKey, Number(row.bytes), row.sha256]))).rows[0];
+      if (!changed) throw error(409, 'EGRN_FILE_CONFLICT', 'Не удалось сохранить перенос оригинала выписки.');
+      check(); commitAttempted = true;
+      await step(client.query('COMMIT')); linked = true;
+      console.info('egrn original migrated', { file_id: id, bytes: Number(row.bytes) });
+      // Keep the old immutable chunks in this rollout. A download opened
+      // before the mapping changed can finish reading its original safely.
+      return changed;
+    } catch (failure) {
+      if (client && !released) {
+        if (commitAttempted || controller.signal.aborted) { client.release(true); released = true; }
+        else {
+          try { await step(client.query('ROLLBACK')); }
+          catch (_) { client.release(true); released = true; }
+        }
+      }
+      if (attempted && !linked) {
+        // A COMMIT may succeed even when its acknowledgement is lost. Never
+        // remove that object until a fresh connection confirms its mapping.
+        let keep = commitAttempted;
+        if (commitAttempted) {
+          try {
+            const row = await reconcileMigration(id);
+            if (row?.storage === 's3' && row.object_key === objectKey && matches(row, Number(original.egrn_order_id), original.source_key, original.sha256, Number(original.bytes))) {
+              console.info('egrn original migrated', { file_id: id, bytes: Number(row.bytes) });
+              return row;
+            }
+          } catch (_) {}
+        }
+        if (!keep) await removeAttempt(objectKey);
+      }
+      throw failure;
+    } finally {
+      clearTimeout(timer); request.signal?.removeEventListener('abort', abort);
+      if (client && !released) client.release();
+    }
+  }
+  async function reconcileMigration(id) {
+    let client, released = false, timedOut = false, rejectTimeout;
+    const deadline = new Promise((_, reject) => { rejectTimeout = reject; }); deadline.catch(() => {});
+    const timeout = Math.min(30000, Math.max(1, options.migrationReconcileTimeoutMs || 30000));
+    const timer = setTimeout(() => { timedOut = true; rejectTimeout(error(503, 'EGRN_FILE_MIGRATION_TIMEOUT', 'Не удалось подтвердить перенос выписки.')); }, timeout);
+    try {
+      const acquiring = pool.connect();
+      acquiring.then(value => { if (timedOut && !client) { released = true; value.release(true); } }, () => {});
+      client = await Promise.race([acquiring, deadline]);
+      if (timedOut) throw error(503, 'EGRN_FILE_MIGRATION_TIMEOUT', 'Не удалось подтвердить перенос выписки.');
+      return (await Promise.race([client.query(`SELECT ${COLUMNS} FROM egrn_files WHERE id=$1`, [id]), deadline])).rows[0];
+    } finally { clearTimeout(timer); if (client && !released) client.release(timedOut || undefined); }
+  }
   async function downloadUrl(id, options = {}) {
     if (!validId(id)) throw error(404, 'EGRN_FILE_NOT_FOUND', 'Файл выписки не найден.');
     if (options.signal?.aborted) throw cancelled();
     await ensure();
-    const row = (await pool.query(`SELECT ${COLUMNS} FROM egrn_files WHERE id=$1`, [id])).rows[0];
+    let row = (await pool.query(`SELECT ${COLUMNS} FROM egrn_files WHERE id=$1`, [id])).rows[0];
     if (!row) throw error(404, 'EGRN_FILE_NOT_FOUND', 'Файл выписки не найден.');
-    // Old PostgreSQL originals keep their existing streaming download. An S3
-    // failure must not silently turn a direct download back into paid egress.
+    if (row.storage === 'postgres' && Number(row.bytes) > DIRECT_MIGRATION_BYTES && objects && objects.configured()) {
+      row = await migrateLegacyOriginal(row, options);
+    }
+    // Small originals and installations without S3 retain the existing path.
+    // A configured storage failure never falls back to paid file proxying.
     if (row.storage !== 's3') return null;
     return objects.downloadUrl({ key: row.object_key, ...metadata(row), signal: options.signal }, options);
   }

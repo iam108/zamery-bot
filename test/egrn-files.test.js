@@ -23,7 +23,7 @@ function memoryPool(options = {}) {
   async function query(sql, params = [], state = { files, chunks }) {
     calls.push({ sql, chunk: sql.startsWith('INSERT INTO egrn_file_chunks') ? params[1] : undefined,
       bytes: sql.startsWith('INSERT INTO egrn_file_chunks') ? params[2].length : undefined });
-    if (sql.includes('CREATE TABLE') || sql.includes('pg_advisory_xact_lock')) return { rows: [] };
+    if (sql.includes('CREATE TABLE') || sql.includes('pg_advisory_xact_lock') || sql.startsWith('SET LOCAL ')) return { rows: [] };
     if (sql.startsWith('INSERT INTO egrn_files(')) {
       if (state.files.has(params[0])) return { rows: [] };
       const [id, egrn_order_id, source_key, name, mime, bytes, sha256, storage = 'postgres', object_key = null] = params;
@@ -35,6 +35,12 @@ function memoryPool(options = {}) {
       state.chunks.get(params[0]).set(params[1], options.retain === false ? { bytes: params[2].length } : Buffer.from(params[2]));
       if (options.onChunk) await options.onChunk(params);
       return { rows: [] };
+    }
+    if (sql.startsWith("UPDATE egrn_files SET storage='s3'")) {
+      const row = state.files.get(params[0]);
+      if (!row || row.storage !== 'postgres' || row.object_key !== null || row.bytes !== params[2] || row.sha256 !== params[3]) return { rows: [] };
+      const changed = { ...row, storage: 's3', object_key: params[1] };
+      state.files.set(params[0], changed); return { rows: [{ ...changed }] };
     }
     if (sql.includes(' FROM egrn_files WHERE id=')) return { rows: state.files.has(params[0]) ? [{ ...state.files.get(params[0]) }] : [] };
     if (sql.includes(' FROM egrn_files WHERE egrn_order_id=')) return { rows: [...state.files.values()].filter(row => row.egrn_order_id === params[0]).map(row => ({ ...row })) };
@@ -54,7 +60,7 @@ function memoryPool(options = {}) {
         if (sql === 'COMMIT') { files = state.files; chunks = state.chunks; state = null; active--; return { rows: [] }; }
         if (sql === 'ROLLBACK') { if (state) active--; state = null; return { rows: [] }; }
         return query(sql, params, state || { files, chunks });
-      }, release() { if (!done) { done = true; released++; unlock(); } } };
+      }, release(destroy) { if (!done) { if (destroy && state) { state = null; active--; } done = true; released++; unlock(); } } };
     }
   };
 }
@@ -74,6 +80,119 @@ function objectFixture(options = {}) {
     async remove(key) { removed.push(key); data.delete(key); }
   };
 }
+
+async function migrationFixture(extra = {}) {
+  const pool = memoryPool(), legacy = createEgrnFileStore(pool, { objectStore: null });
+  const saved = await legacy.save(input(pdf(50 * MiB + 17)));
+  const objects = objectFixture(extra.objects || {}), signed = [];
+  objects.downloadUrl = async (file, opts) => { signed.push({ file, opts }); return 'https://synthetic.storage.example/direct'; };
+  return { pool, objects, saved, signed, store: createEgrnFileStore(extra.pool?.(pool) || pool, { objectStore: objects, ...extra.options }) };
+}
+
+test('legacy large originals migrate once while retaining their ID, exact bytes and old in-flight chunks', async () => {
+  const h = await migrationFixture(), before = await h.store.get(h.saved.id);
+  assert.equal(await h.store.downloadUrl(h.saved.id), 'https://synthetic.storage.example/direct');
+  assert.deepEqual(await h.store.get(h.saved.id), before);
+  const row = (await h.pool.query('SELECT storage,object_key FROM egrn_files WHERE id=$1', [h.saved.id])).rows[0];
+  assert.equal(row.storage, 's3'); assert.equal(h.objects.writes.length, 1);
+  assert.equal(digest(h.objects.data.get(row.object_key)), h.saved.sha256);
+  const reads = h.pool.calls.filter(call => call.sql.startsWith('SELECT content FROM egrn_file_chunks')).length;
+  assert.equal(reads, 51); assert.equal(h.pool.active, 0);
+  assert.equal(h.pool.calls.some(call => /^DELETE FROM egrn_file_chunks/i.test(call.sql)), false);
+  await h.store.downloadUrl(h.saved.id);
+  assert.equal(h.objects.writes.length, 1); assert.equal(h.signed.length, 2);
+  assert.equal(h.pool.calls.filter(call => call.sql.startsWith('SELECT content FROM egrn_file_chunks')).length, reads);
+});
+
+test('concurrent old-link downloads upload one legacy original and share its committed S3 mapping', async () => {
+  const h = await migrationFixture(), another = createEgrnFileStore(h.pool, { objectStore: h.objects });
+  const result = await Promise.all([h.store.downloadUrl(h.saved.id), another.downloadUrl(h.saved.id)]);
+  assert.deepEqual(result, ['https://synthetic.storage.example/direct', 'https://synthetic.storage.example/direct']);
+  assert.equal(h.objects.writes.length, 1); assert.equal(h.objects.removed.length, 0); assert.equal(h.pool.active, 0);
+  assert.equal(h.signed[0].file.key, h.signed[1].file.key);
+});
+
+test('migration cancellation after upload rolls back the mapping and removes only its own attempted object', async () => {
+  const controller = new AbortController();
+  const h = await migrationFixture({ objects: { afterPut() { controller.abort(); } } });
+  await assert.rejects(h.store.downloadUrl(h.saved.id, { signal: controller.signal }), { code: 'EGRN_FILE_CANCELLED' });
+  const row = (await h.pool.query('SELECT storage,object_key FROM egrn_files WHERE id=$1', [h.saved.id])).rows[0];
+  assert.equal(row.storage, 'postgres'); assert.equal(row.object_key, null); assert.equal(h.pool.active, 0);
+  assert.equal(h.objects.removed.length, 1); assert.equal(h.objects.data.size, 0); assert.equal(h.signed.length, 0);
+  assert.equal((await read(createEgrnFileStore(h.pool, { objectStore: null }), h.saved.id)).sha256, h.saved.sha256);
+});
+
+test('a stalled migration upload has a bounded deadline and releases its SQL transaction', { timeout: 3000 }, async () => {
+  const h = await migrationFixture({ objects: { beforePut() { return new Promise(() => {}); } }, options: { migrationTimeoutMs: 15 } });
+  await assert.rejects(h.store.downloadUrl(h.saved.id), { code: 'EGRN_FILE_MIGRATION_TIMEOUT' });
+  assert.equal(h.pool.active, 0); assert.equal(h.objects.removed.length, 1); assert.equal(h.signed.length, 0);
+  assert.equal((await h.pool.query('SELECT storage FROM egrn_files WHERE id=$1', [h.saved.id])).rows[0].storage, 'postgres');
+});
+
+test('a lost migration COMMIT acknowledgement is reconciled without deleting the live S3 original', async () => {
+  const h = await migrationFixture({ pool(base) {
+    return { query: base.query, async connect() {
+      const client = await base.connect(); let changed = false;
+      return { release: client.release, async query(sql, params) {
+        if (sql.startsWith("UPDATE egrn_files SET storage='s3'")) changed = true;
+        const result = await client.query(sql, params);
+        if (sql === 'COMMIT' && changed) throw new Error('injected lost migration COMMIT acknowledgement');
+        return result;
+      } };
+    } };
+  } });
+  assert.equal(await h.store.downloadUrl(h.saved.id), 'https://synthetic.storage.example/direct');
+  assert.equal(h.pool.active, 0); assert.equal(h.objects.removed.length, 0); assert.equal(h.objects.data.size, 1);
+  assert.equal((await h.pool.query('SELECT storage FROM egrn_files WHERE id=$1', [h.saved.id])).rows[0].storage, 's3');
+});
+
+test('legacy compatibility remains when storage is absent, while configured failures do not proxy large files', async () => {
+  const pool = memoryPool({ retain: false }), legacy = createEgrnFileStore(pool, { objectStore: null });
+  const saved = await legacy.save(input(pdf(50 * MiB + 1)));
+  assert.equal(await legacy.downloadUrl(saved.id), null);
+  assert.equal(await createEgrnFileStore(pool, { objectStore: { configured: () => false } }).downloadUrl(saved.id), null);
+  await assert.rejects(createEgrnFileStore(pool, { objectStore: { configured() { throw new Error('invalid storage configuration'); } } }).downloadUrl(saved.id), /invalid storage configuration/);
+  assert.equal(pool.calls.filter(call => call.sql.startsWith('SELECT content FROM egrn_file_chunks')).length, 0);
+});
+
+test('cancellation racing a migration connection acquisition releases that connection exactly once', async () => {
+  for (const late of [false, true]) {
+    const controller = new AbortController(); let connects = 0, releases = 0, resolveAcquire;
+    const row = { id: '00000000-0000-5000-8000-000000000001', egrn_order_id: 1, source_key: 'legacy', name: 'original.pdf',
+      mime: 'application/pdf', bytes: 50 * MiB + 1, sha256: 'a'.repeat(64), storage: 'postgres', object_key: null };
+    const pool = { async query() { return { rows: [row] }; }, connect() {
+      connects++;
+      if (connects === 1) return Promise.resolve({ async query() { return { rows: [] }; }, release() {} });
+      const client = { async query() { assert.fail('A cancelled acquired connection must not begin migration'); }, release() { assert.equal(++releases, 1); } };
+      if (late) { queueMicrotask(() => controller.abort()); return new Promise(resolve => { resolveAcquire = () => resolve(client); }); }
+      queueMicrotask(() => controller.abort()); return Promise.resolve(client);
+    } };
+    const store = createEgrnFileStore(pool, { objectStore: { configured: () => true, put() { assert.fail('Cancelled acquisition must not upload'); } } });
+    await store.ensure();
+    await assert.rejects(store.downloadUrl(row.id, { signal: controller.signal }), { code: 'EGRN_FILE_CANCELLED' });
+    resolveAcquire?.(); await new Promise(resolve => setImmediate(resolve)); assert.equal(releases, 1);
+  }
+});
+
+test('lost-COMMIT reconciliation is bounded and retains the original when verification SQL stalls', { timeout: 3000 }, async () => {
+  let lost = false, closed = 0;
+  const h = await migrationFixture({ options: { migrationReconcileTimeoutMs: 15 }, pool(base) {
+    return { query: base.query, async connect() {
+      if (lost) return { query() { return new Promise(() => {}); }, release(destroy) { assert.equal(destroy, true); closed++; } };
+      const client = await base.connect(); let changed = false;
+      return { release: client.release, async query(sql, params) {
+        if (sql.startsWith("UPDATE egrn_files SET storage='s3'")) changed = true;
+        const result = await client.query(sql, params);
+        if (sql === 'COMMIT' && changed) { lost = true; throw new Error('injected lost migration COMMIT acknowledgement'); }
+        return result;
+      } };
+    } };
+  } });
+  await assert.rejects(h.store.downloadUrl(h.saved.id), /injected lost migration COMMIT acknowledgement/);
+  assert.equal(closed, 1); assert.equal(h.objects.removed.length, 0); assert.equal(h.objects.data.size, 1);
+  assert.equal(h.pool.active, 0);
+  assert.equal((await h.pool.query('SELECT storage FROM egrn_files WHERE id=$1', [h.saved.id])).rows[0].storage, 's3');
+});
 
 test('direct download signs only the selected S3 original while legacy PostgreSQL stays compatible', async () => {
   const pool = memoryPool(), objects = objectFixture(), calls = [];
