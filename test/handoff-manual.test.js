@@ -40,6 +40,7 @@ test('manual MO client retains its cadastral number but performs no EGRN, audit,
  const body=await h.body(),first=await h.invoke(body);assert.equal(first.delivery_complete,true);const rows=await h.cases();assert.equal(rows.length,1);const c=rows[0];
  assert.equal(c.order_id,null);assert.equal(c.request_id,null);assert.equal(c.checklist_key,'MO_OBSH');assert.equal(c.data._handoff.fields.cad_num,body.cad_num);assert.equal(c.data._handoff.egrn.result,'skipped-manual');assert.equal(c.data._handoff.egrn.order_started,false);assert.equal(c.data._handoff.egrn.completed,true);
  assert.deepEqual(h.events.map(e=>[e.type,e.chat]),[['card',LAWYER],['notice',CLIENTS]]);assert.ok(!h.events[0].opts.reply_markup.inline_keyboard.flat().some(button=>button.web_app?.url.includes('view=report')));assert.doesNotMatch(h.events[0].text,/Полный отчёт и оригиналы/);
+ assert.deepEqual(h.events[0].opts.reply_markup.inline_keyboard[1].map(button=>button.text),['Документы клиента']);assert.equal(new URL(h.events[0].opts.reply_markup.inline_keyboard[1][0].web_app.url).search,'?case_id='+c.id+'&view=documents');
  assert.doesNotMatch(h.events[1].text,/отчёт/i,'A manual client has no audit report to promise');assert.equal(h.events[1].opts.reply_markup.inline_keyboard[0][0].text,'Открыть клиента');
  await h.invoke(body);await h.invoke({resume_case_id:c.id});assert.equal(h.events.length,2);assert.equal((await h.cases()).length,1);
 }));

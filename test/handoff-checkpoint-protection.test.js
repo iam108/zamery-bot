@@ -35,7 +35,7 @@ async function fixture(run,options={}) {
       if (name === '../checklists') return { LISTS: {}, STAGES: ['Сбор документов', 'Подано', 'Выездная проверка', 'Архив'], pickChecklist: () => 'QA', flagLabels: () => options.flagLabels||{} };
       if (name === '../bot/instance') return { telegram: { async sendMessage(...args) { telegram.push(args); if(options.sendMessage)return options.sendMessage(...args);return { message_id: telegram.length }; } } };
       if (name === './handoff-packet') return { setupHandoffPacket: () => ({}) };
-      if (name === './handoff-manual' || name === './handoff-manual-materials') return require('../src/web/' + name);
+      if (['./handoff-manual','./handoff-manual-materials','./handoff-case-documents','./handoff-case-package','./handoff-case-profile'].includes(name)) return require('../src/web/' + name);
       if (name === './auth') return require('../src/web/auth');
       if (name === './reminder-recipients') return require('../src/web/reminder-recipients');
       if (name === './http-errors') return require('../src/web/http-errors');

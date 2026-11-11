@@ -116,6 +116,7 @@ function cardOptions(base,c,state) {
   if(c.checklist_key)navigation.push({text:'📋 Чек-лист клиента',web_app:{url:new URL('/checklist?case_id='+c.id,base).href}});
   if(url)navigation.push({text:'Перейти к отчёту',web_app:{url}});
   if(navigation.length)keyboard.push(navigation);
+  keyboard.push([{text:'Документы клиента',web_app:{url:new URL('/handoff?case_id='+c.id+'&view=documents',base).href}}]);
   const video=https(report.video_url),archive=https(state.packet.archive_url);
   if(video)keyboard.push([{text:'▶ Видео осмотра',url:video}]);
   if(archive)keyboard.push([{text:'Архив объекта',url:archive}]);
@@ -453,4 +454,4 @@ function createHandoffSubmitter(options={}) {
     }
   };
 }
-module.exports={createHandoffSubmitter,HandoffError,DDL,hasPendingLinkedEgrn,cardOptions};
+module.exports={createHandoffSubmitter,HandoffError,DDL,hasPendingLinkedEgrn,cardOptions,cardText};

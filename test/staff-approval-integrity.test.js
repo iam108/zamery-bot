@@ -33,6 +33,7 @@ async function fixture(run, options = {}) {
     if(name==='./order-delivery-admin')return {setupOrderDeliveryAdmin(){}};
     if(name==='./handoff-status-admin')return {setupHandoffStatusAdmin(){}};
     if(name==='./handoff-notice-admin')return {setupHandoffNoticeAdmin(){}};
+    if(name==='./handoff-company-admin')return {setupHandoffCompanyAdmin(){}};
     if(name==='./case-open')return {setupCaseOpen(){return async()=>{};}};
     if(name==='./manual-order-attachments')return {setupManualOrderAttachments(){}};
     if(name==='./staff-approval')return require('../src/bot/staff-approval');

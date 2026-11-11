@@ -11,6 +11,11 @@ CREATE TABLE IF NOT EXISTS handoff_manual_materials (
   bytes INT NOT NULL, sha256 TEXT NOT NULL, content BYTEA NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY(owner_tg_id,submit_id,id)
+);
+CREATE TABLE IF NOT EXISTS case_document_batches (
+  id UUID PRIMARY KEY, case_id INT NOT NULL REFERENCES cases(id), owner_tg_id BIGINT NOT NULL,
+  recipient_tg_id BIGINT NOT NULL, files JSONB NOT NULL, delivery JSONB NOT NULL DEFAULT '{}',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );`;
 function fail(message, status=400, code='HANDOFF_MATERIAL_INVALID') {
   throw Object.assign(new Error(message), {status,code});
@@ -44,6 +49,12 @@ function createManualMaterialsStore(pool) {
   async function ensure() {return ready ||= pool.query(DDL).catch(error=>{ready=null;throw error;});}
   async function rows(client,owner,submitId) {return (await client.query('SELECT * FROM handoff_manual_materials WHERE owner_tg_id=$1 AND submit_id=$2 ORDER BY created_at,id',identity(owner,submitId))).rows;}
   async function list(owner,submitId,originals=false) {await ensure();return (await rows(pool,owner,submitId)).map(originals?verified:metadata);}
+  async function read(owner,submitId,id) {
+    if (!UUID.test(String(id || ''))) fail('Документ не найден.',404);
+    await ensure();const ids=identity(owner,submitId);
+    const row=(await pool.query('SELECT * FROM handoff_manual_materials WHERE owner_tg_id=$1 AND submit_id=$2 AND id=$3',[...ids,String(id).toLowerCase()])).rows[0];
+    if (!row) fail('Документ не найден.',404);return verified(row);
+  }
   async function mutate(owner,submitId,fn) {
     const ids=identity(owner,submitId);await ensure();const client=await pool.connect();
     try {
@@ -53,6 +64,7 @@ function createManualMaterialsStore(pool) {
       const staff=(await client.query('SELECT tg_id,role,approved FROM staff WHERE tg_id=$1',[owner])).rows[0];
       if (!canManageCases(staff,owner)) fail('Нет доступа к документам клиента.',403,'HANDOFF_FORBIDDEN');
       if ((await client.query('SELECT id FROM cases WHERE created_by=$1 AND handoff_submit_id=$2',ids)).rows.length) fail('Передача уже началась. Состав документов сохранён.',409,'HANDOFF_MATERIAL_FROZEN');
+      if ((await client.query('SELECT id FROM case_document_batches WHERE owner_tg_id=$1 AND id=$2',ids)).rows.length) fail('Документы уже прикреплены к клиенту. Для новых файлов создайте следующий пакет.',409,'HANDOFF_MATERIAL_FROZEN');
       await fn(client,ids);const result=(await rows(client,...ids)).map(metadata);await client.query('COMMIT');return result;
     } catch(error) {await client.query('ROLLBACK').catch(()=>{});throw error;} finally {client.release();}
   }
@@ -82,7 +94,7 @@ function createManualMaterialsStore(pool) {
         body.submit_id.toLowerCase()!==c.handoff_submit_id.toLowerCase()) fail('Документы клиента недоступны.',404);
     return selection(await rows(pool,c.created_by,c.handoff_submit_id),body.manual_files || []);
   }
-  return {ensure,list,put,remove,freeze,loadCase};
+  return {ensure,list,read,put,remove,freeze,loadCase};
 }
 function setupHandoffManualMaterials(app,{pool,ready=async()=>{},store=createManualMaterialsStore(pool)}={}) {
   const upload=require('multer')({storage:require('multer').memoryStorage(),limits:{files:1,fileSize:LIMITS.fileBytes,fields:0,parts:2}}).single('file');

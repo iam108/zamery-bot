@@ -189,6 +189,17 @@ test('stopped EGRN delivery is unknown and only a complete saved link manifest b
   await h.db.query('UPDATE egrn_orders SET delivery_manifest=$1 WHERE id=70',[JSON.stringify(['one'])]);
   const egrn=(await h.service.packet({order_id:60,report_id:15})).egrn;assert.equal(egrn.status,'available');assert.doesNotMatch(JSON.stringify(egrn),/provider-secret|url|key/);
 }));
+test('assigned packet returns the saved legal entity separately from the historical source brand without changing its signature',pg,async()=>database(async h=>{
+  const before=await h.service.packet({order_id:60,report_id:15});
+  await h.db.exec('ALTER TABLE cases ADD COLUMN org TEXT, ADD COLUMN address TEXT, ADD COLUMN inn TEXT, ADD COLUMN region TEXT, ADD COLUMN kind TEXT, ADD COLUMN service TEXT, ADD COLUMN contacts JSONB');
+  const saved={org:'ООО «Юрлицо менеджера»',address:'Москва, Исправленный адрес, 9',inn:'7701234567',region:'МСК',kind:'Общепит',service:'Получение',cad_num:'77:01:0004016:1064',contacts:[{name:'Анна',phone:'+79991234567',tg:'',comment:'Согласовать визит'}]};
+  await h.db.query('INSERT INTO cases(id,order_id,lawyer_tg_id,lawyer_name,org,address,inn,region,kind,service,contacts,data) VALUES(800,60,108,$1,$2,$3,$4,$5,$6,$7,$8,$9)',
+    ['Юрист',saved.org,saved.address,saved.inn,saved.region,saved.kind,saved.service,JSON.stringify(saved.contacts),JSON.stringify({_handoff:{version:2,completed:true,fields:{cad_num:saved.cad_num},body:{private:'never expose'},cards:{108:99}}})]);
+  const after=await h.service.packet({order_id:60,report_id:15});
+  assert.deepEqual(after.assignment.profile,saved);assert.deepEqual(after.order,before.order);assert.equal(after.signature,before.signature);
+  assert.doesNotMatch(JSON.stringify(after.assignment),/never expose|cards|private/);
+}));
+
 test('packet exposes existing assignment and its resumable submit ID without changing the source signature or claiming legacy delivery completion',pg,async()=>database(async h=>{
   const first=await h.service.packet({order_id:60,report_id:15});assert.equal(first.assignment,null);
   await h.db.query("INSERT INTO cases(id,order_id,lawyer_name) VALUES(800,60,'Юрист ранее')");
@@ -212,6 +223,29 @@ test('required group notice projects only safe delivery state while private comp
   assert.equal((await h.service.packet({order_id:60,report_id:15})).assignment.group_notice,undefined);
   assert.ok(h.sql.every(sql=>/^SELECT\b/.test(sql)));
 }));
+
+test('packet returns the selected case profile instead of a newer client sharing the same source order',pg,async()=>database(async h=>{
+  await h.db.exec('ALTER TABLE cases ADD COLUMN org TEXT');
+  await h.db.query("INSERT INTO cases(id,order_id,org,lawyer_name,data) VALUES(800,60,'ООО Менеджер','Первый юрист','{}'),(801,60,'ООО Другая компания','Другой юрист','{}')");
+  const latest=await h.service.packet({order_id:60,report_id:15}),selected=await h.service.packet({order_id:60,report_id:15,case_id:800});
+  assert.equal(latest.assignment.case_id,801);assert.equal(selected.assignment.case_id,800);assert.equal(selected.assignment.profile.org,'ООО Менеджер');assert.equal(selected.signature,latest.signature);
+}));
+
+test('packet lists additional documents only for an authorized assignment and uses the accessible lawyer case',async()=>{
+  const routes=new Map(),calls=[];let documentsDenied=false,actor=101,role='lawyer',approved=true,assignment={case_id:801,profile:{org:'ООО Другое',contacts:[{phone:'PRIVATE'}]}};
+  const own={id:800,order_id:60,lawyer_tg_id:101,org:'ООО Менеджер',data:{}};
+  setupHandoffPacket({get(path,run){routes.set(path,run);}},{
+    pool:{async query(){return{rows:[{tg_id:actor,role,approved,access_case:own}]};}},
+    service:{async packet(){return {ok:true,signature:'source-signature',order:{id:60},assignment:assignment&&JSON.parse(JSON.stringify(assignment))};}},
+    caseDocumentsService:{async list(id,user){calls.push([id,user]);if(documentsDenied)throw Object.assign(new Error('Access revoked'),{status:403,code:'CASE_DOCUMENT_FORBIDDEN'});return{ok:true,case_id:id,files:[{id:'new-file',name:'Документ менеджера.pdf'}],batches:[]};}}
+  });
+  async function read(){let status=200,body;const res={set(){return this;},status(value){status=value;return this;},json(value){body=value;}};await routes.get('/api/handoff/packet')({tgUser:{id:actor},query:{}},res);return{status,body};}
+  const lawyer=await read();assert.equal(lawyer.status,200);assert.equal(lawyer.body.assignment.case_id,800);assert.equal(lawyer.body.assignment.profile.org,own.org);assert.doesNotMatch(JSON.stringify(lawyer.body),/PRIVATE|ООО Другое/);assert.deepEqual(calls,[[800,101]]);assert.equal(lawyer.body.signature,'source-signature');assert.equal(lawyer.body.case_documents.files[0].name,'Документ менеджера.pdf');
+  approved=false;const denied=await read();assert.equal(denied.status,403);assert.equal(calls.length,1);assert.equal(denied.body.case_documents,undefined);
+  approved=true;role='manager';assignment=null;const fresh=await read();assert.equal(fresh.status,200);assert.equal(fresh.body.case_documents,undefined);assert.equal(calls.length,1);
+  assignment={case_id:802};const assigned=await read();assert.equal(assigned.status,200);assert.deepEqual(calls.at(-1),[802,101]);
+  documentsDenied=true;const revoked=await read();assert.equal(revoked.status,403);assert.equal(revoked.body.code,'CASE_FORBIDDEN');assert.equal(revoked.body.case_documents,undefined);
+});
 
 test('packet route grants group-only resume to managers for safe pending states and keeps private completion truthful',async()=>{
   const routes=new Map();let assignment,role='manager';

@@ -53,6 +53,7 @@ test('V2 delivers the complete packet only to the assigned lawyer even when a sh
   for(const card of cards){assert.ok(card.text.length<2000);assert.doesNotMatch(card.text,/ПОЛНЫЙ ТЕКСТ АУДИТОРА|Контакт передала Ирина|Ответы и наблюдения/);assert.match(card.text,/Карина|Лесная/);}
   const lawyerButtons=cards[0].opts.reply_markup.inline_keyboard.flat();assert.ok(lawyerButtons.some(button=>button.web_app?.url.includes('/checklist?case_id='+c.id)));assert.ok(lawyerButtons.some(button=>button.web_app?.url.includes('view=report')));assert.ok(lawyerButtons.some(button=>button.url===h.packet.report.video_url));
   assert.deepEqual(cards[0].opts.reply_markup.inline_keyboard[0].map(button=>button.text),['📋 Чек-лист клиента','Перейти к отчёту']);
+  assert.deepEqual(cards[0].opts.reply_markup.inline_keyboard[1].map(button=>button.text),['Документы клиента']);assert.equal(new URL(cards[0].opts.reply_markup.inline_keyboard[1][0].web_app.url).search,'?case_id='+c.id+'&view=documents');
   const reportLink=new URL(cards[0].opts.reply_markup.inline_keyboard[0][1].web_app.url);
   assert.equal(reportLink.searchParams.get('report_id'),'15');assert.equal(reportLink.searchParams.get('report_src'),'a');
   assert.equal(reportLink.searchParams.get('order_id'),'60');assert.equal(reportLink.searchParams.has('k'),false);assert.equal(reportLink.searchParams.has('u'),false);
@@ -64,6 +65,19 @@ test('V2 delivers the complete packet only to the assigned lawyer even when a sh
   assert.equal(h.egCalls.length,0);assert.equal(h.packetCalls(),1);assert.equal(h.reportCalls(),1);
   const before=h.events.length;h.packet.signature='b'.repeat(64);
   const replay=await h.restart()(h.context);assert.deepEqual(replay,result);assert.equal(h.events.length,before);assert.equal(h.packetCalls(),1);assert.equal((await h.cases()).length,1);
+}));
+
+test('the manager legal entity survives source-brand differences and a resumed delivery after source changes',pg,async()=>fixture(async h=>{
+  const org='ООО «Компания менеджера»';h.body.org=org;h.packet.order.org='Бренд заявки аудитору';
+  let reject=true;h.setFail(event=>{if(event.type==='card'&&reject){reject=false;throw tgFailure('Known rejection before card delivery');}});
+  const first=await h.submit(h.context);assert.equal(first.delivery_complete,false);
+  let row=(await h.cases())[0];assert.equal(row.org,org);assert.equal(row.data._handoff.fields.org,org);assert.equal(row.data._handoff.body.org,org);
+  h.packet.order.org='Новый бренд после начала передачи';await h.db.query("UPDATE orders SET object_name='Ещё один бренд' WHERE id=60");
+  const result=await h.restart()({...h.context,body:{resume_case_id:first.id}});assert.equal(result.delivery_complete,true);assert.equal(result.id,first.id);
+  row=(await h.cases())[0];assert.equal(row.org,org);assert.equal(row.data._handoff.fields.org,org);assert.equal(h.packetCalls(),1);
+  const card=h.events.find(event=>event.type==='card'&&event.id),notice=h.events.find(event=>event.type==='notice');
+  assert.match(card.text,/ООО «Компания менеджера»/);assert.doesNotMatch(card.text,/Бренд заявки|Новый бренд|Ещё один бренд/);
+  assert.match(notice.text,/Организация: ООО «Компания менеджера»/);assert.match(notice.text,/Объект: Ещё один бренд/);
 }));
 
 test('handoff recipient revocation after a partial attempt stops delivery and reactivation resumes the same case',pg,async()=>fixture(async h=>{

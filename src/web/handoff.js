@@ -1345,7 +1345,9 @@ function setupHandoff(app) {
   const bot = require('../bot/instance');
   startDecisionReminders(bot);
   const WEBAPP_URL = process.env.WEBAPP_URL;
-  const packetService = require('./handoff-packet').setupHandoffPacket(app);
+  const caseDocumentsService=require('./handoff-case-documents').setupHandoffCaseDocuments(app,{pool,ready:ensureTables});
+  require('./handoff-case-package').setupCasePackage(app,{pool,ready:ensureTables,documents:caseDocumentsService});
+  const packetService = require('./handoff-packet').setupHandoffPacket(app,{caseDocumentsService});
   require('./handoff-manual').setupHandoffManual(app,{pool,ready:ensureTables});
   require('./handoff-manual-materials').setupHandoffManualMaterials(app,{pool,ready:ensureTables});
   let submitV2;
@@ -1378,7 +1380,8 @@ function setupHandoff(app) {
         const checkpoint=selectedCase.data?._handoff,body=checkpoint?.body;
         if(checkpoint?.version===2&&body&&(body.order_id==null?selectedCase.order_id==null:selectedCase.order_id!=null&&/^[1-9]\d*$/.test(String(body.order_id))&&Number(body.order_id)===Number(selectedCase.order_id))&&['a','r'].includes(body.report_src)&&/^[1-9]\d*$/.test(String(body.report_id))&&Number.isSafeInteger(Number(body.report_id))&&Number(body.report_id)>0)
           caseReport={src:body.report_src,id:Number(body.report_id),text:selectedCase.audit_text||'',order_id:selectedCase.order_id||null};
-        if(!orderId)caseProfile={id:null,org:selectedCase.org||'',address:selectedCase.address||'',inn:selectedCase.inn||'',cad_num:checkpoint?.fields?.cad_num||'',region:selectedCase.region||'',kind:selectedCase.kind||'',service:selectedCase.service||'',contacts:Array.isArray(selectedCase.contacts)?selectedCase.contacts:[]};
+        const confirmedProfile=require('./handoff-case-profile').savedCaseProfile(selectedCase);
+        if(confirmedProfile)caseProfile={id:orderId||null,...confirmedProfile};
       }else if (!manager) {
         var ownedCase = orderId && (await pool.query('SELECT * FROM cases WHERE order_id=$1 AND lawyer_tg_id=$2 ORDER BY id DESC LIMIT 1', [orderId, req.tgUser.id])).rows[0];
         if (!requireCase(req, res, ownedCase || null)) return;
@@ -1400,7 +1403,7 @@ function setupHandoff(app) {
         if (rq) request = { id: rq.id, text: rq.text, created_at: rq.created_at, f: parseRequest(rq.text) };
       }
       res.json({
-        ok: true, lawyers: lawyers, request: request,
+        ok: true, can_manage: manager, lawyers: lawyers, request: request,
         report: selectedCase?caseReport:audit ? { src: 'a', id: audit.id, text: audit.text, created_at: audit.created_at, order_id: audit.order_id, metadata: auditMetadata(audit) } : null,
         order: caseProfile|| (order ? {
           id: order.id, org: order.object_name || '', client: order.owner_name || '',

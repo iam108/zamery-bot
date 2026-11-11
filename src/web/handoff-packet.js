@@ -23,6 +23,13 @@ function groupNotice(state) {
   const messages={confirmed:'Сводка в чате клиентов опубликована.',pending:'Сводка в чат клиентов ещё не отправлена.',rejected:'Сводку не удалось отправить в чат клиентов. Можно повторить только сводку.',blocked:'Сводка в чат клиентов пока не опубликована. Повторите проверку публикации.',unknown:'Публикация сводки в чате клиентов не подтверждена. Сначала проверьте чат; автоматический повтор остановлен.'};
   return {status,message:messages[status],manual_review:status==='unknown',retry:['pending','rejected','blocked'].includes(status)};
 }
+function assignmentView(row) {
+  if (!row) return null;
+  const checkpoint = object(object(row.data)._handoff), profile = require('./handoff-case-profile').savedCaseProfile(row), notice = groupNotice(checkpoint);
+  return {case_id:Number(row.id),lawyer_name:text(row.lawyer_name),submit_id:text(row.handoff_submit_id)||null,
+    ...(checkpoint.manual_review?{manual_review:true}:{}),...(profile?{profile}:{}),...(notice?{group_notice:notice}:{}),
+    ...(['true','false'].includes(String(checkpoint.completed))?{delivery_complete:String(checkpoint.completed)==='true'&&!require('./handoff-submit').hasPendingLinkedEgrn(checkpoint,row.lawyer_tg_id)}:{})};
+}
 function https(value) {
   try { const url = new URL(text(value)); return url.protocol === 'https:' && !url.username && !url.password ? url.href : ''; } catch (_) { return ''; }
 }
@@ -225,12 +232,10 @@ function createPacketService(options = {}) {
       let assignment=null;
       if(order){
         try{
-          // to_jsonb keeps this read compatible with a legacy cases table
-          // before the first V2 submit adds its optional checkpoint columns.
-          const row=(await pool.query("SELECT id,lawyer_name,lawyer_tg_id,data->'_handoff' AS checkpoint,data->'_handoff'->>'completed' AS delivery_complete,data->'_handoff'->>'manual_review' AS manual_review,to_jsonb(cases)->>'handoff_submit_id' AS submit_id FROM cases WHERE order_id=$1 ORDER BY id DESC LIMIT 1",[orderId])).rows[0];
-          if(row)assignment={case_id:Number(row.id),lawyer_name:text(row.lawyer_name),submit_id:text(row.submit_id)||null,...(row.manual_review?{manual_review:true}:{}),
-            ...(groupNotice(object(row.checkpoint))?{group_notice:groupNotice(object(row.checkpoint))}:{}),
-            ...(['true','false'].includes(String(row.delivery_complete))?{delivery_complete:String(row.delivery_complete)==='true'&&!require('./handoff-submit').hasPendingLinkedEgrn(object(row.checkpoint),row.lawyer_tg_id)}:{})};
+          // SELECT * remains compatible with legacy tables without optional checkpoint columns.
+          const caseId=integer(query.case_id,true);
+          const row=(await pool.query(caseId ? 'SELECT * FROM cases WHERE order_id=$1 AND id=$2' : 'SELECT * FROM cases WHERE order_id=$1 ORDER BY id DESC LIMIT 1',caseId?[orderId,caseId]:[orderId])).rows[0];
+          assignment=assignmentView(row);
         }catch(error){if(error.code!=='42P01')throw error;}
       }
       const requestId = integer(query.request_id, true);
@@ -268,14 +273,14 @@ function setupHandoffPacket(app, options = {}) {
       if(!canAccessCase(record,req.tgUser&&req.tgUser.id,record?.access_case)||nullable(client.order_id)!==nullable(orderId)||state.version!==2||nullable(selection.order_id)!==nullable(client.order_id)||
         (report?Number(selection.report_id)!==Number(report.id)||selection.report_src!==report.src:selection.report_id!=null||selection.report_src!=null))
         fail(403,'CASE_FORBIDDEN','Этот отчёт не входит в доступный вам комплект клиента.');
-      return canManageCases(record,req.tgUser&&req.tgUser.id);
+      return {manager:canManageCases(record,req.tgUser&&req.tgUser.id),client:record.access_case};
     }
     // Storage and packet reads can outlive middleware authorization. Resolve
     // the current staff role and current assignment in the same SQL snapshot.
     const record = (await pool.query(`SELECT s.tg_id,s.role,s.approved,to_jsonb(c) AS access_case FROM staff s
       LEFT JOIN LATERAL (SELECT * FROM cases WHERE order_id=$1 AND lawyer_tg_id=$2 ORDER BY id DESC LIMIT 1) c ON true
       WHERE s.tg_id=$2`, [orderId, req.tgUser && req.tgUser.id])).rows[0];
-    if (canManageCases(record, req.tgUser && req.tgUser.id)) return true;
+    if (canManageCases(record, req.tgUser && req.tgUser.id)) return {manager:true,client:null};
     const row = record?.access_case;
     if (!canAccessCase(record, req.tgUser && req.tgUser.id, row)) fail(403, 'CASE_FORBIDDEN', 'Этот клиент недоступен вашему аккаунту.');
     if (report && (!report.order_id || Number(report.order_id) !== Number(orderId))) {
@@ -286,7 +291,7 @@ function setupHandoffPacket(app, options = {}) {
       if (Number(selection.report_id) !== Number(report.id) || selection.report_src !== report.src)
         fail(403, 'CASE_FORBIDDEN', 'Этот отчёт не входит в переданный вам комплект.');
     }
-    return false;
+    return {manager:false,client:row};
   }
   const route = run => async (req,res) => {
     res.set('Cache-Control','private, no-store').set('X-Content-Type-Options','nosniff');
@@ -298,7 +303,18 @@ function setupHandoffPacket(app, options = {}) {
   app.get('/api/handoff/packet', route(async (req,res) => {
     const packet = await service.packet(req.query);
     const caseId=integer(req.query.case_id,true);
-    const manager = await authorize(req, packet.order && packet.order.id, packet.report,caseId);
+    const access = await authorize(req, packet.order && packet.order.id, packet.report,caseId), manager=access.manager;
+    // An order may have more than one historical assignment. Client data must
+    // come from the explicit case or the lawyer's currently accessible case.
+    if(access.client){
+      if(Number(access.client.id)!==Number(packet.assignment?.case_id))packet.assignment=assignmentView(access.client);
+      else {const profile=require('./handoff-case-profile').savedCaseProfile(access.client);if(profile)packet.assignment.profile=profile;else delete packet.assignment.profile;}
+    }
+    const documentsCaseId=caseId||packet.assignment?.case_id;
+    if(documentsCaseId&&options.caseDocumentsService){
+      try{packet.case_documents=await options.caseDocumentsService.list(documentsCaseId,req.tgUser&&req.tgUser.id);}
+      catch(error){if(error?.code==='CASE_DOCUMENT_FORBIDDEN'&&[401,403].includes(error.status))fail(error.status,'CASE_FORBIDDEN','Доступ к комплекту клиента изменился.');throw error;}
+    }
     if(caseId&&packet.report?.media)for(const file of packet.report.media){const url=new URL(file.url,'https://handoff.invalid');url.searchParams.set('case_id',String(caseId));file.url=url.pathname+url.search;}
     if (packet.assignment) packet.assignment.can_resume = manager && !packet.assignment.manual_review &&
       (packet.assignment.delivery_complete === false || packet.assignment.delivery_complete === true && packet.assignment.group_notice?.retry === true);

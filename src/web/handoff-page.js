@@ -1,3 +1,4 @@
+const documentsUI = require('./handoff-documents-ui');
 // A small handoff surface. Saved report contents remain read-only; corrections
 // belong to the manager's object card, never to the auditor's recorded answers.
 function handoffModel() {
@@ -16,6 +17,12 @@ function handoffModel() {
     state.priority = ['обычный', 'срочно'].indexOf(cached.priority) >= 0 ? cached.priority : 'обычный';
     state.comment = typeof cached.comment === 'string' ? cached.comment : '';
     state.submitId = cached.submitId || state.submitId;
+    state.editedFields = {};
+    ['org','address','inn','cad_num','region','kind','service'].forEach(function(key){
+      if(cached.editedFields && cached.editedFields[key] === true && cached.profile && typeof cached.profile[key] === 'string') {
+        state.editedFields[key] = true; state.profile[key] = cached.profile[key];
+      }
+    });
     // Explicit edits are restored only for the same underlying object snapshot.
     if (cached.fingerprint === fingerprint(source)) {
       if (cached.profile) state.profile = Object.assign({}, source, cached.profile);
@@ -53,25 +60,26 @@ function handoffClient() {
   var M = window.HandoffModel, $ = function (id) { return document.getElementById(id); };
   var tg = window.Telegram && window.Telegram.WebApp;
   if (tg) { tg.ready(); tg.expand(); }
-  var query = new URLSearchParams(location.search), manual = query.get('mode') === 'manual', orderId = manual ? '' : query.get('order_id') || '', requestId = manual ? '' : query.get('request_id') || '', caseId=manual?'':query.get('case_id')||'',readonly = !manual && query.get('view') === 'report';
+  var query = new URLSearchParams(location.search), manual = query.get('mode') === 'manual', orderId = manual ? '' : query.get('order_id') || '', requestId = manual ? '' : query.get('request_id') || '', caseId=manual?'':query.get('case_id')||'',documentsView=!manual&&query.get('view')==='documents', readonly = !manual && (query.get('view') === 'report'||documentsView);
   var userId = tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id || query.get('u') || sessionValue('tg_u') || 'staff';
-  var cacheKey = 'handoff-v2:' + userId + ':' + (manual ? 'manual' : orderId ? 'order-' + orderId : requestId ? 'request-' + requestId : 'new');
-  var S = { profile: {}, source: {}, sourceLoaded: false, sourceContacts: [], contacts: [], lawyer: null, lawyers: [], priority: 'обычный', comment: '', packet: null, report: null, selectedReport: null, egrnOrder: false, submitId: uuid(), pending: null, completed: null, existingAssignment: null, loading: true, packetError: '', error: '', review: false, sending: false };
+  var cacheKey = 'handoff-v2:' + userId + ':' + (manual ? 'manual' : caseId ? 'case-'+caseId : orderId ? 'order-' + orderId : requestId ? 'request-' + requestId : 'new');
+  var S = { hydrating:true, profile: {}, editedFields: {}, source: {}, sourceLoaded: false, sourceContacts: [], contacts: [], lawyer: null, lawyers: [], priority: 'обычный', comment: '', packet: null, report: null, selectedReport: null, egrnOrder: false, submitId: uuid(), pending: null, completed: null, existingAssignment: null, loading: true, packetError: '', error: '', review: false, sending: false };
   if(manual){S.source=emptyProfile();S.profile=Object.assign({},S.source);}
-  var layer = '', reportFocus = null, zoomFocus = null, imageEpoch = 0, imageUrls = [], imageControllers = [], zoomScale = 1, searchTimer, searchSequence = 0, packetSequence = 0;
+  var extras;
+  var layer = '', reportFocus = null, zoomFocus = null, imageEpoch = 0, imageUrls = [], imageControllers = [], downloadControllers=[], zoomScale = 1, searchTimer, searchSequence = 0, packetSequence = 0;
   var manualMatches = { key:'',items:[],checked:false,loading:false,error:'',createNew:false }, matchSequence = 0;
   var manualFiles = [], manualQueue = [], manualFilesBusy = false, manualFilesReady = false, manualFilesError = '', manualLimits = {files:20,fileBytes:12582912,totalBytes:104857600};
   function sessionValue(key) { try { return sessionStorage.getItem(key); } catch (_) { return ''; } }
   function uuid() { return window.crypto && window.crypto.randomUUID ? window.crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) { var n = Math.floor(Math.random() * 16); return (c === 'x' ? n : (n & 3) | 8).toString(16); }); }
   function save() {
-    if (readonly) return;
-    var serialized=JSON.stringify({ version: 2, savedAt:Date.now(), fingerprint: M.fingerprint(S.source), packetSignature: S.packet && S.packet.signature || '', sourceContacts: S.sourceContacts, profile: S.profile, contacts: S.contacts, lawyer: S.lawyer, priority: S.priority, comment: S.comment, egrnOrder: S.egrnOrder, submitId: S.submitId, pending: S.pending, completed: S.completed });
+    if (readonly||S.hydrating) return;
+    var serialized=JSON.stringify({ version: 2, savedAt:Date.now(), fingerprint: M.fingerprint(S.source), packetSignature: S.packet && S.packet.signature || '', sourceContacts: S.sourceContacts, profile: S.profile, editedFields: S.editedFields, contacts: S.contacts, lawyer: S.lawyer, priority: S.priority, comment: S.comment, egrnOrder: S.egrnOrder, submitId: S.submitId, pending: S.pending, completed: S.completed, documents: extras && extras.snapshot() });
     try { sessionStorage.setItem(cacheKey,serialized); } catch (_) {}
-    if(manual)try{localStorage.setItem(cacheKey,serialized);}catch(_){}
+    try{localStorage.setItem(cacheKey,serialized);}catch(_){}
   }
   function cached() {
     var transient=null,durable=null;try{transient=JSON.parse(sessionValue(cacheKey)||'null');}catch(_){}
-    if(manual)try{durable=JSON.parse(localStorage.getItem(cacheKey)||'null');}catch(_){}
+    try{durable=JSON.parse(localStorage.getItem(cacheKey)||'null');}catch(_){}
     return durable&&(!transient||Number(durable.savedAt||0)>=Number(transient.savedAt||0))?durable:transient;
   }
   async function api(url, options) {
@@ -103,7 +111,7 @@ function handoffClient() {
     if (info.egrnLinks) lines.push('Крупные выписки ЕГРН по ссылке: ' + info.egrnLinks);
     lines.push(info.video ? 'Видео по ссылке' : 'Видео не приложено', egrnText(info));
     if (S.egrnOrder) lines.push('Заказать новую ЕГРН по указанному кадастровому номеру');
-    return lines;
+    return lines.concat(extras ? extras.summary().map(function(name){return 'Дополнительно: '+name;}) : []);
   }
   function renderObject() {
     var p = S.profile;
@@ -111,7 +119,7 @@ function handoffClient() {
     $('object-source').hidden=manual;$('object-address').hidden=manual;$('object-meta').hidden=manual;
     $('object-address').textContent = p.address || 'Добавьте адрес объекта';
     $('object-meta').textContent = [p.kind, p.service, p.region].filter(Boolean).join(' · ') || 'Укажите тип объекта и услугу';
-    $('object-source').textContent = orderId ? 'Заявка на замер №' + orderId : requestId ? 'Заявка клиента №' + requestId : 'Новый клиент';
+    $('object-source').textContent = confirmedCase()?'Клиент №'+confirmedCase():orderId ? 'Заявка на замер №' + orderId : requestId ? 'Заявка клиента №' + requestId : 'Новый клиент';
     ['org', 'address', 'inn', 'cad_num', 'region', 'kind', 'service'].forEach(function (key) { $(key).value = p[key] || ''; });
     $('contacts').innerHTML = S.contacts.map(function (c, i) { return '<div class="contact-row"><div class="contact-fields"><label>Имя<input data-contact="' + i + '" data-field="name" value="' + M.escape(c.name) + '" autocomplete="name"></label><label>Телефон<input data-contact="' + i + '" data-field="phone" value="' + M.escape(c.phone) + '" inputmode="tel" autocomplete="tel"></label><label>Telegram<input data-contact="' + i + '" data-field="tg" value="' + M.escape(c.tg) + '" placeholder="@имя"></label>' + (c.comment ? '<p class="contact-note">' + M.escape(c.comment) + '</p>' : '') + '</div><button type="button" class="icon-button remove-contact" data-remove-contact="' + i + '" aria-label="Удалить контакт ' + M.escape(c.name || i + 1) + '">×</button></div>'; }).join('');
     $('no-contacts').hidden = !!S.contacts.length;
@@ -120,7 +128,7 @@ function handoffClient() {
     $('historical-note').hidden = !$('historical-note').textContent;
   }
   function renderPacket() {
-    $('packet-section').hidden=manual;
+    $('packet-section').hidden=manual||documentsView&&!(S.packet&&S.packet.report);
     $('manual-load-error').hidden=!manual||!S.packetError;
     $('manual-load-error-text').textContent=S.packetError;
     var report = S.packet && S.packet.report, info = M.packageInfo(S.packet);
@@ -153,22 +161,22 @@ function handoffClient() {
   function updateFooter() {
     var b = $('go'), name = assignmentName(), locked = !!S.pending || !!S.completed || !!S.existingAssignment;
     b.textContent = manual ? 'Создать и передать' : 'Передать' + (name ? ' · ' + name : ' юристу');
-    b.disabled = S.loading || !!S.packetError || S.sending || locked || manual&&(manualFilesBusy||!manualFilesReady||manualQueue.length>0||manualMatches.loading);
+    b.disabled = !!(extras && extras.blocking()) || S.loading || !!S.packetError || S.sending || locked || manual&&(manualFilesBusy||!manualFilesReady||manualQueue.length>0||manualMatches.loading);
     $('form-error').textContent = S.error;
     $('form-error').hidden = !S.error;
     $('assignment').hidden = readonly || !!S.existingAssignment;
     $('footer').hidden = readonly || S.review || locked;
     $('review').hidden = !S.review || readonly;
     $('main-form').hidden = S.review && !readonly;
-    $('readonly-note').hidden = !readonly;
-    $('page-title').textContent = manual ? 'Создать клиента' : readonly ? 'Отчёт аудитора' : 'Передача юристу';
-    $('page-subtitle').textContent = manual ? 'Объект, услуга и ответственный юрист' : readonly ? 'Материалы осмотра и оригиналы' : 'Объект, готовый комплект и ответственный';
+    $('readonly-note').hidden = !readonly||documentsView;
+    $('page-title').textContent = manual ? 'Создать клиента' : documentsView?'Документы клиента':readonly ? 'Отчёт аудитора' : 'Передача юристу';
+    $('page-subtitle').textContent = manual ? 'Объект, услуга и ответственный юрист' : documentsView?'Комплект клиента и дополнительные файлы':readonly ? 'Материалы осмотра и оригиналы' : 'Объект, готовый комплект и ответственный';
     $('footer-note').textContent=manual?(manualFilesBusy?'Сохраняю документы…':manualMatches.loading?'Проверяю существующих клиентов…':'Перед созданием покажем юриста и сведения клиента'):'Перед отправкой покажем получателя и состав комплекта';
-    $('delivery').hidden = readonly || !locked;
+    $('delivery').hidden = readonly&&!documentsView || !locked;
     if (S.existingAssignment) {
       var assignment = S.existingAssignment, confirmed = assignment.delivery_complete === true && assignment.manual_review !== true, incomplete = assignment.delivery_complete === false && assignment.manual_review !== true, group=M.groupNotice(assignment.group_notice),groupRetry=confirmed&&group&&group.retry;
       $('delivery-title').textContent = (confirmed ? 'Уже передано: ' : 'Юрист назначен: ') + (assignment.lawyer_name || 'юристу');
-      $('delivery-text').textContent = 'Клиент №' + assignment.case_id + '.' + (confirmed ? ' Доставка полного комплекта подтверждена. Материалы отчёта можно открыть выше.' : incomplete ? ' Доставка этого комплекта ещё не завершена. Повторное создание клиента недоступно.' : ' Подтверждение доставки не сохранено. Нужна проверка доставки.') + (assignment.message ? ' ' + assignment.message : '');
+      $('delivery-text').textContent = 'Клиент №' + assignment.case_id + '.' + (confirmed ? ' Основной комплект передан. Документы доступны для скачивания.' : incomplete ? ' Доставка этого комплекта ещё не завершена. Повторное создание клиента недоступно.' : ' Подтверждение доставки не сохранено. Нужна проверка доставки.') + (assignment.message ? ' ' + assignment.message : '');
       if(group)$('delivery-text').textContent+='\nЛичная доставка юристу: '+(confirmed?'подтверждена.':'ещё не подтверждена.')+'\n'+group.message;
       $('retry-send').hidden = assignment.can_resume !== true || confirmed&&!groupRetry;
       $('retry-send').disabled = S.sending;
@@ -195,10 +203,21 @@ function handoffClient() {
     $('choose-report').disabled = locked;
     $('egrn-order').disabled = locked;
     $('manual-create-another').hidden=!manual||!S.completed||!!S.pending||S.sending;
+    var currentCase=confirmedCase();
+    if(extras){extras.render({visible:!S.hydrating&&(!manual||!!currentCase)&&!S.review,caseId:currentCase,readonly:readonly,locked:S.sending||S.review||!!S.pending||!!(S.existingAssignment&&S.existingAssignment.delivery_complete!==true)});
+      if(currentCase&&extras.pendingDelivery()&&!readonly){$('delivery-title').textContent='Клиент передан · документы ожидают отправки';$('delivery-text').textContent='Основная передача сохранена.\nДополнительные документы ещё не доставлены. Статус и повтор отправки — в разделе документов.';}
+      $('manual-create-another').disabled=extras.outstanding();
+      if(readonly){$('retry-send').hidden=true;$('manual-create-another').hidden=true;}
+    }
+    $('download-package').hidden=!currentCase;
+    $('report-download-package').hidden=!currentCase;
     if(manual)renderManualFiles();
   }
+  function confirmedCase(){return S.completed&&S.completed.id||S.existingAssignment&&S.existingAssignment.case_id||S.packet&&S.packet.assignment&&S.packet.assignment.case_id||null;}
+  function downloadPackage(button){var id=confirmedCase();if(!id)return;download({name:(S.profile.org||'Клиент '+id).replace(/[\\/:*?"<>|]/g,'_')+'.zip',url:'/api/handoff/cases/'+id+'/package'},button);}
+
   function render() { renderObject(); renderPacket(); renderAssignment(); if(manual)renderManualMatches(); }
-  function fieldChanged(key, value) { S.profile[key] = value; S.error = ''; if(manual&&['org','address','inn'].indexOf(key)>=0)resetManualMatches();save(); renderObject(); renderPacket(); updateFooter(); }
+  function fieldChanged(key, value) { S.profile[key] = value; S.editedFields[key] = true; S.error = ''; if(manual&&['org','address','inn'].indexOf(key)>=0)resetManualMatches();save(); renderObject(); renderPacket(); updateFooter(); }
   function manualMatchKey(){return JSON.stringify(['org','address','inn'].map(function(key){return M.text(S.profile[key]).toLowerCase().replace(/\s+/g,' ');}));}
   function resetManualMatches(){matchSequence++;manualMatches={key:'',items:[],checked:false,loading:false,error:'',createNew:false};renderManualMatches();}
   function renderManualMatches(){
@@ -281,7 +300,8 @@ function handoffClient() {
     if(!manual||!S.completed||S.pending||S.sending||manualFilesBusy)return;
     try{sessionStorage.removeItem(cacheKey);}catch(_){}
     try{localStorage.removeItem(cacheKey);}catch(_){}
-    S.profile=emptyProfile();S.source=emptyProfile();S.contacts=[];S.sourceContacts=[];S.lawyer=null;S.priority='обычный';S.comment='';S.egrnOrder=false;S.submitId=uuid();S.pending=null;S.completed=null;S.existingAssignment=null;S.review=false;S.error='';
+    S.profile=emptyProfile();S.editedFields={};S.source=emptyProfile();S.contacts=[];S.sourceContacts=[];S.lawyer=null;S.priority='обычный';S.comment='';S.egrnOrder=false;S.submitId=uuid();S.pending=null;S.completed=null;S.existingAssignment=null;S.review=false;S.error='';
+    if(extras)extras.reset();
     manualFiles=[];manualQueue=[];manualFilesReady=false;manualFilesError='';resetManualMatches();save();load();$('org').focus();
   }
   function buildPayload() {
@@ -290,12 +310,12 @@ function handoffClient() {
   }
   function hasClientContact() { return S.contacts.some(function (contact) { return M.text(contact.name) || M.text(contact.phone) || M.text(contact.tg); }); }
   function checkedManualResult(result, expectedCaseId){
-    if(!manual)return result;
     var id=result&&result.id;
     if(!(['number','string'].indexOf(typeof id)>=0&&/^[1-9]\d*$/.test(String(id))&&Number.isSafeInteger(Number(id))&&Number(id)<=2147483647)||typeof result.delivery_complete!=='boolean'||expectedCaseId&&Number(id)!==Number(expectedCaseId))throw Object.assign(new Error('Ответ сервера о клиенте не подтверждён. Повторите эту же передачу.'),{code:'HANDOFF_ACK_UNCONFIRMED'});
     return result;
   }
   function validation() {
+    if(extras&&extras.blocking())return 'Дождитесь сохранения дополнительных документов или завершите загрузку.';
     if (!S.lawyer || !assignmentName()) return 'Выберите юриста, которому передать клиента.';
     if (!M.text(S.profile.org)) return 'Укажите организацию в карточке объекта.';
     if (!M.text(S.profile.address)) return 'Укажите адрес в карточке объекта.';
@@ -345,7 +365,8 @@ function handoffClient() {
         if (resumed.delivery_complete) {
           var resumedNotice=M.groupNotice(resumed.group_notice);
           S.completed = { id: resumed.id, name: S.existingAssignment.lawyer_name, warn: resumed.warn || '',egrnNote:S.existingAssignment.egrnNote||'',groupNotice:resumedNotice,canResumeNotice:!!(resumedNotice&&resumedNotice.retry) };
-          S.existingAssignment = null;
+          S.existingAssignment = null;save();
+          if(extras)await extras.send(resumed.id);
         } else {
           S.error = resumed.warn || 'Доставка ещё не завершена. Повторите попытку.';
           S.existingAssignment.message = S.error; S.existingAssignment.manual_review = resumed.manual_review === true;
@@ -356,7 +377,7 @@ function handoffClient() {
       return;
     }
     if (!savedPayload && !S.review) return;
-    var payload = savedPayload || buildPayload(), expectedManualCaseId=manual&&S.pending&&S.pending.caseId;
+    var payload = savedPayload || buildPayload(), expectedManualCaseId=S.pending&&S.pending.caseId;
     S.sending = true;
     // Cache the exact body before dispatch: a failed response resumes this case.
     S.pending = { payload: payload, name: assignmentName(), message: 'Передача выполняется. Если связь прервётся, повтор продолжит эту же отправку.' };
@@ -371,7 +392,8 @@ function handoffClient() {
       } else {
         var egrnNote = { attached: 'ЕГРН приложена.', waiting: 'Заказанная ЕГРН ещё ожидается; после получения бот доставит её отдельно.', none: 'Готовая выписка ЕГРН в комплекте отсутствует.' }[result.egrn_note] || (typeof result.egrn_note === 'string' ? result.egrn_note : '');
         var resultNotice=M.groupNotice(result.group_notice);
-        S.completed = { id: result.id, name: S.pending.name, warn: result.warn || '', egrnNote: egrnNote,groupNotice:resultNotice,canResumeNotice:!!(resultNotice&&resultNotice.retry) }; S.pending = null;
+        S.completed = { id: result.id, name: S.pending.name, warn: result.warn || '', egrnNote: egrnNote,groupNotice:resultNotice,canResumeNotice:!!(resultNotice&&resultNotice.retry) }; S.pending = null;save();
+        if(extras)await extras.send(result.id);
         try { if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('success'); } catch (_) {}
       }
     } catch (error) {
@@ -390,24 +412,31 @@ function handoffClient() {
   }
   function applyPacket(data, options) {
     var packet = data.packet || data;
-    if (!packet || !packet.order && !packet.report) throw new Error('Комплект не найден. Повторите загрузку.');
+    if (!packet || !packet.order && !packet.report && !packet.assignment) throw new Error('Комплект не найден. Повторите загрузку.');
     S.packet = packet; S.report = packet.report || null; S.packetError = '';
     if (packet.order && (!S.sourceLoaded || !options || options.profile !== false)) {
+      var editedProfile=S.profile,editedFields=Object.assign({},S.editedFields),editedContacts=JSON.stringify(S.contacts)!==JSON.stringify(S.sourceContacts)?S.contacts:null;
       S.source = Object.assign(emptyProfile(), M.profile(packet.order)); S.profile = Object.assign({}, S.source); S.contacts = M.contacts(packet.order.contacts);
       S.sourceContacts = M.contacts(packet.order.contacts);
       S.sourceLoaded = true;
-      var previous = readonly ? null : cached(); M.restore(S, previous, S.source);
+      var previous = readonly || options && options.profile === false ? null : cached(); M.restore(S, previous, S.source);
+      if(options && options.profile === false){
+        Object.keys(editedFields).forEach(function(key){if(editedFields[key]===true)S.profile[key]=editedProfile[key];});
+        S.editedFields=editedFields;if(editedContacts)S.contacts=editedContacts;
+      }
       if (previous && previous.packetSignature && previous.packetSignature !== packet.signature && !S.pending) { S.completed = null; S.submitId = uuid(); }
       if (S.lawyer && !S.lawyers.some(function (x) { return String(x.tg_id) === String(S.lawyer); })) S.lawyer = null;
     } else if (packet.order) {
       var nextSource = Object.assign(emptyProfile(), M.profile(packet.order)), nextProfile = Object.assign({}, nextSource);
-      Object.keys(nextProfile).forEach(function (key) { if (S.profile[key] !== S.source[key]) nextProfile[key] = S.profile[key]; });
+      Object.keys(nextProfile).forEach(function (key) { if (S.editedFields[key] === true || S.profile[key] !== S.source[key]) nextProfile[key] = S.profile[key]; });
       if (JSON.stringify(S.contacts) === JSON.stringify(S.sourceContacts)) S.contacts = M.contacts(packet.order.contacts);
       S.sourceContacts = M.contacts(packet.order.contacts);
       S.profile = nextProfile; S.source = nextSource;
     }
+    S.hydrating=false;
     var assigned = packet.assignment;
     if (assigned && assigned.case_id) {
+      if(assigned.profile){S.profile=Object.assign(emptyProfile(),M.profile(assigned.profile));S.contacts=M.contacts(assigned.profile.contacts);}
       var samePending = assigned.delivery_complete === false && assigned.manual_review !== true && assigned.can_resume !== false && S.pending && S.pending.payload && S.pending.payload.handoff_version === 2 && assigned.submit_id && assigned.submit_id === S.pending.payload.submit_id;
       if (S.completed && (String(S.completed.id) !== String(assigned.case_id) || assigned.delivery_complete !== true || assigned.manual_review === true)) S.completed = null;
       if(S.completed){S.completed.groupNotice=M.groupNotice(assigned.group_notice);S.completed.canResumeNotice=assigned.can_resume===true;}
@@ -430,15 +459,19 @@ function handoffClient() {
     S.loading = true; S.packetError = ''; renderPacket(); updateFooter();
     try { var data = await api('/api/handoff/packet?' + qs.toString()); if (sequence !== packetSequence) return false; applyPacket(data, options); return true; }
     catch (error) { if (sequence === packetSequence) S.packetError = error.message; return false; }
-    finally { if (sequence === packetSequence) { S.loading = false; render(); if (readonly && !S.packetError && S.packet && S.packet.report && S.packet.report.text) openReport(); } }
+    finally { if (sequence === packetSequence) { S.loading = false; render(); if (readonly && !documentsView && !S.packetError && S.packet && S.packet.report && S.packet.report.text) openReport(); } }
   }
   async function load() {
+    S.hydrating=true;
+    if(extras)extras.restore((cached()||{}).documents);
     S.loading = true; S.error = ''; render();
     try {
       var pref = await api(manual?'/api/handoff/prefill':'/api/handoff/prefill?order_id=' + encodeURIComponent(orderId) + '&request_id=' + encodeURIComponent(requestId)+(caseId?'&case_id='+encodeURIComponent(caseId):''));
+      if(documentsView){readonly=pref.can_manage!==true;document.body.classList.toggle('readonly',readonly);}
+      if(caseId&&pref.order&&pref.order.id)orderId=String(pref.order.id);
       S.lawyers = pref.lawyers || [];
       if(manual){
-        S.source=emptyProfile();S.profile=Object.assign({},S.source);S.contacts=[];S.sourceContacts=[];M.restore(S,cached(),S.source);S.profile.cad_num='';S.egrnOrder=false;
+        S.source=emptyProfile();S.profile=Object.assign({},S.source);S.contacts=[];S.sourceContacts=[];M.restore(S,cached(),S.source);S.hydrating=false;S.profile.cad_num='';S.egrnOrder=false;
         if(S.lawyer&&!S.lawyers.some(function(item){return String(item.tg_id)===String(S.lawyer);}))S.lawyer=null;
         save(); // Persist the upload owner/SID before the first materials request.
         S.packet=await api('/api/handoff/packet');if(S.packet.order||S.packet.report||S.packet.request)throw new Error('Не удалось подготовить нового клиента. Повторите загрузку формы.');
@@ -454,17 +487,19 @@ function handoffClient() {
         if (!S.contacts.length && (f.client || f.phone)) S.contacts = [{ name: M.text(f.client), phone: M.text(f.phone), tg: '', comment: '' }];
         S.sourceContacts = M.contacts(S.contacts);
         if (!readonly) M.restore(S, cached(), S.source);
+        S.hydrating=false;
         var selection=explicit||pref.report;
         S.packet = await api('/api/handoff/packet?request_id=' + encodeURIComponent(requestId)+(caseId?'&case_id='+encodeURIComponent(caseId):'')+(caseId&&selection?'&report_src='+encodeURIComponent(selection.src)+'&report_id='+encodeURIComponent(selection.id):''));
         S.report = S.packet.report || null; S.packetError = '';
+        if(caseId&&S.packet.assignment)applyPacket(S.packet,{profile:false});
         if (explicit || pref.report) await chooseReport(explicit || pref.report, false);
         else changedUnlinkedPacket(S.packet);
       }
     } catch (error) { S.packetError = error.message; }
     finally {
       S.loading = false; render();
-      if (readonly && !$('report-dialog').open && S.packet && S.packet.report && S.packet.report.text) openReport();
-      else if (readonly && !S.packetError) announce('Сохранённый отчёт не найден.');
+      if (readonly && !documentsView && !$('report-dialog').open && S.packet && S.packet.report && S.packet.report.text) openReport();
+      else if (readonly && !documentsView && !S.packetError) announce('Сохранённый отчёт не найден.');
     }
   }
   async function chooseReport(it, closeAfter) {
@@ -473,7 +508,7 @@ function handoffClient() {
     if (!orderId && it.order_id) {
       // A source order already identified by the saved report must survive a
       // temporary packet failure. Keep V2 and retry the complete original set.
-      orderId = String(it.order_id); cacheKey = 'handoff-v2:' + userId + ':order-' + orderId;
+      orderId = String(it.order_id); cacheKey = 'handoff-v2:' + userId + ':' + (caseId?'case-'+caseId:'order-'+orderId);
     }
     if (orderId) {
       if (!await loadPacket(it, { profile: false })) { if (S.packetError) $('search-error').textContent = S.packetError; return; }
@@ -494,8 +529,8 @@ function handoffClient() {
           if (S.packet.order.id && S.packet.signature) {
             // A saved audit with a verified source order uses the complete V2
             // package, even when the manager arrived through report search.
-            orderId = String(S.packet.order.id); cacheKey = 'handoff-v2:' + userId + ':order-' + orderId;
-            applyPacket(S.packet); metadata = S.profile;
+            orderId = String(S.packet.order.id); cacheKey = 'handoff-v2:' + userId + ':' + (caseId?'case-'+caseId:'order-'+orderId);
+            applyPacket(S.packet, {profile:false}); metadata = S.profile;
           }
         }
         // Only labelled structured metadata may fill an empty new-client card.
@@ -571,22 +606,22 @@ function handoffClient() {
   async function download(file, button) {
     var url = M.protectedUrl(file.url, location.origin);
     if (!url) { announce('Ссылка на оригинал недоступна.'); return; }
-    var old = button.innerHTML,epoch=imageEpoch,controller=new AbortController();imageControllers.push(controller);button.disabled = true; button.textContent = 'Скачиваю…';
+    var inReport=$('report-dialog').open;var old = button.innerHTML,epoch=imageEpoch,controller=new AbortController();(inReport?imageControllers:downloadControllers).push(controller);button.disabled = true; button.textContent = 'Скачиваю…';
     try {
       if (/\/egrn\/[0-9a-f-]+\/link(?:\?|$)/i.test(url)) {
         var link = await api(url), downloadUrl = M.safeHttp(link.url);
-        if(controller.signal.aborted||epoch!==imageEpoch||!$('report-dialog').open)return;
+        if(controller.signal.aborted||inReport&&(epoch!==imageEpoch||!$('report-dialog').open))return;
         if (!downloadUrl) throw new Error('Не удалось открыть оригинал выписки.');
         if (tg && tg.openLink) tg.openLink(downloadUrl);
         else { var original = document.createElement('a'); original.href = downloadUrl; original.target = '_blank'; original.rel = 'noopener'; original.click(); }
         return;
       }
       var u = new URL(url, location.origin); u.searchParams.set('download', '1');
-      var blob = await originalBlob(u.pathname + u.search,controller);if(controller.signal.aborted||epoch!==imageEpoch||!$('report-dialog').open)return;
+      var blob = await originalBlob(u.pathname + u.search,controller);if(controller.signal.aborted||inReport&&(epoch!==imageEpoch||!$('report-dialog').open))return;
       var blobUrl = URL.createObjectURL(blob), a = document.createElement('a'); a.href = blobUrl; a.download = file.name || 'Документ'; document.body.appendChild(a); a.click(); a.remove();
       setTimeout(function () { URL.revokeObjectURL(blobUrl); }, 30000);
-    } catch (error) { if(epoch===imageEpoch&&$('report-dialog').open&&error.code!=='HANDOFF_FILE_CANCELLED')$('report-notice').textContent = error.message; }
-    finally { imageControllers=imageControllers.filter(function(item){return item!==controller;});button.disabled = false; button.innerHTML = old; }
+    } catch (error) { if(error.code!=='HANDOFF_FILE_CANCELLED'){if(inReport&&epoch===imageEpoch&&$('report-dialog').open)$('report-notice').textContent=error.message;else if(!inReport)announce(error.message);} }
+    finally { imageControllers=imageControllers.filter(function(item){return item!==controller;});downloadControllers=downloadControllers.filter(function(item){return item!==controller;});button.disabled = false; button.innerHTML = old; }
   }
   function openReport() {
     var report = S.packet && S.packet.report; if (!report || !report.text) return;
@@ -599,7 +634,7 @@ function handoffClient() {
     $('report-video').hidden = !video; if (video) $('report-video').href = video;
     $('report-archive').hidden = !archive; if (archive) $('report-archive').href = archive;
     $('report-telegram').hidden = !telegram; if (telegram) $('report-telegram').href = telegram;
-    var media = Array.isArray(report.media) ? report.media : [], images = M.gallery(media), list = media.concat(S.packet.materials || [], S.packet.egrn_links || []), epoch = imageEpoch;
+    var media = Array.isArray(report.media) ? report.media : [], images = M.gallery(media), list = media.concat(S.packet.materials || [], S.packet.egrn_links || [], S.packet.case_documents && S.packet.case_documents.files || []), epoch = imageEpoch;
     $('gallery').innerHTML = ''; $('gallery-empty').hidden = images.length > 0;
     $('gallery-empty').textContent = !M.packageInfo(S.packet).known ? 'Вложения старого отчёта здесь не восстановлены. Откройте оригинальные сообщения в Telegram, если ссылка доступна.' : 'Фотографии и графика к этому отчёту не приложены.';
     images.forEach(function (file) {
@@ -630,7 +665,7 @@ function handoffClient() {
     if (tg) tg.close(); else if (requestId) location.href = '/requests'; else history.back();
   }
   ['org', 'address', 'inn', 'cad_num', 'region', 'kind', 'service'].forEach(function (key) { $(key).addEventListener('change', function () { fieldChanged(key, this.value.trim()); }); });
-  if(manual)['org','address','inn'].forEach(function(key){$(key).addEventListener('input',function(){S.profile[key]=this.value.trim();S.error='';resetManualMatches();save();updateFooter();});});
+  ['org','address','inn','cad_num'].forEach(function(key){$(key).addEventListener('input',function(){S.profile[key]=this.value.trim();S.editedFields[key]=true;S.error='';if(manual&&key!=='cad_num')resetManualMatches();save();updateFooter();});});
   $('contacts').addEventListener('input', function (event) { var input = event.target; if (input.dataset.contact != null && S.contacts[Number(input.dataset.contact)]) { S.contacts[Number(input.dataset.contact)][input.dataset.field] = input.value; save(); } });
   $('contacts').addEventListener('click', function (event) { var button = event.target.closest('[data-remove-contact]'); if (!button) return; S.contacts.splice(Number(button.dataset.removeContact), 1); save(); renderObject(); });
   $('add-contact').onclick = function () { S.contacts.push({ name: '', phone: '', tg: '', comment: '' }); renderObject(); var inputs = $('contacts').querySelectorAll('input'); if (inputs.length) inputs[inputs.length - 3].focus(); save(); };
@@ -652,6 +687,8 @@ function handoffClient() {
   $('manual-files-cancel').onclick=cancelManualQueue;
   $('manual-file-list').onclick=function(event){var button=event.target.closest('[data-manual-remove]');if(button)removeManualFile(button.dataset.manualRemove);};
   $('manual-create-another').onclick=createAnotherManual;
+  $('download-package').onclick=function(){downloadPackage(this);};
+  $('report-download-package').onclick=function(){downloadPackage(this);};
   $('open-report').onclick = openReport;
   $('choose-report').onclick = function () { openDialog('search-dialog', 'report-query'); layerHistory('search'); searchReports(); };
   $('report-query').oninput = function () { clearTimeout(searchTimer); searchTimer = setTimeout(searchReports, 250); };
@@ -668,7 +705,7 @@ function handoffClient() {
   $('back').onclick = back;
   ['report-dialog', 'zoom-dialog', 'search-dialog'].forEach(function (id) { $(id).addEventListener('cancel', function (event) { event.preventDefault(); back(); }); });
   window.addEventListener('popstate', function () { if ($('zoom-dialog').open && (!history.state || history.state.handoffLayer !== 'zoom')) closeZoom(true); if ($('report-dialog').open && (!history.state || !history.state.handoffLayer)) closeReport(true); if ($('search-dialog').open && (!history.state || history.state.handoffLayer !== 'search')) closeSearch(true); });
-  window.addEventListener('pagehide', function () { save(); releaseImages(); });
+  window.addEventListener('pagehide', function () { save(); releaseImages();downloadControllers.forEach(function(c){c.abort();});downloadControllers=[]; });
   if (tg && tg.BackButton) { try { tg.BackButton.show(); tg.BackButton.onClick(back); } catch (_) {} }
   if (readonly) document.body.classList.add('readonly');
   if(manual){
@@ -679,6 +716,7 @@ function handoffClient() {
   var dark = tg && tg.colorScheme === 'dark' || !tg && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
   document.documentElement.dataset.theme = dark ? 'dark' : 'light';
   try { if (tg) { tg.setHeaderColor(dark ? '#111928' : '#e8f1fc'); tg.setBackgroundColor(dark ? '#111928' : '#e8f1fc'); } } catch (_) {}
+  extras=window.HandoffDocuments({node:$,api:api,model:M,uuid:uuid,bytes:bytes,changed:function(){save();updateFooter();},download:download});
   load();
 }
 
@@ -687,7 +725,7 @@ function handoffPage() {
 :root{font:100%/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#152338;background:#e9f1fa;--ink:#152338;--muted:#596b83;--glass:rgba(255,255,255,.61);--solid:#f5f8ff;--border:rgba(255,255,255,.9);--input:rgba(130,150,188,.13);--blue:#3167ff;--shadow:0 16px 48px rgba(56,84,144,.10),inset 0 1px 0 rgba(255,255,255,.9)}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 8% 12%,#bedfff 0,transparent 48%),radial-gradient(ellipse at 95% 45%,#e0d6ff 0,transparent 51%),radial-gradient(ellipse at 25% 95%,#c7f1e5 0,transparent 55%),#e9f1fa;background-attachment:fixed;color:var(--ink)}button,input,select,textarea{font:inherit;color:inherit}button,a,input,select,textarea{-webkit-tap-highlight-color:transparent}button,a{touch-action:manipulation}button{cursor:pointer;min-height:46px;border:0;line-height:1.25;transition:background .12s ease,transform .12s ease}button:active:not(:disabled){transform:scale(.975)}button:disabled{cursor:default;opacity:.48}button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:3px solid #265df4;outline-offset:3px}[hidden]{display:none!important}h1,h2,h3,p{margin:0}h1{font-size:1.8rem;line-height:1.15;letter-spacing:-.035em}h2{font-size:1.23rem;line-height:1.3;letter-spacing:-.018em}h3{font-size:1.07rem;line-height:1.4}small,.muted{color:var(--muted)}small{font-size:.83rem}.shell{width:min(100%,800px);margin:auto;padding:20px 16px calc(126px + env(safe-area-inset-bottom))}.page-heading{display:flex;align-items:center;gap:12px;margin:4px 0 22px}.page-heading small{display:block;margin-top:6px}.back,.icon-button{border-radius:50%;background:var(--input);min-width:46px;flex:none}.back{font-size:1.3rem}.glass{background:var(--glass);border:1.5px solid var(--border);border-radius:30px;box-shadow:var(--shadow);backdrop-filter:blur(24px) saturate(125%);-webkit-backdrop-filter:blur(24px) saturate(125%)}.card{padding:24px;margin:0 0 18px}.card-header{display:flex;align-items:start;justify-content:space-between;gap:12px;margin-bottom:17px}.object-source{font-size:.77rem;font-weight:650;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);margin-bottom:9px}.object-org{font-size:1.38rem;letter-spacing:-.025em;line-height:1.25;overflow-wrap:anywhere}.object-address{font-size:1.05rem;line-height:1.5;margin-top:9px}.object-meta{margin-top:10px;color:var(--muted);font-size:.9rem}.text-button{color:#2558db;background:transparent;border-radius:14px;padding:9px 12px;min-height:44px;font-weight:600}.details{margin-top:16px}.details>summary{list-style:none;cursor:pointer;color:#2558db;font-weight:600;min-height:44px;display:flex;align-items:center;justify-content:space-between}.details>summary::-webkit-details-marker{display:none}.details>summary:after{content:'＋';font-size:1.2rem}.details[open]>summary:after{content:'−'}.details[open]>summary{margin-bottom:15px}.details-editable{border:0;padding:0;margin:0;min-width:0}.fields{display:grid;grid-template-columns:1fr 1fr;gap:15px}.wide{grid-column:1/-1}label{display:block;font-size:.86rem;font-weight:600;color:var(--muted)}input,select,textarea{display:block;width:100%;border:1px solid transparent;border-radius:17px;background:var(--input);padding:13px 15px;margin-top:7px;min-height:50px;font-size:1rem;font-weight:400;color:var(--ink)}textarea{resize:vertical;min-height:98px;line-height:1.5}input::placeholder,textarea::placeholder{color:var(--muted);opacity:.8}input:focus,textarea:focus,select:focus{background:var(--solid)}.contacts-title{margin:23px 0 12px}.contact-row{display:flex;gap:10px;align-items:start;margin:10px 0 16px}.contact-fields{flex:1;min-width:0;display:grid;grid-template-columns:1fr 1fr;gap:10px}.contact-fields label:last-of-type{grid-column:1/-1}.contact-note{font-size:.85rem;color:var(--muted);grid-column:1/-1;white-space:pre-wrap}.remove-contact{margin-top:25px;font-size:1.4rem}.note{font-size:.85rem;line-height:1.5;color:var(--muted);margin-top:16px;padding:12px 14px;border-radius:16px;background:var(--input)}.report-overview{display:flex;flex-direction:column;gap:5px;margin-bottom:14px}.status{font-size:1.05rem;font-weight:650;letter-spacing:-.015em}.status[data-status=ready]{color:#10865b}.status[data-status=actions],.status[data-status=insufficient]{color:#9b5700}.status[data-status=obstacle]{color:#b22645}.outline-button,.soft-button{padding:13px 17px;border-radius:18px;background:var(--input);font-weight:600}.outline-button{background:rgba(255,255,255,.35);border:1px solid rgba(100,126,169,.2)}.full{width:100%}.counts{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:20px 0}.count strong{display:block;font-size:1.55rem;font-weight:650;line-height:1.3;letter-spacing:-.03em}.count span{font-size:.75rem;color:var(--muted);line-height:1.35;display:block;margin-top:3px}.package-details{display:grid;gap:8px;font-size:.88rem;color:var(--muted)}.package-details p{display:flex;align-items:baseline;gap:9px}.package-details p:before{content:'•';color:#6685bc}.check{font-weight:400;display:flex;gap:10px;align-items:start;margin-top:17px;padding:13px;background:var(--input);border-radius:16px}.check input{flex:none;display:inline;width:21px;height:21px;min-height:21px;margin:2px 0 0;accent-color:var(--blue)}.check small{display:block;line-height:1.4;margin-top:5px}.packet-bottom{margin-top:12px;display:flex;justify-content:flex-end}.assignment-fields{display:grid;grid-template-columns:1fr 1fr;gap:16px}.assignment-fields .wide{margin-top:1px}.assignment-fields #lawyers{font-weight:600}.footer{position:fixed;bottom:0;left:0;right:0;padding:12px 16px calc(12px + env(safe-area-inset-bottom));background:linear-gradient(0deg,rgba(220,239,247,.88),rgba(234,242,255,.68));border-top:1px solid var(--border);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);z-index:10}.footer-inner{width:min(100%,768px);margin:auto}.primary{color:white;background:var(--blue);padding:16px 24px;border-radius:22px;font-weight:650;box-shadow:0 8px 22px rgba(49,103,255,.18);min-height:56px}.footer small{display:block;text-align:center;margin-top:6px;font-size:.73rem}.error{color:#9b243a;font-size:.88rem;white-space:pre-wrap;margin:12px 0}.loading{color:var(--muted);padding:18px 0}.review-title{margin:10px 0 21px}.review-eyebrow{font-size:.8rem;color:var(--muted);margin:14px 0 4px}.review-lawyer{font-size:1.6rem;line-height:1.3;letter-spacing:-.025em}.review-address{margin:7px 0}.review-list{padding:0;list-style:none;display:grid;gap:7px;margin:14px 0 0;font-size:.95rem}.review-list li{display:flex;gap:10px;align-items:baseline}.review-list li:before{content:'•';color:#6685bc}.review-actions{display:flex;flex-direction:column;gap:10px;margin-top:20px}.review-comment{white-space:pre-wrap;margin-top:18px}.delivery h2{margin-bottom:8px}.delivery p{color:var(--muted);white-space:pre-wrap}.delivery button{margin-top:16px}.notice{font-size:.9rem;color:var(--muted);white-space:pre-wrap;margin:10px 0}.readonly .details,.readonly #choose-report,.readonly #egrn-order-box{display:none}.readonly .shell{padding-bottom:30px}dialog{color:var(--ink);background:var(--solid);border:0;padding:0;max-width:none;max-height:none;overscroll-behavior:contain}dialog::backdrop{background:rgba(20,34,56,.4);backdrop-filter:blur(5px);-webkit-backdrop-filter:blur(5px)}.sheet{width:min(100%,1000px);height:100dvh;height:100vh;height:100dvh;margin:0 auto;border-radius:0;overflow:hidden;box-shadow:0 0 90px rgba(12,31,60,.18)}.sheet-inner{height:100%;display:flex;flex-direction:column}.sheet-header{display:flex;gap:16px;align-items:center;justify-content:space-between;padding:18px 22px calc(14px + env(safe-area-inset-top));flex:none;background:var(--glass);border-bottom:1px solid rgba(124,146,180,.12);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px)}.sheet-tabs{display:flex;gap:7px;padding:8px 18px 10px;background:var(--solid);flex:none;border-bottom:1px solid rgba(124,146,180,.12)}.sheet-tabs button{flex:1;background:var(--input);border-radius:14px;padding:9px 10px;font-size:.86rem;font-weight:600;min-height:44px}.sheet-heading{min-width:0}.sheet-heading h2{overflow-wrap:anywhere}.sheet-heading small{display:block;margin-top:4px}.sheet-header button{flex:none}.sheet-body{overflow:auto;flex:1;padding:22px 24px calc(40px + env(safe-area-inset-bottom));overscroll-behavior:contain;-webkit-overflow-scrolling:touch}.full-report-text{font:inherit;font-size:1rem;line-height:1.65;white-space:pre-wrap;overflow-wrap:anywhere;word-break:normal;margin:0 0 24px;max-height:none;overflow:visible}.report-link{display:block;border-radius:17px;background:var(--input);padding:14px 17px;color:#2558db;font-weight:600;text-decoration:none;margin:12px 0}.report-section{margin:32px 0 16px}.report-image{margin:0 0 24px;border-radius:20px;overflow:hidden;border:1px solid rgba(108,132,166,.15);background:rgba(255,255,255,.6)}.report-image figcaption{font-size:.9rem;padding:12px 15px;font-weight:600;white-space:pre-wrap}.image-open{position:relative;width:100%;display:block;padding:0;background:#e3eaf2;min-height:0}.image-open:disabled{opacity:1}.image-open img{width:100%;display:block;height:auto;max-height:none}.image-state{padding:18px;color:var(--muted);font-size:.9rem}.zoom-hint{position:absolute;bottom:12px;right:12px;background:rgba(255,255,255,.9);color:#223248;box-shadow:0 2px 8px #0002;border-radius:12px;padding:5px 12px;font-size:1.3rem}.download-row{display:flex;align-items:center;justify-content:space-between;gap:14px;text-align:left;background:var(--input);border-radius:17px;padding:14px 16px;width:100%;margin:10px 0}.download-row strong{font-weight:550;display:block;overflow-wrap:anywhere}.download-row small{display:block;margin-top:4px}.download-row>span:last-child{font-size:1.4rem}.zoom-sheet{width:100vw;height:100dvh;margin:0;background:#121a29;color:#fff}.zoom-sheet .sheet-header{background:#182236;border-color:#ffffff15}.zoom-sheet .sheet-header small{color:#b9c7de}.zoom-sheet button{color:white;background:#ffffff18}.zoom-toolbar{display:flex;gap:8px;align-items:center;justify-content:center;padding:10px;background:#182236}.zoom-toolbar button{border-radius:14px;padding:8px 17px;min-width:48px}.zoom-content{flex:1;overflow:auto;display:block;padding:12px;-webkit-overflow-scrolling:touch;touch-action:pan-x pan-y pinch-zoom}.zoom-content img{display:block;width:100%;height:auto;max-width:none;margin:0 auto;transform-origin:top left}.search-sheet{height:90dvh;bottom:0;top:auto;border-radius:28px 28px 0 0}.report-result{display:block;text-align:left;width:100%;background:var(--input);border-radius:18px;padding:16px;margin:12px 0}.report-result strong,.report-result span{display:block}.report-result span{font-size:.8rem;color:var(--muted);margin-top:6px}.report-result p{font-size:.9rem;margin-top:8px;line-height:1.4}.sheet-open{overflow:hidden}.select-report-search{margin-bottom:16px}.readonly-note{margin-bottom:15px}.info{color:var(--muted);font-size:.87rem}.empty{color:var(--muted);font-size:.9rem;padding:12px 0}.block-gap{margin-top:16px}
 [data-theme=dark]{--ink:#ecf1ff;--muted:#b1c1d8;--glass:rgba(34,46,69,.85);--solid:#172134;--border:rgba(190,211,255,.2);--input:rgba(151,174,222,.13);--blue:#507eff;--shadow:0 16px 48px #0002,inset 0 1px 0 #ffffff12;background:#111928}[data-theme=dark] body{background:radial-gradient(ellipse at 10% 10%,#203e64 0,transparent 50%),radial-gradient(ellipse at 96% 55%,#342c57 0,transparent 53%),radial-gradient(ellipse at 30% 100%,#1c454a 0,transparent 50%),#111928}[data-theme=dark] .text-button,[data-theme=dark] .details>summary,[data-theme=dark] .report-link{color:#adc3ff}[data-theme=dark] .footer{background:rgba(27,40,62,.86)}[data-theme=dark] .outline-button,[data-theme=dark] .report-image{background:rgba(37,51,77,.8)}[data-theme=dark] .status[data-status=ready]{color:#6ee3ad}[data-theme=dark] .status[data-status=actions],[data-theme=dark] .status[data-status=insufficient]{color:#ffd18a}[data-theme=dark] .status[data-status=obstacle],[data-theme=dark] .error{color:#ffb3bd}[data-theme=dark] .image-open{background:#21314a}
 @media(max-width:550px){.shell{padding:17px 12px calc(130px + env(safe-area-inset-bottom))}.card{padding:21px 19px;border-radius:28px;margin-bottom:15px}.page-heading{padding:0 4px;margin-bottom:19px}.page-heading small{font-size:.79rem}h1{font-size:1.6rem}.object-org{font-size:1.28rem}.fields{grid-template-columns:1fr}.wide{grid-column:auto}.assignment-fields{grid-template-columns:1fr}.assignment-fields .wide{grid-column:auto}.contact-fields{grid-template-columns:1fr}.contact-fields label:last-of-type{grid-column:auto}.sheet-header{padding:14px 14px calc(12px + env(safe-area-inset-top));gap:10px}.sheet-header h2{font-size:1rem}.sheet-header small{font-size:.76rem}.sheet-header .soft-button{font-size:.86rem;padding:10px 13px}.sheet-body{padding:20px 17px calc(32px + env(safe-area-inset-bottom))}.full-report-text{font-size:.94rem}.count strong{font-size:1.45rem}.count span{font-size:.72rem}.counts{gap:6px}.contact-note{grid-column:auto}}@media(prefers-reduced-motion:reduce){*,*:before,*:after{scroll-behavior:auto!important;transition:none!important;animation:none!important}button:active:not(:disabled){transform:none}}@media(prefers-reduced-transparency:reduce){.glass,.footer,.sheet-header{background:var(--solid);backdrop-filter:none;-webkit-backdrop-filter:none}}@media(prefers-contrast:more){.glass{border-color:var(--muted);background:var(--solid)}input,select,textarea{border-color:var(--muted)}.muted,small{color:var(--ink)}}
-.manual-client #details{margin-top:0;border:0;padding-top:0}.manual-client #manual-optional-fields{display:grid;gap:16px;padding-top:14px}.manual-client #contact-section .contacts-title{margin-top:0}.manual-client .assignment-fields{grid-template-columns:1fr}.manual-documents .details{margin:0;border:0;padding:0}.manual-documents summary{min-height:44px;align-content:center;font-weight:650}.manual-documents summary span{font-size:.86rem;font-weight:400;color:var(--muted)}.manual-match-list,.manual-file-list{list-style:none;padding:0;margin:16px 0}.manual-match-list li{border-bottom:1px solid var(--border);padding:14px 0;overflow-wrap:anywhere}.manual-match-list li:first-child{padding-top:0}.manual-match-list p{margin:5px 0}.manual-match-list a{display:block;min-height:44px;padding:12px 0 0;text-decoration:none}.manual-file-list li{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 0;border-bottom:1px solid var(--border)}.manual-file-list li>span{min-width:0}.manual-file-list strong{display:block;font-weight:550;overflow-wrap:anywhere}.manual-file-list small{display:block;margin-top:4px}.manual-file-actions{display:flex;flex-wrap:wrap;gap:10px}.manual-client #review-list{margin-bottom:16px}
+.document-history{list-style:none;padding:0;margin:20px 0 0}.document-history>li{padding:16px 0;border-top:1px solid var(--border)}.manual-client #details{margin-top:0;border:0;padding-top:0}.manual-client #manual-optional-fields{display:grid;gap:16px;padding-top:14px}.manual-client #contact-section .contacts-title{margin-top:0}.manual-client .assignment-fields{grid-template-columns:1fr}.manual-documents .details{margin:0;border:0;padding:0}.manual-documents summary{min-height:44px;align-content:center;font-weight:650}.manual-documents summary span{font-size:.86rem;font-weight:400;color:var(--muted)}.manual-match-list,.manual-file-list{list-style:none;padding:0;margin:16px 0}.manual-match-list li{border-bottom:1px solid var(--border);padding:14px 0;overflow-wrap:anywhere}.manual-match-list li:first-child{padding-top:0}.manual-match-list p{margin:5px 0}.manual-match-list a{display:block;min-height:44px;padding:12px 0 0;text-decoration:none}.manual-file-list li{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 0;border-bottom:1px solid var(--border)}.manual-file-list li>span{min-width:0}.manual-file-list strong{display:block;font-weight:550;overflow-wrap:anywhere}.manual-file-list small{display:block;margin-top:4px}.manual-file-actions{display:flex;flex-wrap:wrap;gap:10px}.manual-client #review-list{margin-bottom:16px}
 </style><script src="https://telegram.org/js/telegram-web-app.js"></script><script src="/auth.js"></script></head><body>
 <main class="shell"><header class="page-heading"><button id="back" class="back" type="button" aria-label="Назад">←</button><div><h1 id="page-title">Передача юристу</h1><small id="page-subtitle">Объект, готовый комплект и ответственный</small></div></header><p id="readonly-note" class="info readonly-note" hidden>Просмотр материалов. Изменения и передача здесь недоступны.</p><p id="notice" class="notice" role="status" aria-live="polite"></p>
 <div id="main-form"><section class="glass card" aria-labelledby="object-org"><p id="object-source" class="object-source"></p><h2 id="object-org" class="object-org">Загружаю объект…</h2><p id="object-address" class="object-address"></p><p id="object-meta" class="object-meta"></p><details id="details" class="details"><summary id="details-summary">Изменить сведения и контакты</summary><p id="historical-note" class="note" hidden></p><fieldset id="details-editable" class="details-editable"><div class="fields"><label class="wide">Организация<input id="org" autocomplete="organization"></label><label class="wide">Адрес объекта<input id="address" autocomplete="street-address"></label><label id="inn-field">ИНН <span class="muted">· необязательно</span><input id="inn" inputmode="numeric"></label><label id="cad-field">Кадастровый номер<input id="cad_num" placeholder="77:01:0000000:0000"></label><label>Регион<select id="region"><option value="">Выберите</option><option value="МСК">Москва</option><option value="МО">Московская область</option><option value="СПб">Санкт-Петербург</option></select></label><label>Тип объекта<select id="kind"><option value="">Выберите</option><option>Общепит</option><option>Магазин</option><option>Табак</option></select></label><label class="wide">Услуга<select id="service"><option value="">Выберите</option><option>Получение</option><option>Продление</option><option>Переоформление</option></select></label></div><div id="contact-section"><h3 class="contacts-title">Контакты клиента</h3><p id="no-contacts" class="empty">В заявке нет сохранённых контактов.</p><div id="contacts"></div><button type="button" id="add-contact" class="text-button">＋ Добавить контакт</button></div><details id="manual-optional" class="details" hidden><summary>Контакты, ИНН и комментарий <span class="muted">· необязательно</span></summary><div id="manual-optional-fields"></div></details></fieldset></details></section>
@@ -696,15 +734,18 @@ function handoffPage() {
 <section id="manual-documents" class="glass card manual-documents" hidden><details id="manual-documents-details" class="details"><summary id="manual-documents-summary">Документы<span id="manual-file-count"> · необязательно</span></summary><p id="manual-file-limit" class="info block-gap"></p><ul id="manual-file-list" class="manual-file-list"></ul><input id="manual-files" type="file" multiple hidden accept=".pdf,.doc,.docx,.xls,.xlsx,.zip,.jpg,.jpeg,.png,.webp,.gif,.heic,.heif,.avif,.tif,.tiff,.bmp"><button id="manual-add-files" type="button" class="soft-button">＋ Добавить документы</button><p id="manual-file-status" class="info block-gap" role="status" aria-live="polite"></p><div class="manual-file-actions"><button id="manual-files-retry" type="button" class="soft-button" hidden>Повторить загрузку</button><button id="manual-files-cancel" type="button" class="text-button" hidden>Отменить оставшиеся</button></div></details></section>
 <section id="packet-section" class="glass card" aria-labelledby="packet-title"><div class="card-header"><h2 id="packet-title">Комплект юристу</h2></div><p id="packet-loading" class="loading" role="status">Собираю сохранённые материалы…</p><div id="packet-error" hidden><p id="packet-error-text" class="error" role="alert"></p><button type="button" id="retry-load" class="soft-button">Повторить загрузку</button></div><div id="packet-content" hidden><div class="report-overview"><span id="report-status" class="status"></span><small id="report-date"></small></div><button type="button" id="open-report" class="outline-button full">Открыть полный отчёт</button><div id="packet-counts" class="counts"></div><div class="package-details"><p id="video-state"></p><p id="materials-state"></p><p id="egrn-state"></p><p id="archive-state" hidden></p></div><label id="egrn-order-box" class="check" hidden><input type="checkbox" id="egrn-order"><span>Заказать новую выписку ЕГРН<small>По кадастровому номеру <span id="egrn-cad"></span>. Это новый заказ у поставщика.</small></span></label><div class="packet-bottom"><button type="button" id="choose-report" class="text-button">Выбрать отчёт</button></div></div></section>
 <section id="assignment" class="glass card" aria-labelledby="assignment-title"><div class="card-header"><h2 id="assignment-title">Кому передать</h2></div><div class="assignment-fields"><label>Юрист<select id="lawyers"><option value="">Выберите юриста</option></select></label><label id="priority-field">Приоритет<select id="priority"><option value="обычный">Обычный</option><option value="срочно">Срочно</option></select></label><label id="comment-field" class="wide">Комментарий юристу <span class="muted">· необязательно</span><textarea id="comment" placeholder="Только то, что важно при передаче"></textarea></label></div><p id="lawyer-empty" class="error" hidden>Нет доступных юристов. Юристу нужно зарегистрироваться через /start в боте.</p><p id="form-error" class="error" role="alert" hidden></p></section></div>
+<button type="button" id="download-package" class="soft-button full" style="margin-bottom:18px" hidden>Скачать комплект</button><section id="extra-documents" class="glass card" hidden><h2 id="extra-documents-title">Дополнительные документы</h2><p id="extra-documents-help" class="info block-gap"></p><input id="extra-document-input" type="file" multiple hidden accept=".pdf,.doc,.docx,.xls,.xlsx,.zip,.jpg,.jpeg,.png,.webp,.gif,.heic,.heif,.avif,.tif,.tiff,.bmp"><button id="extra-document-add" type="button" class="soft-button full block-gap">＋ Прикрепить документы</button><p id="extra-document-limit" class="info block-gap"></p><ul id="extra-document-list" class="manual-file-list"></ul><p id="extra-document-status" class="info" role="status" aria-live="polite"></p><div class="manual-file-actions block-gap"><button id="extra-document-send" type="button" class="primary" hidden>Дослать документы</button><button id="extra-document-retry" type="button" class="soft-button" hidden>Повторить загрузку</button><button id="extra-document-cancel" type="button" class="text-button" hidden>Убрать оставшиеся из очереди</button></div><ul id="extra-document-history" class="document-history"></ul><p id="extra-document-history-status" class="error" role="status"></p><button id="extra-document-history-retry" type="button" class="soft-button" hidden>Обновить список документов</button></section>
 <section id="review" hidden aria-labelledby="review-title"><h2 id="review-title" class="review-title">Проверьте передачу</h2><div class="glass card"><p class="review-eyebrow">Получатель в Telegram</p><h3 id="review-lawyer" class="review-lawyer"></h3><p class="review-eyebrow">Объект</p><h3 id="review-org"></h3><p id="review-address" class="review-address"></p><p id="review-meta" class="muted"></p><p class="review-eyebrow block-gap">Что получит юрист</p><ul id="review-list" class="review-list"></ul><p id="review-comment" class="review-comment"></p><div class="review-actions"><button type="button" id="confirm-send" class="primary full">Подтвердить передачу</button><button type="button" id="review-back" class="soft-button full">Вернуться к редактированию</button></div></div></section>
 <section id="delivery" class="glass card delivery" hidden role="status"><h2 id="delivery-title"></h2><p id="delivery-text"></p><button type="button" id="retry-send" class="primary full">Повторить доставку</button><button type="button" id="manual-create-another" class="soft-button full block-gap" hidden>Создать ещё клиента</button></section></main>
 <footer id="footer" class="footer"><div class="footer-inner"><button type="button" class="primary full" id="go" disabled>Передать юристу</button><small id="footer-note">Перед отправкой покажем получателя и состав комплекта</small></div></footer>
-<dialog id="report-dialog" class="sheet" aria-labelledby="report-heading"><div class="sheet-inner"><header class="sheet-header"><div class="sheet-heading"><h2 id="report-heading">Отчёт аудитора</h2><small id="report-subtitle"></small></div><button type="button" id="report-close" class="soft-button">К передаче</button></header><nav class="sheet-tabs" aria-label="Разделы полного отчёта"><button type="button" id="jump-text">Текст</button><button type="button" id="jump-images">Схемы и фото</button><button type="button" id="jump-files">Файлы</button></nav><div id="report-body" class="sheet-body"><p id="report-address-note" class="note" hidden></p><pre id="report-text" class="full-report-text"></pre><a id="report-video" class="report-link" target="_blank" rel="noopener noreferrer" hidden>Смотреть видео ↗</a><a id="report-archive" class="report-link" target="_blank" rel="noopener noreferrer" hidden>Архив объекта ↗</a><a id="report-telegram" class="report-link" target="_blank" rel="noopener noreferrer" hidden>Оригинальные сообщения в Telegram ↗</a><h3 id="report-images-heading" class="report-section">Схемы, планы и фотографии</h3><p id="gallery-empty" class="empty"></p><div id="gallery"></div><h3 id="report-files-heading" class="report-section">Оригиналы и документы заявки</h3><p class="info">Нажмите на файл, чтобы скачать его целиком.</p><p id="originals-empty" class="empty">Сохранённых файлов нет.</p><div id="report-originals"></div><p id="report-notice" class="error" role="status"></p></div></div></dialog>
+<dialog id="report-dialog" class="sheet" aria-labelledby="report-heading"><div class="sheet-inner"><header class="sheet-header"><div class="sheet-heading"><h2 id="report-heading">Отчёт аудитора</h2><small id="report-subtitle"></small></div><button type="button" id="report-close" class="soft-button">К передаче</button></header><nav class="sheet-tabs" aria-label="Разделы полного отчёта"><button type="button" id="jump-text">Текст</button><button type="button" id="jump-images">Схемы и фото</button><button type="button" id="jump-files">Файлы</button></nav><div id="report-body" class="sheet-body"><p id="report-address-note" class="note" hidden></p><pre id="report-text" class="full-report-text"></pre><a id="report-video" class="report-link" target="_blank" rel="noopener noreferrer" hidden>Смотреть видео ↗</a><a id="report-archive" class="report-link" target="_blank" rel="noopener noreferrer" hidden>Архив объекта ↗</a><a id="report-telegram" class="report-link" target="_blank" rel="noopener noreferrer" hidden>Оригинальные сообщения в Telegram ↗</a><h3 id="report-images-heading" class="report-section">Схемы, планы и фотографии</h3><p id="gallery-empty" class="empty"></p><div id="gallery"></div><h3 id="report-files-heading" class="report-section">Оригиналы и документы заявки</h3><p class="info">Нажмите на файл, чтобы скачать его целиком.</p><p id="originals-empty" class="empty">Сохранённых файлов нет.</p><button type="button" id="report-download-package" class="soft-button full" hidden>Скачать комплект</button><div id="report-originals"></div><p id="report-notice" class="error" role="status"></p></div></div></dialog>
 <dialog id="zoom-dialog" class="zoom-sheet" aria-labelledby="zoom-label"><div class="sheet-inner"><header class="sheet-header"><h2 id="zoom-label">Изображение</h2><button type="button" id="zoom-close" class="soft-button">Назад к отчёту</button></header><div class="zoom-toolbar"><button type="button" id="zoom-minus" aria-label="Уменьшить">−</button><span id="zoom-value">100%</span><button type="button" id="zoom-plus" aria-label="Увеличить">＋</button><button type="button" id="zoom-fit">Вписать</button></div><div class="zoom-content"><img id="zoom-image" alt=""></div></div></dialog>
 <dialog id="search-dialog" class="sheet search-sheet" aria-labelledby="search-title"><div class="sheet-inner"><header class="sheet-header"><h2 id="search-title">Сохранённые отчёты</h2><button type="button" id="search-close" class="soft-button">Закрыть</button></header><div class="sheet-body"><label class="select-report-search">Название, адрес или ИНН<input type="search" id="report-query" autocomplete="off" placeholder="Найти отчёт"></label><p id="search-error" class="error" role="status"></p><button type="button" id="search-retry" class="text-button">Обновить поиск</button><div id="search-results"></div></div></div></dialog>
-<script>window.HandoffModel=(${handoffModel.toString()})();(${handoffClient.toString()})();</script></body></html>`;
+<script>window.HandoffDocuments=(${documentsUI.toString()});window.HandoffModel=(${handoffModel.toString()})();(${handoffClient.toString()})();</script></body></html>`;
 }
 
 module.exports = handoffPage;
 module.exports.client = handoffClient;
 module.exports.model = handoffModel;
+
+module.exports.documents = documentsUI;

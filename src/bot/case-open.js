@@ -35,6 +35,7 @@ function urls(baseValue,caseId,report) {
   const make=(pathname,params)=>{const url=new URL(pathname,base);url.search=new URLSearchParams(params).toString();if(url.origin!==base.origin)throw new Error('Invalid WebApp origin');return url.href;};
   const buttons=[[{text:'📋 Чек-лист клиента',web_app:{url:make('/checklist',{case_id:String(caseId)})}}]];
   if(report)buttons[0].push({text:'Перейти к отчёту',web_app:{url:make('/handoff',{view:'report',...(report.order?{order_id:String(report.order)}:{case_id:String(caseId)}),report_src:report.src,report_id:String(report.report)})}});
+  buttons.push([{text:'Документы клиента',web_app:{url:make('/handoff',{case_id:String(caseId),view:'documents'})}}]);
   return {disable_web_page_preview:true,reply_markup:{inline_keyboard:buttons}};
 }
 function createCaseOpener(options={}) {

@@ -54,6 +54,11 @@ async function fixture(options,run){
 }
 function recipient(h,chat){return h.calls.find(call=>call.method==='sendMessage'&&String(call.chat)===String(chat));}
 function buttons(message){return message?.opts?.reply_markup?.inline_keyboard.flat()||[];}
+function assertDocumentsAction(message,caseId){
+  const rows=message.opts.reply_markup.inline_keyboard;
+  assert.deepEqual(rows[1],[{text:'Документы клиента',web_app:{url:'https://audit.example/handoff?case_id='+caseId+'&view=documents'}}]);
+  assert.equal(rows[0].some(button=>button.text==='Документы клиента'),false,'Documents use their own row, preserving checklist/report navigation');
+}
 function assertPrivatePackage(h){
   assert.ok(h.calls.filter(call=>call.method==='copyMessages').every(call=>String(call.payload.chat_id)===String(LAWYER)));
   assert.equal(recipient(h,SOURCE),undefined,'The measurements chat never receives a second handoff card');
@@ -84,7 +89,7 @@ for(const[name,reportData]of[
   ['non-HTTPS saved link',JSON.stringify({ui_version:5,workflow:{video_url:'http://disk.yandex.ru/d/not-https'}})],
   ['malformed saved JSON','{not-json'],
 ])test(name+' cannot add empty or untrusted V2 recipient action buttons',pg,async()=>fixture({reportData},async h=>{
-  const result=await h.send();assert.equal(result.delivery_complete,true);const lawyerKeys=buttons(recipient(h,LAWYER));assert.equal(lawyerKeys.filter(key=>key.url).length,0);assert.equal(lawyerKeys.length,2,'Checklist and exact frozen report remain available');assert.ok(lawyerKeys.every(key=>key.web_app));assertPrivatePackage(h);
+  const result=await h.send();assert.equal(result.delivery_complete,true);const lawyerKeys=buttons(recipient(h,LAWYER));assert.equal(lawyerKeys.filter(key=>key.url).length,0);assert.equal(lawyerKeys.length,3,'Checklist, exact frozen report and client documents remain available');assert.ok(lawyerKeys.every(key=>key.web_app));assertDocumentsAction(recipient(h,LAWYER),result.id);assertPrivatePackage(h);
 }));
 
 test('a safe HTTPS video saved by an older audit remains trusted, while a manager body URL never replaces it',pg,async()=>fixture({reportData:{ui_version:4,workflow:{video_url:VIDEO}}},async h=>{
@@ -93,7 +98,7 @@ test('a safe HTTPS video saved by an older audit remains trusted, while a manage
 
 test('a manager body video URL cannot create a video or report action when no saved audit was selected',pg,async()=>fixture({noAudit:true},async h=>{
   const result=await h.send({audit_text:'Manual manager context'});assert.equal(result.delivery_complete,true);assert.equal(h.calls.filter(call=>call.method==='copyMessages').length,0);
-  const keys=buttons(recipient(h,LAWYER));assert.equal(keys.length,1,'A valid V2 licence case retains its required checklist');assert.ok(keys[0].web_app?.url.includes('/checklist?case_id='));assert.equal(keys.some(button=>button.url||button.web_app?.url.includes('view=report')),false);assertPrivatePackage(h);
+  const keys=buttons(recipient(h,LAWYER));assert.equal(keys.length,2,'A valid V2 licence case retains its required checklist and document access');assertDocumentsAction(recipient(h,LAWYER),result.id);assert.ok(keys[0].web_app?.url.includes('/checklist?case_id='));assert.equal(keys.some(button=>button.url||button.web_app?.url.includes('view=report')),false);assertPrivatePackage(h);
 }));
 
 test('a no-order legacy report over 100 messages copies its final ZIP in the second private batch',pg,async()=>fixture({src:'r',messageIds:Array.from({length:105},(_,i)=>1000+i)},async h=>{

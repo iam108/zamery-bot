@@ -31,9 +31,10 @@ test('only private command registration occurs at setup, and malformed IDs read 
 });
 test('current assigned lawyer receives the saved legal organization plus distinct brand and credential-free navigation',pg,()=>fixture(async h=>{
   const c=await h.open(),reply=c.replies[0];assert.match(reply.text,/Клиент #39/);assert.match(reply.text,/Организация: ИП Юридическое имя/);assert.match(reply.text,/Объект: Чанг/);assert.match(reply.text,/Москва, улица Тестовая, 39/);assert.match(reply.text,/Общепит · Продление/);assert.match(reply.text,/Этап: Сбор документов/);assert.match(reply.text,/https:\/\/t.me\/LRSZamer_bot\?start=case_39/);
-  const links=buttons(c);assert.equal(links.length,2);assert.equal(links[1].text,'Перейти к отчёту');
-  assert.equal(reply.extra.reply_markup.inline_keyboard.length,1);assert.equal(reply.extra.reply_markup.inline_keyboard[0].length,2);
+  const links=buttons(c);assert.equal(links.length,3);assert.equal(links[1].text,'Перейти к отчёту');
+  assert.equal(reply.extra.reply_markup.inline_keyboard.length,2);assert.equal(reply.extra.reply_markup.inline_keyboard[0].length,2);
   for(const button of links){const url=new URL(button.web_app.url);assert.equal(url.origin,'https://bot.example');assert.equal(url.searchParams.has('u'),false);assert.equal(url.searchParams.has('k'),false);}
+  assert.deepEqual(reply.extra.reply_markup.inline_keyboard[1].map(button=>button.text),['Документы клиента']);assert.equal(new URL(links[2].web_app.url).search,'?case_id=39&view=documents');
   assert.equal(new URL(links[0].web_app.url).search,'?case_id=39');assert.equal(new URL(links[1].web_app.url).searchParams.get('report_id'),'16');assert.deepEqual(h.queries[0].args,[39,808]);assert.equal(h.queries.length,1);
 }));
 test('unassigned lawyers, auditors, missing/unapproved staff and absent cases receive the same generic response',pg,()=>fixture(async h=>{
@@ -54,14 +55,18 @@ test('a V2 no-order case opens its exact saved report through case_id without cr
   await h.db.exec('UPDATE cases SET order_id=NULL WHERE id=39;UPDATE audits SET order_id=NULL WHERE id=15');
   await h.save({_handoff:{version:2,body:{order_id:null,report_src:'a',report_id:15}}});
   const c=await h.open(),url=new URL(buttons(c)[1].web_app.url);assert.equal(url.pathname,'/handoff');assert.equal(url.searchParams.get('case_id'),'39');assert.equal(url.searchParams.get('view'),'report');assert.equal(url.searchParams.get('report_id'),'15');assert.equal(url.searchParams.has('order_id'),false);assert.equal(url.searchParams.has('u'),false);assert.equal(url.searchParams.has('k'),false);
-  for(const body of [{order_id:null,report_src:null,report_id:null},{order_id:62,report_src:'a',report_id:15}]){await h.save({_handoff:{version:2,body}});assert.equal(buttons(await h.open()).length,1);}
+  for(const body of [{order_id:null,report_src:null,report_id:null},{order_id:62,report_src:'a',report_id:15}]){await h.save({_handoff:{version:2,body}});assert.equal(buttons(await h.open()).length,2);}
+}));
+test('manual clients without an order or report retain document access for the assigned lawyer and manager',pg,()=>fixture(async h=>{
+  await h.db.exec('UPDATE cases SET order_id=NULL WHERE id=39');await h.save({_handoff:{version:2,body:{order_id:null,report_id:null,manual_client:true}}});
+  for(const actor of [808,108]){const c=await h.open(actor),keyboard=c.replies[0].extra.reply_markup.inline_keyboard;assert.deepEqual(keyboard.map(row=>row.map(button=>button.text)),[['📋 Чек-лист клиента'],['Документы клиента']]);assert.equal(new URL(keyboard[1][0].web_app.url).search,'?case_id=39&view=documents');}
 }));
 test('invalid or unknown saved report bindings never fall back to the latest audit or inject an external URL',pg,()=>fixture(async h=>{
-  for(const change of [{order_id:63},{report_id:'15&report_id=99'},{report_src:'https://evil.invalid'},{report_id:null}]){await h.save({_handoff:{version:2,body:{order_id:62,report_src:'a',report_id:15,...change}}});assert.equal(buttons(await h.open()).length,1);}
-  await h.save({_handoff:{version:99,body:{order_id:62,report_src:'a',report_id:15}}});assert.equal(buttons(await h.open()).length,1);
+  for(const change of [{order_id:63},{report_id:'15&report_id=99'},{report_src:'https://evil.invalid'},{report_id:null}]){await h.save({_handoff:{version:2,body:{order_id:62,report_src:'a',report_id:15,...change}}});assert.equal(buttons(await h.open()).length,2);}
+  await h.save({_handoff:{version:99,body:{order_id:62,report_src:'a',report_id:15}}});assert.equal(buttons(await h.open()).length,2);
 }));
 test('legacy cases without an audit still open their checklist, and archived cases remain explicitly labelled',pg,()=>fixture(async h=>{
-  await h.db.query('DELETE FROM audits WHERE order_id=62');await h.save({_stage:'Архив'});const c=await h.open();assert.equal(buttons(c).length,1);assert.match(c.replies[0].text,/Этап: Архив/);
+  await h.db.query('DELETE FROM audits WHERE order_id=62');await h.save({_stage:'Архив'});const c=await h.open();assert.equal(buttons(c).length,2);assert.match(c.replies[0].text,/Этап: Архив/);
   await h.db.query("UPDATE orders SET object_name='ИП Юридическое имя' WHERE id=62");assert.doesNotMatch((await h.open()).replies[0].text,/Объект:/);
 }));
 test('links stay on the configured HTTPS WebApp origin and never carry base credentials or query keys',pg,()=>fixture(async h=>{

@@ -15,6 +15,7 @@ function harness(initialStaff, adminIds = '') {
     '../web/handoff': { setupReportsBot() {} }, './egrn': { setupEgrn() {} },
     './report-link-admin': { setupReportLinkAdmin() {} }, './order-delivery-admin': { setupOrderDeliveryAdmin() {} },
     './handoff-status-admin': { setupHandoffStatusAdmin() {} }, './handoff-notice-admin': { setupHandoffNoticeAdmin() {} },
+    './handoff-company-admin': { setupHandoffCompanyAdmin() {} },
     './case-open': { setupCaseOpen() { return async () => {}; } },
     './staff-approval': { createStaffApprovalHandler() { return async () => {}; } },
     './manual-order-attachments': { setupManualOrderAttachments() {} },

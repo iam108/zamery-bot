@@ -17,6 +17,7 @@ function setupBot() {
   require('./order-delivery-admin').setupOrderDeliveryAdmin(bot, { pool });
   require('./handoff-status-admin').setupHandoffStatusAdmin(bot, { pool });
   require('./handoff-notice-admin').setupHandoffNoticeAdmin(bot, { pool });
+  require('./handoff-company-admin').setupHandoffCompanyAdmin(bot, { pool });
   const auth = require('../web/auth');
   const { ensureStaff, canManageCases } = auth;
   const staffMenu = require('./staff-menu').getStaffMenu(bot, { pool, auth, webappUrl: WEBAPP_URL });

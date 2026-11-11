@@ -32,6 +32,7 @@ function harness(staff = { tg_id: 42, role: 'auditor', approved: true }, options
       if (name === './order-delivery-admin') return require('../src/bot/order-delivery-admin');
       if (name === './handoff-status-admin') return require('../src/bot/handoff-status-admin');
       if (name === './handoff-notice-admin') return require('../src/bot/handoff-notice-admin');
+      if (name === './handoff-company-admin') return require('../src/bot/handoff-company-admin');
       if (name === './case-open') return require('../src/bot/case-open');
       if (name === './staff-approval') return require('../src/bot/staff-approval');
       if (name === './staff-menu') return { getStaffMenu() { return { async refresh() {} }; } };
