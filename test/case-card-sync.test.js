@@ -35,6 +35,30 @@ test('no-order and imported reports use their exact saved selection instead of a
   assert.equal((await h.create()()).updated,1);const url=new URL(h.calls[0][3].inline_keyboard[0][1].web_app.url);assert.equal(url.searchParams.get('case_id'),'39');assert.equal(url.searchParams.get('report_src'),'r');assert.equal(url.searchParams.get('report_id'),'25');assert.equal(url.searchParams.has('order_id'),false);
 }));
 
+test('historical group recipients do not block the current private card repair or alter group delivery receipts',pg,()=>fixture(async h=>{
+  const group='-1003209708976';
+  for(const historical of [{chat:group,role:'clients'},{chat:Number(group)},{chat:group,role:'historical-group'}]){
+    const state=initial();state.recipients=[historical,{chat:'808',role:'lawyer'},{chat:-1009999999999,role:'clients'}];
+    state.cards={[group]:120,808:1411,'-1009999999999':90};
+    state.auditCopies={[group]:{offset:3,messageIds:[121,122,123]},808:{offset:3,messageIds:[1412,1413,1414]}};
+    state.requestCopies={[group]:{offset:1,messageIds:[124]}};
+    state.materials={completed:true,confirmed:{[group]:[125],808:[1415]}};
+    await h.put(state);const before=h.calls.length;assert.equal((await h.create()()).updated,1);assert.equal(h.calls.length,before+1);
+    assert.equal(h.calls.at(-1)[0],'808');assert.equal(h.calls.at(-1)[1],1411);
+    const saved=(await h.read()).data._handoff;assert.equal(saved.card_ui_version,UI_VERSION);delete saved.card_ui_version;assert.deepEqual(saved,state);
+    assert.equal((await h.create()()).examined,0);assert.equal(h.calls.length,before+1);
+  }
+}));
+
+test('historical recipient compatibility still rejects ambiguous private destinations and malformed group chats',pg,()=>fixture(async h=>{
+  const lawyer={chat:'808',role:'lawyer'},group={chat:'-1003209708976',role:'clients'};
+  const variants=[[],[group],[group,{chat:'808'}],[group,{chat:'808',role:'clients'}],[group,{chat:'909',role:'lawyer'}],
+    [lawyer,{chat:808,role:'lawyer'}],[lawyer,{chat:909,role:'lawyer'}],[lawyer,{chat:101,role:'manager'}],
+    ...[0,'0',-0,'-0','-01',-1.5,'-1.5',Number.MIN_SAFE_INTEGER-1,'-9007199254740992',null,true,{},[-100],'-100oops'].map(chat=>[lawyer,{chat,role:'clients'}]),
+    [lawyer,null],[lawyer,[]],[lawyer,'-1003209708976']];
+  for(const recipients of variants){await h.put({...initial(),recipients});const result=await h.create()();assert.equal(result.skipped,1);assert.equal(result.updated,0);assert.equal(h.calls.length,0);assert.equal((await h.read()).data._handoff.card_ui_version,undefined);}
+}));
+
 test('partial, unknown, manual, mismatched and missing-receipt handoffs do not trigger a Telegram edit',pg,()=>fixture(async h=>{
   const variants=[{}, {...initial(),version:1},{...initial(),completed:false},{...initial(),inflight:{type:'card'}},{...initial(),manual_review:'Unknown delivery'},
     {...initial(),cards:{}},{...initial(),cards:{808:0}},{...initial(),cards:{808:'6&bad'}},{...initial(),recipients:[{chat:'909',role:'lawyer'}]},

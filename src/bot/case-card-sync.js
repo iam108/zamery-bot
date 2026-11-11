@@ -3,6 +3,7 @@
 const UI_VERSION = 1, MAX_CASES = 50, EDIT_TIMEOUT_MS = 10000, EDIT_INTERVAL_MS = 150;
 const object = value => value && typeof value === 'object' && !Array.isArray(value) ? value : null;
 const positive = value => (typeof value === 'number' || typeof value === 'string' && /^[1-9]\d*$/.test(value)) && Number.isSafeInteger(Number(value)) && Number(value) > 0;
+const groupChat = value => (typeof value === 'number' || typeof value === 'string' && /^-[1-9]\d*$/.test(value)) && Number.isSafeInteger(Number(value)) && Number(value) < 0;
 const CANDIDATES_SQL = `SELECT c.id FROM cases c JOIN staff s ON s.tg_id=c.lawyer_tg_id
   WHERE s.approved IS TRUE AND s.role='lawyer' AND c.checklist_key IS NOT NULL
     AND c.data#>'{_handoff,version}'='2'::jsonb AND c.data#>'{_handoff,completed}'='true'::jsonb
@@ -26,8 +27,12 @@ function target(row) {
     !['a','r'].includes(body.report_src)||String(report.id)!==String(body.report_id)||report.src!==body.report_src)return null;
   const orderMatches=row.order_id==null?body.order_id==null:positive(row.order_id)&&positive(body.order_id)&&Number(row.order_id)===Number(body.order_id);
   const recipients=state.recipients,chat=String(row.lawyer_tg_id),cards=object(state.cards);
-  if(!orderMatches||!Array.isArray(recipients)||recipients.length!==1||recipients[0]?.role!=='lawyer'||
-    String(recipients[0]?.chat)!==chat||!cards||!positive(cards[chat]))return null;
+  if(!orderMatches||!Array.isArray(recipients)||!cards||!positive(cards[chat]))return null;
+  // Early V2 handoffs also retained a group recipient. Preserve that history,
+  // but repair only the one current lawyer's acknowledged private card.
+  const privateRecipients=recipients.filter(item=>object(item)&&positive(item.chat));
+  if(privateRecipients.length!==1||privateRecipients[0].role!=='lawyer'||String(privateRecipients[0].chat)!==chat||
+    recipients.some(item=>!object(item)||item!==privateRecipients[0]&&!groupChat(item.chat)))return null;
   return {state,chat,messageId:Number(cards[chat])};
 }
 
