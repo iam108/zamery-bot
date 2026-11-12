@@ -338,7 +338,7 @@ test('typing a note while an unrelated Telegram save is in flight keeps the draf
   const saving = client.flush();
   assert.equal(requests[0].expectedNote, 'А');
   client.typeNote('В');
-  respond({ status: 200, headers: { get() {} }, text: async () => JSON.stringify({ ok: true, note: 'Б' }) });
+  respond({ status: 200, headers: { get() {} }, text: async () => JSON.stringify({ ok: true, note: 'Б', revision:1 }) });
   await saving;
   assert.deepEqual({ ...client.state() }, { draft: 'В', base: 'А', conflict: 'Б' });
   assert.equal(JSON.parse(storage.get('zamery_cl_17')).d._comment, 'В');
@@ -381,29 +381,31 @@ test('a stale checklist response freezes autosave and explicit recovery keeps a 
   assert.equal(JSON.parse(storage.get('zamery_cl_17:recovery')).data.answer.s, 'ok');
 });
 
-function autosaveClient({ data = {}, revision = 0, storage = new Map() } = {}) {
+function autosaveClient({ data = {}, revision = 0, storage = new Map(), caseId = 17 } = {}) {
   const start = source.indexOf('function checklistClient()');
   const end = source.indexOf('\n  render();\n  loadReminders();', start);
   const elements = new Map(), events = new Map(), requests = [], timers = new Map(), alerts = [];
   let serial = 0;
-  const location = { search: '', href: '' };
+  const location = { search: '?case_id='+caseId+'&u=808&k=synthetic', hash: '#tgWebAppData=synthetic', href: '', reloads: 0, reload() { this.reloads++; } };
+  const storagePolicy = { fail: false, silent: false };
   const client = vm.runInNewContext('(' + source.slice(start, end) + `
     return { flush, edit(value) { D.answer = value; changed(); }, note(value) { D._comment = value; changed(); }, data() { return D; } };
   })()`, {
     window: { addEventListener: (name, fn) => events.set(name, fn), location,
-      __CFG: { data: structuredClone(data), list: { sections: [], passport: [] }, caseInfo: { id: 17, revision } } },
+      __CFG: { data: structuredClone(data), list: { sections: [], passport: [] }, caseInfo: { id: caseId, revision } } },
     document: { documentElement: { dataset: {} }, addEventListener() {},
       getElementById(id) { if (!elements.has(id)) elements.set(id, { style: {} }); return elements.get(id); } },
     location, AbortController, alert: message => alerts.push(message),
-    localStorage: { getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key) },
+    localStorage: { getItem: key => storage.get(key), setItem: (key, value) => { if(storagePolicy.fail)throw new Error('Quota exceeded'); if(!storagePolicy.silent)storage.set(key,value); }, removeItem: key => storage.delete(key) },
     setTimeout(fn, delay) { const id = ++serial; timers.set(id, { fn, delay }); return id; },
     clearTimeout: id => timers.delete(id), setInterval() {}, clearInterval() {},
     fetch(url, options) { return new Promise((resolve, reject) => requests.push({ url, body: JSON.parse(options.body), signal: options.signal, resolve, reject })); },
   });
-  return { client, requests, storage, elements, events, location, alerts,
+  return { client, requests, storage, storagePolicy, timers, elements, events, location, alerts,
     respond(index, body = { ok: true, note: '', revision: index + 1 }, status = 200) {
       requests[index].resolve({ status, headers: { get() {} }, text: async () => JSON.stringify(body), json: async () => body });
     },
+    respondRaw(index, text, status = 200) { requests[index].resolve({ status, headers: { get() {} }, text: async () => text }); },
     async tick(delay) { for (const [id, timer] of [...timers]) if (timer.delay === delay) { timers.delete(id); timer.fn(); } await new Promise(setImmediate); },
   };
 }
@@ -476,7 +478,7 @@ for (const stage of ['fetch', 'body']) test('a stalled save '+stage+' releases p
 for (const stage of ['fetch', 'body']) test('a stalled print-link '+stage+' times out without navigation or losing a newer edit', async () => {
   const h = autosaveClient(); const printing = h.elements.get('printBtn').onclick(); await new Promise(setImmediate);
   assert.equal(h.requests[0].url, '/api/checklist/printlink'); h.client.edit('B');
-  if (stage === 'body') h.requests[0].resolve({ json: () => new Promise(() => {}) });
+  if (stage === 'body') h.requests[0].resolve({ status: 200, text: () => new Promise(() => {}) });
   await new Promise(setImmediate); await h.tick(30000);
   assert.equal(h.elements.get('printBtn').disabled, false); await printing;
   assert.equal(h.location.href, ''); assert.equal(h.requests[0].signal.aborted, true);
@@ -514,4 +516,117 @@ test('matching notes never acknowledge different checklist answers or missing se
     assert.equal(JSON.parse(storage.get('zamery_cl_17')).d.answer, 'Old local answer');
     assert.match(h.elements.get('st').textContent, /другом окне/);
   }
+});
+
+const gatewayPage = '<!doctype html><title>Checking your browser...</title><style>:root { --bg: hsl(250, 24%, 9%); --fg: hsl(0, 0%, 100%); }</style><p>Verifying...</p>';
+
+for (const status of [200, 503]) test('an HTML '+status+' gateway response preserves the latest draft and pauses retries without leaking HTML', async () => {
+  const h = autosaveClient(); h.client.edit('A'); const saving = h.client.flush(); h.client.edit('B');
+  h.respondRaw(0, gatewayPage, status); assert.equal(await saving, false);
+  assert.equal(JSON.parse(h.storage.get('zamery_cl_17')).d.answer, 'B');
+  assert.match(h.elements.get('st').textContent, /На устройстве/);
+  assert.doesNotMatch(h.elements.get('st').textContent, /Checking|Verifying|:root|hsl|повтор через/);
+  assert.equal(h.elements.get('connectionBtn').hidden, false);
+  await h.tick(2500); await h.tick(5000); await h.tick(10000); await h.tick(40000);
+  h.events.get('online')(); h.events.get('pagehide')(); await new Promise(setImmediate);
+  assert.equal(h.requests.length, 1);
+});
+
+test('connection recovery backs up queued edits, retains this webview auth URL and restores without touching another client', async () => {
+  const other = JSON.stringify({ t: Date.now(), d: { answer: 'Other client' }, revision: 4, noteBase: '' });
+  const storage = new Map([['zamery_cl_18', other]]);
+  const h = autosaveClient({ storage }); h.client.edit('A'); const saving = h.client.flush();
+  h.respondRaw(0, gatewayPage); await saving;
+  h.client.edit('Queued after gateway'); h.client.note('Latest queued note');
+  const url = { search: h.location.search, hash: h.location.hash, href: h.location.href };
+  h.elements.get('connectionBtn').onclick(); assert.equal(h.location.reloads, 1);
+  assert.deepEqual({ search:h.location.search, hash:h.location.hash, href:h.location.href }, url);
+  const pending = JSON.parse(storage.get('zamery_cl_17'));
+  assert.equal(pending.d.answer, 'Queued after gateway'); assert.equal(pending.d._comment, 'Latest queued note');
+  assert.equal(pending.noteBase, ''); assert.equal(pending.revision, 0);
+  const reopened = autosaveClient({ storage }); assert.equal(reopened.client.data().answer, 'Queued after gateway');
+  const retry = reopened.client.flush(); assert.equal(reopened.requests[0].body.expectedRevision, 0);
+  assert.equal(reopened.requests[0].body.expectedNote, '');
+  reopened.respond(0, { ok:true, note:'Latest queued note', revision:1 }); assert.equal(await retry, true);
+  assert.equal(reopened.elements.get('st').textContent, 'Сохранено'); assert.equal(reopened.elements.get('connectionBtn').hidden, true);
+  assert.equal(storage.has('zamery_cl_17'), false); assert.equal(storage.get('zamery_cl_18'), other);
+});
+
+for (const failure of ['throw', 'silent']) test('connection recovery never reloads or promises a saved draft when local storage '+failure+' fails', async () => {
+  const h = autosaveClient(); h.client.edit('A'); const saving = h.client.flush();
+  h.storagePolicy[failure === 'throw' ? 'fail' : 'silent'] = true;
+  h.client.edit('B newer than last durable draft'); h.respondRaw(0, gatewayPage); await saving;
+  assert.match(h.elements.get('st').textContent, /Не сохранено/);
+  assert.doesNotMatch(h.elements.get('st').textContent, /На устройстве|Сохранено на/);
+  h.elements.get('connectionBtn').onclick(); assert.equal(h.location.reloads, 0);
+  assert.equal(JSON.parse(h.storage.get('zamery_cl_17')).d.answer, 'A');
+  h.storagePolicy.fail = false; h.storagePolicy.silent = false;
+  h.elements.get('connectionBtn').onclick(); assert.equal(h.location.reloads, 1);
+  assert.equal(JSON.parse(h.storage.get('zamery_cl_17')).d.answer, 'B newer than last durable draft');
+});
+
+for (const sample of [{status:500,body:{ok:true,note:'Do not accept',revision:99}}, {status:200,body:{ok:'true',error:gatewayPage}}, {status:200,body:{ok:true}}, {status:200,body:{ok:true,note:'',revision:-1}}]) {
+  test('only a successful HTTP response with boolean API acknowledgement can clear a draft: '+sample.status+'/'+sample.body.ok, async () => {
+    const h = autosaveClient(); h.client.edit('Unsaved'); const saving = h.client.flush();
+    h.respond(0, sample.body, sample.status); assert.equal(await saving, false);
+    assert.equal(JSON.parse(h.storage.get('zamery_cl_17')).d.answer, 'Unsaved');
+    assert.notEqual(h.elements.get('st').textContent, 'Сохранено');
+    assert.doesNotMatch(h.elements.get('st').textContent, /Checking|:root|hsl|Do not accept/);
+    h.elements.get('st').onclick(); assert.equal(h.requests[1].body.expectedRevision, 0); assert.equal(h.requests[1].body.expectedNote, '');
+    h.respond(1); await new Promise(setImmediate); assert.equal(h.elements.get('st').textContent, 'Сохранено');
+  });
+}
+
+for (const status of [401,403]) test('JSON access refusal '+status+' is not treated as a gateway challenge or bypassed by recovery', async () => {
+  const h = autosaveClient(); h.client.edit('Keep private'); const saving = h.client.flush();
+  h.respond(0, { ok:false, code:'CASE_FORBIDDEN', error:gatewayPage }, status); await saving;
+  assert.equal(h.elements.get('connectionBtn').hidden, true);
+  h.elements.get('connectionBtn').onclick(); assert.equal(h.location.reloads, 0);
+  h.events.get('online')(); await h.tick(2500); await new Promise(setImmediate); assert.equal(h.requests.length, 1);
+  assert.equal(JSON.parse(h.storage.get('zamery_cl_17')).d.answer, 'Keep private');
+  assert.doesNotMatch(h.elements.get('st').textContent, /Checking|:root|hsl/);
+});
+
+test('an HTML print-link response blocks stale printing and offers safe recovery for edits made during the request', async () => {
+  const h = autosaveClient(); const printing = h.elements.get('printBtn').onclick(); await new Promise(setImmediate);
+  assert.equal(h.requests[0].url, '/api/checklist/printlink'); h.client.edit('Typed while print link loaded');
+  h.respondRaw(0, gatewayPage, 503); await printing;
+  assert.equal(h.location.href, ''); assert.equal(h.elements.get('printBtn').disabled, false);
+  assert.equal(h.elements.get('connectionBtn').hidden, false);
+  assert.equal(JSON.parse(h.storage.get('zamery_cl_17')).d.answer, 'Typed while print link loaded');
+  assert.equal(h.alerts.length, 1); assert.doesNotMatch(h.alerts[0], /Checking|:root|hsl|SyntaxError|Unexpected/);
+  assert.match(h.alerts[0], /Проверьте соединение/);
+});
+
+test('a connection reload does not bypass a newer checklist revision or note baseline', async () => {
+  const h = autosaveClient({ data:{_comment:'Original'}, revision:3 }); h.client.edit('Pending A'); const saving = h.client.flush();
+  h.respondRaw(0,gatewayPage); await saving; h.elements.get('connectionBtn').onclick();
+  const reopened = autosaveClient({ data:{answer:'New server answer',_comment:'Other note'}, revision:4, storage:h.storage });
+  assert.equal(await reopened.client.flush(), false); assert.equal(reopened.requests.length,0);
+  assert.match(reopened.elements.get('st').textContent,/другом окне/); assert.equal(reopened.elements.get('connectionBtn').hidden,true);
+  assert.equal(JSON.parse(h.storage.get('zamery_cl_17')).d.answer,'Pending A');
+});
+
+test('an older window ACK does not delete another window newer draft, and its failed save recopies the latest draft', async () => {
+  const storage = new Map(); const a = autosaveClient({storage}); const b = autosaveClient({storage});
+  a.client.edit('A first'); const first = a.client.flush(); b.client.edit('B latest');
+  a.respond(0); await first; assert.equal(JSON.parse(storage.get('zamery_cl_17')).d.answer,'B latest');
+  const second = b.client.flush(); storage.delete('zamery_cl_17'); b.requests[0].reject(new Error('Synthetic interruption')); await second;
+  assert.equal(JSON.parse(storage.get('zamery_cl_17')).d.answer,'B latest');
+});
+
+test('a print gateway with no local edits does not overwrite another window pending draft', async () => {
+  const storage = new Map(); const a = autosaveClient({storage}); const b = autosaveClient({storage});
+  b.client.edit('Other window pending'); const latest = storage.get('zamery_cl_17');
+  const printing = a.elements.get('printBtn').onclick(); await new Promise(setImmediate); a.respondRaw(0,gatewayPage); await printing;
+  assert.equal(storage.get('zamery_cl_17'),latest); a.elements.get('connectionBtn').onclick(); assert.equal(a.location.reloads,0);
+});
+
+test('ordinary network retries stop after three failures and explicit status retry still works', async () => {
+  const h = autosaveClient(); h.client.edit('Retry safely');
+  for(let attempt=0;attempt<3;attempt++) { const saving=h.client.flush(); h.requests[attempt].reject(new Error('Offline')); await saving; }
+  assert.match(h.elements.get('st').textContent,/Нажмите для повтора/);
+  await h.tick(5000); await h.tick(10000); await h.tick(40000); assert.equal(h.requests.length,3);
+  h.elements.get('st').onclick(); assert.equal(h.requests.length,4); h.respond(3); await new Promise(setImmediate);
+  assert.equal(h.elements.get('st').textContent,'Сохранено');
 });

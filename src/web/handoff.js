@@ -2552,8 +2552,47 @@ function checklistClient() {
   // ── Сохранение ────────────────────────────────────────
   var timer = null, refresh = null;
   var LKEY = 'zamery_cl_' + CASE.id;
-  function backup() { try { localStorage.setItem(LKEY, JSON.stringify({ t: Date.now(), d: D, noteBase: noteBase, revision: checklistRevision })); } catch (e) {} }
-  function dropBackup() { try { localStorage.removeItem(LKEY); } catch (e) {} }
+  var lastBackup = null, localSaved = false, connectionBlocked = false, accessDenied = false;
+  function backup() {
+    localSaved = false;
+    try {
+      // A print/connection check with no local edits must not replace a pending
+      // draft written by another window for this same client.
+      var current = localStorage.getItem(LKEY);
+      if (JSON.stringify(D) === lastSaved && current && current !== lastBackup) return false;
+      var value = JSON.stringify({ t: Date.now(), d: D, noteBase: noteBase, revision: checklistRevision });
+      localStorage.setItem(LKEY, value);
+      // Some webviews can silently reject a storage write. Only promise recovery
+      // after reading back the exact draft, including its note/revision baseline.
+      if (localStorage.getItem(LKEY) === value) { lastBackup = value; localSaved = true; }
+    } catch (e) {}
+    return localSaved;
+  }
+  function dropBackup() {
+    // An ACK from this window must not delete a newer draft from another one.
+    try { if (lastBackup !== null && localStorage.getItem(LKEY) === lastBackup) localStorage.removeItem(LKEY); } catch (e) {}
+    lastBackup = null; localSaved = false;
+  }
+  function connectionStatus() {
+    setSt('err', localSaved ? 'На устройстве · нужна проверка связи' : 'Не сохранено · не закрывайте окно');
+  }
+  function blockConnection() {
+    connectionBlocked = true;
+    clearTimeout(timer); clearTimeout(retryTimer); clearInterval(countdown);
+    backup(); connectionStatus();
+  }
+  function responseResult(response, text) {
+    var value = null;
+    try { value = JSON.parse(text); } catch (_) {}
+    var valid = value && typeof value === 'object' && !Array.isArray(value);
+    var status = Number(response.status);
+    return { data: valid ? value : null, ok: status >= 200 && status < 300 && valid && value.ok === true,
+      // Gateway pages can use 200 as well as 403/503. They are never an API ACK.
+      connection: !valid && status !== 429,
+      denied: valid && (status === 401 || status === 403),
+      reason: status === 401 || status === 403 ? 'нет доступа — откройте чек-лист кнопкой бота'
+        : status === 429 ? 'сервер занят' : 'сервер временно недоступен' };
+  }
   function sameSnapshot(left, right) {
     function ordered(key, value) {
       if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
@@ -2564,10 +2603,12 @@ function checklistClient() {
   function changed() {
     if (inFlight) dirty = true;
     backup();
-    setSt('saving', 'Сохраняю…');
+    if (connectionBlocked) connectionStatus();
+    else if (accessDenied) setSt('err', 'Не сохранено · откройте чек-лист кнопкой бота');
+    else setSt('saving', 'Сохраняю…');
     summary();
     clearTimeout(refresh); refresh = setTimeout(refreshCounters, 250);
-    clearTimeout(timer); timer = setTimeout(flush, 2500);
+    clearTimeout(timer); if (!connectionBlocked && !accessDenied) timer = setTimeout(flush, 2500);
   }
   function refreshCounters() {
     // Обновляем счётчики в заголовках разделов без полной перерисовки
@@ -2583,12 +2624,14 @@ function checklistClient() {
   }
   function setSt(cls, t) {
     var s = document.getElementById('st'); s.className = 'st ' + cls; s.textContent = t;
+    document.getElementById('connectionBtn').hidden = !connectionBlocked || checklistConflict || noteConflict !== null;
     // Пока есть несохранённое — Telegram переспросит перед закрытием
     try { if (cls === 'ok') tg.disableClosingConfirmation(); else tg.enableClosingConfirmation(); } catch (e) {}
   }
 
   // Один запрос за раз; всё, что изменилось во время отправки, уйдёт следующим запросом.
-  // При отказе сервера (лимит, обрыв связи) — повтор с паузой 3 → 6 → 12 → 24 → 30 с, пока не сохранится.
+  // Краткие обрывы повторяем автоматически; страницу проверки соединения
+  // можно открыть только явным действием после подтверждённой локальной записи.
   var inFlight = false, dirty = false, failCount = 0, retryTimer = null, countdown = null, pendingSave = null;
   var lastSaved = JSON.stringify(D), retryAfter = 0;
   async function checklistRequest(url, options, consume) {
@@ -2624,6 +2667,8 @@ function checklistClient() {
       setSt('err', 'Заметка изменилась в другом окне. Нажмите здесь, чтобы сохранить свой черновик.');
       return false;
     }
+    if (connectionBlocked) { backup(); connectionStatus(); return false; }
+    if (accessDenied) { backup(); setSt('err', 'Не сохранено · откройте чек-лист кнопкой бота'); return false; }
     var s = stats();
     var sentNote = D._comment || '';
     var body = JSON.stringify({ case_id: CASE.id, data: D, done: s.done, total: s.total, expectedNote: noteBase, expectedRevision: checklistRevision });
@@ -2640,9 +2685,8 @@ function checklistClient() {
       });
       var r = received.response;
       retryAfter = parseInt(r.headers.get('Retry-After')) || 0;
-      var txt = received.text, j = null;
-      try { j = JSON.parse(txt); } catch (pe) {}
-      ok = !!(j && j.ok);
+      var result = responseResult(r, received.text), j = result.data;
+      ok = result.ok && typeof j.note === 'string' && Number.isSafeInteger(j.revision) && j.revision >= 0;
       if (ok && typeof j.note === 'string') savedNote = j.note;
       if (ok && Number.isSafeInteger(j.revision)) checklistRevision = j.revision;
       if (r.status === 409 && j && ['checklist_conflict', 'checklist_version_required'].indexOf(j.code) !== -1) checklistConflict = true;
@@ -2650,16 +2694,16 @@ function checklistClient() {
         noteConflict = j.note;
       }
       if (!ok) {
-        // Показываем настоящую причину: код ответа и начало текста
-        var snippet = String(txt || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80);
-        why = j ? (j.error || 'ошибка сервера') + ' [' + r.status + ']'
-          : (r.status === 429 || /^rate limited/i.test(snippet) ? 'сервер занят' : 'ошибка') + ' [' + r.status + (snippet ? ': ' + snippet : '') + ']';
+        why = result.reason;
+        connectionBlocked = result.connection;
+        accessDenied = result.denied;
         console.log('save failed', r.status, j && j.code || '');
       }
     } catch (e) { why = e.code === 'CHECKLIST_TIMEOUT' ? 'сервер не ответил вовремя' : 'нет связи'; }
     inFlight = false;
     if (checklistConflict) { backup(); setSt('err', 'Чек-лист изменился в другом окне. Нажмите, чтобы сохранить копию и открыть актуальные ответы.'); return false; }
     if (noteConflict !== null) {
+      backup();
       setSt('err', 'Заметка изменилась в другом окне. Нажмите здесь, чтобы сохранить свой черновик.');
       return false;
     }
@@ -2687,7 +2731,13 @@ function checklistClient() {
       else { dropBackup(); setSt('ok', 'Сохранено'); }
       return true;
     }
+    // Recopy the latest edit after a failed request: another window may have
+    // acknowledged its own snapshot while this request was still pending.
+    backup();
+    if (connectionBlocked) { blockConnection(); return false; }
+    if (accessDenied) { setSt('err', 'Не сохранено · откройте чек-лист кнопкой бота'); return false; }
     failCount++;
+    if (failCount >= 3) { setSt('err', 'Не сохранено (' + why + '). Нажмите для повтора.'); return false; }
     var wait = Math.max(Math.min(retryAfter, 120), Math.min(40, 5 * Math.pow(2, failCount - 1)));
     var left = wait;
     setSt('err', 'Не сохранено (' + why + '), повтор через ' + left + ' с');
@@ -2702,6 +2752,14 @@ function checklistClient() {
   document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') flush(); });
   window.addEventListener('pagehide', function () { flush(); });
   window.addEventListener('online', function () { failCount = 0; flush(); });
+  document.getElementById('connectionBtn').onclick = function () {
+    if (!connectionBlocked || checklistConflict || noteConflict !== null) return;
+    clearTimeout(timer); clearTimeout(retryTimer); clearInterval(countdown);
+    if (!backup()) { connectionStatus(); return; }
+    // Reload this same webview, retaining Telegram auth/session and cookies.
+    // Opening an external browser would not repair the mini-app's connection.
+    window.location.reload();
+  };
   // Тап по статусу — сохранить прямо сейчас
   document.getElementById('st').onclick = function () {
     if (checklistConflict) {
@@ -2724,7 +2782,11 @@ function checklistClient() {
       if (tg && tg.showConfirm) tg.showConfirm(message, resolve); else resolve(window.confirm(message));
       return;
     }
-    failCount = 0; flush();
+    if (connectionBlocked) { document.getElementById('connectionBtn').onclick(); return; }
+    accessDenied = false; failCount = 0; flush();
+  };
+  document.getElementById('st').onkeydown = function (event) {
+    if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); this.onclick(); }
   };
   document.getElementById('printBtn').onclick = async function () {
     // Внутри Telegram печать не работает — открываем версию для печати в браузере (там «Сохранить как PDF»)
@@ -2739,8 +2801,13 @@ function checklistClient() {
     try {
       failCount = 0;
       await saveLatest();
-      var j = await checklistRequest('/api/checklist/printlink', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ case_id: CASE.id }) }, function (response) { return response.json(); });
-      if (!j.ok) throw new Error(j.error || 'нет доступа');
+      var printed = await checklistRequest('/api/checklist/printlink', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ case_id: CASE.id }) }, async function (response) { return responseResult(response, await response.text()); });
+      if (!printed.ok) {
+        if (printed.connection) blockConnection();
+        throw new Error(printed.connection ? 'Проверьте соединение кнопкой внизу чек-листа. Ответы остаются в форме.' : printed.reason);
+      }
+      var j = printed.data;
+      if (typeof j.url !== 'string' || !j.url) throw new Error('Сервер не вернул ссылку для печати. Повторите попытку.');
       // The lawyer can keep typing while the navigation link is loading.
       await saveLatest();
       if (tg && tg.openLink && tg.initData) tg.openLink(j.url); else location.href = j.url;
@@ -2755,8 +2822,9 @@ function checklistClient() {
   // Если в прошлый раз закрыли до сохранения — восстанавливаем отметки с телефона и досохраняем
   var restored = false;
   try {
-    var bk = JSON.parse(localStorage.getItem(LKEY) || 'null');
+    var storedBackup = localStorage.getItem(LKEY), bk = JSON.parse(storedBackup || 'null');
     if (bk && bk.d && Date.now() - bk.t < 7 * 24 * 3600 * 1000) {
+      lastBackup = storedBackup; localSaved = true;
       if (sameSnapshot(bk.d, D)) {
         // The previous request committed before its ACK was lost. Keep the
         // complete current server snapshot and its revision/note baseline.
@@ -2878,11 +2946,12 @@ function checklistPage(c, L, actorId) {
     '.miss.on{background:color-mix(in srgb,var(--bad) 16%,transparent);border-color:color-mix(in srgb,var(--bad) 50%,transparent);color:var(--bad);font-weight:600}',
     '.note.plain{border-color:transparent;margin-top:0}',
     // нижняя панель
-    '.dock{position:fixed;left:12px;right:12px;bottom:max(12px,env(safe-area-inset-bottom));z-index:6;border-radius:999px;display:flex;align-items:center;gap:10px;padding:8px 8px 8px 18px;background:var(--glass2)}',
-    '.st{flex:1;font-size:13px;color:var(--ink2);display:flex;align-items:center;gap:7px}',
-    '.st:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--ok)}',
+    '.dock{position:fixed;left:12px;right:12px;bottom:max(12px,env(safe-area-inset-bottom));z-index:6;border-radius:30px;display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;padding:8px 8px 8px 18px;background:var(--glass2)}',
+    '.st{flex:1;min-width:0;min-height:44px;font-size:13px;color:var(--ink2);display:flex;align-items:center;gap:7px;overflow-wrap:anywhere}',
+    '.st:before{content:"";flex:none;width:7px;height:7px;border-radius:50%;background:var(--ok)}',
     '.st.saving:before{background:var(--warn)}.st.err{color:var(--bad);cursor:pointer}.st.err:before{background:var(--bad)}',
-    '.pbtn{border:0;border-radius:999px;padding:11px 18px;font:inherit;font-weight:600;font-size:14px;color:var(--ink);background:var(--well);cursor:pointer}',
+    '.pbtn{flex:none;min-height:44px;border:0;border-radius:999px;padding:11px 18px;font:inherit;font-weight:600;font-size:14px;color:var(--ink);background:var(--well);cursor:pointer}',
+    '#connectionBtn{flex:1 0 100%;background:var(--accent);color:#fff}#connectionBtn[hidden]{display:none}.pbtn:focus-visible,.st:focus-visible{outline:2px solid var(--accent);outline-offset:2px}',
     'button:focus-visible,.inp:focus-visible{outline:2px solid var(--accent);outline-offset:2px}',
     '@media (prefers-reduced-motion:reduce){*{transition:none!important}}',
     // печать
@@ -2925,7 +2994,7 @@ function checklistPage(c, L, actorId) {
     '<span class="pnums"><span id="pnum">0</span><span id="ptot"></span></span><span id="pbad" class="pbad"></span></button>' +
     '<div id="probs" class="glass" hidden></div>' +
     '<main id="list"></main>' +
-    '<div class="dock glass"><span id="st" class="st"></span><button id="printBtn" class="pbtn" type="button">Печать</button></div>' +
+    '<div class="dock glass"><span id="st" class="st" role="status" aria-live="polite" tabindex="0"></span><button id="printBtn" class="pbtn" type="button">Печать</button><button id="connectionBtn" class="pbtn" type="button" hidden>Проверить соединение</button></div>' +
     '<script>var HOLIDAYS=' + json(HOLIDAYS) + ';var WORKING_DAYS=' + json(WORKING_DAYS) + ';var DEFAULT_HOLIDAYS=' + json(DEFAULT_HOLIDAYS) + ';' +
     [isWorkday, addWorkdays, workdaysBetween, decisionDays, mskToday, ruDate].map(function (f) { return f.toString(); }).join('\n') +
     '\nwindow.__CFG=' + json(cfg) + ';(' + checklistClient.toString() + ')();</script>' +
