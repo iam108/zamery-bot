@@ -301,7 +301,8 @@ function casePacket(client, selection, fallback = null) {
   const id = Number(client.id), { snapshot, state, orderId } = selection;
   const prefix = '/api/handoff/cases/' + id;
   const order = snapshot?.order || (orderId ? { id:orderId } : null);
-  const report = snapshot?.report || fallback || (text(client.audit_text) ? { text:String(client.audit_text), media:[] } : null);
+  const savedText = text(client.audit_text) ? String(client.audit_text) : '';
+  const report = snapshot ? snapshot.report : fallback ? { ...fallback, text:savedText || fallback.text } : savedText ? { text:savedText, media:[] } : null;
   const materials = (snapshot?.materials || []).map(file => ({ ...materialView(file, orderId), url:prefix + '/materials/' + file.id }));
   const egrn = state.linkedEgrn?.files || snapshot?.egrn_links;
   const egrn_links = (snapshot && Array.isArray(egrn) ? egrn : []).map(file => ({ ...materialView(file, orderId), role:'egrn', source:file.source, url:prefix + '/egrn/' + file.id + '/link' }));
