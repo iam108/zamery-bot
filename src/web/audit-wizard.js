@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const reportIssuesPath = require.resolve('../../public/audit-report-issues');
 
 function auditWizard() {
   return `<!doctype html>
@@ -38,13 +39,13 @@ function auditWizard() {
   <script src="/audit-plan-editor.js?v=20261109-ready-artwork"><\/script>
   <script src="/audit-actions.js?v=20261106-explicit-phone"><\/script>
   <script src="/audit-route.js?v=20261030-actions5"><\/script>
-  <script src="/audit-report-issues.js?v=20261109-floor-check"><\/script>
-  <script src="/audit-wizard-client.js?v=20261110-recovery"><\/script>
+  <script src="/audit-wizard-client.js?v=20261113-report-issues"><\/script>
 </body>
 </html>`;
 }
 
-// Separate source files keep the page readable and allow ordinary static routes.
-auditWizard.client = () => fs.readFileSync(path.join(__dirname, 'audit-wizard-client.js'), 'utf8');
+// Deliver the shared diagnosis and the form together so their versions match.
+auditWizard.client = () => [reportIssuesPath, path.join(__dirname, 'audit-wizard-client.js')]
+  .map(file => fs.readFileSync(file, 'utf8')).join('\n');
 auditWizard.css = () => fs.readFileSync(path.join(__dirname, 'audit-wizard.css'), 'utf8');
 module.exports = auditWizard;

@@ -73,3 +73,26 @@ test('choosing actions never bypasses a missing entrance photo or marked plan', 
  const visit=await seed(62,'catering','Получение',data=>{data.workflow.conclusion_status='actions';data.evidence=data.evidence.filter(file=>file.role!=='entrance');data.plan.annotations=[];delete data.plan.preview_evidence_id;});
  try{const page=visit.page;assert.match(await page.locator('#report-feedback').innerText(),/Главный вход: добавьте фото/i);assert.match(await page.locator('#report-feedback').innerText(),/границ|разметк/i);assert.equal(await page.locator('#report-feedback [data-conclusion-choice]').count(),0);const before=service.messages.length;await page.locator('#submit-audit').click();assert.equal(service.messages.length,before);assert.equal((await service.pool.query('SELECT id FROM audits WHERE order_id=62')).rows.length,0);assert.equal((await service.draft(62)).submitting_revision,null);clean(visit);}finally{await visit.context.close();}
 });
+
+test('the auditor can review the exact conflicting answer when the gateway challenges the former rules script', { timeout: 60000 }, async () => {
+  await service.pool.query(`INSERT INTO orders(id,address,owner_name,object_type,object_name,has_video,status,submitted_by,submitted_name,telegram_msg_id,service)
+    SELECT 63,address,owner_name,object_type,object_name,has_video,status,submitted_by,submitted_name,63,service FROM orders WHERE id=62`);
+  const visit = await seed(63, 'catering', 'Получение', data => { data.inspection.rooms_complete = 'Нет'; });
+  try {
+    const { page } = visit;
+    await page.route('**/audit-report-issues.js*', route => route.fulfill({
+      status: 200,
+      contentType: 'text/html',
+      body: '<!doctype html><title>Checking your browser...</title>',
+    }));
+    await page.reload();
+    await page.locator('#step-content[aria-busy=false]').waitFor();
+    await step(page, 2);
+    const conflictingAnswer = issue(page, 'rooms-incomplete');
+    assert.match(await conflictingAnswer.innerText(), /Указано «Часть не входит»/);
+    await answerFocus(page, 'rooms-incomplete', 'inspection.rooms_complete', 'Нет');
+    clean(visit);
+  } finally {
+    await visit.context.close();
+  }
+});
