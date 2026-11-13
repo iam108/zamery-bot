@@ -28,7 +28,7 @@ async function fixture(run,config={}){
     org:'ООО «ЧООКДИ»',inn:'7701234567',address:'Москва, Лесная, 5',region:'МСК',kind:'Общепит',service:'Продление',priority:'срочно',cad_num:'77:01:0004016:1064',contacts:[{name:'Карина',phone:'+79991234567',comment:'Позвонить перед выездом'}],comment:'Сначала согласовать время',egrn_order:false};
   const pick={chat_id:SOURCE,msg_ids:Array.from({length:105},(_,i)=>100+i),text:packet.report.text,report_data:{evidence:[{sha256:files[0].sha256}]}};
   async function action(event){events.push(event);if(fail)await fail(event);await mutate(event);}
-  const telegram={async sendMessage(chat,text,opts){const event={type:String(chat)===String(LAWYER)?'card':'notice',chat:String(chat),text,opts,noticeTarget:options.clientsChatId};await action(event);event.id=sequence++;return {message_id:event.id};},
+  const telegram={async sendMessage(chat,text,opts){const type=String(chat)!==String(LAWYER)?'notice':text.startsWith('<b>Сведения от менеджера · клиент №')?'manager-details':'card';const event={type,chat:String(chat),text,opts,noticeTarget:options.clientsChatId};await action(event);event.id=sequence++;return {message_id:event.id};},
     async callApi(method,payload){assert.equal(method,'copyMessages');const event={type:'copy',chat:String(payload.chat_id),payload};await action(event);const ids=payload.message_ids.map(()=>({message_id:sequence++}));return config.shortCopy&&event.chat===String(LAWYER)?ids.slice(1):ids;},
     async sendDocument(chat,file,opts){const event={type:'zip',chat:String(chat),name:file.filename,opts};await action(event);const chunks=[];for await(const chunk of file.source)chunks.push(Buffer.from(chunk));event.buffer=Buffer.concat(chunks);event.id=sequence++;return {message_id:event.id};}};
   const options={pool,ready:async()=>{},packetService:{async packet(query){packetCalls++;assert.deepEqual(query,{order_id:60,report_src:'a',report_id:15,request_id:body.request_id||null});return JSON.parse(JSON.stringify({...packet,request:config.requestMismatch?{id:999}:body.request_id?{id:body.request_id}:null}));}},telegram,
@@ -44,13 +44,16 @@ test('V2 delivers the complete packet only to the assigned lawyer even when a sh
   const result=await h.submit(h.context);assert.equal(result.delivery_complete,true);assert.equal(result.ok,true);
   const cases=await h.cases();assert.equal(cases.length,1);const c=cases[0],state=c.data._handoff;
   assert.equal(c.client,'Карина');assert.equal(c.priority,'🔥 горящий');assert.equal(c.audit_text,h.packet.report.text);assert.equal(c.address,'Москва, Лесная, 5');
-  assert.deepEqual(h.events.slice(0,2).map(event=>event.type),['card','copy']);
+  assert.deepEqual(h.events.slice(0,3).map(event=>event.type),['card','manager-details','copy']);
   assert.ok(h.events.every(event=>event.chat===String(LAWYER)||event.type==='notice'));
   assert.deepEqual(state.recipients,[{chat:String(LAWYER),role:'lawyer'}]);
   const cards=h.events.filter(event=>event.type==='card');assert.equal(cards.length,1);
   const notices=h.events.filter(event=>event.type==='notice');assert.equal(notices.length,1);assert.equal(notices[0].chat,CLIENTS);assert.match(notices[0].text,/^Клиент передан юристу/);assert.match(notices[0].text,/Клиентов в работе у юриста: 1/);assert.doesNotMatch(notices[0].text,/Карина|7999|ПОЛНЫЙ ТЕКСТ|баланс/i);assert.ok(notices[0].opts.reply_markup.inline_keyboard.flat().every(button=>!button.web_app&&button.url==='https://t.me/LRSZamer_bot?start=case_'+c.id));
   assert.equal(state.groupNotice.status,'confirmed');assert.equal(state.groupNotice.receipt.message_id,notices[0].id);
   for(const card of cards){assert.ok(card.text.length<2000);assert.doesNotMatch(card.text,/ПОЛНЫЙ ТЕКСТ АУДИТОРА|Контакт передала Ирина|Ответы и наблюдения/);assert.match(card.text,/Карина|Лесная/);}
+  const details=h.events.find(event=>event.type==='manager-details');assert.match(details.text,/Позвонить перед выездом/);assert.match(cards[0].text,/Полный комментарий и контакты — следом/);assert.doesNotMatch(notices[0].text,/Позвонить перед выездом|Сначала согласовать время/);
+  assert.deepEqual(details.opts.reply_parameters,{message_id:cards[0].id,allow_sending_without_reply:true});
+  assert.deepEqual(state.managerDetails.messageIds,[details.id]);
   const lawyerButtons=cards[0].opts.reply_markup.inline_keyboard.flat();assert.ok(lawyerButtons.some(button=>button.web_app?.url.includes('/checklist?case_id='+c.id)));assert.ok(lawyerButtons.some(button=>button.web_app?.url.includes('view=report')));assert.ok(lawyerButtons.some(button=>button.url===h.packet.report.video_url));
   assert.deepEqual(cards[0].opts.reply_markup.inline_keyboard[0].map(button=>button.text),['📋 Чек-лист клиента','Перейти к отчёту']);
   assert.deepEqual(cards[0].opts.reply_markup.inline_keyboard[1].map(button=>button.text),['Документы клиента']);assert.equal(new URL(cards[0].opts.reply_markup.inline_keyboard[1][0].web_app.url).search,'?case_id='+c.id+'&view=documents');
@@ -69,6 +72,46 @@ test('V2 delivers the complete packet only to the assigned lawyer even when a sh
   assert.equal(h.egCalls.length,0);assert.equal(h.packetCalls(),1);assert.equal(h.reportCalls(),1);
   const before=h.events.length;h.packet.signature='b'.repeat(64);
   const replay=await h.restart()(h.context);assert.deepEqual(replay,result);assert.equal(h.events.length,before);assert.equal(h.packetCalls(),1);assert.equal((await h.cases()).length,1);
+}));
+
+test('short manager fields fit the private card without creating a companion message',pg,async()=>fixture(async h=>{
+  delete h.body.contacts[0].comment;
+  const result=await h.submit(h.context);assert.equal(result.delivery_complete,true);
+  assert.deepEqual(h.events.slice(0,2).map(event=>event.type),['card','copy']);
+  assert.match(h.events[0].text,/Карина[\s\S]*Сначала согласовать время/);
+  assert.equal((await h.cases())[0].data._handoff.managerDetails,undefined);
+}));
+
+test('a long manager comment and every contact arrive privately in numbered parts; a rejected part alone is retried',pg,async()=>fixture(async h=>{
+  const comment='Начало <условия> & «сроки»\n'+'😀'.repeat(1800)+'\nПоследняя строка.';
+  h.body.comment=comment;
+  h.body.contacts.push({name:'Анна',tg:'@test_example',comment:'Второй контакт'}, {comment:'Отдельное примечание'}, {name:'Денис',phone:'+79990001122'});
+  h.setFail(event=>{if(event.type==='manager-details'&&/ · 2\/\d+<\/b>/.test(event.text))throw tgFailure('Temporary private rejection');});
+  const first=await h.submit(h.context);assert.equal(first.delivery_complete,false);assert.equal(first.retry,true);
+  assert.deepEqual(h.events.map(event=>event.type),['card','manager-details','manager-details']);
+  const saved=(await h.cases())[0].data._handoff.managerDetails;
+  assert.equal(saved.messageIds.length,1);
+  assert.doesNotMatch(h.events[0].text,/Последняя строка|Отдельное примечание|Денис/);
+  h.setFail(null);
+  const resume={...h.context,body:{resume_case_id:first.id}};
+  const final=await h.restart()(resume);assert.equal(final.delivery_complete,true);
+  const delivered=h.events.filter(event=>event.type==='manager-details'&&event.id);
+  assert.ok(delivered.length>1);
+  assert.ok(delivered.every((event,index)=>event.chat===String(LAWYER)&&event.text.length<4096&&event.text.includes(' · '+(index+1)+'/'+delivered.length+'</b>')));
+  const details=delivered.map(event=>event.text.split('\n\n')[0].length).map((length,index)=>delivered[index].text.slice(length+2)).join('');
+  assert.ok(details.includes('Начало &lt;условия&gt; &amp; «сроки»\n'+'😀'.repeat(1800)+'\nПоследняя строка.'));
+  for (const contact of ['Карина','Позвонить перед выездом','Анна · @test_example','Второй контакт','Отдельное примечание','Денис · +79990001122']) assert.ok(details.includes(contact));
+  assert.deepEqual((await h.cases())[0].data._handoff.managerDetails.messageIds,delivered.map(event=>event.id));
+  const count=h.events.length;assert.equal((await h.restart()(resume)).delivery_complete,true);assert.equal(h.events.length,count);
+}));
+
+test('an unknown manager message acknowledgement stops the private packet without automatic replay',pg,async()=>fixture(async h=>{
+  h.setFail(event=>{if(event.type==='manager-details')throw new Error('Synthetic uncertain receipt');});
+  const first=await h.submit(h.context);assert.equal(first.delivery_complete,false);assert.equal(first.manual_review,true);assert.equal(first.retry,false);
+  assert.deepEqual(h.events.map(event=>event.type),['card','manager-details']);
+  const state=(await h.cases())[0].data._handoff;assert.equal(state.inflight.type,'manager-details');assert.deepEqual(state.managerDetails.messageIds,[]);
+  h.setFail(null);
+  const resumed=await h.restart()({...h.context,body:{resume_case_id:first.id}});assert.equal(resumed.manual_review,true);assert.equal(h.events.length,2);
 }));
 
 test('a blocked audit lists the saved issues before creating a client or sending any message',pg,async()=>fixture(async h=>{
@@ -292,9 +335,11 @@ test('an older checkpoint with a failed first private card cannot restore copies
   let failed=false;h.setFail(event=>{if(event.type==='card'&&!failed){failed=true;throw tgFailure('Private card was rejected');}});
   const first=await h.submit(h.context),c=(await h.cases())[0],state=c.data._handoff;
   state.recipients=[{chat:SOURCE,role:'lawyer'},{chat:CLIENTS,role:'clients'}];
+  delete state.managerDetails;
   await h.db.query("UPDATE cases SET data=jsonb_set(data,'{_handoff}',$1::jsonb) WHERE id=$2",[JSON.stringify(state),c.id]);
   const result=await h.restart()(h.context);assert.equal(result.delivery_complete,true);assert.equal(result.id,first.id);
   assert.ok(h.events.every(event=>event.chat===String(LAWYER)||event.type==='notice'&&event.chat===CLIENTS));assert.equal(h.events.filter(event=>event.type==='copy').length,2);
+  assert.equal(h.events.filter(event=>event.type==='manager-details').length,0);assert.match(h.events.find(event=>event.type==='card'&&event.id).text,/Полные сведения — в разделе «Документы клиента»/);
   assert.equal(h.egCalls.length,1);assert.equal(h.egCalls[0].order,false);assert.deepEqual(h.egCalls[0].targets,[{chat:LAWYER,reply:(await h.cases())[0].data._handoff.cards[String(LAWYER)],case_id:Number((await h.cases())[0].id)}]);
 },{withEgrn:false}));
 test('a historical group-only remainder does not repeat completed private files or EGRN when retried',pg,async()=>fixture(async h=>{

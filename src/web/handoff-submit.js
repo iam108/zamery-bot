@@ -3,6 +3,7 @@ const { getSessionLockPool } = require('../db/session-lock-pool');
 const { canManageCases, canAccessCase } = require('./auth');
 const { createHandoffNoticePublisher, initialNotice, pendingNotice, noticeWarning, SAVE_CHECKPOINT_SQL } = require('./handoff-group-notice');
 const { manualClient } = require('./handoff-manual');
+const { splitTelegramHtml } = require('../bot/audit-delivery');
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DDL = `ALTER TABLE cases ADD COLUMN IF NOT EXISTS handoff_submit_id TEXT;
   ALTER TABLE cases ADD COLUMN IF NOT EXISTS handoff_signature TEXT;
@@ -103,31 +104,57 @@ function short(item, limit) {
   }
   return result.trimEnd() + '…';
 }
+const managerCardLimits = {org:500, address:500, identifiers:150, contact:150, comment:500, manager:100};
+function contactLine(contact) { return [contact.name,contact.phone,contact.tg].filter(Boolean).join(' · '); }
+function clientIdentifiers(profile) {
+  return [profile.inn && 'ИНН ' + profile.inn, profile.cad_num && 'кадастр ' + profile.cad_num].filter(Boolean).join(' · ');
+}
+function managerDetailsNeeded(profile, managerName) {
+  const over = (item, field) => esc(value(item)).length > managerCardLimits[field];
+  const contacts = profile.contacts || [];
+  return over(profile.org, 'org') || over(profile.address, 'address') || over(clientIdentifiers(profile), 'identifiers') ||
+    over(profile.comment, 'comment') || over(managerName, 'manager') || contacts.length > 2 ||
+    contacts.some(contact => contact.comment || over(contactLine(contact), 'contact'));
+}
+function managerDetailsParts(profile, managerName) {
+  if (!managerDetailsNeeded(profile, managerName)) return [];
+  const lines = [esc(profile.org), esc(profile.address), esc([profile.kind,profile.service,profile.region,profile.priority].filter(Boolean).join(' · '))];
+  if (profile.inn) lines.push('ИНН: ' + esc(profile.inn));
+  if (profile.cad_num) lines.push('Кадастровый номер: ' + esc(profile.cad_num));
+  if (profile.contacts.length) {
+    lines.push('', '<b>Контакты</b>');
+    for (const [index, contact] of profile.contacts.entries()) {
+      lines.push(esc((index + 1) + '. ' + (contactLine(contact) || 'Примечание')));
+      if (contact.comment) lines.push(esc(contact.comment));
+    }
+  }
+  if (profile.comment) lines.push('', '<b>Комментарий менеджера</b>', esc(profile.comment));
+  if (managerName) lines.push('', 'Передал: ' + esc(managerName));
+  // Leave room for the client number and part indicator on every message.
+  return splitTelegramHtml(lines.join('\n'), 3400);
+}
 function cardText(c,state) {
   const packet = state.packet, report = packet.report || {};
   const materials = packet.materials || [], media = report.media || [];
   const reference = c.order_id ? ' · заявка №' + c.order_id : '';
-  const lines = ['⚖️ <b>Клиент №' + c.id + reference + '</b>', '<b>' + short(c.org, 500) + '</b>', short(c.address, 500),
+  const lines = ['⚖️ <b>Клиент №' + c.id + reference + '</b>', '<b>' + short(c.org, managerCardLimits.org) + '</b>', short(c.address, managerCardLimits.address),
     short([c.kind, c.service, c.region, c.priority].filter(Boolean).join(' · '), 160)];
-  const identifiers = [c.inn && 'ИНН ' + c.inn, state.fields.cad_num && 'кадастр ' + state.fields.cad_num].filter(Boolean);
-  if (identifiers.length) lines.push(short(identifiers.join(' · '), 150));
+  const identifiers = clientIdentifiers({...c, cad_num:state.fields.cad_num});
+  if (identifiers) lines.push(short(identifiers, managerCardLimits.identifiers));
 
   const contacts = (c.contacts || []).filter(contact => contact.name || contact.phone || contact.tg);
   if (contacts.length) {
     lines.push('', '<b>Контакты</b>');
-    for (const contact of contacts.slice(0, 2)) lines.push(short([contact.name, contact.phone, contact.tg].filter(Boolean).join(' · '), 150));
-    if (contacts.length > 2 || contacts.some(contact => contact.comment)) lines.push('Все контакты и примечания — в разделе «Документы клиента».');
+    for (const contact of contacts.slice(0, 2)) lines.push(short(contactLine(contact), managerCardLimits.contact));
   }
 
   if (c.comment || state.manager_name) {
     lines.push('', '<b>От менеджера</b>');
-    if (c.comment) {
-      const comment = short(c.comment, 500);
-      lines.push(comment);
-      if (comment !== esc(value(c.comment))) lines.push('Весь комментарий — в разделе «Документы клиента».');
-    }
-    if (state.manager_name) lines.push('Передал: ' + short(state.manager_name, 100));
+    if (c.comment) lines.push(short(c.comment, managerCardLimits.comment));
+    if (state.manager_name) lines.push('Передал: ' + short(state.manager_name, managerCardLimits.manager));
   }
+  if (state.managerDetails?.parts.length) lines.push(c.comment && contacts.length ? 'Полный комментарий и контакты — следом, в «Сведениях от менеджера».' : 'Полные сведения — следом, в «Сведениях от менеджера».');
+  else if (managerDetailsNeeded({...c, cad_num:state.fields.cad_num}, state.manager_name)) lines.push('Полные сведения — в разделе «Документы клиента».');
 
   if (packet.report || c.audit_text || materials.length || packet.manual_materials?.length || state.extraDocuments?.files?.length) {
     lines.push('', '<b>Материалы</b>');
@@ -356,7 +383,8 @@ function createHandoffSubmitter(options={}) {
         }
         const recipients=[{chat:String(lawyer.tg_id),role:'lawyer'}];
         const groupNotice=initialNotice(options.clientsChatId??process.env.CLIENTS_CHAT_ID);
-        state={version:2,body:JSON.parse(serialized),fields:d,packet,source,request,manager_name:value(staff?.name),recipients,cards:{},auditCopies:{},requestCopies:{},materials:{confirmed:{},completed:manual?!packet.manual_materials.length:!orderId},linkedEgrn:{files:linkedOriginals(packet),confirmed:{},completed:false},egrn:{completed:manual,order_started:false,...(manual?{result:'skipped-manual'}:{})},completed:false,...(groupNotice?{groupNotice}:{}),...(extraDocuments?{extraDocuments}:{})};
+        const managerName=value(staff?.name), details=managerDetailsParts(d,managerName);
+        state={version:2,body:JSON.parse(serialized),fields:d,packet,source,request,manager_name:managerName,recipients,cards:{},auditCopies:{},requestCopies:{},materials:{confirmed:{},completed:manual?!packet.manual_materials.length:!orderId},linkedEgrn:{files:linkedOriginals(packet),confirmed:{},completed:false},egrn:{completed:manual,order_started:false,...(manual?{result:'skipped-manual'}:{})},completed:false,...(groupNotice?{groupNotice}:{}),...(extraDocuments?{extraDocuments}:{}),...(details.length?{managerDetails:{parts:details,messageIds:[]}}:{})};
         reportUrl(options.webappUrl||process.env.WEBAPP_URL,state);
         await checkActor(client,user.id);
         c=(await client.query(`INSERT INTO cases(order_id,lawyer_tg_id,lawyer_name,checklist_key,org,inn,client,phone,address,region,kind,service,priority,comment,audit_text,total,created_by,contacts,request_id,handoff_submit_id,handoff_signature,data)
@@ -408,7 +436,7 @@ function createHandoffSubmitter(options={}) {
       const validateReceipts=(chat,result)=>{
         const copied=state.auditCopies[String(chat)],request=state.requestCopies?.[String(chat)];
         const known=new Set([state.cards[String(chat)],...(copied?.messageIds||[]),...Object.values(copied?.sources||{}).flatMap(source=>source.messageIds||[]),
-          ...(request?.messageIds||[]),...(state.materials.confirmed?.[String(chat)]||[]),...Object.values(state.linkedEgrn?.confirmed?.[String(chat)]||{}).map(receipt=>receipt?.message_id)].map(messageId).filter(Boolean));
+          ...(request?.messageIds||[]),...(state.managerDetails?.messageIds||[]),...(state.materials.confirmed?.[String(chat)]||[]),...Object.values(state.linkedEgrn?.confirmed?.[String(chat)]||{}).map(receipt=>receipt?.message_id)].map(messageId).filter(Boolean));
         for(const receipt of Array.isArray(result)?result:[result]){
           const id=messageId(receipt?.message_id);
           if(!id||known.has(id)||receipt?.chat!=null&&String(receipt.chat.id)!==String(chat))throw Object.assign(new Error('Telegram не подтвердил новые сообщения в личном чате юриста.'),{code:'HANDOFF_TELEGRAM_RECEIPT'});
@@ -428,6 +456,20 @@ function createHandoffSubmitter(options={}) {
         const sent=await send({type:'card',chat:target.chat},()=>tg.sendMessage(target.chat,cardText(c,state),cardOptions(base,c,state)));
         if(!Number.isSafeInteger(Number(sent?.message_id))||Number(sent.message_id)<1)throw new Error('Missing card receipt');
         state.cards[target.chat]=Number(sent.message_id);state.inflight=null;await save(true);receiptPending=false;
+      }
+      const details=state.managerDetails;
+      if (details) {
+        const chat=String(c.lawyer_tg_id);
+        while (details.messageIds.length < details.parts.length) {
+          const index=details.messageIds.length;
+          const suffix=details.parts.length>1 ? ' · ' + (index+1) + '/' + details.parts.length : '';
+          const header='<b>Сведения от менеджера · клиент №' + c.id + suffix + '</b>';
+          const sent=await send({type:'manager-details',chat,index},()=>tg.sendMessage(chat,header+'\n\n'+details.parts[index],{
+            parse_mode:'HTML', disable_web_page_preview:true,
+            reply_parameters:{message_id:state.cards[chat],allow_sending_without_reply:true},
+          }));
+          details.messageIds.push(messageId(sent.message_id));state.inflight=null;await save(true);receiptPending=false;
+        }
       }
       for(const target of state.recipients){
         const recipient=state.auditCopies[target.chat]||{offset:0,messageIds:[]};state.auditCopies[target.chat]=recipient;
