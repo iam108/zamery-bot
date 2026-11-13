@@ -13,7 +13,7 @@ async function fixture(run,config={}){
     CREATE TABLE reports(id INT PRIMARY KEY,chat_id BIGINT,msg_ids BIGINT[],first_id BIGINT);
     CREATE TABLE cases(id SERIAL PRIMARY KEY,order_id INT,lawyer_tg_id BIGINT,lawyer_name TEXT,checklist_key TEXT,org TEXT,inn TEXT,client TEXT,phone TEXT,address TEXT,region TEXT,kind TEXT,service TEXT,priority TEXT,comment TEXT,audit_text TEXT,total INT,created_by BIGINT,contacts JSONB,request_id INT,data JSONB DEFAULT '{}');
     INSERT INTO orders VALUES(60,'Синтетический бренд',NULL);
-    INSERT INTO staff VALUES(808,'Юрист проверки','lawyer',true),(101,'Менеджер','manager',true);`);
+    INSERT INTO staff VALUES(808,'Юрист проверки','lawyer',true),(101,'Менеджер','manager',true),(102,'Второй менеджер','manager',true);`);
   const pool={query:(query,params)=>params?db.query(query,params):db.exec(query),async connect(){const identity=randomUUID();return {async query(query,params){
     if(query.startsWith('SELECT pg_try_advisory_lock')){const key=params[0],available=!locks.has(key)||locks.get(key)===identity;if(available)locks.set(key,identity);return {rows:[{locked:available}]};}
     if(query.startsWith('SELECT pg_advisory_unlock')){if(locks.get(params[0])===identity)locks.delete(params[0]);return {rows:[{pg_advisory_unlock:true}]};}
@@ -48,7 +48,7 @@ test('V2 delivers the complete packet only to the assigned lawyer even when a sh
   assert.ok(h.events.every(event=>event.chat===String(LAWYER)||event.type==='notice'));
   assert.deepEqual(state.recipients,[{chat:String(LAWYER),role:'lawyer'}]);
   const cards=h.events.filter(event=>event.type==='card');assert.equal(cards.length,1);
-  const notices=h.events.filter(event=>event.type==='notice');assert.equal(notices.length,1);assert.equal(notices[0].chat,CLIENTS);assert.match(notices[0].text,/^Клиент передан юристу/);assert.match(notices[0].text,/В работе у юриста: 1 клиентов/);assert.doesNotMatch(notices[0].text,/Карина|7999|ПОЛНЫЙ ТЕКСТ|баланс/i);assert.ok(notices[0].opts.reply_markup.inline_keyboard.flat().every(button=>!button.web_app&&button.url==='https://t.me/LRSZamer_bot?start=case_'+c.id));
+  const notices=h.events.filter(event=>event.type==='notice');assert.equal(notices.length,1);assert.equal(notices[0].chat,CLIENTS);assert.match(notices[0].text,/^Клиент передан юристу/);assert.match(notices[0].text,/Клиентов в работе у юриста: 1/);assert.doesNotMatch(notices[0].text,/Карина|7999|ПОЛНЫЙ ТЕКСТ|баланс/i);assert.ok(notices[0].opts.reply_markup.inline_keyboard.flat().every(button=>!button.web_app&&button.url==='https://t.me/LRSZamer_bot?start=case_'+c.id));
   assert.equal(state.groupNotice.status,'confirmed');assert.equal(state.groupNotice.receipt.message_id,notices[0].id);
   for(const card of cards){assert.ok(card.text.length<2000);assert.doesNotMatch(card.text,/ПОЛНЫЙ ТЕКСТ АУДИТОРА|Контакт передала Ирина|Ответы и наблюдения/);assert.match(card.text,/Карина|Лесная/);}
   const lawyerButtons=cards[0].opts.reply_markup.inline_keyboard.flat();assert.ok(lawyerButtons.some(button=>button.web_app?.url.includes('/checklist?case_id='+c.id)));assert.ok(lawyerButtons.some(button=>button.web_app?.url.includes('view=report')));assert.ok(lawyerButtons.some(button=>button.url===h.packet.report.video_url));
@@ -57,14 +57,143 @@ test('V2 delivers the complete packet only to the assigned lawyer even when a sh
   const reportLink=new URL(cards[0].opts.reply_markup.inline_keyboard[0][1].web_app.url);
   assert.equal(reportLink.searchParams.get('report_id'),'15');assert.equal(reportLink.searchParams.get('report_src'),'a');
   assert.equal(reportLink.searchParams.get('order_id'),'60');assert.equal(reportLink.searchParams.has('k'),false);assert.equal(reportLink.searchParams.has('u'),false);
+  assert.equal(reportLink.searchParams.get('case_id'),String(c.id));
+  const rework=lawyerButtons.find(button=>button.text==='Вернуть на доработку');
+  assert.equal(new URL(rework.web_app.url).search,'?case_id='+c.id+'&rework=1');
+  assert.match(cards[0].text,/Документы заявки: 2/);
   for(const target of [String(LAWYER)]){
     const copies=h.events.filter(event=>event.type==='copy'&&event.chat===target);assert.deepEqual(copies.map(event=>event.payload.message_ids.length),[100,5]);assert.ok(copies.flatMap(event=>event.payload.message_ids).includes(204));
-    const zip=h.events.filter(event=>event.type==='zip'&&event.chat===target);assert.equal(zip.length,1);assert.ok(zip[0].buffer.includes(h.files[1].buffer));assert.ok(!zip[0].buffer.includes(h.files[0].buffer));assert.equal(zip[0].opts.reply_to_message_id,state.cards[target]);
+    const zip=h.events.filter(event=>event.type==='zip'&&event.chat===target);assert.equal(zip.length,1);assert.ok(zip[0].buffer.includes(h.files[1].buffer));assert.ok(!zip[0].buffer.includes(h.files[0].buffer),'A document already delivered in the audit is not repeated in Telegram');assert.equal(zip[0].opts.reply_to_message_id,state.cards[target]);
     assert.equal(state.auditCopies[target].offset,105);assert.equal(state.auditCopies[target].messageIds.length,105);assert.equal(state.materials.confirmed[target].length,1);
   }
   assert.equal(h.egCalls.length,0);assert.equal(h.packetCalls(),1);assert.equal(h.reportCalls(),1);
   const before=h.events.length;h.packet.signature='b'.repeat(64);
   const replay=await h.restart()(h.context);assert.deepEqual(replay,result);assert.equal(h.events.length,before);assert.equal(h.packetCalls(),1);assert.equal((await h.cases()).length,1);
+}));
+
+test('a blocked audit lists the saved issues before creating a client or sending any message',pg,async()=>fixture(async h=>{
+  h.packet.report.readiness = { blocking: true, issues: ['Уточнить результат по территории.'], territory: 'Нужно уточнить' };
+  await assert.rejects(h.submit(h.context), error => error.code === 'HANDOFF_REPORT_INCOMPLETE' &&
+    error.case_created === false && error.message.includes('Уточнить результат по территории.'));
+  assert.equal((await h.cases()).length, 0);
+  assert.equal(h.events.length, 0);
+}));
+
+test('a started handoff keeps its original document archive selection across retries',pg,async()=>fixture(async h=>{
+  h.setFail(event => { if (event.type === 'card') throw tgFailure('Temporary card rejection'); });
+  const first = await h.submit(h.context);
+  assert.equal(first.delivery_complete,false);
+  let failed = false;
+  h.setFail(event => {
+    if (event.type === 'zip' && !failed) {
+      failed = true;
+      throw tgFailure('Temporary ZIP rejection');
+    }
+  });
+  assert.equal((await h.restart()(h.context)).delivery_complete,false);
+  const original = (await h.cases())[0].data._handoff.materials.packetHash;
+  assert.match(original,/^[a-f\d]{64}$/);
+  assert.equal((await h.restart()(h.context)).delivery_complete,true);
+  const current = (await h.cases())[0].data._handoff.materials;
+  assert.equal(current.packetHash,original);
+  const delivered = h.events.find(event=>event.type==='zip'&&event.id);
+  assert.ok(delivered.buffer.includes(h.files[1].buffer));
+  assert.ok(!delivered.buffer.includes(h.files[0].buffer));
+}));
+
+async function stageReviewedDocument(h) {
+  const store = require('../src/web/handoff-manual-materials').createManualMaterialsStore(h.pool);
+  const submitId = randomUUID();
+  const original = { originalname: 'Договор менеджера.pdf', mimetype: 'application/pdf', buffer: Buffer.from('%PDF-1.7 manager attachment\n%%EOF') };
+  const files = await store.put(101, submitId, original);
+  h.body.extra_documents = { submit_id: submitId, files };
+  h.packet.report.readiness = { blocking: false, issues: [], territory: 'Ограничений не выявлено' };
+  return { store, submitId, original, files };
+}
+
+test('reviewed extras are frozen before the first send, resume from the original manager and finish before the group notice',pg,async()=>fixture(async h=>{
+  const {store,submitId,original,files} = await stageReviewedDocument(h);
+  let rejected = false;
+  h.setFail(async event => {
+    if (event.type === 'card') {
+      await assert.rejects(store.remove(101, submitId, files[0].id), error => error.code === 'HANDOFF_MATERIAL_FROZEN');
+    }
+    if (event.type === 'zip' && event.opts.caption.startsWith('📎 Дополнительные документы') && !rejected) {
+      rejected = true;
+      throw tgFailure('Synthetic refusal of the previewed manager attachments');
+    }
+  });
+  const first = await h.submit(h.context);
+  assert.equal(first.delivery_complete, false);
+  assert.equal(first.retry, true);
+  assert.equal(h.events.some(event => event.type === 'notice'), false);
+  const initial = (await h.cases())[0];
+  assert.equal(initial.data._handoff.extraDocuments.completed, false);
+  assert.equal(initial.data._handoff.completed, false);
+  const before = h.events.length;
+  const other = { body: {resume_case_id:first.id}, user: {id:102}, staff: {name:'Второй менеджер',role:'manager',approved:true} };
+  const completed = await h.restart()(other);
+  assert.equal(completed.delivery_complete, true);
+  assert.equal(completed.extra_documents_submit_id, submitId);
+  assert.deepEqual(h.events.slice(before).map(event => event.type), ['zip', 'notice']);
+  assert.ok(h.events[before].buffer.includes(original.buffer));
+  assert.equal(h.events[before].opts.reply_to_message_id, initial.data._handoff.cards[String(LAWYER)]);
+  assert.match(h.events[0].text, /Дополнительные документы: 1/);
+  assert.match(h.events[0].text, /Территория: Ограничений не выявлено/);
+  const batch = (await h.db.query('SELECT * FROM case_document_batches WHERE id=$1',[submitId])).rows[0];
+  assert.equal(Number(batch.owner_tg_id),101);
+  assert.equal(Number(batch.recipient_tg_id),LAWYER);
+  assert.equal(batch.delivery.completed,true);
+  const service = require('../src/web/handoff-case-documents').createCaseDocumentsService({pool:h.pool,store,telegram:h.options.telegram});
+  const saved = await service.file(first.id, submitId, files[0].id, LAWYER);
+  assert.ok(saved.buffer.equals(original.buffer));
+  const events = h.events.length;
+  assert.deepEqual(await h.restart()(other), completed);
+  assert.equal(h.events.length, events);
+  assert.equal((await h.cases()).length,1);
+}));
+
+test('resuming a frozen handoff after reassignment cannot send to a different lawyer',pg,async()=>fixture(async h=>{
+  h.setFail(event => { if (event.type === 'card') throw tgFailure('Temporary card rejection'); });
+  const first = await h.submit(h.context);
+  assert.equal(first.delivery_complete,false);
+  await h.db.exec("INSERT INTO staff VALUES(909,'Новый юрист','lawyer',true)");
+  await h.db.query("UPDATE cases SET lawyer_tg_id=909,lawyer_name='Новый юрист' WHERE id=$1",[first.id]);
+  h.setFail(null);
+  const count = h.events.length;
+  const resume = { ...h.context, body: {resume_case_id:first.id} };
+  const blocked = await h.restart()(resume);
+  assert.equal(blocked.delivery_complete,false);
+  assert.match(blocked.warn,/Назначенный юрист изменился/);
+  assert.equal(h.events.length,count);
+  await h.db.query("UPDATE cases SET lawyer_tg_id=808,lawyer_name='Юрист проверки' WHERE id=$1",[first.id]);
+  assert.equal((await h.restart()(resume)).delivery_complete,true);
+  assert.equal(h.events.filter(event=>event.type==='card'&&event.id).length,1);
+  assert.equal((await h.cases()).length,1);
+}));
+
+test('changed reviewed extras fail before client creation, and an unknown receipt cannot publish a success notice',pg,async()=>fixture(async h=>{
+  const {submitId,files} = await stageReviewedDocument(h);
+  h.body.extra_documents.files[0] = {...files[0], name:'Unreviewed.pdf'};
+  await assert.rejects(h.submit(h.context), error => error.code === 'HANDOFF_MATERIAL_CHANGED' && error.case_created === false);
+  assert.equal(h.events.length, 0);
+  assert.equal((await h.cases()).length, 0);
+  h.body.extra_documents.files[0] = {...files[0], name:'Договор менеджера.pdf'};
+  h.setFail(event => {
+    if (event.type === 'zip' && event.opts.caption.startsWith('📎 Дополнительные документы')) throw new Error('Synthetic lost receipt');
+  });
+  const first = await h.submit(h.context);
+  assert.equal(first.delivery_complete,false);
+  assert.equal(first.retry,false);
+  assert.equal(first.manual_review,true);
+  assert.equal(h.events.some(event=>event.type==='notice'),false);
+  const state=(await h.cases())[0].data._handoff;
+  assert.equal(state.extraDocuments.submit_id,submitId);
+  assert.equal(state.extraDocuments.completed,false);
+  const count=h.events.length;
+  const retry=await h.restart()({...h.context,body:{resume_case_id:first.id}});
+  assert.equal(retry.manual_review,true);
+  assert.equal(h.events.length,count);
 }));
 
 test('the manager legal entity survives source-brand differences and a resumed delivery after source changes',pg,async()=>fixture(async h=>{
@@ -77,7 +206,7 @@ test('the manager legal entity survives source-brand differences and a resumed d
   row=(await h.cases())[0];assert.equal(row.org,org);assert.equal(row.data._handoff.fields.org,org);assert.equal(h.packetCalls(),1);
   const card=h.events.find(event=>event.type==='card'&&event.id),notice=h.events.find(event=>event.type==='notice');
   assert.match(card.text,/ООО «Компания менеджера»/);assert.doesNotMatch(card.text,/Бренд заявки|Новый бренд|Ещё один бренд/);
-  assert.match(notice.text,/Организация: ООО «Компания менеджера»/);assert.match(notice.text,/Объект: Ещё один бренд/);
+  assert.match(notice.text,/^Организация: ООО «Компания менеджера»$/m);assert.match(notice.text,/^Объект: Ещё один бренд$/m);
 }));
 
 test('handoff recipient revocation after a partial attempt stops delivery and reactivation resumes the same case',pg,async()=>fixture(async h=>{

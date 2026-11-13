@@ -1,4 +1,5 @@
 const { createHash } = require('node:crypto');
+const { handoffReadiness } = require('./handoff-readiness');
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const IMAGE_OR_PDF = /^(?:image\/(?:jpeg|png|webp|gif|heic|heif|avif|tiff|bmp)|application\/pdf)$/;
@@ -28,7 +29,25 @@ function assignmentView(row) {
   const checkpoint = object(object(row.data)._handoff), profile = require('./handoff-case-profile').savedCaseProfile(row), notice = groupNotice(checkpoint);
   return {case_id:Number(row.id),lawyer_name:text(row.lawyer_name),submit_id:text(row.handoff_submit_id)||null,
     ...(checkpoint.manual_review?{manual_review:true}:{}),...(profile?{profile}:{}),...(notice?{group_notice:notice}:{}),
+    ...(checkpoint.version === 2 ? {
+      egrn_delivery: egrnDelivery(checkpoint, row.lawyer_tg_id),
+      manager_files: (Array.isArray(checkpoint.packet?.manual_materials) ? checkpoint.packet.manual_materials : [])
+        .map(({id,name,mime,role,bytes}) => ({id,name,mime,role,bytes})),
+      ...(checkpoint.extraDocuments?.completed === true ? {extra_documents_submit_id:checkpoint.extraDocuments.submit_id} : {}),
+    } : {}),
     ...(['true','false'].includes(String(checkpoint.completed))?{delivery_complete:String(checkpoint.completed)==='true'&&!require('./handoff-submit').hasPendingLinkedEgrn(checkpoint,row.lawyer_tg_id)}:{})};
+}
+function egrnDelivery(checkpoint, lawyerId) {
+  const state = object(checkpoint.egrn);
+  const pendingLinked = require('./handoff-submit').hasPendingLinkedEgrn(checkpoint, lawyerId);
+  if (state.uncertain) return {status:'unknown',text:'Доставка ЕГРН требует проверки.'};
+  if (pendingLinked || state.completed === false) return {status:'pending',text:'Доставка ЕГРН пока не подтверждена.'};
+  if (['included', 'included-links', 'attached'].includes(state.result) && state.completed === true) {
+    return {status:'delivered',text:state.result === 'included' ? 'ЕГРН входит в документы заявки.' : 'ЕГРН отправлена в личный чат юриста.'};
+  }
+  if (['waiting','ordered'].includes(state.result)) return {status:'waiting',text:'Выписка ожидается. Бот пришлёт её юристу после готовности.'};
+  if (['none','missing','unavailable','skipped-manual'].includes(state.result)) return {status:'missing',text:'ЕГРН в переданном комплекте отсутствует.'};
+  return {status:'unknown',text:'Доставка ЕГРН не подтверждена сохранённой передачей.'};
 }
 function https(value) {
   try { const url = new URL(text(value)); return url.protocol === 'https:' && !url.username && !url.password ? url.href : ''; } catch (_) { return ''; }
@@ -223,8 +242,9 @@ function createPacketService(options = {}) {
       if (report?.src === 'a') {
         const { photoCaption } = require('../bot/audit-delivery');
         report.media = (await media(selected)).map(({ expected, raw }) => ({ id: expected.id, name: expected.name, mime: expected.mime, role: expected.role, subject_id: expected.subject_id,
-          bytes: Number(raw.bytes), caption: photoCaption(expected, orderId, data), url: '/api/handoff/reports/' + report.id + '/files/' + expected.id +
+          bytes: Number(raw.bytes), sha256: expected.sha256, caption: photoCaption(expected, orderId, data), url: '/api/handoff/reports/' + report.id + '/files/' + expected.id +
             (!selected.order_id && orderId ? '?order_id=' + orderId : '') }));
+        report.readiness = handoffReadiness(data, {videoUrl:report.video_url, videoRequired:order?.has_video === true});
       }
       if (report) report.historical_address_difference = view && report.address && report.address !== view.address ? { report: report.address, order: view.address } : null;
       let readiness;
@@ -245,7 +265,7 @@ function createPacketService(options = {}) {
         if (!original) fail(404, 'REQUEST_NOT_FOUND', 'Сохранённая исходная заявка не найдена.');
         request = { id: Number(original.id), text: String(original.text || ''), created_at: original.created_at };
       }
-      const signature = createHash('sha256').update(canonical({ order: view, request, egrn_links, report: report ? { id: report.id, src: report.src } : null,
+      const signature = createHash('sha256').update(canonical({ order: view, request, egrn_links, report,
         materials: materials.map(({ id,sha256,bytes,name,mime,role }) => ({ id,sha256,bytes,name,mime,role })) })).digest('hex');
       return { ok: true, signature, order: view, request, report, materials, egrn_links, egrn: safeEgrn(readiness, view?.cad_num || ''), archive_url: view?.archive_url || '', assignment };
     },
@@ -261,20 +281,51 @@ function disposition(name, download) {
   const clean = text(name).split(/[\\/]/).pop().replace(/[\x00-\x1f\x7f]/g, '').slice(0,180) || 'material';
   return (download ? 'attachment' : 'inline') + '; filename="material"; filename*=UTF-8\'\'' + encodeURIComponent(clean).replace(/['()*]/g, char => '%' + char.charCodeAt(0).toString(16).toUpperCase());
 }
+function savedSelection(client, query = {}) {
+  const state = object(object(client.data)._handoff), body = object(state.body);
+  const orderId = Number(client.order_id) || null, reportId = Number(body.report_id) || null;
+  const src = ['a','r'].includes(body.report_src) ? body.report_src : null;
+  const order = integer(query.order_id, true), report = integer(query.report_id, true);
+  if ((order && order !== orderId) || (report && (report !== reportId || (query.report_src || 'a') !== src)) ||
+      (state.version === 2 && (Number(body.order_id) || null) !== orderId)) {
+    fail(403, 'CASE_FORBIDDEN', 'Этот отчёт не входит в доступный вам комплект клиента.');
+  }
+  const snapshot = state.version === 2 && Array.isArray(state.packet?.materials) ? state.packet : null;
+  if (snapshot && ((Number(snapshot.order?.id) || null) !== orderId || (Number(snapshot.report?.id) || null) !== reportId || (snapshot.report?.src || null) !== src ||
+      (snapshot.report?.order_id && Number(snapshot.report.order_id) !== orderId))) {
+    fail(409, 'CASE_PACKET_CHANGED', 'Не удалось подтвердить сохранённый состав передачи.');
+  }
+  return { state, snapshot, orderId, reportId, src };
+}
+function casePacket(client, selection, fallback = null) {
+  const id = Number(client.id), { snapshot, state, orderId } = selection;
+  const prefix = '/api/handoff/cases/' + id;
+  const order = snapshot?.order || (orderId ? { id:orderId } : null);
+  const report = snapshot?.report || fallback || (text(client.audit_text) ? { text:String(client.audit_text), media:[] } : null);
+  const materials = (snapshot?.materials || []).map(file => ({ ...materialView(file, orderId), url:prefix + '/materials/' + file.id }));
+  const egrn = state.linkedEgrn?.files || snapshot?.egrn_links;
+  const egrn_links = (snapshot && Array.isArray(egrn) ? egrn : []).map(file => ({ ...materialView(file, orderId), role:'egrn', source:file.source, url:prefix + '/egrn/' + file.id + '/link' }));
+  const exactReport = report ? { ...report, media:(Array.isArray(report.media) ? report.media : []).map(file => ({ ...file,
+    url:'/api/handoff/reports/' + report.id + '/files/' + file.id + '?' + new URLSearchParams({ case_id:id, ...(orderId ? { order_id:orderId } : {}) }) })) } : null;
+  return { ok:true, order, report:exactReport, assignment:assignmentView(client), files_known:!!snapshot,
+    signature:snapshot?.signature || null, materials, egrn_links, egrn:safeEgrn(snapshot?.egrn, text(snapshot?.egrn?.cad_num || order?.cad_num)), archive_url:https(snapshot?.archive_url) };
+}
+function fileMatches(expected, actual, keys) {
+  return !!actual && keys.every(key => text(expected[key]) === text(actual[key])) && Number(expected.bytes) === Number(actual.bytes) &&
+    (!expected.sha256 || text(expected.sha256) === text(actual.sha256));
+}
 function setupHandoffPacket(app, options = {}) {
   const service = options.service || createPacketService(options);
   const pool = options.pool || require('../db/pool');
   const { canManageCases, canAccessCase } = require('./auth');
-  async function authorize(req, orderId, report, caseId) {
-    if(caseId!=null){
-      const record=(await pool.query('SELECT to_jsonb(c) AS access_case,s.tg_id,s.role,s.approved FROM cases c LEFT JOIN staff s ON s.tg_id=$2 WHERE c.id=$1',[caseId,req.tgUser&&req.tgUser.id])).rows[0];
-      const client=object(record?.access_case),state=object(object(client.data)._handoff),selection=object(state.body);
-      const nullable=value=>value==null?null:Number(value);
-      if(!canAccessCase(record,req.tgUser&&req.tgUser.id,record?.access_case)||nullable(client.order_id)!==nullable(orderId)||state.version!==2||nullable(selection.order_id)!==nullable(client.order_id)||
-        (report?Number(selection.report_id)!==Number(report.id)||selection.report_src!==report.src:selection.report_id!=null||selection.report_src!=null))
-        fail(403,'CASE_FORBIDDEN','Этот отчёт не входит в доступный вам комплект клиента.');
-      return {manager:canManageCases(record,req.tgUser&&req.tgUser.id),client:record.access_case};
-    }
+  let materialsStore = options.materialsStore, egrnStore = options.orderEgrnLinks;
+  async function caseAccess(req, caseId) {
+    const actor = req.tgUser?.id;
+    const record = (await pool.query('SELECT to_jsonb(c) AS access_case,s.tg_id,s.role,s.approved FROM cases c LEFT JOIN staff s ON s.tg_id=$2 WHERE c.id=$1',[caseId, actor])).rows[0];
+    if (!canAccessCase(record, actor, record?.access_case)) fail(403, 'CASE_FORBIDDEN', 'Этот клиент недоступен вашему аккаунту.');
+    return { manager:canManageCases(record, actor), client:record.access_case };
+  }
+  async function authorize(req, orderId, report) {
     // Storage and packet reads can outlive middleware authorization. Resolve
     // the current staff role and current assignment in the same SQL snapshot.
     const record = (await pool.query(`SELECT s.tg_id,s.role,s.approved,to_jsonb(c) AS access_case FROM staff s
@@ -298,12 +349,65 @@ function setupHandoffPacket(app, options = {}) {
     try { await run(req,res); }
     catch (error) { const known = error instanceof PacketError; res.status(known ? error.status : 503).json({ ok:false, code:known ? error.code : 'HANDOFF_PACKET_UNAVAILABLE', error:known ? error.message : 'Не удалось открыть комплект передачи. Повторите попытку.' }); }
   };
+  async function scopedFile(req, caseId, group, query = {}) {
+    const id = text(req.params.fileId).toLowerCase();
+    if (!UUID.test(id)) fail(400, 'INVALID_FILE_ID', 'Некорректный номер материала.');
+    const { client } = await caseAccess(req, caseId), selection = savedSelection(client, query);
+    const { snapshot, orderId, state } = selection;
+    if (group === 'report' && !snapshot) return { orderId, id, expected:null, saved:false };
+    const files = group === 'report' ? snapshot.report?.media : group === 'materials' ? snapshot?.materials : snapshot && (state.linkedEgrn?.files || snapshot.egrn_links);
+    const expected = Array.isArray(files) && files.find(file => text(file?.id).toLowerCase() === id);
+    if (!expected) fail(404, 'FILE_NOT_IN_CASE', 'Этот файл не входит в сохранённый комплект клиента.');
+    return { orderId, id, expected, saved:true };
+  }
+  function verifiedScope(before, after) {
+    if (before.orderId !== after.orderId || before.saved !== after.saved || canonical(before.expected) !== canonical(after.expected)) {
+      fail(409, 'CASE_PACKET_CHANGED', 'Состав передачи изменился. Откройте комплект ещё раз.');
+    }
+  }
+  function sendOriginal(req, res, file) {
+    res.set('Content-Type',file.mime).set('Content-Length',String(file.buffer.length)).set('Content-Disposition',disposition(file.name,req.query.download === '1')).send(file.buffer);
+  }
   // These routes must be mounted after setupAuth: the shared /api/handoff
   // requireStaff middleware protects metadata and every original-file request.
   app.get('/api/handoff/packet', route(async (req,res) => {
-    const packet = await service.packet(req.query);
-    const caseId=integer(req.query.case_id,true);
-    const access = await authorize(req, packet.order && packet.order.id, packet.report,caseId), manager=access.manager;
+    const caseId = integer(req.query.case_id, true);
+    let packet, access;
+    if (caseId) {
+      access = await caseAccess(req, caseId);
+      const selection = savedSelection(access.client, req.query);
+      let fallback = null;
+      if (!selection.snapshot && selection.reportId && selection.src) {
+        try { fallback = (await service.packet({ order_id:selection.orderId, report_id:selection.reportId, report_src:selection.src })).report; }
+        catch (error) { if (!(error instanceof PacketError)) throw error; }
+        access = await caseAccess(req, caseId);
+        const current = savedSelection(access.client, req.query);
+        if (current.reportId !== selection.reportId || current.src !== selection.src || current.orderId !== selection.orderId || current.snapshot) {
+          fail(409, 'CASE_PACKET_CHANGED', 'Состав передачи изменился. Откройте комплект ещё раз.');
+        }
+      }
+      packet = casePacket(access.client, selection, fallback);
+    } else {
+      // Resolve the saved case first when the lawyer follows an order-only link.
+      const order = integer(req.query.order_id, true);
+      if (order) {
+        access = await authorize(req, order, null);
+        if (access.client) {
+          const selection = savedSelection(access.client);
+          if (selection.snapshot) packet = casePacket(access.client, savedSelection(access.client, req.query));
+        }
+      }
+      if (!packet) {
+        packet = await service.packet(req.query);
+        access = await authorize(req, packet.order && packet.order.id, packet.report);
+        if (access.client) {
+          const selection = savedSelection(access.client);
+          if (selection.snapshot) packet = casePacket(access.client, savedSelection(access.client, req.query));
+          else packet = { ...packet, files_known:false, materials:[], egrn_links:[], egrn:safeEgrn(null, packet.order?.cad_num || '') };
+        }
+      }
+    }
+    const manager = access.manager;
     // An order may have more than one historical assignment. Client data must
     // come from the explicit case or the lawyer's currently accessible case.
     if(access.client){
@@ -315,20 +419,61 @@ function setupHandoffPacket(app, options = {}) {
       try{packet.case_documents=await options.caseDocumentsService.list(documentsCaseId,req.tgUser&&req.tgUser.id);}
       catch(error){if(error?.code==='CASE_DOCUMENT_FORBIDDEN'&&[401,403].includes(error.status))fail(error.status,'CASE_FORBIDDEN','Доступ к комплекту клиента изменился.');throw error;}
     }
-    if(caseId&&packet.report?.media)for(const file of packet.report.media){const url=new URL(file.url,'https://handoff.invalid');url.searchParams.set('case_id',String(caseId));file.url=url.pathname+url.search;}
     if (packet.assignment) packet.assignment.can_resume = manager && !packet.assignment.manual_review &&
       (packet.assignment.delivery_complete === false || packet.assignment.delivery_complete === true && packet.assignment.group_notice?.retry === true);
     if (!manager) delete packet.request;
     res.json(packet);
   }));
   app.get('/api/handoff/reports/:auditId/files/:fileId', route(async (req,res) => {
-    const packet = await service.packet({ report_id: req.params.auditId, report_src: 'a', order_id: req.query.order_id });
-    const caseId=integer(req.query.case_id,true);
-    await authorize(req, packet.order && packet.order.id, packet.report,caseId);
-    const file = await service.file(req.params.auditId,req.params.fileId);
-    await authorize(req,packet.order&&packet.order.id,packet.report,caseId);
-    res.set('Content-Type',file.mime).set('Content-Length',String(file.buffer.length)).set('Content-Disposition',disposition(file.name,req.query.download === '1')).send(file.buffer);
+    const query = { report_id:req.params.auditId, report_src:'a', order_id:req.query.order_id };
+    let packet, caseId = integer(req.query.case_id,true);
+    if (!caseId) {
+      packet = await service.packet(query);
+      const access = await authorize(req, packet.order?.id || null, packet.report);
+      if (access.client && savedSelection(access.client).snapshot) caseId = Number(access.client.id);
+    }
+    if (caseId) {
+      const scope = await scopedFile(req, caseId, 'report', query);
+      if (!scope.saved) {
+        packet = await service.packet({ ...query, order_id:scope.orderId });
+        if (!packet.report || Number(packet.order?.id || 0) !== Number(scope.orderId || 0)) fail(403, 'CASE_FORBIDDEN', 'Этот отчёт не входит в доступный вам комплект клиента.');
+      }
+      const file = await service.file(req.params.auditId, scope.id);
+      verifiedScope(scope, await scopedFile(req, caseId, 'report', query));
+      if (scope.expected && !fileMatches(scope.expected, file, ['id','name','mime','role','subject_id'])) fail(409, 'REPORT_FILE_CHANGED', 'Оригинал не совпадает с материалом сохранённого отчёта.');
+      return sendOriginal(req, res, file);
+    }
+    const file = await service.file(req.params.auditId, req.params.fileId);
+    const access = await authorize(req, packet.order?.id || null, packet.report);
+    if (access.client && savedSelection(access.client).snapshot) fail(409, 'CASE_PACKET_CHANGED', 'Откройте оригинал из сохранённого комплекта клиента.');
+    sendOriginal(req, res, file);
+  }));
+  app.get('/api/handoff/cases/:caseId/materials/:fileId', route(async (req,res) => {
+    const caseId = integer(req.params.caseId), scope = await scopedFile(req, caseId, 'materials');
+    materialsStore ||= require('./order-materials').createMaterialsStore(pool);
+    let file;
+    try { file = await materialsStore.download(scope.orderId, scope.id); }
+    catch (error) { if (error.status === 404) fail(404, 'CASE_FILE_UNAVAILABLE', 'Сохранённый документ заявки недоступен.'); throw error; }
+    verifiedScope(scope, await scopedFile(req, caseId, 'materials'));
+    if (!fileMatches(scope.expected, file, ['id','name','mime','role'])) fail(409, 'CASE_FILE_CHANGED', 'Оригинал не совпадает с сохранённым документом заявки.');
+    sendOriginal(req, res, file);
+  }));
+  app.get('/api/handoff/cases/:caseId/egrn/:fileId/link', route(async (req,res) => {
+    const caseId = integer(req.params.caseId), scope = await scopedFile(req, caseId, 'egrn');
+    egrnStore ||= require('./order-egrn-links').createOrderEgrnLinks({ pool, readOnly:true });
+    let result;
+    try {
+      const file = await egrnStore.delivery(scope.orderId, scope.id, scope.expected);
+      result = file.kind === 'link' ? file : await egrnStore.link(scope.orderId, scope.id);
+    } catch (error) {
+      if ([404,409].includes(error.status)) fail(error.status, 'CASE_EGRN_UNAVAILABLE', 'Сохранённая выписка недоступна. Проверьте сообщение бота.');
+      throw error;
+    }
+    verifiedScope(scope, await scopedFile(req, caseId, 'egrn'));
+    const url = https(result?.url);
+    if (!url) fail(503, 'CASE_EGRN_UNAVAILABLE', 'Не удалось получить ссылку на выписку.');
+    res.json({ ok:true, url });
   }));
   return service;
 }
-module.exports = { createPacketService, setupHandoffPacket, normalizeContacts, innFromOrder, PacketError };
+module.exports = { createPacketService, setupHandoffPacket, normalizeContacts, innFromOrder, assignmentView, PacketError };

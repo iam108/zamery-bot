@@ -29,7 +29,7 @@ async function fixture(run){
 test('old completed case preview is SELECT-only and explicit apply publishes only one exact summary',pg,async()=>fixture(async h=>{
   h.before(sql=>assert.match(sql.trim(),/^SELECT/));const p=h.publisher(),preview=await p.preview(39,{actorId:101});h.before(async()=>{});
   assert.equal(preview.status,'missing');assert.equal(preview.generation,0);assert.equal(preview.can_apply,true);assert.equal(h.sends.length,0);assert.equal((await h.saved()).groupNotice,undefined);
-  assert.match(preview.text,/^Клиент передан юристу/);assert.match(preview.text,/ООО Тест[\s\S]*Синтетический бренд[\s\S]*Тестовая, 62/);assert.match(preview.text,/Заявка #62 · Клиент #39/);assert.match(preview.text,/В работе у юриста: 2 клиентов$/);assert.doesNotMatch(preview.text,/баланс|оплат|Карина|7999/);
+  assert.match(preview.text,/^Клиент передан юристу · Синтетический юрист/);assert.match(preview.text,/ООО Тест[\s\S]*Синтетический бренд[\s\S]*Тестовая, 62/);assert.match(preview.text,/Заявка #62 · Клиент #39/);assert.match(preview.text,/Клиентов в работе у юриста: 2$/);assert.doesNotMatch(preview.text,/баланс|оплат|Карина|7999|https?:\/\//);
   const result=await h.apply(p,preview);assert.equal(result.state,'confirmed');assert.equal(h.sends.length,1);assert.equal(h.sends[0].text,preview.text);assert.equal(h.sends[0].chat,GROUP);assert.deepEqual(h.sends[0].options.reply_markup.inline_keyboard,[[{text:'Открыть клиента и отчёт',url:'https://t.me/LRSZamer_bot?start=case_39'}]]);
   const saved=await h.saved();assert.equal(saved.completed,true);assert.equal(saved.groupNotice.receipt.message_id,1700);assert.equal(saved.groupNotice.intent,null);
   assert.equal((await h.apply(h.publisher(),preview)).state,'replayed');assert.equal((await h.publisher().preview(39,{actorId:101})).can_apply,false);assert.equal(h.sends.length,1);
@@ -76,7 +76,16 @@ test('busy admin cursor survives the live sender checkpoint and cannot authorize
 test('completed submit holds lock111 throughout the group send and a concurrent resume keeps private success',pg,async()=>fixture(async h=>{
   h.state.groupNotice=initialNotice(GROUP);await h.replace(h.state);let entered,release;const started=new Promise(resolve=>{entered=resolve;}),gate=new Promise(resolve=>{release=resolve;});h.setSend(async()=>{entered();await gate;return{message_id:1700};});
   const submit=()=>createHandoffSubmitter({...h.options,ready:async()=>{}})({body:{resume_case_id:39},user:{id:101},staff:{role:'manager',approved:true}});
-  const first=submit();await started;assert.equal(h.locks.size,1);const busy=await submit();assert.equal(busy.delivery_complete,true);assert.equal(h.sends.length,1);release();assert.equal((await first).delivery_complete,true);assert.equal(h.locks.size,0);assert.equal((await submit()).delivery_complete,true);assert.equal(h.sends.length,1);
+  const first=submit();await started;
+  try{
+    assert.equal(h.locks.size,1);const busy=await submit();assert.equal(busy.delivery_complete,true);assert.equal(h.sends.length,1);
+    let reassigned=false;
+    h.after(async sql=>{if(!reassigned&&sql.startsWith('SELECT * FROM cases WHERE created_by=')){reassigned=true;await h.db.exec('UPDATE cases SET lawyer_tg_id=999 WHERE id=39');}});
+    const changed=await submit();assert.equal(changed.delivery_complete,false);assert.match(changed.warn,/Назначенный юрист изменился/);assert.equal(h.sends.length,1);
+  }finally{
+    h.after(async()=>{});await h.db.exec('UPDATE cases SET lawyer_tg_id=808 WHERE id=39');release();
+  }
+  assert.equal((await first).delivery_complete,true);assert.equal(h.locks.size,0);assert.equal((await submit()).delivery_complete,true);assert.equal(h.sends.length,1);
 }));
 test('old completed without registration is never auto-backfilled, and unset chat preserves completion',pg,async()=>fixture(async h=>{
   const context={body:{resume_case_id:39},user:{id:101},staff:{role:'manager',approved:true}};

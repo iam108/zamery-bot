@@ -457,10 +457,10 @@ test('a fresh resumable assignment button invokes only the existing case recover
 for(const status of ['pending','rejected','blocked'])test('reopening private-complete handoff with '+status+' group notice retries only the summary and keeps a later rejection visible',async()=>{
   const bodies=[],p=packet();p.assignment={case_id:75,lawyer_name:'Мария',delivery_complete:true,can_resume:true,group_notice:{status,manual_review:false}};
   const h=harness({packet:p,post:async(n,body)=>{bodies.push(body);return h.response({ok:true,id:75,delivery_complete:true,group_notice:{status:n===1?'rejected':'confirmed',manual_review:false}});}});await pause();
-  assert.match(h.node('delivery-text').textContent,/Личная доставка юристу: подтверждена/);assert.match(h.node('delivery-text').textContent,/Сводк/);
+  assert.match(h.node('delivery-text').textContent,/Основной комплект передан/);assert.match(h.node('delivery-text').textContent,/Сводк/);
   assert.equal(h.node('retry-send').hidden,false);assert.equal(h.node('retry-send').textContent,'Повторить сводку в чат');
   h.node('retry-send').click();await pause();assert.deepEqual(bodies,[{resume_case_id:75}]);
-  assert.match(h.node('delivery-text').textContent,/Личная доставка полного комплекта юристу подтверждена/);assert.match(h.node('delivery-text').textContent,/Сводку не удалось отправить/);
+  assert.match(h.node('delivery-text').textContent,/сохранённые материалы отправлены юристу/);assert.match(h.node('delivery-text').textContent,/Сводку не удалось отправить/);
   assert.equal(h.node('retry-send').hidden,false);assert.equal(h.node('retry-send').textContent,'Повторить сводку в чат');
   h.node('retry-send').click();await pause();assert.deepEqual(bodies,[{resume_case_id:75},{resume_case_id:75}]);assert.equal(h.node('retry-send').hidden,true);assert.match(h.node('delivery-text').textContent,/Сводка в чате клиентов опубликована/);
   h.node('retry-send').click();await pause();assert.equal(bodies.length,2);
@@ -468,7 +468,7 @@ for(const status of ['pending','rejected','blocked'])test('reopening private-com
 
 for(const notice of [{status:'unknown'},{status:'sending'},{status:'rejected',manual_review:true}])test('private-complete handoff with uncertain group receipt offers no resend: '+JSON.stringify(notice),async()=>{
   const p=packet();p.assignment={case_id:75,lawyer_name:'Мария',delivery_complete:true,can_resume:true,group_notice:notice};
-  const h=harness({packet:p});await pause();assert.match(h.node('delivery-text').textContent,/Личная доставка юристу: подтверждена/);assert.match(h.node('delivery-text').textContent,/Сначала проверьте чат/);
+  const h=harness({packet:p});await pause();assert.match(h.node('delivery-text').textContent,/Основной комплект передан/);assert.match(h.node('delivery-text').textContent,/Сначала проверьте чат/);
   assert.equal(h.node('retry-send').hidden,true);h.node('retry-send').click();await pause();assert.equal(h.postRequests(),0);
 });
 
@@ -476,7 +476,7 @@ test('new private delivery with rejected group summary stays recoverable and an 
   const bodies=[],h=harness({post:async(n,body)=>{bodies.push(body);return h.response({ok:true,id:75,delivery_complete:true,egrn_note:'waiting',group_notice:{status:n===1?'rejected':'unknown',manual_review:n!==1}});}});
   await pause();lawyer(h);h.node('go').click();h.node('confirm-send').click();await pause();
   assert.equal(bodies[0].handoff_version,2);assert.equal(h.node('retry-send').hidden,false);assert.match(h.node('delivery-text').textContent,/Заказанная ЕГРН ещё ожидается/);
-  assert.match(h.node('delivery-text').textContent,/Личная доставка полного комплекта юристу подтверждена/);assert.equal(h.cached().completed.groupNotice.status,'rejected');
+  assert.match(h.node('delivery-text').textContent,/сохранённые материалы отправлены юристу/);assert.equal(h.cached().completed.groupNotice.status,'rejected');
   h.node('retry-send').click();await pause();assert.deepEqual(bodies[1],{resume_case_id:75});assert.equal(h.node('retry-send').hidden,true);assert.match(h.node('delivery-text').textContent,/Сначала проверьте чат/);assert.match(h.node('delivery-text').textContent,/Заказанная ЕГРН ещё ожидается/);
   h.node('retry-send').click();h.node('confirm-send').click();await pause();assert.equal(bodies.length,2);
 });
@@ -736,21 +736,24 @@ function documentsServer() {
 }
 async function extraFile(h,name='Договор.pdf') {h.node('extra-document-input').files=[new Blob(['test'],{type:'application/pdf'})];h.node('extra-document-input').files[0].name=name;h.node('extra-document-input').onchange();await pause();}
 
-test('ordinary handoff attaches manager documents, preserves company, then appends a second batch without recreating the client',async()=>{
-  const docs=documentsServer(),h=harness({fetch:docs.fetch});await pause();lawyer(h);
+test('ordinary handoff freezes the reviewed manager documents with the same request and later sends a separate batch',async()=>{
+  const docs=documentsServer(),bodies=[],h=harness({fetch:docs.fetch,post:async(_,body)=>{bodies.push(body);return h.response({ok:true,id:75,delivery_complete:true,extra_documents_submit_id:body.extra_documents.submit_id});}});await pause();lawyer(h);
   h.node('org').value='ООО Тестовый лимон';h.node('org').listeners.input.call(h.node('org'));
   await extraFile(h);assert.match(h.node('extra-document-status').textContent,/Файлы сохранены/);
   h.node('go').click();assert.match(h.node('review-list').innerHTML,/Дополнительно: Договор.pdf/);h.node('confirm-send').click();await pause();
-  assert.equal(h.postRequests(),1);assert.equal(docs.sent.length,1);assert.equal(docs.sent[0].id,75);assert.notEqual(docs.sent[0].body.submit_id,h.cached().submitId);assert.equal(h.cached().profile.org,'ООО Тестовый лимон');
+  assert.equal(h.postRequests(),1);assert.equal(docs.sent.length,0);assert.equal(bodies[0].org,'ООО Тестовый лимон');
+  assert.deepEqual(bodies[0].extra_documents.files,docs.staged.get(bodies[0].extra_documents.submit_id));
+  assert.notEqual(bodies[0].extra_documents.submit_id,h.cached().documents.id);
+  assert.equal(h.cached().profile.org,'ООО Тестовый лимон');
   assert.equal(h.node('extra-document-send').hidden,true);
-  await extraFile(h,'ТО.pdf');h.node('extra-document-send').click();await pause();assert.equal(h.postRequests(),1);assert.equal(docs.sent.length,2);assert.notEqual(docs.sent[0].body.submit_id,docs.sent[1].body.submit_id);
+  await extraFile(h,'ТО.pdf');h.node('extra-document-send').click();await pause();assert.equal(h.postRequests(),1);assert.equal(docs.sent.length,1);assert.notEqual(docs.sent[0].body.submit_id,bodies[0].extra_documents.submit_id);
   h.node('download-package').click();await pause();assert.equal(h.created.length,1,'ZIP can download while report modal is closed');assert.match(docs.fetched[0],/cases\/75\/package/);
 });
 
 test('lost document ACK survives browser-session closure and reconciles the same delivered batch without redoing handoff',async()=>{
   const docs=documentsServer();let lost=true;
   const custom=(url,init,response)=>{const result=docs.fetch(url,init,response);if(lost&&init.method==='POST'&&/\/cases\/75\/documents$/.test(url)){lost=false;return Promise.reject(new Error('Connection lost after commit'));}return result;};
-  const h=harness({fetch:custom});await pause();lawyer(h);await extraFile(h);h.node('go').click();h.node('confirm-send').click();await pause();
+  const h=harness({fetch:custom});await pause();lawyer(h);h.node('go').click();h.node('confirm-send').click();await pause();await extraFile(h);h.node('extra-document-send').click();await pause();
   assert.equal(h.cached().completed.id,75);assert.ok(h.cached().documents.attempt);assert.match(h.node('delivery-text').textContent,/ещё не доставлены/);
   const p=packet();p.assignment={case_id:75,lawyer_name:'Елена',delivery_complete:true,profile:{...p.order,org:'ООО Тестовый лимон'}};
   const fresh=harness({packet:p,persistent:Object.fromEntries(h.persistent),fetch:custom});await pause();
@@ -768,7 +771,7 @@ test('changed lawyer or unknown delivery disables automatic document retry while
       if(init.method==='POST'&&/\/cases\/75\/documents$/.test(url)){const body=JSON.parse(init.body);docs.sent.push(body);return response({ok:true,case_id:75,delivery_complete:false,batch:{id:body.submit_id,status,retry:false,warn:'Проверьте назначение и доставку',files:body.files}});}
       return docs.fetch(url,init,response);
     };
-    const h=harness({fetch:custom});await pause();lawyer(h);await extraFile(h);h.node('go').click();h.node('confirm-send').click();await pause();
+    const h=harness({fetch:custom});await pause();lawyer(h);h.node('go').click();h.node('confirm-send').click();await pause();await extraFile(h);h.node('extra-document-send').click();await pause();
     assert.equal(h.node('extra-document-send').disabled,true);assert.equal(h.cached().documents.attempt.review,true);h.node('extra-document-send').click();await pause();assert.equal(docs.sent.length,1);
   }
 });
@@ -785,7 +788,7 @@ test('a restored upload keeps the manager company, lawyer and comments before as
 
 test('a failed document POST before commit remains retryable after closing the browser',async()=>{
   const docs=documentsServer();let fail=true;const custom=(url,init,response)=>{if(fail&&init.method==='POST'&&/\/cases\/75\/documents$/.test(url)){fail=false;throw new Error('Offline before request');}return docs.fetch(url,init,response);};
-  const h=harness({fetch:custom});await pause();lawyer(h);await extraFile(h);h.node('go').click();h.node('confirm-send').click();await pause();const original=h.cached().documents.attempt.submit_id;
+  const h=harness({fetch:custom});await pause();lawyer(h);h.node('go').click();h.node('confirm-send').click();await pause();await extraFile(h);h.node('extra-document-send').click();await pause();const original=h.cached().documents.attempt.submit_id;
   const p=packet();p.assignment={case_id:75,lawyer_name:'Елена',delivery_complete:true};
   const fresh=harness({fetch:custom,packet:p,persistent:Object.fromEntries(h.persistent)});await pause();assert.equal(fresh.node('extra-document-send').disabled,false);fresh.node('extra-document-send').click();await pause();assert.equal(docs.sent.length,1);assert.equal(docs.sent[0].body.submit_id,original);assert.equal(fresh.postRequests(),0);assert.equal(fresh.cached().documents.attempt,null);
 });
@@ -796,6 +799,71 @@ test('documents view resolves an existing bound case and allows only its manager
     const h=harness({query:'?case_id=75&view=documents',packet:p,prefill:{ok:true,can_manage:manage,order:{...p.order,org:'ООО Тестовый лимон'},report:{id:15,src:'a'},lawyers:[{tg_id:108,name:'Елена'}]}});await pause();
     assert.equal(h.node('page-title').textContent,'Документы клиента');assert.equal(h.node('object-org').textContent,'ООО Тестовый лимон');assert.equal(h.node('report-dialog').open,false);assert.equal(h.node('extra-document-add').hidden,!manage);assert.equal(h.node('download-package').hidden,false);assert.equal(h.node('footer').hidden,true);
   }
+});
+
+test('the assigned lawyer can see complete saved notes, contacts, readiness and named originals on one page',async()=>{
+  const p=packet(),comment='Проверить договор\n'+('Уточнить этап регистрации. '.repeat(40))+'Последняя строка';
+  p.report.readiness={blocking:true,issues:['Зоны: вывод нужно уточнить.']};
+  p.assignment={case_id:75,lawyer_name:'Елена',delivery_complete:true,egrn_delivery:{status:'waiting',text:'выписка ещё готовится'},
+    profile:{...p.order,org:'ООО Клиент',priority:'горящий',comment,contacts:[...p.order.contacts,
+      {name:'Андрей',tg:'@synthetic_contact',comment:'Запасной контакт <главный>'}]},
+    manager_files:[{name:'Согласование.docx',bytes:34,role:'manager'}]};
+  const h=harness({query:'?case_id=75&view=documents',packet:p,prefill:{ok:true,can_manage:false,order:p.order,report:{id:15,src:'a'},lawyers:[]}});await pause();
+  assert.equal(h.node('saved-client-summary').hidden,false);assert.equal(h.node('saved-client-comment').textContent,comment);
+  assert.match(h.node('object-meta').textContent,/Срочно/);assert.match(h.node('saved-client-contacts').innerHTML,/Позвонить до выезда/);
+  assert.match(h.node('saved-client-contacts').innerHTML,/Запасной контакт &lt;главный&gt;/);
+  assert.match(h.node('packet-issues-list').innerHTML,/Зоны: вывод нужно уточнить/);
+  assert.match(h.node('egrn-state').textContent,/ещё готовится/);
+  assert.equal(h.node('packet-file-list').open,true);
+  const originals=h.node('packet-originals').innerHTML;
+  assert.match(originals,/Оригиналы аудита/);assert.match(originals,/Документы заявки/);
+  assert.equal(originals.match(/Согласование\.docx/g).length,1);assert.match(originals,/В ZIP-комплекте/);
+  h.node('packet-originals').querySelectorAll('[data-download]').at(-1).click();await pause();
+  assert.ok(h.calls.some(call=>call[1]==='/api/audit/orders/60/materials/manager-egrn?download=1'));
+});
+
+test('a saved report with unresolved readiness blocks a new assignment and leaves report review accessible',async()=>{
+  const p=packet();p.report.status='ready';p.report.readiness={blocking:true,issues:['Зоны: вывод нужно уточнить.']};
+  const h=harness({packet:p});await pause();lawyer(h);
+  assert.equal(h.node('go').disabled,true);assert.equal(h.node('open-report').disabled,false);
+  assert.equal(h.node('report-status').textContent,'Нужно уточнить');
+  assert.match(h.node('packet-issues-list').innerHTML,/Зоны: вывод нужно уточнить/);
+  h.node('go').click();h.node('confirm-send').click();await pause();
+  assert.equal(h.postRequests(),0);assert.equal(h.node('review').hidden,true);
+});
+
+test('a manager opening documents from rework can attach a file and return to the same case',async()=>{
+  const p=packet();p.assignment={case_id:75,lawyer_name:'Елена',delivery_complete:true,profile:p.order};
+  const h=harness({query:'?case_id=75&view=documents&rework=1',packet:p,
+    prefill:{ok:true,can_manage:true,order:p.order,report:{id:15,src:'a'},lawyers:[]}});
+  await pause();
+  assert.equal(h.node('extra-document-add').hidden,false);assert.equal(h.node('back').textContent,'← К доработке');
+  h.node('back').click();assert.equal(h.context.location.href,'/checklist?case_id=75&rework=1');
+});
+
+test('a confirmed documents card retains contact details and supplemental downloads while the audit packet is temporarily unavailable',async()=>{
+  const p=packet(),assignment={case_id:75,lawyer_name:'Елена',delivery_complete:true,profile:{...p.order,comment:'Сохранённый комментарий'}};
+  const h=harness({query:'?case_id=75&view=documents',packetError:true,packet:p,
+    prefill:{ok:true,can_manage:false,case_id:75,case_assignment:assignment,order:p.order,report:{id:15,src:'a'},lawyers:[]}});
+  await pause();
+  assert.equal(h.node('packet-section').hidden,false);assert.equal(h.node('packet-error').hidden,false);
+  assert.equal(h.node('saved-client-comment').textContent,'Сохранённый комментарий');
+  assert.equal(h.node('extra-documents').hidden,false);
+  assert.ok(h.calls.some(call=>call[1]==='/api/handoff/cases/75/documents'));
+  assert.equal(h.node('download-package').hidden,false);
+});
+
+test('a partial handoff restores the exact reviewed attachments and clears them only on matching receipt',async()=>{
+  const docs=documentsServer(),bodies=[];
+  const h=harness({fetch:docs.fetch,post(_,body){bodies.push(body);return h.response({ok:true,id:75,delivery_complete:false,retry:true});}});
+  await pause();lawyer(h);await extraFile(h);h.node('go').click();h.node('confirm-send').click();await pause();
+  const cached=h.cached();assert.deepEqual(cached.pending.payload,bodies[0]);assert.equal(cached.documents.id,bodies[0].extra_documents.submit_id);
+  assert.equal(h.node('extra-document-add').disabled,true);assert.equal(docs.sent.length,0);
+  const p=packet();p.assignment={case_id:75,lawyer_name:'Елена',delivery_complete:false,submit_id:bodies[0].submit_id,can_resume:true};
+  const fresh=harness({packet:p,fetch:docs.fetch,persistent:Object.fromEntries(h.persistent),post(_,body){bodies.push(body);return fresh.response({ok:true,id:75,delivery_complete:true,extra_documents_submit_id:bodies[0].extra_documents.submit_id});}});
+  await pause();fresh.node('retry-send').click();await pause();
+  assert.deepEqual(bodies[1],bodies[0]);assert.equal(docs.sent.length,0);
+  assert.equal(fresh.cached().documents.hasDraft,false);
 });
 
 test('review opening report should not silently cancel a separately started package download',async()=>{

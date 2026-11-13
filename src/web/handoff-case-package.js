@@ -9,6 +9,7 @@ const {createManualMaterialsStore}=require('./handoff-manual-materials');
 const {createCaseDocumentsService}=require('./handoff-case-documents');
 const {createPacketService}=require('./handoff-packet');
 const {createOrderEgrnLinks}=require('./order-egrn-links');
+const {savedCaseProfile}=require('./handoff-case-profile');
 const UUID=/^[a-f\d]{8}-[a-f\d]{4}-[1-8][a-f\d]{3}-[89ab][a-f\d]{3}-[a-f\d]{12}$/i;
 const MAX_BYTES=1024*1024*1024,MAX_FILES=1000;
 const object=v=>v&&typeof v==='object'&&!Array.isArray(v)?v:{};
@@ -26,6 +27,19 @@ function documentName(value){
   return extension?component(name.slice(0,-extension.length))+extension:component(name);
 }
 function https(value){try{const url=new URL(value);return url.protocol==='https:'&&!url.username&&!url.password?url.href:'';}catch{return '';}}
+function contactLines(row, profile) {
+  const contacts = profile?.contacts || [];
+  if (!contacts.length) return [row.client, row.phone].filter(Boolean).join(' · ');
+  return contacts.map(contact => [
+    [contact.name, contact.phone, contact.tg].filter(Boolean).join(' · '),
+    contact.comment,
+  ].filter(Boolean).join('\n')).join('\n\n');
+}
+function caseSnapshot(row) {
+  const state = object(object(row.data)._handoff);
+  return JSON.stringify([savedCaseProfile(row), row.org, row.address, row.client, row.phone, row.audit_text,
+    row.created_by, row.handoff_submit_id, row.lawyer_tg_id, row.order_id, state.body, state.packet]);
+}
 function entries(value){if(value==null)return [];if(!Array.isArray(value))fail(409,'CASE_PACKAGE_CHANGED','Не удалось подтвердить состав документов клиента.');return value;}
 function expected(file){
   if(!file||!UUID.test(file.id||'')||typeof file.name!=='string'||typeof file.mime!=='string'||!Number.isSafeInteger(Number(file.bytes))||Number(file.bytes)<1||Number(file.bytes)>LIMITS.fileBytes)
@@ -72,8 +86,8 @@ function createCasePackageService(options={}){
   }
   async function prepare(caseId,actorId){
     if(options.ready)await options.ready();const c=await access(caseId,actorId),state=object(object(c.data)._handoff),packet=object(state.packet),body=object(state.body);
-    const snapshot=JSON.stringify([c.org,c.address,c.audit_text,c.created_by,c.handoff_submit_id,c.lawyer_tg_id,c.order_id,state.body,state.packet]);
-    const check=async()=>{const latest=await access(caseId,actorId),s=object(object(latest.data)._handoff);if(snapshot!==JSON.stringify([latest.org,latest.address,latest.audit_text,latest.created_by,latest.handoff_submit_id,latest.lawyer_tg_id,latest.order_id,s.body,s.packet]))fail(409,'CASE_PACKAGE_CHANGED','Клиент или состав документов изменился. Скачайте комплект заново.');};
+    const snapshot=caseSnapshot(c),profile=savedCaseProfile(c);
+    const check=async()=>{if(snapshot!==caseSnapshot(await access(caseId,actorId)))fail(409,'CASE_PACKAGE_CHANGED','Клиент или состав документов изменился. Скачайте комплект заново.');};
     const root=component(c.org,'Клиент')+'/Клиент №'+Number(caseId),items=[],links=['Документы, которые открываются отдельно. Они не включены в ZIP.'],used=new Set();
     let total=0;
     function add(name,bytes,load){
@@ -84,11 +98,13 @@ function createCasePackageService(options={}){
     }
     function text(name,value){const buffer=Buffer.from(value+'\n','utf8');add(name,buffer.length,async()=>buffer);}
     function original(group,file,index,load){expected(file);add(group+'/'+String(index+1).padStart(3,'0')+'-'+documentName(file.name),Number(file.bytes),async()=>verify(await load(),file));}
+    const contacts = contactLines(c, profile);
+    const identifiers = [c.inn && 'ИНН '+c.inn, profile?.cad_num && 'Кадастровый номер '+profile.cad_num].filter(Boolean).join(' · ');
     text('Отчёт.txt',[c.org||'Клиент','Клиент №'+Number(caseId),c.address||'',
-      [c.kind,c.service,c.region].filter(Boolean).join(' · '),c.inn?'ИНН: '+c.inn:'',
-      [c.client,c.phone].filter(Boolean).join(' · '),c.priority?'Приоритет: '+c.priority:'',
-      c.comment?'Комментарий менеджера: '+c.comment:'',
-      packet.report?.text||c.audit_text||'Отчёт аудитора не привязан к этому клиенту.'].filter(Boolean).join('\n\n'));
+      [c.kind,c.service,c.region].filter(Boolean).join(' · '),identifiers,
+      contacts && 'Контакты\n'+contacts,c.priority?'Приоритет '+c.priority:'',
+      c.comment?'Комментарий менеджера\n'+c.comment:'',
+      'Отчёт аудитора\n'+(packet.report?.text||c.audit_text||'Отчёт аудитора не привязан к этому клиенту.')].filter(Boolean).join('\n\n'));
     const orderId=Number(c.order_id||0);
     if(state.version===2){
       if(Number(body.order_id||0)!==orderId||Number(packet.order?.id||0)!==orderId)fail(409,'CASE_PACKAGE_CHANGED','Связь с исходной заявкой изменилась.');

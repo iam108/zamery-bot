@@ -42,8 +42,9 @@ function databasePool(db, { master = false } = {}) {
   return pool;
 }
 
-async function createService({ master = false, clientsGroup = '' } = {}) {
+async function createService({ master = false, clientsGroup = '', privateChats = [] } = {}) {
   const db = new PGlite(), pool = databasePool(db, { master }), objects = new Map(), messages = [], originals = new Map(), egrnRequests = [], timers = [];
+  const allowedPrivateChats = new Set(privateChats.map(String));
   const env = { BOT_TOKEN: 'synthetic-e2e-token', GROUP_CHAT_ID: GROUP, CLIENTS_CHAT_ID: clientsGroup, WEBAPP_URL: 'https://example.invalid', DATABASE_URL: 'postgres://example.invalid/e2e' };
   const previousEnv = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]])); Object.assign(process.env, env);
   const caches = new Map();
@@ -59,7 +60,8 @@ async function createService({ master = false, clientsGroup = '' } = {}) {
   for (const method of ['sendMessage', 'sendPhoto', 'sendMediaGroup', 'sendDocument', 'editMessageText', 'editMessageReplyMarkup']) {
     telegram[method] = async (...args) => {
       const clientNotice = clientsGroup && String(args[0]) === String(clientsGroup);
-      assert.ok(String(args[0]) === GROUP || master && String(args[0]) === String(LAWYER) || clientNotice);
+      const privateNotice = method === 'sendMessage' && allowedPrivateChats.has(String(args[0]));
+      assert.ok(String(args[0]) === GROUP || master && String(args[0]) === String(LAWYER) || clientNotice || privateNotice);
       if (clientNotice) assert.equal(method, 'sendMessage', 'The clients group may receive only a short handoff notice, never documents or photos');
       const event = { method, args }; messages.push(event);
       if (!master) return method === 'sendMediaGroup' ? args[1].map(() => ({ message_id: ++nextMessage })) : { message_id: ++nextMessage };

@@ -11,6 +11,10 @@ let service,browser,reportId;
 const artifacts=path.resolve(process.env.E2E_ARTIFACTS_DIR||'test-results/e2e');
 const company='ООО «ТЕСТОВЫЙ ДОГОВОР»';
 const sourceName='Synthetic source establishment';
+const managerAddress='Москва, Тестовая улица, 58, помещение 2';
+const managerInn='1234567890';
+const managerCad='77:01:0004016:9999';
+const managerComment='Уточнить регистрацию договора аренды.\nТехническое описание оплачено.';
 const document=name=>Buffer.concat([multiPagePdf(),Buffer.from('\n% '+name+'\n')]);
 const auditOriginal=document('Auditor source original');
 const orderOriginal=document('Original order document');
@@ -18,7 +22,7 @@ const initialDocument=document('Manager initial extra document');
 const laterDocument=document('Manager later extra document');
 before(async()=>{
   await fs.mkdir(artifacts,{recursive:true});
-  service=await createService({master:true});browser=await chromium.launch();
+  service=await createService({master:true,clientsGroup:'-1001000000002'});browser=await chromium.launch();
   await service.pool.query('UPDATE orders SET contacts=$1,cad_num=\'\',owner_name=$2,object_name=$2 WHERE id=58',[
     JSON.stringify([{name:'Synthetic contact',phone:'+79991234567'}]),sourceName]);
   const telegram=require('../../src/bot/instance').telegram;
@@ -30,7 +34,7 @@ before(async()=>{
   reportId=Number((await service.pool.query('INSERT INTO audits(order_id,text,chat_id,msg_ids,report_data) VALUES(58,$1,$2,$3,$4) RETURNING id',[
     text,GROUP,[message.message_id,file.message_id],JSON.stringify(data)])).rows[0].id);
   const materials=require('../../src/web/order-materials');
-  await materials.saveOrderMaterials(58,materials.prepareMaterials([{originalname:'order-original.pdf',mimetype:'application/pdf',buffer:orderOriginal}]));
+  await materials.saveOrderMaterials(58,materials.prepareMaterials([{originalname:'order-original.pdf',mimetype:'application/pdf',buffer:orderOriginal}],['egrn']));
 });
 after(async()=>{await browser?.close();await service?.close();});
 const clean=visit=>{assert.deepEqual(visit.errors,[]);assert.deepEqual(visit.blocked,[]);};
@@ -64,7 +68,17 @@ test('normal report handoff preserves manager company and documents through clos
     await page.locator('#lawyers option[value="'+LAWYER+'"]').waitFor({state:'attached'});
     await until(()=>page.locator('#open-report').isEnabled(),'Source report loaded');
     await page.locator('#details').evaluate(element=>{element.open=true;});
-    await page.locator('#org').fill(company);await page.locator('#org').press('Tab');
+    for(const [field,value] of [['org',company],['address',managerAddress],['inn',managerInn],['cad_num',managerCad]]){
+      const input=page.locator('#'+field);
+      await input.fill(value);
+      await input.press('Tab');
+      assert.equal(await input.inputValue(),value);
+    }
+    await page.locator('#kind').selectOption('Магазин');
+    await page.locator('#service').selectOption('Получение');
+    await page.locator('[data-contact="0"][data-field="tg"]').fill('@synthetic_contact');
+    await page.locator('#priority').selectOption('срочно');
+    await page.locator('#comment').fill(managerComment);
     const initialFiles=await uploaded(page,'manager-contract.pdf',initialDocument);
     assert.equal(initialFiles.length,1);assert.equal(initialFiles[0].sha256,hash(initialDocument));
     await page.screenshot({path:artifacts+'/desktop-initial-attachment.png',fullPage:true});
@@ -77,19 +91,29 @@ test('normal report handoff preserves manager company and documents through clos
     const start=service.messages.length;
     await page.locator('#go').click();await page.locator('#review').waitFor({state:'visible'});
     assert.match(await page.locator('#review').innerText(),/manager-contract\.pdf/);
+    assert.match(await page.locator('#review-identifiers').innerText(),/1234567890.+77:01:0004016:9999/);
+    assert.equal(await page.locator('#review-comment').innerText(),managerComment);
+    let independentPosts=0;
+    page.on('request',request=>{if(request.method()==='POST'&&/\/api\/handoff\/cases\/\d+\/documents$/.test(new URL(request.url()).pathname))independentPosts++;});
     const handed=page.waitForResponse(r=>new URL(r.url()).pathname==='/api/handoff'&&r.request().method()==='POST');
-    const attached=page.waitForResponse(r=>/\/api\/handoff\/cases\/\d+\/documents$/.test(new URL(r.url()).pathname)&&r.request().method()==='POST');
     await page.locator('#confirm-send').click();
-    const handoff=await (await handed).json(),initial=await (await attached).json();
-    assert.equal(handoff.delivery_complete,true);assert.equal(initial.delivery_complete,true);assert.equal(initial.case_id,handoff.id);
+    const handoffResponse=await handed,handoff=await handoffResponse.json();
+    const sent=handoffResponse.request().postDataJSON();
+    assert.deepEqual({org:sent.org,address:sent.address,inn:sent.inn,cad:sent.cad_num,priority:sent.priority,comment:sent.comment},
+      {org:company,address:managerAddress,inn:managerInn,cad:managerCad,priority:'срочно',comment:managerComment});
+    assert.equal(handoff.delivery_complete,true,JSON.stringify(handoff));assert.equal(handoff.extra_documents_submit_id,saved.documents.id);
+    assert.deepEqual(sent.extra_documents,{submit_id:saved.documents.id,files:initialFiles.map(({id,name,mime,role,bytes,sha256})=>({id,name,mime,role,bytes,sha256}))});
     await page.locator('#extra-document-history').getByRole('button',{name:/manager-contract\.pdf/}).waitFor();
     const caseId=Number(handoff.id),record=(await service.pool.query('SELECT * FROM cases WHERE id=$1',[caseId])).rows[0];
+    const [initial]=(await service.pool.query('SELECT * FROM case_document_batches WHERE case_id=$1',[caseId])).rows;
+    assert.equal(initial.delivery.completed,true);assert.equal(initial.recipient_tg_id.toString(),String(LAWYER));assert.equal(independentPosts,0);
     assert.equal(record.org,company);assert.equal(record.data._handoff.body.org,company);
     assert.equal(record.data._handoff.packet.order.org,sourceName,'Auditor source is preserved separately');
-    assert.equal(initial.batch.id,saved.documents.id);assert.notEqual(initial.batch.id,record.handoff_submit_id);
+    assert.equal(initial.id,saved.documents.id);assert.notEqual(initial.id,record.handoff_submit_id);
     assert.equal((await service.pool.query('SELECT id FROM cases WHERE order_id=58')).rows.length,1);
     const events=service.messages.slice(start),card=events.find(e=>e.method==='sendMessage'&&String(e.args[0])===String(LAWYER));
     assert.ok(card);assert.match(card.args[1],/ТЕСТОВЫЙ ДОГОВОР/);
+    for(const text of [managerAddress,managerInn,managerCad,managerComment,'@synthetic_contact','Магазин','Получение','горящий'])assert.ok(card.args[1].includes(text),text);
     assert.equal(events.filter(e=>e.method==='sendMessage'&&String(e.args[0])===String(LAWYER)).length,1);
     const reportButton=card.args[2].reply_markup.inline_keyboard.flat().find(button=>button.text==='Перейти к отчёту');
     assert.ok(reportButton);const reportUrl=new URL(reportButton.web_app.url);assert.equal(reportUrl.searchParams.get('report_id'),String(reportId));
@@ -97,6 +121,10 @@ test('normal report handoff preserves manager company and documents through clos
     const firstArchives=await privateArchives();
     assert.equal(firstArchives.flatMap(a=>a.files).filter(f=>f.buffer.equals(initialDocument)).length,1);
     assert.equal(firstArchives.flatMap(a=>a.files).filter(f=>f.buffer.equals(orderOriginal)).length,1);
+    const additionalArchive=firstArchives.find(archive=>archive.files.some(file=>file.buffer.equals(initialDocument)));
+    const lastPrivateIndex=events.findIndex(e=>e.item?.message_id===additionalArchive.item.message_id);
+    const groupIndex=events.findIndex(e=>e.method==='sendMessage'&&String(e.args[0])==='-1001000000002');
+    assert.ok(lastPrivateIndex>=0&&groupIndex>lastPrivateIndex,'The group is notified only after the reviewed manager originals are delivered');
 
     // Add a second batch to the existing client; lose only the HTTP response,
     // after the actual server has saved Telegram receipts and immutable bytes.
@@ -131,12 +159,16 @@ test('normal report handoff preserves manager company and documents through clos
     assert.equal(await lawyer.page.locator('#footer').isVisible(),false);
     const received=await downloaded(lawyer.page,lawyer.page.locator('#report-originals').getByRole('button',{name:/manager-addendum\.pdf/}));
     assert.equal(received.name,'manager-addendum.pdf');assert.equal(hash(received.buffer),hash(laterDocument));assert.ok(received.buffer.equals(laterDocument));
+    const receivedOrder=await downloaded(lawyer.page,lawyer.page.locator('#report-originals').getByRole('button',{name:/order-original\.pdf/}));
+    assert.equal(receivedOrder.name,'order-original.pdf');assert.deepEqual(receivedOrder.buffer,orderOriginal);
     const archive=await downloaded(lawyer.page,lawyer.page.locator('#report-download-package'));
     assert.match(archive.name,/ТЕСТОВЫЙ ДОГОВОР/);const contents=await unzip(archive.buffer);
     assert.ok(contents.every(f=>f.name.startsWith(company+'/Клиент №'+caseId+'/')));
     for(const original of [orderOriginal,initialDocument,laterDocument])assert.equal(contents.filter(f=>f.buffer.equals(original)).length,1,'ZIP contains every frozen document exactly once');
     assert.match(contents.find(f=>f.name.endsWith('/Отчёт.txt')).buffer.toString(),/ТЕСТОВЫЙ ДОГОВОР/);
     assert.match(contents.find(f=>f.name.endsWith('/Отчёт.txt')).buffer.toString(),/Synthetic auditor report/);
+    const summary=contents.find(f=>f.name.endsWith('/Отчёт.txt')).buffer.toString();
+    for(const text of [managerAddress,managerInn,managerCad,managerComment,'@synthetic_contact'])assert.ok(summary.includes(text),text);
     assert.equal(service.egrnRequests.length,0);assert.equal(service.messages.length,afterLost,'Read-only downloads do not resend Telegram messages');clean(visit);clean(lawyer);
   }finally{await lawyer?.context.close();await visit.context.close();}
 });
@@ -150,6 +182,11 @@ test('case document view supports managers and assigned lawyers for report clien
       await visit.page.locator('#extra-document-history').getByRole('button',{name:/manager-contract\.pdf/}).waitFor();
       assert.equal(await visit.page.locator('#page-title').innerText(),'Документы клиента');
       assert.equal(await visit.page.locator('#org').inputValue(),company);
+      assert.equal(await visit.page.locator('#saved-client-comment').innerText(),managerComment);
+      assert.match(await visit.page.locator('#saved-client-contacts').innerText(),/@synthetic_contact/);
+      assert.match(await visit.page.locator('#saved-client-identifiers').innerText(),/1234567890.+77:01:0004016:9999/);
+      assert.match(await visit.page.locator('#object-meta').innerText(),/Магазин · Получение · МСК · Срочно/);
+      if(actor===LAWYER)await visit.page.screenshot({path:artifacts+'/mobile-lawyer-handoff-package.png',fullPage:true});
       assert.equal(await visit.page.locator('#report-dialog').isVisible(),false,'Documents view must not force a report modal');
       assert.equal(await visit.page.locator('#extra-document-add').isVisible(),actor!==LAWYER);
       const result=await downloaded(visit.page,visit.page.locator('#download-package'));

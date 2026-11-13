@@ -29,13 +29,14 @@ function selection(row) {
   if(row.has_selection||!order)return null;
   const report=positive(row.latest_audit_id,2147483647);return report?{order,report,src:'a',legacy:true}:null;
 }
-function urls(baseValue,caseId,report) {
+function urls(baseValue,caseId,report,canReturn) {
   const base=new URL(baseValue);
   if(base.protocol!=='https:'||base.username||base.password)throw new Error('Invalid WebApp base');
   const make=(pathname,params)=>{const url=new URL(pathname,base);url.search=new URLSearchParams(params).toString();if(url.origin!==base.origin)throw new Error('Invalid WebApp origin');return url.href;};
   const buttons=[[{text:'📋 Чек-лист клиента',web_app:{url:make('/checklist',{case_id:String(caseId)})}}]];
-  if(report)buttons[0].push({text:'Перейти к отчёту',web_app:{url:make('/handoff',{view:'report',...(report.order?{order_id:String(report.order)}:{case_id:String(caseId)}),report_src:report.src,report_id:String(report.report)})}});
+  if(report)buttons[0].push({text:'Перейти к отчёту',web_app:{url:make('/handoff',{view:'report',...(report.order?{order_id:String(report.order)}:{}),...(!report.legacy?{case_id:String(caseId)}:{}),report_src:report.src,report_id:String(report.report)})}});
   buttons.push([{text:'Документы клиента',web_app:{url:make('/handoff',{case_id:String(caseId),view:'documents'})}}]);
+  if(canReturn)buttons.push([{text:'Вернуть на доработку',web_app:{url:make('/checklist',{case_id:String(caseId),rework:'1'})}}]);
   return {disable_web_page_preview:true,reply_markup:{inline_keyboard:buttons}};
 }
 function createCaseOpener(options={}) {
@@ -54,7 +55,8 @@ function createCaseOpener(options={}) {
         lines.push('Адрес: '+(text(row.address)||'Не указан'));
         const kind=[text(row.kind,100),text(row.service,100)].filter(Boolean).join(' · ');if(kind)lines.push(kind);
         lines.push('Этап: '+(STAGES.includes(row.stage)?row.stage:'Сбор документов'),'','Открыть этого клиента: https://t.me/LRSZamer_bot?start=case_'+caseId);
-        card={text:lines.join('\n'),extra:urls(options.webappUrl??process.env.WEBAPP_URL,caseId,selection(row))};
+        const canReturn = staff.role === 'lawyer' && String(row.lawyer_tg_id) === String(actor) && row.stage !== 'Архив';
+        card={text:lines.join('\n'),extra:urls(options.webappUrl??process.env.WEBAPP_URL,caseId,selection(row),canReturn)};
       }
     } catch (_) { /* Do not disclose existence, names, raw errors or credentials. */ }
     if(!card)return ctx.reply(NOT_AVAILABLE);

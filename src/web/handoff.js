@@ -1346,6 +1346,7 @@ function setupHandoff(app) {
   startDecisionReminders(bot);
   const WEBAPP_URL = process.env.WEBAPP_URL;
   const caseDocumentsService=require('./handoff-case-documents').setupHandoffCaseDocuments(app,{pool,ready:ensureTables});
+  const rework = require('./case-rework').createCaseReworkService({pool,ready:ensureTables,telegram:bot.telegram,webappUrl:WEBAPP_URL});
   require('./handoff-case-package').setupCasePackage(app,{pool,ready:ensureTables,documents:caseDocumentsService});
   const packetService = require('./handoff-packet').setupHandoffPacket(app,{caseDocumentsService});
   require('./handoff-manual').setupHandoffManual(app,{pool,ready:ensureTables});
@@ -1404,6 +1405,7 @@ function setupHandoff(app) {
       }
       res.json({
         ok: true, can_manage: manager, lawyers: lawyers, request: request,
+        ...(selectedCase ? {case_id:Number(selectedCase.id),case_assignment:require('./handoff-packet').assignmentView(selectedCase)} : {}),
         report: selectedCase?caseReport:audit ? { src: 'a', id: audit.id, text: audit.text, created_at: audit.created_at, order_id: audit.order_id, metadata: auditMetadata(audit) } : null,
         order: caseProfile|| (order ? {
           id: order.id, org: order.object_name || '', client: order.owner_name || '',
@@ -1424,7 +1426,7 @@ function setupHandoff(app) {
       var d = req.body;
       if (d && (d.handoff_version === 2 || d.resume_case_id != null)) {
         if (!submitV2) submitV2 = require('./handoff-submit').createHandoffSubmitter({
-          pool, ready: ensureTables, packetService, telegram: bot.telegram, loadReport: getReport,
+          pool, ready: ensureTables, packetService, caseDocumentsService, telegram: bot.telegram, loadReport: getReport,
           pickChecklist, webappUrl: WEBAPP_URL,
         });
         return res.json(await submitV2({ body: d, user: req.tgUser, staff: req.staff }));
@@ -1558,6 +1560,7 @@ function setupHandoff(app) {
 
   // Запрос недостающих документов: в «Заявки по клиенту» и менеджеру
   app.post('/api/checklist/request', async function (req, res) {
+    if (['return_for_rework', 'resolve_rework', 'get_rework'].includes(req.body?.action)) return rework.handle(req, res);
     try {
       await ensureTables(); await ensureDeadlines();
       var c = (await pool.query('SELECT * FROM cases WHERE id=$1', [parseInt(req.body.case_id)])).rows[0];
@@ -2951,13 +2954,15 @@ function checklistPage(c, L, actorId) {
     '.st:before{content:"";flex:none;width:7px;height:7px;border-radius:50%;background:var(--ok)}',
     '.st.saving:before{background:var(--warn)}.st.err{color:var(--bad);cursor:pointer}.st.err:before{background:var(--bad)}',
     '.pbtn{flex:none;min-height:44px;border:0;border-radius:999px;padding:11px 18px;font:inherit;font-weight:600;font-size:14px;color:var(--ink);background:var(--well);cursor:pointer}',
+    '#rework-panel{border-radius:22px;padding:15px;margin:10px 0 16px}#rework-panel h2{font-size:17px}#rework-panel p{margin:8px 0;white-space:pre-wrap;overflow-wrap:anywhere}#rework-panel label{display:block;margin:10px 0 5px;font-weight:600}#rework-panel textarea{width:100%;min-height:100px;padding:10px;border:1px solid var(--hair);border-radius:12px;background:var(--well);color:var(--ink);font:inherit;resize:vertical}#rework-panel details{margin-top:12px}#rework-panel summary{cursor:pointer;padding:8px 0}#rework-panel .rework-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}#rework-panel .pbtn{display:inline-flex;align-items:center;text-decoration:none}#rework-panel [role=alert]{color:var(--bad)}#rework-panel .rework-history{border-top:1px solid var(--hair);padding:10px 0}#rework-panel [hidden]{display:none!important}',
+    '#rework-panel .rework-primary{background:var(--accent);color:#fff}#rework-panel .pbtn:disabled{opacity:.65;cursor:wait}',
     '#connectionBtn{flex:1 0 100%;background:var(--accent);color:#fff}#connectionBtn[hidden]{display:none}.pbtn:focus-visible,.st:focus-visible{outline:2px solid var(--accent);outline-offset:2px}',
     'button:focus-visible,.inp:focus-visible{outline:2px solid var(--accent);outline-offset:2px}',
     '@media (prefers-reduced-motion:reduce){*{transition:none!important}}',
     // печать
     '@media print{',
     ' html,body{background:#fff!important;color:#000;padding:0;font-size:11px}',
-    ' .field,.dock,#capsule .pbad,.chev,.link,.sign,.skip{display:none!important}',
+    ' .field,.dock,#capsule .pbad,.chev,.link,.sign,.skip,#rework-panel{display:none!important}',
     ' .docrow{padding:2px 0}.docname{font-size:11px}.docrow.lack .docname{color:#000;text-decoration:underline}',
     ' .glass{background:#fff!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important;box-shadow:none!important;border:1px solid #bbb}',
     ' .glass:before{display:none}',
@@ -2989,6 +2994,7 @@ function checklistPage(c, L, actorId) {
     '<style>' + css + '</style></head><body>' +
     '<div class="field" aria-hidden="true"><i></i><i></i><i></i></div>' +
     '<header class="top"><div class="kicker">' + esc(L.title) + '</div><h1>' + esc(c.org) + '</h1><div class="facts">' + facts + '</div></header>' +
+    '<section id="rework-panel" class="glass" aria-labelledby="rework-title" hidden><h2 id="rework-title">Доработка заявки</h2><div id="rework-state" role="status" aria-live="polite"></div><div id="rework-content"></div></section>' +
     '<button id="capsule" class="glass" type="button" aria-label="Прогресс чек-листа">' +
     '<svg viewBox="0 0 40 40"><circle class="trk" cx="20" cy="20" r="15"/><circle id="ring" cx="20" cy="20" r="15"/></svg>' +
     '<span class="pnums"><span id="pnum">0</span><span id="ptot"></span></span><span id="pbad" class="pbad"></span></button>' +
@@ -2997,7 +3003,7 @@ function checklistPage(c, L, actorId) {
     '<div class="dock glass"><span id="st" class="st" role="status" aria-live="polite" tabindex="0"></span><button id="printBtn" class="pbtn" type="button">Печать</button><button id="connectionBtn" class="pbtn" type="button" hidden>Проверить соединение</button></div>' +
     '<script>var HOLIDAYS=' + json(HOLIDAYS) + ';var WORKING_DAYS=' + json(WORKING_DAYS) + ';var DEFAULT_HOLIDAYS=' + json(DEFAULT_HOLIDAYS) + ';' +
     [isWorkday, addWorkdays, workdaysBetween, decisionDays, mskToday, ruDate].map(function (f) { return f.toString(); }).join('\n') +
-    '\nwindow.__CFG=' + json(cfg) + ';(' + checklistClient.toString() + ')();</script>' +
+    '\nwindow.__CFG=' + json(cfg) + ';(' + checklistClient.toString() + ')();(' + require('./case-rework-ui').toString() + ')(' + JSON.stringify(Number(c.id)) + ',' + JSON.stringify(String(actorId)) + ');</script>' +
     '</body></html>';
 }
 

@@ -44,15 +44,14 @@ function noticeWarning(state, caseId) {
   return prefix + (notice.warning || 'Краткая карточка в чате клиентов ещё не опубликована.') + ' Проверка: /handoff_notice ' + caseId + '.';
 }
 function summary(row, state) {
-  const lines = ['Клиент передан юристу', 'Организация: ' + clean(row.org)];
+  const ids = (row.order_id ? 'Заявка #' + row.order_id + ' · ' : row.request_id ? 'Исходная заявка #' + row.request_id + ' · ' : '') + 'Клиент #' + row.id;
+  const lines = ['Клиент передан юристу · ' + clean(row.lawyer_name, 200), '', 'Организация: ' + clean(row.org)];
   if (clean(row.object_name) && clean(row.object_name) !== clean(row.org)) lines.push('Объект: ' + clean(row.object_name));
-  lines.push('Адрес: ' + clean(row.address), (row.order_id ? 'Заявка #' + row.order_id + ' · ' : row.request_id ? 'Исходная заявка #' + row.request_id + ' · ' : '') + 'Клиент #' + row.id,
-    [clean(row.kind, 100), clean(row.service, 100)].filter(Boolean).join(' · '),
-    'Юрист: ' + clean(row.lawyer_name, 200), 'Приоритет: ' + clean(row.priority, 100),
-    state.body?.manual_client === true ? 'Карточка клиента — в личке юриста.' + (state.packet?.manual_materials?.length ? ' Приложенные документы — там же.' : '') : 'Отчёт и собранные материалы — в личке юриста.');
+  lines.push(clean(row.address), [clean(row.kind, 100), clean(row.service, 100), clean(row.priority, 100) && 'Приоритет: ' + clean(row.priority, 100)].filter(Boolean).join(' · '), ids, '',
+    state.body?.manual_client === true ? (state.packet?.manual_materials?.length ? 'Карточка и документы отправлены в личку юриста.' : 'Карточка отправлена в личку юриста.') : 'Отчёт и собранные материалы — в личке юриста.');
   if (['waiting', 'ordered'].includes(state.egrn?.result)) lines.push('ЕГРН: ожидается.');
-  lines.push((state.body?.manual_client === true ? 'Открыть клиента: ' : 'Открыть клиента и отчёт: ') + 'https://t.me/LRSZamer_bot?start=case_' + row.id,
-    'В работе у юриста: ' + Number(row.active_cases) + ' клиентов');
+  if (['none', 'missing', 'unavailable'].includes(state.egrn?.result)) lines.push('ЕГРН: отсутствует в комплекте.');
+  lines.push('Клиентов в работе у юриста: ' + Number(row.active_cases));
   return lines.join('\n');
 }
 

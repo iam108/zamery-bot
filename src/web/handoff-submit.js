@@ -82,25 +82,70 @@ function hasPendingLinkedEgrn(state,chat) {
   const files=state.linkedEgrn?.files||state.packet?.egrn_links||[];
   return Array.isArray(files)&&files.some(file=>!linkedReceipt(state,chat,String(file?.id||'').toLowerCase()));
 }
-function short(item,limit) {const s=value(item);return s.length>limit?s.slice(0,limit-1).replace(/[\uD800-\uDBFF]$/,'')+'…':s;}
+function reviewedDocuments(body, manual) {
+  if (body.extra_documents == null) return null;
+  const extra = body.extra_documents;
+  if (manual || !extra || typeof extra !== 'object' || Array.isArray(extra) || typeof extra.submit_id !== 'string' ||
+      !UUID.test(extra.submit_id) || extra.submit_id.toLowerCase() === body.submit_id.toLowerCase() || !Array.isArray(extra.files) ||
+      !extra.files.length || extra.files.length > 20) {
+    fail(400, 'HANDOFF_MATERIAL_INVALID', 'Проверьте дополнительные документы в форме передачи.');
+  }
+  return { submit_id: extra.submit_id.toLowerCase(), files: extra.files };
+}
+function short(item, limit) {
+  const source = value(item), escaped = esc(source);
+  if (escaped.length <= limit) return escaped;
+  let result = '';
+  for (const character of source) {
+    const entity = esc(character);
+    if (result.length + entity.length >= limit) break;
+    result += entity;
+  }
+  return result.trimEnd() + '…';
+}
 function cardText(c,state) {
-  const report=state.packet.report||{},lines=['⚖️ <b>Клиент передан юристу</b>','🏢 <b>'+esc(c.org)+'</b>','📍 '+esc(c.address),esc([c.kind,c.service,c.region].join(' · '))];
-  if(c.inn)lines.push('ИНН: '+esc(c.inn));
-  if(state.fields.cad_num)lines.push('Кадастр: '+esc(state.fields.cad_num));
-  const contacts=c.contacts.filter(contact=>contact.name||contact.phone||contact.tg);
-  for(const contact of contacts.slice(0,3)){const parts=[contact.name,contact.phone,contact.tg].filter(Boolean);if(parts.length)lines.push('👤 '+parts.map(part=>esc(short(part,120))).join(' · '));}
-  if(contacts.length>3)lines.push('Остальные контакты — в карточке клиента.');
-  lines.push('⚖️ Юрист: '+esc(c.lawyer_name),'Приоритет: '+esc(c.priority));
-  if(report.actor)lines.push('Аудитор: '+esc(short(report.actor,100)));
-  const status={ready:'Соответствует по проверенным пунктам',actions:'Нужны действия',insufficient:'Нужно уточнить',obstacle:'Есть препятствие'}[report.status];
-  if(status)lines.push('Итог аудита: '+esc(status));
-  if(state.packet.report)lines.push('Полный отчёт и оригиналы — следом.');
-  else if(c.audit_text)lines.push(esc(short(c.audit_text,1000)));
-  if(state.packet.materials.length)lines.push('Документы заявки: '+state.packet.materials.length+'.');
-  if(state.packet.manual_materials?.length)lines.push('Документы клиента: '+state.packet.manual_materials.length+'.');
-  if(c.comment)lines.push('💬 '+esc(short(c.comment,500)));
-  if(state.manager_name)lines.push('Передал: '+esc(short(state.manager_name,100)));
-  lines.push('#заявка'+c.id);return lines.join('\n');
+  const packet = state.packet, report = packet.report || {};
+  const materials = packet.materials || [], media = report.media || [];
+  const reference = c.order_id ? ' · заявка №' + c.order_id : '';
+  const lines = ['⚖️ <b>Клиент №' + c.id + reference + '</b>', '<b>' + short(c.org, 500) + '</b>', short(c.address, 500),
+    short([c.kind, c.service, c.region, c.priority].filter(Boolean).join(' · '), 160)];
+  const identifiers = [c.inn && 'ИНН ' + c.inn, state.fields.cad_num && 'кадастр ' + state.fields.cad_num].filter(Boolean);
+  if (identifiers.length) lines.push(short(identifiers.join(' · '), 150));
+
+  const contacts = (c.contacts || []).filter(contact => contact.name || contact.phone || contact.tg);
+  if (contacts.length) {
+    lines.push('', '<b>Контакты</b>');
+    for (const contact of contacts.slice(0, 2)) lines.push(short([contact.name, contact.phone, contact.tg].filter(Boolean).join(' · '), 150));
+    if (contacts.length > 2 || contacts.some(contact => contact.comment)) lines.push('Все контакты и примечания — в разделе «Документы клиента».');
+  }
+
+  if (c.comment || state.manager_name) {
+    lines.push('', '<b>От менеджера</b>');
+    if (c.comment) {
+      const comment = short(c.comment, 500);
+      lines.push(comment);
+      if (comment !== esc(value(c.comment))) lines.push('Весь комментарий — в разделе «Документы клиента».');
+    }
+    if (state.manager_name) lines.push('Передал: ' + short(state.manager_name, 100));
+  }
+
+  if (packet.report || c.audit_text || materials.length || packet.manual_materials?.length || state.extraDocuments?.files?.length) {
+    lines.push('', '<b>Материалы</b>');
+    const status = { ready: 'Соответствует по проверенным пунктам', actions: 'Нужны действия', insufficient: 'Нужно уточнить', obstacle: 'Есть препятствие' }[report.status];
+    if (packet.report) lines.push('Отчёт аудитора' + (status ? ' · ' + status : '') + (report.actor ? ' · ' + short(report.actor, 100) : ''));
+    else if (c.audit_text) lines.push(short(c.audit_text, 350));
+    if (report.readiness?.territory) lines.push('Территория: ' + short(report.readiness.territory, 220));
+    if (media.length) lines.push('Оригиналы аудита: ' + media.length + '.');
+    if (materials.length) lines.push('Документы заявки: ' + materials.length + '.');
+    if (packet.manual_materials?.length) lines.push('Документы клиента: ' + packet.manual_materials.length + '.');
+    if (state.extraDocuments?.files?.length) lines.push('Дополнительные документы: ' + state.extraDocuments.files.length + '.');
+    if (materials.some(file => file.role === 'egrn') || packet.egrn_links?.length) lines.push('ЕГРН входит в комплект.');
+    else if (state.egrn?.result === 'attached') lines.push('ЕГРН отправлена отдельным сообщением.');
+    else if (['waiting', 'ordered'].includes(state.egrn?.result)) lines.push('ЕГРН ожидается отдельным сообщением.');
+    else if (state.fields.cad_num && state.body?.manual_client !== true) lines.push('ЕГРН по кадастру отправляется отдельно при наличии.');
+  }
+  lines.push('', '#заявка' + c.id);
+  return lines.join('\n');
 }
 function reportUrl(base,state,caseId) {
   let url;try{url=new URL('/handoff',base);}catch(_){fail(503,'HANDOFF_CONFIG','Не настроена ссылка на карточку передачи.');}
@@ -108,7 +153,7 @@ function reportUrl(base,state,caseId) {
   if(!state.body.report_id||!['a','r'].includes(state.body.report_src))return null;
   const params={view:'report',report_src:state.body.report_src,report_id:String(state.body.report_id)};
   if(state.body.order_id)params.order_id=String(state.body.order_id);
-  else if(caseId)params.case_id=String(caseId);
+  if(caseId)params.case_id=String(caseId);
   url.search=new URLSearchParams(params).toString();return url.href;
 }
 function cardOptions(base,c,state) {
@@ -120,14 +165,15 @@ function cardOptions(base,c,state) {
   const video=https(report.video_url),archive=https(state.packet.archive_url);
   if(video)keyboard.push([{text:'▶ Видео осмотра',url:video}]);
   if(archive)keyboard.push([{text:'Архив объекта',url:archive}]);
+  if(c.checklist_key)keyboard.push([{text:'Вернуть на доработку',web_app:{url:new URL('/checklist?case_id='+c.id+'&rework=1',base).href}}]);
   return {parse_mode:'HTML',...(keyboard.length?{reply_markup:{inline_keyboard:keyboard}}:{})};
 }
 function partial(c,state,warn,retry=true) {return {ok:true,id:Number(c.id),delivery_complete:false,retry, ...(state.manual_review?{manual_review:true}:{}),warn};}
-function completed(c,state) {const warn=[state.egrn?.note,noticeWarning(state,c.id)].filter(Boolean).join('\n');return {ok:true,id:Number(c.id),delivery_complete:true,...(warn?{warn}:{}),...(state.groupNotice?{group_notice:{status:state.groupNotice.status,manual_review:state.groupNotice.status==='unknown'||!!state.groupNotice.intent}}:{})};}
+function completed(c,state) {const warn=[state.egrn?.note,noticeWarning(state,c.id)].filter(Boolean).join('\n');return {ok:true,id:Number(c.id),delivery_complete:true,...(warn?{warn}:{}),...(state.extraDocuments?.completed?{extra_documents_submit_id:state.extraDocuments.submit_id}:{}),...(state.groupNotice?{group_notice:{status:state.groupNotice.status,manual_review:state.groupNotice.status==='unknown'||!!state.groupNotice.intent}}:{})};}
 
 function createHandoffSubmitter(options={}) {
   const pool=options.pool||require('../db/pool');let initialized;
-  let manualMaterials;
+  let manualMaterials, caseDocuments;
   const manualStore=()=>manualMaterials||=options.manualMaterialsStore||require('./handoff-manual-materials').createManualMaterialsStore(pool);
   async function ensure() {
     if(!initialized)initialized=(async()=>{if(options.ready)await options.ready();await pool.query(DDL);})().catch(error=>{initialized=null;throw error;});
@@ -135,6 +181,9 @@ function createHandoffSubmitter(options={}) {
   }
   const packetService=()=>options.packetService||require('./handoff-packet').createPacketService({pool});
   const telegram=()=>options.telegram||require('../bot/instance').telegram;
+  const documentsService = () => caseDocuments ||= options.caseDocumentsService || require('./handoff-case-documents').createCaseDocumentsService({
+    pool, ready: options.ready, store: manualStore(), telegram: telegram(), lockPool: options.caseDocumentsLockPool,
+  });
   let noticePublisher;
   const finishNotice=async(c,state,client,actorId)=>{
     if(pendingNotice(state)){
@@ -160,6 +209,13 @@ function createHandoffSubmitter(options={}) {
     if(state.version!==2||!state.packet||!state.body) {const error=new HandoffError(409,'HANDOFF_CHECKPOINT_MISSING','Не удалось подтвердить состояние передачи. Проверьте созданного клиента перед повтором.');error.case_created=true;error.case_id=Number(c.id);throw error;}
     return state;
   }
+  function unchangedRecipient(c, state) {
+    const reviewedLawyer = state.body?.lawyer_tg_id;
+    return reviewedLawyer != null && String(reviewedLawyer) === String(c.lawyer_tg_id);
+  }
+  function changedRecipient(c, state) {
+    return partial(c, state, 'Назначенный юрист изменился. Проверьте получателя перед продолжением передачи.');
+  }
   return async function submit({body,user,staff}={}) {
     if (!canManageCases(staff, user && user.id)) fail(403, 'HANDOFF_FORBIDDEN', 'Передавать клиента может менеджер.');
     let owner = String(user?.id || '');
@@ -177,6 +233,7 @@ function createHandoffSubmitter(options={}) {
     }
     if (!body || typeof body !== 'object' || Array.isArray(body) || body.handoff_version !== 2 || !UUID.test(body.submit_id || '')) fail(400, 'HANDOFF_INVALID', 'Для передачи нужен постоянный номер отправки и версия формы 2.');
     const manual=manualClient(body);
+    const extra = reviewedDocuments(body, manual);
     const orderId=body.order_id==null?null:positive(body.order_id,'Выберите заявку на выезд.'),reportId=body.report_id==null?null:positive(body.report_id,'Выберите сохранённый отчёт аудитора.');
     if(orderId>2147483647||reportId>2147483647)fail(400,'HANDOFF_INVALID','Некорректный номер заявки или отчёта.');
     if(orderId&&!reportId||reportId&&!['a','r'].includes(body.report_src)||!reportId&&body.report_src!=null)fail(400,'HANDOFF_INVALID','Выберите сохранённый отчёт аудитора.');
@@ -186,21 +243,52 @@ function createHandoffSubmitter(options={}) {
     let serialized;try{serialized=canonical(body);}catch(_){fail(400,'HANDOFF_INVALID','Не удалось прочитать данные передачи.');}
     if(Buffer.byteLength(serialized)>2*1024*1024)fail(413,'HANDOFF_INVALID','Слишком большой текст передачи.');
     const signature=createHash('sha256').update(serialized).digest('hex'),submitId=body.submit_id.toLowerCase();
-    let c,state,client,locked=false,orderLocked=false,unlockError,receiptPending=false;
+    let c,state,client,locked=false,orderLocked=false,extraBatchLocked=false,extraUploadLocked=false,unlockError,receiptPending=false;
+    const extraUploadKey = extra && owner + ':' + extra.submit_id;
+    const releaseExtraLocks = async () => {
+      if (extraUploadLocked) {
+        await client.query('SELECT pg_advisory_unlock(111,hashtext($1))', [extraUploadKey]);
+        extraUploadLocked = false;
+      }
+      if (extraBatchLocked) {
+        await client.query('SELECT pg_advisory_unlock(113,hashtext($1))', [extra.submit_id]);
+        extraBatchLocked = false;
+      }
+    };
     try {
       await ensure();
-      if(manual)await manualStore().ensure();
+      if (manual || extra) await manualStore().ensure();
       c=await getExisting(pool,owner,submitId);
       if(c)state=compatible(c,signature);
       await checkActor(pool,user.id);
-      if(c){state=compatible(c,signature);if(state.completed&&!hasPendingLinkedEgrn(state,c.lawyer_tg_id)&&!pendingNotice(state))return completed(c,state);if(state.manual_review)return partial(c,state,state.manual_review,false);}
+      if (c) {
+        if (state.manual_review) return partial(c, state, state.manual_review, false);
+        if (!unchangedRecipient(c, state)) return changedRecipient(c, state);
+        if (state.completed && !hasPendingLinkedEgrn(state, c.lawyer_tg_id) && !pendingNotice(state)) return completed(c, state);
+      }
       client=await getSessionLockPool(pool,options.lockPool).connect();
       locked=!!(await client.query('SELECT pg_try_advisory_lock(111,hashtext($1)) AS locked',[owner+':'+submitId])).rows[0]?.locked;
-      if(!locked){if(c)return state.completed&&!hasPendingLinkedEgrn(state,c.lawyer_tg_id)?completed(c,state):partial(c,state,'Передача уже выполняется. Повторите проверку результата.',true);const busy=new HandoffError(409,'HANDOFF_BUSY','Передача уже выполняется. Повторите проверку результата.');delete busy.case_created;throw busy;}
+      if (!locked) {
+        c=await getExisting(client,owner,submitId);
+        if (c) {
+          state=compatible(c,signature);
+          await checkActor(client,user.id);
+          if (state.manual_review) return partial(c,state,state.manual_review,false);
+          if (!unchangedRecipient(c,state)) return changedRecipient(c,state);
+          if (state.completed && !hasPendingLinkedEgrn(state,c.lawyer_tg_id)) return completed(c,state);
+          return partial(c,state,'Передача уже выполняется. Повторите проверку результата.',true);
+        }
+        const busy=new HandoffError(409,'HANDOFF_BUSY','Передача уже выполняется. Повторите проверку результата.');delete busy.case_created;throw busy;
+      }
       c=await getExisting(client,owner,submitId);
       if(c)state=compatible(c,signature);
       await checkActor(client,user.id);
-      if(c){state=compatible(c,signature);if(state.completed&&!hasPendingLinkedEgrn(state,c.lawyer_tg_id))return await finishNotice(c,state,client,user.id);if(state.inflight||state.materials?.inflight)state.manual_review='Не удалось сохранить подтверждение предыдущей отправки. Проверьте уже доставленные сообщения вручную; автоматический повтор остановлен, чтобы не создавать дубли.';if(state.manual_review)return partial(c,state,state.manual_review,false);}
+      if (c) {
+        if (state.inflight || state.materials?.inflight) state.manual_review='Не удалось сохранить подтверждение предыдущей отправки. Проверьте уже доставленные сообщения вручную; автоматический повтор остановлен, чтобы не создавать дубли.';
+        if (state.manual_review) return partial(c, state, state.manual_review, false);
+        if (!unchangedRecipient(c, state)) return changedRecipient(c, state);
+        if (state.completed && !hasPendingLinkedEgrn(state,c.lawyer_tg_id)) return await finishNotice(c,state,client,user.id);
+      }
       else {
         if(assignmentKey)orderLocked=!!(await client.query('SELECT pg_try_advisory_lock(112,$1) AS locked',[assignmentKey])).rows[0]?.locked;
         const assigned=orderId?(await client.query('SELECT * FROM cases WHERE order_id=$1 ORDER BY id DESC LIMIT 1',[orderId])).rows[0]:requestId?(await client.query('SELECT * FROM cases WHERE request_id=$1 ORDER BY id DESC LIMIT 1',[requestId])).rows[0]:null;
@@ -208,7 +296,7 @@ function createHandoffSubmitter(options={}) {
           const error=new HandoffError(409,'HANDOFF_ALREADY_ASSIGNED','Заявка уже передана юристу «'+(value(assigned.lawyer_name)||'не указан')+'», клиент №'+assigned.id+'.');
           const assignedState = json(json(assigned.data)._handoff);
           if (assignedState.version === 2) {
-            error.delivery_complete = assignedState.completed === true && !hasPendingLinkedEgrn(assignedState,assigned.lawyer_tg_id);
+            error.delivery_complete = assignedState.completed === true && unchangedRecipient(assigned, assignedState) && !hasPendingLinkedEgrn(assignedState,assigned.lawyer_tg_id);
             error.can_resume = !error.delivery_complete && !assignedState.manual_review;
           }
           error.case_created=true;error.case_id=Number(assigned.id);error.retry=false;throw error;
@@ -219,6 +307,11 @@ function createHandoffSubmitter(options={}) {
         if(!packet||Number(packet.order?.id||0)!==Number(orderId||0)||reportId&&(!packet.report||packet.report.id!==reportId||packet.report.src!==body.report_src)||!reportId&&packet.report)fail(409,'HANDOFF_REPORT_UNAVAILABLE','Не удалось подтвердить выбранный отчёт и заявку.');
         if(!orderId&&((packet.materials||[]).length||(packet.egrn_links||[]).length))fail(409,'HANDOFF_REPORT_UNAVAILABLE','У материалов должна быть сохранённая исходная заявка. Откройте её перед передачей.');
         if(!/^[a-f\d]{64}$/i.test(body.packet_signature||'')||body.packet_signature!==packet.signature)fail(409,'HANDOFF_PACKET_CHANGED','Заявка или её документы изменились. Обновите комплект перед передачей.');
+        if (packet.report?.readiness?.blocking === true) {
+          const issues = Array.isArray(packet.report.readiness.issues) ? packet.report.readiness.issues.map(value).filter(Boolean).slice(0, 6) : [];
+          const message = 'До передачи нужен уточнённый отчёт аудитора.';
+          fail(409, 'HANDOFF_REPORT_INCOMPLETE', issues.length ? message + '\n' + issues.join('\n') : message);
+        }
         const lawyer=(await client.query("SELECT tg_id,name FROM staff WHERE tg_id=$1 AND role='lawyer' AND approved=true",[lawyerId])).rows[0];
         if(!lawyer)fail(400,'HANDOFF_LAWYER','Юрист не найден среди одобренных сотрудников.');
         const checklist=(options.pickChecklist||require('../checklists').pickChecklist)(d.region,d.kind,d.service);
@@ -229,6 +322,26 @@ function createHandoffSubmitter(options={}) {
           catch(error){
             const messages={HANDOFF_MATERIAL_CHANGED:'Документы клиента изменились. Обновите список перед передачей.',HANDOFF_MATERIAL_INTEGRITY:'Не удалось подтвердить целостность документа клиента. Передача остановлена.',HANDOFF_MATERIAL_INVALID:'Проверьте список документов клиента.'};
             if(messages[error.code])throw new HandoffError(error.code==='HANDOFF_MATERIAL_INTEGRITY'?503:error.code==='HANDOFF_MATERIAL_CHANGED'?409:400,error.code,messages[error.code]);
+            throw error;
+          }
+        }
+        let extraDocuments;
+        if (extra) {
+          // Reserve the same identities used by the upload and supplemental
+          // delivery routes until the reviewed selection is bound to the case.
+          extraBatchLocked = !!(await client.query('SELECT pg_try_advisory_lock(113,hashtext($1)) AS locked', [extra.submit_id])).rows[0]?.locked;
+          if (!extraBatchLocked) fail(409, 'HANDOFF_MATERIAL_CHANGED', 'Документы уже отправляются. Обновите список перед передачей.');
+          extraUploadLocked = !!(await client.query('SELECT pg_try_advisory_lock(111,hashtext($1)) AS locked', [extraUploadKey])).rows[0]?.locked;
+          if (!extraUploadLocked) fail(409, 'HANDOFF_MATERIAL_CHANGED', 'Дождитесь сохранения документов и обновите список перед передачей.');
+          const used = await client.query(`SELECT id::text AS id FROM case_document_batches WHERE id=$1::text::uuid
+            UNION ALL SELECT id::text FROM cases WHERE data#>>'{_handoff,extraDocuments,submit_id}'=$1 OR (created_by=$2 AND handoff_submit_id=$1) LIMIT 1`, [extra.submit_id, owner]);
+          if (used.rows.length) fail(409, 'HANDOFF_MATERIAL_CHANGED', 'Этот пакет документов уже привязан к клиенту. Обновите список перед передачей.');
+          try {
+            const files = await manualStore().freeze(client, owner, extra.submit_id, extra.files);
+            extraDocuments = { submit_id: extra.submit_id, files, completed: false };
+          } catch (error) {
+            if (error.code === 'HANDOFF_MATERIAL_CHANGED' || error.code === 'HANDOFF_MATERIAL_INVALID') fail(409, 'HANDOFF_MATERIAL_CHANGED', 'Дополнительные документы изменились. Обновите список перед передачей.');
+            if (error.code === 'HANDOFF_MATERIAL_INTEGRITY') fail(503, 'HANDOFF_MATERIAL_INTEGRITY', 'Не удалось подтвердить целостность дополнительного документа. Проверьте исходный файл.');
             throw error;
           }
         }
@@ -243,7 +356,7 @@ function createHandoffSubmitter(options={}) {
         }
         const recipients=[{chat:String(lawyer.tg_id),role:'lawyer'}];
         const groupNotice=initialNotice(options.clientsChatId??process.env.CLIENTS_CHAT_ID);
-        state={version:2,body:JSON.parse(serialized),fields:d,packet,source,request,manager_name:value(staff?.name),recipients,cards:{},auditCopies:{},requestCopies:{},materials:{confirmed:{},completed:manual?!packet.manual_materials.length:!orderId},linkedEgrn:{files:linkedOriginals(packet),confirmed:{},completed:false},egrn:{completed:manual,order_started:false,...(manual?{result:'skipped-manual'}:{})},completed:false,...(groupNotice?{groupNotice}:{})};
+        state={version:2,body:JSON.parse(serialized),fields:d,packet,source,request,manager_name:value(staff?.name),recipients,cards:{},auditCopies:{},requestCopies:{},materials:{confirmed:{},completed:manual?!packet.manual_materials.length:!orderId},linkedEgrn:{files:linkedOriginals(packet),confirmed:{},completed:false},egrn:{completed:manual,order_started:false,...(manual?{result:'skipped-manual'}:{})},completed:false,...(groupNotice?{groupNotice}:{}),...(extraDocuments?{extraDocuments}:{})};
         reportUrl(options.webappUrl||process.env.WEBAPP_URL,state);
         await checkActor(client,user.id);
         c=(await client.query(`INSERT INTO cases(order_id,lawyer_tg_id,lawyer_name,checklist_key,org,inn,client,phone,address,region,kind,service,priority,comment,audit_text,total,created_by,contacts,request_id,handoff_submit_id,handoff_signature,data)
@@ -252,7 +365,9 @@ function createHandoffSubmitter(options={}) {
           ON CONFLICT(created_by,handoff_submit_id) WHERE handoff_submit_id IS NOT NULL DO NOTHING RETURNING *`,
           [orderId,lawyer.tg_id,lawyer.name,checklist,d.org,d.inn,d.client,d.phone,d.address,d.region,d.kind,d.service,d.priority,d.comment,packet.report?.text||value(body.audit_text).slice(0,12000),owner,JSON.stringify(d.contacts),requestId,submitId,signature,JSON.stringify({_handoff:state}),user.id,canManageCases({approved:true,role:'auditor'},user.id)])).rows[0];
         if(!c){c=await getExisting(client,owner,submitId);if(!c){await checkActor(client,user.id);throw new Error('No durable handoff case');}state=compatible(c,signature);}
+        await releaseExtraLocks();
       }
+      if (!unchangedRecipient(c, state)) return changedRecipient(c, state);
       c.contacts=Array.isArray(c.contacts)?c.contacts:json(c.contacts);if(!Array.isArray(c.contacts))c.contacts=state.fields.contacts;
       // Older checkpoints include shared chats. Rebuild the destination from
       // the assigned lawyer on every retry, preserving their file receipts.
@@ -355,7 +470,7 @@ function createHandoffSubmitter(options={}) {
           ? options.manualMaterialDelivery||require('./handoff-materials').createHandoffMaterialsDelivery({telegram:tg,loadMaterials:id=>manualStore().loadCase(id),label:'Клиент',description:'Документы клиента.'})
           : options.materialDelivery||require('./handoff-materials').createHandoffMaterialsDelivery({telegram:tg});
         const targets=state.recipients.map(target=>({chat:target.chat,reply:state.cards[target.chat]}));
-        const exclude=new Set(state.source.hashes||[]);
+        const exclude = new Set(state.source.hashes || []);
         const result=await deliver(manual?Number(c.id):Number(state.body.order_id),targets,exclude,{expectedFiles:manual?state.packet.manual_materials:state.packet.materials,packetHash:state.materials.packetHash,confirmed:state.materials.confirmed,beforeSend:chat=>checkRecipient(chat),
           onPrepared:async prepared=>{Object.assign(state.materials,prepared);state.materials.inflight=true;await save();},
           onPart:async(chat,index,id,prepared)=>{receiptPending=true;validateReceipts(chat,{message_id:id});Object.assign(state.materials,prepared);const key=String(chat),ids=state.materials.confirmed[key]||[];if(index!==ids.length)throw new Error('Noncontiguous material receipt');ids.push(id);state.materials.confirmed[key]=ids;await save(true);receiptPending=false;}});
@@ -365,6 +480,27 @@ function createHandoffSubmitter(options={}) {
         }
         state.materials.inflight=false;await save(true);await checkActor(client,user.id);
         state.materials.completed=true;await save();
+      }
+      if (state.extraDocuments && !state.extraDocuments.completed) {
+        const caseId = Number(c.id), submitId = state.extraDocuments.submit_id, recipient = String(c.lawyer_tg_id);
+        await checkRecipient(recipient);
+        const result = await documentsService().sendReviewed({ caseId, actorId: user.id, submitId });
+        const batch = result?.batch;
+        if (result?.ok !== true || result.case_id !== caseId || batch?.id !== submitId || !['delivered', 'pending', 'review'].includes(batch.status) ||
+            result.delivery_complete !== (batch.status === 'delivered')) {
+          return partial(c, state, 'Не удалось подтвердить состояние дополнительных документов. Продолжите эту же передачу.');
+        }
+        if (!result.delivery_complete) {
+          if (batch.status === 'review') {
+            state.manual_review = result.warn || 'Доставка дополнительных документов требует проверки в Telegram.';
+            await save(true);
+            return partial(c, state, state.manual_review, false);
+          }
+          return partial(c, state, result.warn || 'Дополнительные документы ещё не доставлены. Продолжите эту же передачу.', batch.retry !== false);
+        }
+        state.extraDocuments.completed = true;
+        await save(true);
+        await checkRecipient(recipient);
       }
       if(state.linkedEgrn.files.length){
         const links=state.linkedEgrn,target=String(c.lawyer_tg_id);
@@ -433,6 +569,7 @@ function createHandoffSubmitter(options={}) {
         // Final case completion below still requires the current actor.
         await save(providerOutcome);
       }
+      await checkRecipient(String(c.lawyer_tg_id));
       state.completed=true;await save();return await finishNotice(c,state,client,user.id);
     } catch(error) {
       if(c&&state&&(error?.code==='HANDOFF_FORBIDDEN'||error?.actor_forbidden)){
@@ -447,6 +584,9 @@ function createHandoffSubmitter(options={}) {
       const safe=new Error('Не удалось подтвердить создание или доставку клиента. Повторите ту же передачу без изменения данных.');safe.status=503;safe.code='HANDOFF_UNAVAILABLE';throw safe;
     } finally {
       if(client){
+        if (extraBatchLocked || extraUploadLocked) {
+          try { await releaseExtraLocks(); } catch (error) { unlockError = error; }
+        }
         if(orderLocked){try{await client.query('SELECT pg_advisory_unlock(112,$1)',[assignmentKey]);}catch(error){unlockError=error;}}
         if(locked){try{await client.query('SELECT pg_advisory_unlock(111,hashtext($1))',[owner+':'+submitId]);}catch(error){unlockError=error;}}
         client.release(unlockError);

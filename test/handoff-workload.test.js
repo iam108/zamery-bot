@@ -15,7 +15,7 @@ async function fixture(run){
   const context=vm.createContext({module:{exports:{}},process:{env:{}},console:{error(){},log(){}},Buffer,URL,Date,setTimeout(){},setInterval(){},require(name){
     if(name==='../db/pool')return pool;
     if(name==='../bot/instance')return{telegram:{sendMessage(){assert.fail('Workload reads must send no Telegram messages');}}};
-    if(name==='./handoff-packet')return{setupHandoffPacket(){return{};}};
+    if(name==='./handoff-packet')return{...local(name),setupHandoffPacket(){return{};}};
     if(name==='./auth')return auth;
     return local(name);
   }});

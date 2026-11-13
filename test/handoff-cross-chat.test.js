@@ -55,6 +55,7 @@ async function fixture(run) {
     const input = { body, user: { id: 101 }, staff: { name: 'Synthetic manager', role: 'manager', approved: true } };
     const cases = async () => (await db.query('SELECT * FROM cases ORDER BY id')).rows;
     await run({ db, api, events, auditIds, cases, input, submit: () => createHandoffSubmitter(options)(input),
+      async refreshPreview() { input.body.packet_signature = (await packetService.packet(input.body)).signature; },
       intercept(fn) { intercept = fn; }, loads: () => loads });
     assert.ok(events.every(event => event.chat === LAWYER), 'Only the assigned lawyer receives the packet');
   } finally { await db.close(); }
@@ -107,6 +108,9 @@ test('a stored V2 single-chat cursor without a sources list resumes without repe
 
 test('V2 privately forwards captionless nested photo and audio replies from every linked source exactly once', pg, async () => fixture(async h => {
   await h.db.exec("INSERT INTO reports(id,chat_id,first_id,msg_ids,text,author,reply_to) VALUES(11,-100200,84,'{84}','','Synthetic auditor',82),(12,-100100,300,'{300}','Nested photo caption','Synthetic auditor',184),(13,-100100,301,'{301}','','Synthetic auditor',300)");
+  await assert.rejects(h.submit(), { code:'HANDOFF_PACKET_CHANGED' });
+  assert.equal(h.events.length,0);
+  await h.refreshPreview();
   const result = await h.submit(); assert.equal(result.delivery_complete,true);
   const copies = h.events.filter(event => event.type === 'copy');
   assert.deepEqual(copies.filter(event => event.source === CLIENTS).flatMap(event => event.ids),[80,81,82,83,84]);

@@ -7,6 +7,7 @@ const {createHandoffMaterialsDelivery}=require('./handoff-materials');
 const {LIMITS}=require('./order-materials');
 const UUID=/^[a-f\d]{8}-[a-f\d]{4}-[1-8][a-f\d]{3}-[89ab][a-f\d]{3}-[a-f\d]{12}$/i;
 const object=value=>value&&typeof value==='object'&&!Array.isArray(value)?value:{};
+const handoff=row=>object(object(row.data)._handoff);
 const positive=value=>(typeof value==='number'||typeof value==='string'&&/^[1-9]\d*$/.test(value))&&Number.isSafeInteger(Number(value))&&Number(value)>0;
 function fail(status,code,message){throw Object.assign(new Error(message),{status,code});}
 function caseNumber(value){if(!positive(value)||Number(value)>2147483647)fail(400,'CASE_DOCUMENT_INVALID','Некорректный клиент.');return Number(value);}
@@ -16,7 +17,7 @@ function requestedFiles(value){
   if(!Array.isArray(value)||!value.length||value.length>LIMITS.files)fail(400,'CASE_DOCUMENT_INVALID','Прикрепите от 1 до 20 документов.');
   return value.map(file=>{if(!file||typeof file!=='object'||Array.isArray(file))fail(400,'CASE_DOCUMENT_INVALID','Проверьте список документов.');return metadata(file);});
 }
-const ACCESS_SQL=`SELECT c.id,c.org,c.lawyer_tg_id,c.data,actor.tg_id,actor.role,actor.approved,
+const ACCESS_SQL=`SELECT c.id,c.org,c.created_by,c.lawyer_tg_id,c.data,actor.tg_id,actor.role,actor.approved,
   lawyer.tg_id AS recipient_id,lawyer.role AS recipient_role,lawyer.approved AS recipient_approved
   FROM cases c LEFT JOIN staff actor ON actor.tg_id=$2 LEFT JOIN staff lawyer ON lawyer.tg_id=c.lawyer_tg_id WHERE c.id=$1`;
 
@@ -51,23 +52,44 @@ function createCaseDocumentsService(options={}){
     if(!found||JSON.stringify(metadata(found))!==JSON.stringify(metadata(expected)))fail(503,'CASE_DOCUMENT_INTEGRITY','Не удалось подтвердить целостность документа.');
     await access(caseId,actorId);return found;
   }
-  async function send({caseId,actorId,submitId,files,retry=false}={}){
-    caseId=caseNumber(caseId);submitId=batchNumber(submitId);if(!retry)files=requestedFiles(files);
+  async function send({caseId,actorId,submitId,files,retry=false}={}, reviewed = false){
+    caseId=caseNumber(caseId);submitId=batchNumber(submitId);if(!retry&&!reviewed)files=requestedFiles(files);
     await ensure();let current=await access(caseId,actorId,true),client,batch,locked=false,uploadLocked=false,unlockError,owner=String(actorId),receiptPending=false;
+    function requireReviewed(row) {
+      const state = handoff(row), binding = state.extraDocuments, expected = state.body?.extra_documents;
+      if (state.version !== 2 || binding?.submit_id !== submitId || typeof expected?.submit_id !== 'string' || expected.submit_id.toLowerCase() !== submitId ||
+          !positive(row.created_by) || String(state.body?.lawyer_tg_id) !== String(row.lawyer_tg_id)) {
+        fail(409, 'CASE_DOCUMENT_CHANGED', 'Сохранённый пакет документов или назначение юриста изменились. Проверьте передачу.');
+      }
+      const frozen = requestedFiles(binding.files);
+      if (JSON.stringify(frozen) !== JSON.stringify(requestedFiles(expected.files))) fail(409, 'CASE_DOCUMENT_CHANGED', 'Состав документов отличается от подтверждённого. Проверьте передачу.');
+      return { owner: String(row.created_by), files: frozen };
+    }
     const respond=()=>{const view=batchView(batch,current);return {ok:true,case_id:caseId,batch:view,delivery_complete:view.delivery_complete,...(view.warn?{warn:view.warn}:{})};};
     try{
       client=await getSessionLockPool(pool,options.lockPool,'case-documents').connect();
       locked=!!(await client.query('SELECT pg_try_advisory_lock(113,hashtext($1)) AS locked',[submitId])).rows[0]?.locked;
       if(!locked)fail(409,'CASE_DOCUMENT_BUSY','Документы уже отправляются. Проверьте результат через несколько секунд.');
+      current=await access(caseId,actorId,true,client);
+      if (reviewed) ({ owner, files } = requireReviewed(current));
+      else if (!retry && (await client.query("SELECT id FROM cases WHERE data#>>'{_handoff,extraDocuments,submit_id}'=$1 LIMIT 1",[submitId])).rows.length) {
+        fail(409,'CASE_DOCUMENT_CHANGED','Документы входят в сохранённую передачу. Продолжите передачу клиента.');
+      }
       const existing=(await client.query('SELECT * FROM case_document_batches WHERE id=$1',[submitId])).rows[0];
       if(existing){
-        if(Number(existing.case_id)!==caseId||!retry&&(String(existing.owner_tg_id)!==String(actorId)||JSON.stringify(existing.files.map(metadata))!==JSON.stringify(files)))fail(409,'CASE_DOCUMENT_CHANGED','Этот пакет уже сохранён с другими данными. Откройте список документов клиента.');
+        if(Number(existing.case_id)!==caseId||!retry&&(String(existing.owner_tg_id)!==owner||JSON.stringify(existing.files.map(metadata))!==JSON.stringify(files)))fail(409,'CASE_DOCUMENT_CHANGED','Этот пакет уже сохранён с другими данными. Откройте список документов клиента.');
         batch=existing;
         owner=String(batch.owner_tg_id);
       }else if(retry)fail(404,'CASE_DOCUMENT_MISSING','Пакет документов не найден.');
       uploadLocked=!!(await client.query('SELECT pg_try_advisory_lock(111,hashtext($1)) AS locked',[owner+':'+submitId])).rows[0]?.locked;
       if(!uploadLocked)fail(409,'CASE_DOCUMENT_BUSY','Документы ещё сохраняются. Повторите отправку после загрузки.');
       current=await access(caseId,actorId,true,client);
+      const verifyBinding = () => {
+        if (!reviewed) return;
+        const expected = requireReviewed(current);
+        if (expected.owner !== owner || JSON.stringify(expected.files) !== JSON.stringify(files)) fail(409, 'CASE_DOCUMENT_CHANGED', 'Состав документов отличается от подтверждённого. Проверьте передачу.');
+      };
+      verifyBinding();
       if(!batch){
         if(!positive(current.recipient_id)||String(current.recipient_id)!==String(current.lawyer_tg_id)||current.recipient_role!=='lawyer'||current.recipient_approved!==true)fail(409,'CASE_DOCUMENT_RECIPIENT','Назначенный юрист сейчас недоступен. Проверьте назначение клиента.');
         // Staged originals belong to this manager and remain immutable once
@@ -75,6 +97,7 @@ function createCaseDocumentsService(options={}){
         const frozen=await store.freeze(client,owner,submitId,files);
         if((await client.query('SELECT id FROM cases WHERE created_by=$1 AND handoff_submit_id=$2',[owner,submitId])).rows.length)fail(409,'CASE_DOCUMENT_CHANGED','Этот пакет уже входит в исходную передачу. Для досылки выберите новые документы.');
         current=await access(caseId,actorId,true,client);
+        verifyBinding();
         batch=(await client.query(`INSERT INTO case_document_batches(id,case_id,owner_tg_id,recipient_tg_id,files,delivery)
           VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,[submitId,caseId,owner,current.lawyer_tg_id,JSON.stringify(frozen),JSON.stringify({confirmed:{},completed:false,inflight:false})])).rows[0];
       }
@@ -83,6 +106,7 @@ function createCaseDocumentsService(options={}){
       const recipient=String(batch.recipient_tg_id);
       const verifyRecipient=async()=>{
         current=await access(caseId,actorId,true,client);
+        verifyBinding();
         if(String(current.lawyer_tg_id)!==recipient||String(current.recipient_id)!==recipient||current.recipient_role!=='lawyer'||current.recipient_approved!==true)fail(409,'MATERIAL_RECIPIENT_UNAVAILABLE','Доступ или назначение юриста изменились. Подтверждённые документы сохранены.');
       };
       const save=async()=>{
@@ -134,7 +158,7 @@ function createCaseDocumentsService(options={}){
       }
     }
   }
-  return {ensure,list,file,send};
+  return {ensure,list,file,send,sendReviewed: input => send(input, true)};
 }
 
 function setupHandoffCaseDocuments(app,options={}){

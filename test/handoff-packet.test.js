@@ -141,6 +141,19 @@ test('packet signature changes with current order or source materials, not EGRN 
   const injected=createPacketService({pool:h.pool,evidenceStore:h.store,lookupEgrn:async()=>({status:'available',provider_url:'https://secret',raw:'private',file_count:1})});
   assert.doesNotMatch(JSON.stringify((await injected.packet({order_id:60,report_id:15})).egrn),/secret|private|provider/);
 }));
+
+test('an in-place correction to the selected report or original changes a new handoff review signature', pg, async () => database(async h => {
+  const query={order_id:60,report_id:15};
+  const initial=await h.service.packet(query);
+  await h.db.query('UPDATE audits SET text=$1 WHERE id=15',[h.completeText+'Исправленный вывод.']);
+  const revised=await h.service.packet(query);
+  assert.notEqual(revised.signature,initial.signature);
+  const file=h.metadata[0],sha256='a'.repeat(64);
+  const update=items=>items.map(item=>item.id===file.id?{...item,sha256}:item);
+  await h.db.query('UPDATE audits SET report_data=$1 WHERE id=15',[JSON.stringify({...h.data,evidence:update(h.data.evidence),documents:update(h.data.documents)})]);
+  await h.db.query('UPDATE audit_evidence SET sha256=$1 WHERE id=$2',[sha256,file.id]);
+  assert.notEqual((await h.service.packet(query)).signature,revised.signature);
+}));
 test('legacy report keeps every saved / reply text, honestly exposes no fabricated inline files, and keeps real archive link only', pg, async()=>database(async h=>{
   await h.db.query('INSERT INTO reports(id,text,author,chat_id,msg_ids,reply_to,first_id) VALUES(9,$1,$2,$3,$4,50,90)', ['Legacy full report','Мария','-1001234567890',[90]]);
   await h.db.query('INSERT INTO reports(id,text,author,chat_id,msg_ids,reply_to,first_id) VALUES(10,$1,$2,$3,$4,90,91)', ['Saved reply notes','Мария','-1001234567890',[91]]);
@@ -364,6 +377,64 @@ test('a no-order original download rechecks its case after the private object re
   const express=require('express'),app=express();app.use((req,res,next)=>{req.staff={role:'lawyer',approved:true};req.tgUser={id:101};next();});setupHandoffPacket(app,{service:h.service,pool:h.pool});const server=app.listen(0,'127.0.0.1');await once(server,'listening');
   try{const r=await fetch('http://127.0.0.1:'+server.address().port+'/api/handoff/reports/15/files/'+h.files[0].id+'?case_id=800');assert.equal(r.status,403);assert.equal((await r.json()).code,'CASE_FORBIDDEN');}finally{server.close();await once(server,'close');}
 }));
+
+test('the lawyer case shows only the frozen report and named files; all scoped originals recheck assignment after I/O',async()=>{
+  const routes=new Map(), content=Buffer.from('Saved original'), hash=sha(content), secretLink='https://example.test/private-file';
+  const material={id:randomUUID(),name:'Договор.pdf',mime:'application/pdf',role:'lease',bytes:content.length,sha256:hash};
+  const original={...material,id:randomUUID(),name:'Схема.png',mime:'image/png',role:'map',subject_id:'territory'};
+  const extract={...material,id:randomUUID(),name:'Выписка.pdf',role:'egrn',source:'stored'};
+  const other=randomUUID();
+  const saved={order:{id:60,address:'Старый адрес'},report:{id:15,src:'a',order_id:60,text:'Переданный отчёт',media:[original]},materials:[material],egrn_links:[extract],egrn:{status:'available'},signature:'frozen'};
+  const row={id:800,order_id:60,org:'ООО Сохранённый клиент',lawyer_tg_id:101,data:{_handoff:{version:2,body:{order_id:60,report_id:15,report_src:'a'},packet:saved}}};
+  let revoke=false,changed=false,sourceReads=0,reads=0;
+  const read=(file)=>{reads++;if(revoke)row.lawyer_tg_id=102;return{...file,sha256:changed?'f'.repeat(64):hash,buffer:content};};
+  setupHandoffPacket({get(path,run){routes.set(path,run);}},{
+    pool:{async query(_sql,[_id,actor]){return{rows:[{tg_id:actor,role:actor===103?'manager':'lawyer',approved:true,access_case:structuredClone(row)}]};}},
+    service:{async packet(){sourceReads++;return{...saved,signature:'current',report:{...saved.report,text:'Новая версия',media:[...saved.report.media,{...original,id:other}]},materials:[...saved.materials,{...material,id:other}]};},async file(){return read(original);}},
+    materialsStore:{async download(order,id){assert.equal(order,60);assert.equal(id,material.id);return read(material);}},
+    orderEgrnLinks:{async delivery(order,id,expected){assert.equal(order,60);assert.equal(id,extract.id);assert.deepEqual(expected,extract);read(extract);return{kind:'link',url:secretLink};}},
+  });
+  async function request(route,query={},params={},actor=101){
+    let status=200,body;const headers={};
+    const res={set(key,value){headers[key]=value;return this;},status(value){status=value;return this;},json(value){body=value;},send(value){body=value;}};
+    await routes.get(route)({query,params,tgUser:{id:actor}},res);
+    return{status,body,headers};
+  }
+  const packetPath='/api/handoff/packet',reportPath='/api/handoff/reports/:auditId/files/:fileId';
+  const materialPath='/api/handoff/cases/:caseId/materials/:fileId',extractPath='/api/handoff/cases/:caseId/egrn/:fileId/link';
+  const query={case_id:'800'},ids=fileId=>({caseId:'800',fileId});
+  const {status,body}=await request(packetPath,query);
+  assert.equal(status,200);assert.equal(sourceReads,0);assert.equal(body.report.text,saved.report.text);
+  assert.equal(body.files_known,true);assert.equal(body.assignment.profile.org,row.org);
+  assert.equal(body.report.media[0].url,`/api/handoff/reports/15/files/${original.id}?case_id=800&order_id=60`);
+  assert.equal(body.materials[0].url,`/api/handoff/cases/800/materials/${material.id}`);
+  assert.equal(body.egrn_links[0].url,`/api/handoff/cases/800/egrn/${extract.id}/link`);
+  assert.equal((await request(packetPath,{order_id:'60'})).body.signature,'frozen');
+  assert.equal((await request(packetPath,{order_id:'60'},{},103)).body.signature,'current');
+  assert.equal((await request(packetPath,{...query,report_id:'14'})).status,403);
+  assert.equal((await request(packetPath,query,{},102)).status,403);
+  assert.equal((await request(materialPath,{},ids(other))).status,404);
+  assert.equal((await request(reportPath,query,{auditId:'15',fileId:other})).status,404);
+  assert.equal((await request(extractPath,{},ids(other))).status,404);
+  assert.equal(reads,0);
+  assert.deepEqual((await request(materialPath,{download:'1'},ids(material.id))).body,content);
+  assert.deepEqual((await request(reportPath,query,{auditId:'15',fileId:original.id})).body,content);
+  assert.deepEqual((await request(extractPath,{},ids(extract.id))).body,{ok:true,url:secretLink});
+  changed=true;
+  assert.equal((await request(materialPath,{},ids(material.id))).status,409);
+  assert.equal((await request(reportPath,query,{auditId:'15',fileId:original.id})).status,409);
+  changed=false;revoke=true;
+  for(const [route,fileQuery,params] of [[materialPath,{},ids(material.id)],[reportPath,query,{auditId:'15',fileId:original.id}],[extractPath,{},ids(extract.id)]]){
+    const result=await request(route,fileQuery,params);
+    assert.equal(result.status,403);assert.doesNotMatch(JSON.stringify(result.body),/private-file|Saved original/);
+    row.lawyer_tg_id=101;
+  }
+  row.data={};row.audit_text='Текст старого отчёта';
+  const legacy=await request(packetPath,query);
+  assert.equal(legacy.status,200);assert.equal(legacy.body.files_known,false);assert.equal(legacy.body.report.text,row.audit_text);
+  assert.deepEqual(legacy.body.materials,[]);assert.deepEqual(legacy.body.egrn_links,[]);
+  assert.equal((await request(materialPath,{},ids(material.id))).status,404);
+});
 
 for (const change of ['approval','role','assignment']) test('an order-bound original rechecks current '+change+' after storage and remains accessible after restoration',pg,async()=>database(async h=>{
   const previousAdmins=process.env.ADMIN_TG_IDS;process.env.ADMIN_TG_IDS='';

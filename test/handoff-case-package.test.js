@@ -27,12 +27,25 @@ async function fixture(run){
 }
 
 test('package includes frozen audit/order/supplemental bytes, current company, external links and a valid ZIP directory',pg,()=>fixture(async h=>{
+  await h.db.exec('ALTER TABLE cases ADD COLUMN contacts JSONB, ADD COLUMN client TEXT, ADD COLUMN phone TEXT, ADD COLUMN comment TEXT, ADD COLUMN inn TEXT');
+  const contacts = [{name:'Сотрудник',phone:'+70000000001',tg:'@contact_one',comment:'Вход со двора.'},
+    {name:'Администратор',phone:'+70000000002',tg:'@contact_two',comment:'Связаться после 11:00.'}];
+  const comment = 'Сначала согласовать встречу.\n'+('Примечание к комплекту. '.repeat(32))+'Проверить оригинал.';
+  h.state.fields = {cad_num:'77:01:0000001:1'};
+  await h.save();
+  await h.db.query('UPDATE cases SET contacts=$1,comment=$2,inn=$3,client=$4,phone=$5 WHERE id=39',[JSON.stringify(contacts),comment,'7700000000','Устаревший контакт','000']);
   const pack=await h.service.prepare(39,808);assert.deepEqual(h.loaded,[],'Prepare must not load originals');
   const buffer=await collect(archiveParts(pack.items,{check:pack.check}));assert.equal(buffer.length,pack.length);
   const contents=await unzip(buffer);assert.equal(contents.length,5);assert.ok(contents.every(e=>e.name.startsWith('ООО «Тестовый лимон»/Клиент №39/')));
   assert.deepEqual(h.loaded,['audit','order','extra']);
   for(const [folder,original]of [['Аудит',h.audit],['Документы заявки',h.order],['Дополнительные документы',h.extra]])assert.ok(contents.find(e=>e.name.includes('/'+folder+'/')).buffer.equals(original.buffer));
-  assert.match(contents.find(e=>e.name.endsWith('Отчёт.txt')).buffer.toString(),/^ООО «Тестовый лимон»/);
+  const summary=contents.find(e=>e.name.endsWith('Отчёт.txt')).buffer.toString();
+  assert.match(summary,/^ООО «Тестовый лимон»/);
+  assert.match(summary,/ИНН 7700000000 · Кадастровый номер 77:01:0000001:1/);
+  assert.ok(summary.includes('Сотрудник · +70000000001 · @contact_one\nВход со двора.'));
+  assert.ok(summary.includes('Администратор · +70000000002 · @contact_two\nСвязаться после 11:00.'));
+  assert.ok(summary.includes('Комментарий менеджера\n'+comment));
+  assert.doesNotMatch(summary,/Устаревший контакт/);
   const links=contents.find(e=>e.name.endsWith('Ссылки.txt')).buffer.toString();assert.match(links,/не включены в ZIP/);assert.match(links,/https:\/\/example.test\/egrn\/download/);assert.match(links,/Видео осмотра/);assert.match(links,/Архив объекта/);
   const {crc32}=require('../src/web/order-materials');for(const e of contents)assert.equal(e.crc,crc32(e.buffer));
 }));
@@ -66,6 +79,14 @@ test('revocation after original read aborts ZIP before revealing that original',
 
 test('assignment change cancels even a manager download, instead of mixing two case versions',pg,()=>fixture(async h=>{
   const pack=await h.service.prepare(39,101);await h.db.exec('UPDATE cases SET lawyer_tg_id=909 WHERE id=39');await assert.rejects(collect(archiveParts(pack.items,{check:pack.check})),e=>e.code==='CASE_PACKAGE_CHANGED');assert.deepEqual(h.loaded,[]);
+}));
+
+test('a changed manager comment aborts a prepared archive before reading originals',pg,()=>fixture(async h=>{
+  await h.db.exec("ALTER TABLE cases ADD COLUMN comment TEXT DEFAULT 'Подтверждённое примечание'");
+  const pack=await h.service.prepare(39,808);
+  await h.db.exec("UPDATE cases SET comment='Новое примечание' WHERE id=39");
+  await assert.rejects(collect(archiveParts(pack.items,{check:pack.check})),e=>e.code==='CASE_PACKAGE_CHANGED');
+  assert.deepEqual(h.loaded,[]);
 }));
 
 test('revocation just before ZIP completion prevents a valid archive',pg,()=>fixture(async h=>{

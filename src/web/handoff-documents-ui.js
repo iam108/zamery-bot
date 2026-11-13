@@ -27,8 +27,8 @@ function documentsUI(o) {
   function render(next){
     if(next)context=next;
     $('extra-documents').hidden=!context.visible;
-    $('extra-documents-title').textContent=context.caseId?'Документы клиента':'Дополнительные документы';
-    $('extra-documents-help').textContent=context.readonly?'Здесь — дополнительные файлы от менеджера. Все документы собраны в полном комплекте.':context.caseId?'Прикрепите новые файлы и нажмите «Дослать документы».':'Отчёт и документы заявки уже включены. При необходимости приложите договор, ТО или другие файлы.';
+    $('extra-documents-title').textContent='Дополнительные документы';
+    $('extra-documents-help').textContent=context.readonly?'Файлы, которые менеджер приложил при передаче или дослал позже.':context.caseId?'Прикрепите новые файлы и нажмите «Дослать документы».':'Здесь можно приложить договор, техническое описание и другие документы к передаче.';
     $('extra-document-input').disabled=locked()||queue.length>0;
     $('extra-document-add').hidden=!!context.readonly;$('extra-document-add').disabled=$('extra-document-input').disabled;
     $('extra-document-limit').textContent='До '+limits.files+' файлов, по '+o.bytes(limits.fileBytes)+' каждый.';
@@ -46,7 +46,7 @@ function documentsUI(o) {
     $('extra-document-history-status').textContent=historyError;
     $('extra-document-history-retry').hidden=!historyError;$('extra-document-history-retry').disabled=busy;
     if(context.visible&&context.caseId&&String(context.caseId)!==historyCase){historyCase=String(context.caseId);batches=[];historyError='';$('extra-document-history').innerHTML='';void loadHistory();}
-    if(context.visible&&D.hasDraft&&!ready&&!busy&&!D.attempt&&!error){void recover();}
+    if(context.visible&&D.hasDraft&&!ready&&!locked()&&!error){void recover();}
   }
   async function loadHistory(){
     var id=caseNumber(context.caseId);if(!id)return;historyError='';
@@ -57,6 +57,15 @@ function documentsUI(o) {
     }catch(e){if(String(context.caseId)!==String(id))return;historyError=e.message;}emit();
   }
   function clearDraft(){D={id:o.uuid(),hasDraft:false,attempt:null};files=[];queue=[];ready=true;error='';}
+  function handoffAttachment(){
+    if(!ready||!files.length||D.attempt)return null;
+    return {submit_id:D.id,files:metadata(files)};
+  }
+  function acceptHandoff(submitId){
+    if(submitId!==D.id)return;
+    clearDraft();
+    if(context.caseId)void loadHistory();
+  }
   async function recover(){if(busy||context.readonly)return;busy=true;error='';emit();try{await readStaging();}catch(e){error=e.message;}finally{busy=false;emit();}}
   async function upload(){
     if(locked()||!queue.length)return;busy=true;D.hasDraft=true;ready=false;error='';emit();
@@ -94,7 +103,7 @@ function documentsUI(o) {
   $('extra-document-list').onclick=function(e){var button=e.target.closest('[data-extra-remove]');if(button)void remove(button.dataset.extraRemove);};
   $('extra-document-history').onclick=function(e){var retry=e.target.closest('[data-extra-retry]');if(retry){void retryBatch(retry.dataset.extraRetry);return;}var button=e.target.closest('[data-extra-download]');if(!button)return;var parts=button.dataset.extraDownload.split(':'),batch=batches.find(function(b){return b.id===parts[0];}),file=batch&&batch.files.find(function(f){return f.id===parts[1];});if(file)o.download(file,button);};
   $('extra-document-history-retry').onclick=function(){void loadHistory();};
-  return {restore:restore,snapshot:snapshot,render:render,blocking:blocking,outstanding:outstanding,pendingDelivery:function(){return outstanding()||batches.some(function(b){return b.status!=='delivered';});},send:send,summary:function(){return files.map(function(f){return f.name;});},reset:clearDraft};
+  return {restore:restore,snapshot:snapshot,render:render,blocking:blocking,outstanding:outstanding,pendingDelivery:function(){return outstanding()||batches.some(function(b){return b.status!=='delivered';});},summary:function(){return files.map(function(f){return f.name;});},handoffAttachment:handoffAttachment,acceptHandoff:acceptHandoff,reset:clearDraft};
 }
 
 module.exports=documentsUI;
