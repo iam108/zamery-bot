@@ -207,6 +207,65 @@ test('manual client: mobile creation, exact original and lost ACK recovery need 
       assert.equal(service.messages.length, messagesBefore);
       assert.equal(service.egrnRequests.length, 0);
     });
+
+    await t.test('manual creation explains invalid INN and resumes review after a failed duplicate check', async () => {
+      const mobile = await openPage(browser, service, 2002, { pathname: '/handoff?mode=manual', mobile: true });
+      visits.push(mobile);
+      const form = mobile.page;
+      const queriedInns = [], submissions = [];
+      await form.route('**/api/handoff/manual-matches?*', route => {
+        queriedInns.push(new URL(route.request().url()).searchParams.get('inn'));
+        if (queriedInns.length === 1) return route.fulfill({
+          status: 503,
+          json: { ok: false, error: 'Не удалось проверить похожих клиентов. Повторите проверку.' },
+        });
+        return route.continue();
+      });
+      form.on('request', request => {
+        if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/handoff') submissions.push(request.postDataJSON());
+      });
+
+      const startReview = form.getByRole('button', { name: 'Проверить перед передачей', exact: true });
+      await until(() => startReview.isEnabled(), 'Manual form can review the entered data');
+      await form.locator('#org').fill('ООО «Проверка ИНН»');
+      await form.locator('#address').fill('Московская область, Синтетическая улица, 99');
+      await form.locator('#region').selectOption('МО');
+      await form.locator('#kind').selectOption('Общепит');
+      await form.locator('#service').selectOption('Получение');
+      await form.locator('#lawyers').selectOption(String(LAWYER));
+      const optional = form.locator('#manual-optional'), inn = form.locator('#inn');
+      await optional.locator('summary').click();
+      await inn.fill('123456789');
+      await optional.locator('summary').click();
+      await startReview.click();
+      const error = form.locator('#form-error');
+      await error.waitFor({ state: 'visible' });
+      assert.match(await error.textContent(), /ИНН.*10.*12/);
+      assert.equal(await optional.evaluate(section => section.open), true);
+      assert.equal(await inn.evaluate(input => input === document.activeElement), true);
+      assert.deepEqual(queriedInns, []);
+      assert.deepEqual(submissions, []);
+
+      await inn.fill('ИНН: 123\u00a0456 78\u00a090');
+      await startReview.click();
+      const retry = form.locator('#manual-match-retry');
+      await retry.waitFor({ state: 'visible' });
+      assert.match(await form.locator('#manual-match-status').textContent(), /Не удалось проверить похожих клиентов/);
+      assert.deepEqual(queriedInns, ['1234567890']);
+      assert.deepEqual(submissions, []);
+      await retry.click();
+      const confirm = form.getByRole('button', { name: 'Создать и передать', exact: true });
+      await confirm.waitFor({ state: 'visible' });
+      assert.deepEqual(queriedInns, ['1234567890', '1234567890']);
+      assert.deepEqual(submissions, []);
+      await confirm.click();
+      await form.locator('#delivery-title').getByText(/Клиент создан/).waitFor({ state: 'visible' });
+      assert.equal(submissions.length, 1);
+      assert.equal(submissions[0].inn, '1234567890');
+      assert.equal(submissions[0].manual_client, true);
+      assert.equal(submissions[0].egrn_order, false);
+      assert.equal(service.egrnRequests.length, 0);
+    });
     for (const current of visits) { assert.deepEqual(current.errors, []); assert.deepEqual(current.blocked, []); }
   } finally { releaseUpload?.(); await browser?.close(); await service?.close(); }
 });

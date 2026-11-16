@@ -613,7 +613,7 @@ test('manual client mode ignores stale source and readonly URL parameters and us
   const ordinary={version:2,profile:{org:'Ordinary source draft'},submitId:'ordinary',completed:{id:1,name:'Old lawyer'}};
   const h=harness({query:'?mode=manual&order_id=60&request_id=8&report_src=a&report_id=15&case_id=39&view=report',stored:{'handoff-v2:staff:order-60':JSON.stringify(ordinary)}});await pause();
   assert.equal(h.node('page-title').textContent,'Создать клиента');assert.equal(h.node('details').open,true);assert.equal(h.node('cad-field').hidden,true);assert.equal(h.node('packet-section').hidden,true);assert.equal(h.node('readonly-note').hidden,true);
-  assert.equal(h.node('org').value,'');assert.equal(h.node('region').value,'');assert.equal(h.node('priority').value,'обычный');assert.equal(h.node('go').textContent,'Создать и передать');assert.equal(h.node('go').disabled,false);
+  assert.equal(h.node('org').value,'');assert.equal(h.node('region').value,'');assert.equal(h.node('priority').value,'обычный');assert.equal(h.node('go').textContent,'Проверить перед передачей');assert.equal(h.node('go').disabled,false);
   assert.equal(h.node('manual-optional').hidden,false);assert.equal(h.node('manual-optional').open,false);assert.deepEqual(h.node('manual-optional-fields').children.map(item=>item.id),['inn-field','contact-section','comment-field','priority-field']);
   assert.ok(manualDraft(h).submitId);assert.deepEqual(JSON.parse(h.stored.get('handoff-v2:staff:order-60')),ordinary);
   const requests=h.calls.filter(call=>call[0]==='fetch');assert.ok(requests.some(call=>call[1]==='/api/handoff/packet'));assert.equal(requests.some(call=>/[?&](?:order_id|request_id|case_id|report_id)=/.test(call[1])),false);
@@ -621,7 +621,7 @@ test('manual client mode ignores stale source and readonly URL parameters and us
 
 test('manual review and payload contain only real client facts and optional saved files, without report or EGRN claims',async()=>{
   const h=harness({query:'?mode=manual'});await pause();fillManual(h,{region:'МСК'});h.node('go').click();await pause();
-  assert.equal(h.node('review').hidden,false);assert.equal(h.node('review-title').textContent,'Проверьте клиента');assert.equal(h.node('confirm-send').textContent,'Подтвердить создание');
+  assert.equal(h.node('review').hidden,false);assert.equal(h.node('review-title').textContent,'Проверьте клиента');assert.equal(h.node('confirm-send').textContent,'Создать и передать');
   assert.match(h.node('review-list').innerHTML,/Карточка клиента/);assert.match(h.node('review-list').innerHTML,/Чек-лист/);assert.doesNotMatch(h.node('review-list').innerHTML,/ЕГРН|[Оо]тчёт|[Оо]ригиналы|Фото|Схемы/);
   h.node('confirm-send').click();await pause();const body=JSON.parse(h.calls.find(call=>call[1]==='/api/handoff')[2].body);
   assert.equal(body.manual_client,true);assert.equal(body.handoff_version,2);for(const key of ['order_id','request_id','report_id','report_src'])assert.equal(body[key],null,key);
@@ -636,7 +636,7 @@ test('manual creation requires a selected lawyer and displays the actual availab
 
 for(const field of ['org','address','kind','service','region'])test('manual '+field+' is required before matches, review or creation',async()=>{
   const h=harness({query:'?mode=manual'});await pause();fillManual(h,{[field]:''});h.node('go').click();await pause();
-  assert.equal(h.node('review').hidden,true);assert.ok(h.node('form-error').textContent);assert.equal(h.calls.some(call=>call[1].startsWith('/api/handoff/manual-matches')),false);assert.equal(h.postRequests(),0);
+  assert.equal(h.node('review').hidden,true);assert.ok(h.node('form-error').textContent);assert.equal(h.context.document.activeElement.id,field);assert.equal(h.calls.some(call=>call[1].startsWith('/api/handoff/manual-matches')),false);assert.equal(h.postRequests(),0);
 });
 
 test('manual matching exposes existing cases and requires a deliberate new-client choice without merging',async()=>{
