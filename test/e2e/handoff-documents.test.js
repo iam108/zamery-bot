@@ -204,7 +204,7 @@ test('case document view supports managers and assigned lawyers for report clien
     await until(()=>page.locator('#manual-files').isEnabled(),'Manual form is ready');
     const manualName='ООО «ТЕСТ БЕЗ ВЫЕЗДА»';
     await page.locator('#org').fill(manualName);await page.locator('#address').fill('Московская область, Синтетическая улица, 12');
-    await page.locator('#kind').selectOption('Общепит');await page.locator('#service').selectOption('Продление');await page.locator('#lawyers').selectOption(String(LAWYER));
+    await page.locator('#region').selectOption('МО');await page.locator('#kind').selectOption('Общепит');await page.locator('#service').selectOption('Продление');await page.locator('#lawyers').selectOption(String(LAWYER));
     const initial=document('Manual company initial contract');
     await page.locator('#manual-documents-details').evaluate(element=>{element.open=true;});
     await page.locator('#manual-files').setInputFiles({name:'manual-initial.pdf',mimeType:'application/pdf',buffer:initial});

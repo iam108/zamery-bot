@@ -20,7 +20,7 @@ async function unzip(buffer) {
   });
 }
 
-test('manual client: mobile creation, exact original and lost ACK recovery need no order, audit or paid EGRN; duplicates require an explicit choice', { timeout: 90000 }, async () => {
+test('manual client: mobile creation, exact original and lost ACK recovery need no order, audit or paid EGRN; duplicates require an explicit choice', { timeout: 90000 }, async t => {
   let service, browser, releaseUpload; const visits = [], clientsGroup = '-1007777999944';
   try {
     service = await createService({ master: true, clientsGroup }); browser = await chromium.launch();
@@ -30,11 +30,12 @@ test('manual client: mobile creation, exact original and lost ACK recovery need 
     let page = visit.page; const profile = { org: 'ООО «Ручной клиент»', address: 'Московская область, Синтетическая улица, 9' };
     await page.locator('#lawyers option[value="' + LAWYER + '"]').waitFor({ state: 'attached' });
     await until(() => page.locator('#manual-files').isEnabled(), 'Manual document storage and empty packet are ready');
-    assert.equal(await page.locator('#region').inputValue(), 'МО');
+    assert.equal(await page.locator('#region').inputValue(), '');
     async function fillProfile() {
       await page.locator('#details').evaluate(element => { element.open = true; });
       await page.locator('#org').fill(profile.org); await page.locator('#org').press('Tab');
       await page.locator('#address').fill(profile.address); await page.locator('#address').press('Tab');
+      await page.locator('#region').selectOption('МО');
       await page.locator('#kind').selectOption('Общепит'); await page.locator('#service').selectOption('Получение');
       await page.locator('#lawyers').selectOption(String(LAWYER));
     }
@@ -52,9 +53,10 @@ test('manual client: mobile creation, exact original and lost ACK recovery need 
     await (await choose).setFiles({ name: filename, mimeType: 'application/pdf', buffer: pdf });
     await until(() => !!committedUpload, 'The first action saves the PDF before the page receives its upload ACK');
     assert.equal((await service.pool.query('SELECT COUNT(*)::int AS n FROM handoff_manual_materials')).rows[0].n, 1);
+    const savedDraftUrl = page.url();
     await page.close(); releaseUpload();
     page = await visit.context.newPage(); page.setDefaultTimeout(10000); page.on('pageerror', error => visit.errors.push(error.message));
-    await page.goto(service.origin + '/handoff?mode=manual&' + service.keyQuery(2001), { waitUntil: 'domcontentloaded' });
+    await page.goto(savedDraftUrl, { waitUntil: 'domcontentloaded' });
     await until(() => page.locator('#manual-files').isEnabled(), 'A new page restores the same manual draft and server-confirmed file list');
     await page.locator('#manual-documents-details').evaluate(element => { element.open = true; });
     assert.equal(uploadPosts, 1); assert.equal(await page.locator('#manual-file-list [data-manual-remove]').count(), 1);
@@ -137,11 +139,74 @@ test('manual client: mobile creation, exact original and lost ACK recovery need 
     assert.equal(service.messages.slice(start).filter(event => event.method === 'sendMessage' && String(event.args[0]) === String(LAWYER)).length, 2);
     assert.equal(service.messages.slice(start).filter(event => event.method === 'sendMessage' && String(event.args[0]) === clientsGroup).length, 2);
     assert.equal(service.messages.slice(start).filter(event => event.method === 'sendDocument').length, 1);
-    const desktop = await openPage(browser, service, 2002, { pathname: '/handoff?mode=manual', mobile: false }); visits.push(desktop);
+    const desktop = await openPage(browser, service, 2002, { pathname: '/handoff?mode=manual&draft=legacy', mobile: false }); visits.push(desktop);
     await until(() => desktop.page.locator('#manual-files').isEnabled(), 'Desktop manual form is ready');
     assert.equal(await desktop.page.locator('#manual-documents-summary').isVisible(), true);
     await desktop.page.setViewportSize({ width: 1280, height: 1600 });
     await desktop.page.screenshot({ path: path.join(artifacts, 'manual-desktop-form.png'), fullPage: true });
+
+    await t.test('starting a new client from a linked handoff leaves existing drafts intact', async () => {
+      const form = desktop.page, legacyUrl = form.url();
+      const oldCompany = 'ООО «Старый черновик»', newCompany = 'ООО «Новый независимый черновик»';
+      const originalName = 'Документ прежнего клиента.pdf';
+      const casesBefore = (await service.pool.query('SELECT COUNT(*)::int AS n FROM cases')).rows[0].n;
+      const messagesBefore = service.messages.length;
+      const ready = () => until(() => form.locator('#manual-files').isEnabled(), 'Document storage is ready for the current draft');
+
+      await form.locator('#org').fill(oldCompany);
+      await form.locator('#manual-documents-summary').click();
+      await form.locator('#manual-files').setInputFiles({ name: originalName, mimeType: 'application/pdf', buffer: pdf });
+      await form.locator('#manual-file-list').getByText(originalName).waitFor({ state: 'visible' });
+      await ready();
+      await form.goto(service.origin + '/handoff?order_id=58&' + service.keyQuery(2002));
+      await form.getByText('Заявка на замер №58', { exact: true }).waitFor();
+      const createClient = form.locator('#create-client-link');
+      await createClient.waitFor({state:'visible'});
+      const launch = new URL(await createClient.getAttribute('href'), form.url());
+      assert.equal(launch.pathname, '/handoff');
+      assert.equal(launch.searchParams.get('mode'), 'manual');
+      for (const key of ['order_id', 'request_id', 'report_src', 'report_id', 'case_id', 'view', 'draft']) {
+        assert.equal(launch.searchParams.has(key), false, key);
+      }
+      const waitForDraft = () => form.waitForURL(url => url.pathname === '/handoff' && url.searchParams.get('mode') === 'manual' &&
+        !url.searchParams.has('new') && /^[0-9a-f-]{36}$/i.test(url.searchParams.get('draft') || ''));
+      async function assertBlank() {
+        await ready();
+        for (const key of ['org', 'address', 'region', 'lawyers', 'comment']) assert.equal(await form.locator('#' + key).inputValue(), '', key);
+        assert.equal(await form.locator('#manual-file-list li').count(), 0);
+        assert.equal(await form.locator('#packet-section').isVisible(), false);
+      }
+      await createClient.click();
+      await waitForDraft();
+      const firstDraft = form.url();
+      await assertBlank();
+      const resume = form.locator('#resume-manual-draft');
+      const legacyResume = new URL(await resume.getAttribute('href'), form.url());
+      assert.equal(legacyResume.searchParams.get('draft'), 'legacy');
+      assert.equal(legacyResume.searchParams.get('u'), '2002');
+      await form.locator('#org').fill(newCompany);
+      await form.reload();
+      await ready();
+      assert.equal(form.url(), firstDraft);
+      assert.equal(await form.locator('#org').inputValue(), newCompany, 'Reload reopens the newly scoped draft');
+
+      await form.goto(service.origin + '/handoff?mode=manual&' + service.keyQuery(2002));
+      await waitForDraft();
+      assert.notEqual(form.url(), firstDraft, 'Explicit launches use separate draft identities');
+      await assertBlank();
+      await resume.click();
+      await form.waitForURL(firstDraft);
+      await ready();
+      assert.equal(await form.locator('#org').inputValue(), newCompany);
+      await form.goto(legacyUrl);
+      await ready();
+      assert.equal(await form.locator('#org').inputValue(), oldCompany, 'The prior legacy draft remains available');
+      assert.equal(await form.locator('#manual-file-list li').count(), 1);
+      assert.match(await form.locator('#manual-file-list').textContent(), /Документ прежнего клиента\.pdf/);
+      assert.equal((await service.pool.query('SELECT COUNT(*)::int AS n FROM cases')).rows[0].n, casesBefore);
+      assert.equal(service.messages.length, messagesBefore);
+      assert.equal(service.egrnRequests.length, 0);
+    });
     for (const current of visits) { assert.deepEqual(current.errors, []); assert.deepEqual(current.blocked, []); }
   } finally { releaseUpload?.(); await browser?.close(); await service?.close(); }
 });

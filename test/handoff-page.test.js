@@ -34,7 +34,7 @@ function harness(options = {}) {
   }
   const node = id => { if (!nodes.has(id)) nodes.set(id, new Node(id)); return nodes.get(id); };
   const document = { activeElement: null, documentElement: { dataset: {} }, body: new Node('body'), getElementById: node, createElement: tag => new Node(tag), querySelector: selector => selector === 'dialog[open]' ? [...nodes.values()].find(n => n.id.endsWith('dialog') && n.open) || null : null };
-  const responses = { packet: options.packet || packet(), prefill: { ok: true, lawyers: [{ tg_id: 108, name: 'Елена' }, { tg_id: 109, name: 'Мария' }], report: { src: 'a', id: 15 }, order: { id: 60 } } };
+  const responses = { packet: options.packet || packet(), prefill: { ok: true, can_manage: true, lawyers: [{ tg_id: 108, name: 'Елена' }, { tg_id: 109, name: 'Мария' }], report: { src: 'a', id: 15 }, order: { id: 60 } } };
   let packetRequests = 0, sourcePacketRequests=0,postRequests = 0;
   async function fetch(url, init = {}) {
     calls.push(['fetch', url, init]);
@@ -56,7 +56,7 @@ function harness(options = {}) {
     throw new Error('Unexpected fetch ' + url);
   }
   function response(data) { return { ok: true, status: 200, json: async () => clone(data) }; }
-  const historyStack = [{}], history = { state: historyStack[0], pushState(value) { historyStack.push(value); this.state = value; }, back() { historyStack.pop(); this.state = historyStack[historyStack.length - 1] || {}; if (events.get('popstate')) events.get('popstate')(); } };
+  const historyStack = [{}], history = { state: historyStack[0], replaceState(value, title, url) { this.state = value; const next = new URL(url, location.origin); Object.assign(location, { href: next.href, search: next.search, hash: next.hash }); }, pushState(value) { historyStack.push(value); this.state = value; }, back() { historyStack.pop(); this.state = historyStack[historyStack.length - 1] || {}; if (events.get('popstate')) events.get('popstate')(); } };
   class TestURL extends URL {}
   TestURL.createObjectURL = () => { const url = 'blob:protected-' + (created.length + 1); created.push(url); return url; };
   TestURL.revokeObjectURL = url => revoked.push(url);
@@ -596,9 +596,14 @@ for(const [name,mime] of [
   assert.equal(h.created.length,1);assert.equal(h.calls.filter(call=>call[0]==='click'&&call[1]==='a').length,1);assert.equal(h.node('report-notice').textContent,'');
 });
 
-function manualDraft(h){return JSON.parse(h.persistent.get('handoff-v2:staff:manual')||h.stored.get('handoff-v2:staff:manual')||'null');}
+function manualDraft(h) {
+  const query = new URLSearchParams(h.context.location.search);
+  const id = query.get('draft');
+  const key = 'handoff-v2:' + (query.get('u') || 'staff') + ':manual' + (id === 'legacy' ? '' : ':' + id);
+  return JSON.parse(h.persistent.get(key) || h.stored.get(key) || 'null');
+}
 function fillManual(h,changes={}){
-  const values={org:'ООО Новый клиент',address:'Химки, Новая улица, 7',kind:'Общепит',service:'Получение',...changes};
+  const values={org:'ООО Новый клиент',address:'Химки, Новая улица, 7',region:'МО',kind:'Общепит',service:'Получение',...changes};
   for(const [key,value] of Object.entries(values)){h.node(key).value=value;h.node(key).listeners.change.call(h.node(key));}
   lawyer(h);
 }
@@ -608,7 +613,7 @@ test('manual client mode ignores stale source and readonly URL parameters and us
   const ordinary={version:2,profile:{org:'Ordinary source draft'},submitId:'ordinary',completed:{id:1,name:'Old lawyer'}};
   const h=harness({query:'?mode=manual&order_id=60&request_id=8&report_src=a&report_id=15&case_id=39&view=report',stored:{'handoff-v2:staff:order-60':JSON.stringify(ordinary)}});await pause();
   assert.equal(h.node('page-title').textContent,'Создать клиента');assert.equal(h.node('details').open,true);assert.equal(h.node('cad-field').hidden,true);assert.equal(h.node('packet-section').hidden,true);assert.equal(h.node('readonly-note').hidden,true);
-  assert.equal(h.node('org').value,'');assert.equal(h.node('region').value,'МО');assert.equal(h.node('priority').value,'обычный');assert.equal(h.node('go').textContent,'Создать и передать');assert.equal(h.node('go').disabled,false);
+  assert.equal(h.node('org').value,'');assert.equal(h.node('region').value,'');assert.equal(h.node('priority').value,'обычный');assert.equal(h.node('go').textContent,'Создать и передать');assert.equal(h.node('go').disabled,false);
   assert.equal(h.node('manual-optional').hidden,false);assert.equal(h.node('manual-optional').open,false);assert.deepEqual(h.node('manual-optional-fields').children.map(item=>item.id),['inn-field','contact-section','comment-field','priority-field']);
   assert.ok(manualDraft(h).submitId);assert.deepEqual(JSON.parse(h.stored.get('handoff-v2:staff:order-60')),ordinary);
   const requests=h.calls.filter(call=>call[0]==='fetch');assert.ok(requests.some(call=>call[1]==='/api/handoff/packet'));assert.equal(requests.some(call=>/[?&](?:order_id|request_id|case_id|report_id)=/.test(call[1])),false);
@@ -661,7 +666,7 @@ test('manual durable storage restores unblurred fields, contacts and comment in 
   const first=harness({query:'?mode=manual'});await pause();const sid=manualDraft(first).submitId;
   first.node('org').value='Без blur';first.node('org').listeners.input.call(first.node('org'));first.node('comment').value='Комментарий до закрытия';first.node('comment').oninput.call(first.node('comment'));
   first.node('add-contact').click();first.node('contacts').listeners.input({target:{dataset:{contact:'0',field:'phone'},value:'+79991234567'}});
-  const next=harness({query:'?mode=manual',persistent:Object.fromEntries(first.persistent)});await pause();assert.equal(next.node('org').value,'Без blur');assert.equal(next.node('comment').value,'Комментарий до закрытия');assert.match(next.node('contacts').innerHTML,/79991234567/);assert.equal(manualDraft(next).submitId,sid);
+  const next=harness({query:first.context.location.search,persistent:Object.fromEntries(first.persistent)});await pause();assert.equal(next.node('org').value,'Без blur');assert.equal(next.node('comment').value,'Комментарий до закрытия');assert.match(next.node('contacts').innerHTML,/79991234567/);assert.equal(manualDraft(next).submitId,sid);
   const foreign=harness({query:'?mode=manual&u=another',persistent:Object.fromEntries(first.persistent)});await pause();assert.equal(foreign.node('org').value,'');
 });
 
@@ -676,7 +681,7 @@ test('manual upload serializes files and sends only acknowledged metadata after 
 test('a manual file-first lost upload ACK keeps its durable SID and reopening discovers the saved original',async()=>{
   let saved=[];const first=harness({query:'?mode=manual',fetch(url,init,response){if(url.startsWith('/api/handoff/manual-materials')){if(init.method==='POST'){saved=[manualDocument];throw new Error('Lost upload ACK');}return response({ok:true,files:saved});}}});await pause();const sid=manualDraft(first).submitId;
   first.node('manual-files').files=[new File(['source'],'source.pdf')];first.node('manual-files').onchange.call(first.node('manual-files'));await pause();assert.equal(manualDraft(first).submitId,sid);assert.equal(first.node('go').disabled,true);assert.equal(first.node('manual-files-retry').hidden,false);
-  const next=harness({query:'?mode=manual',persistent:Object.fromEntries(first.persistent),manualFiles:saved});await pause();assert.equal(manualDraft(next).submitId,sid);assert.match(next.node('manual-file-list').innerHTML,/Сохранённый план/);assert.equal(next.calls.some(call=>call[1].startsWith('/api/handoff/manual-materials')&&call[2].method==='POST'),false);
+  const next=harness({query:first.context.location.search,persistent:Object.fromEntries(first.persistent),manualFiles:saved});await pause();assert.equal(manualDraft(next).submitId,sid);assert.match(next.node('manual-file-list').innerHTML,/Сохранённый план/);assert.equal(next.calls.some(call=>call[1].startsWith('/api/handoff/manual-materials')&&call[2].method==='POST'),false);
 });
 
 test('a definite manual rejection before case creation preserves SID and uploaded originals for an edited retry',async()=>{
@@ -687,13 +692,24 @@ test('a definite manual rejection before case creation preserves SID and uploade
 test('unknown manual delivery cannot reset or mutate files and restart replays the exact frozen payload',async()=>{
   const first=harness({query:'?mode=manual',manualFiles:[manualDocument],post(){throw new Error('Lost handoff ACK');}});await pause();fillManual(first);first.node('go').click();await pause();first.node('confirm-send').click();await pause();const body=JSON.parse(first.calls.find(call=>call[1]==='/api/handoff')[2].body);
   assert.equal(first.node('manual-create-another').hidden,true);assert.equal(first.node('manual-add-files').disabled,true);first.node('manual-create-another').click();assert.equal(manualDraft(first).submitId,body.submit_id);
-  const next=harness({query:'?mode=manual',manualFiles:[manualDocument],persistent:Object.fromEntries(first.persistent)});await pause();assert.equal(next.node('manual-create-another').hidden,true);next.node('retry-send').click();await pause();assert.deepEqual(JSON.parse(next.calls.find(call=>call[1]==='/api/handoff')[2].body),body);assert.match(next.node('delivery-title').textContent,/Клиент создан/);
+  const next=harness({query:first.context.location.search,manualFiles:[manualDocument],persistent:Object.fromEntries(first.persistent)});await pause();assert.equal(next.node('manual-create-another').hidden,true);next.node('retry-send').click();await pause();assert.deepEqual(JSON.parse(next.calls.find(call=>call[1]==='/api/handoff')[2].body),body);assert.match(next.node('delivery-title').textContent,/Клиент создан/);
 });
 
-test('manual success stays visible across reopening until explicit create-another resets only this draft',async()=>{
+test('manual success stays on its draft URL while create another opens a clean form',async()=>{
   const first=harness({query:'?mode=manual',manualFiles:[manualDocument]});await pause();fillManual(first);first.node('go').click();await pause();first.node('confirm-send').click();await pause();const sid=manualDraft(first).submitId;
-  const second=harness({query:'?mode=manual',persistent:Object.fromEntries(first.persistent),fetch(url,init,response){if(url.startsWith('/api/handoff/manual-materials'))return response({ok:true,files:new URL(url,'https://bot.example').searchParams.get('submit_id')===sid?[manualDocument]:[]});}});await pause();assert.match(second.node('delivery-title').textContent,/Клиент создан/);assert.equal(second.node('manual-create-another').hidden,false);assert.equal(second.postRequests(),0);
-  second.node('manual-create-another').click();await pause();assert.notEqual(manualDraft(second).submitId,sid);assert.equal(second.node('org').value,'');assert.equal(second.node('region').value,'МО');assert.equal(second.node('manual-file-list').innerHTML,'');assert.equal(second.node('delivery').hidden,true);assert.equal(second.node('go').disabled,false);assert.equal(second.postRequests(),0);
+  const second=harness({query:first.context.location.search,persistent:Object.fromEntries(first.persistent),fetch(url,init,response){if(url.startsWith('/api/handoff/manual-materials'))return response({ok:true,files:new URL(url,'https://bot.example').searchParams.get('submit_id')===sid?[manualDocument]:[]});}});await pause();assert.match(second.node('delivery-title').textContent,/Клиент создан/);assert.equal(second.node('manual-create-another').hidden,false);assert.equal(second.postRequests(),0);
+  second.node('manual-create-another').click();
+  assert.equal(second.context.location.href, '/handoff?mode=manual');
+  assert.equal(manualDraft(second).submitId, sid);
+  const fresh = harness({query:'?mode=manual',persistent:Object.fromEntries(second.persistent)});
+  await pause();
+  assert.notEqual(manualDraft(fresh).submitId, sid);
+  assert.equal(fresh.node('org').value,'');
+  assert.equal(fresh.node('region').value,'');
+  assert.equal(fresh.node('manual-file-list').innerHTML,'');
+  assert.equal(fresh.node('delivery').hidden,true);
+  assert.equal(fresh.node('go').disabled,false);
+  assert.equal(fresh.postRequests(),0);
 });
 
 test('a malformed manual creation ACK preserves the exact pending intent and saved files until a valid retry confirms it',async()=>{

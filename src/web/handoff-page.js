@@ -63,8 +63,16 @@ function handoffClient() {
   var query = new URLSearchParams(location.search), manual = query.get('mode') === 'manual', orderId = manual ? '' : query.get('order_id') || '', requestId = manual ? '' : query.get('request_id') || '', caseId=manual?'':query.get('case_id')||'',documentsView=!manual&&query.get('view')==='documents', readonly = !manual && (query.get('view') === 'report'||documentsView);
   var fromRework = documentsView && query.get('rework') === '1';
   var userId = tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id || query.get('u') || sessionValue('tg_u') || 'staff';
-  var cacheKey = 'handoff-v2:' + userId + ':' + (manual ? 'manual' : caseId ? 'case-'+caseId : orderId ? 'order-' + orderId : requestId ? 'request-' + requestId : 'new');
-  var S = { hydrating:true, profile: {}, editedFields: {}, source: {}, sourceLoaded: false, sourceContacts: [], contacts: [], lawyer: null, lawyers: [], priority: 'обычный', comment: '', packet: null, report: null, selectedReport: null, egrnOrder: false, submitId: uuid(), pending: null, completed: null, existingAssignment: null, loading: true, packetError: '', error: '', review: false, sending: false };
+  var manualKey = 'handoff-v2:' + userId + ':manual';
+  var manualDraft = manual ? query.get('draft') : '';
+  if (manual && manualDraft !== 'legacy' && !isDraftId(manualDraft)) {
+    manualDraft = uuid();
+    // Reloading this form must keep the same draft and upload/submit identity.
+    // Reopening from the Telegram keyboard starts from the URL without a draft.
+    history.replaceState(history.state, '', manualUrl(manualDraft));
+  }
+  var cacheKey = manual ? draftKey(manualDraft) : 'handoff-v2:' + userId + ':' + (caseId ? 'case-'+caseId : orderId ? 'order-' + orderId : requestId ? 'request-' + requestId : 'new');
+  var S = { hydrating:true, canManage:false, profile: {}, editedFields: {}, source: {}, sourceLoaded: false, sourceContacts: [], contacts: [], lawyer: null, lawyers: [], priority: 'обычный', comment: '', packet: null, report: null, selectedReport: null, egrnOrder: false, submitId: uuid(), pending: null, completed: null, existingAssignment: null, loading: true, packetError: '', error: '', review: false, sending: false };
   if(manual){S.source=emptyProfile();S.profile=Object.assign({},S.source);}
   var extras;
   var layer = '', reportFocus = null, zoomFocus = null, imageEpoch = 0, imageUrls = [], imageControllers = [], downloadControllers=[], zoomScale = 1, searchTimer, searchSequence = 0, packetSequence = 0;
@@ -72,15 +80,51 @@ function handoffClient() {
   var manualFiles = [], manualQueue = [], manualFilesBusy = false, manualFilesReady = false, manualFilesError = '', manualLimits = {files:20,fileBytes:12582912,totalBytes:104857600};
   function sessionValue(key) { try { return sessionStorage.getItem(key); } catch (_) { return ''; } }
   function uuid() { return window.crypto && window.crypto.randomUUID ? window.crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) { var n = Math.floor(Math.random() * 16); return (c === 'x' ? n : (n & 3) | 8).toString(16); }); }
+  function isDraftId(value) { return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value); }
+  function draftKey(id) { return id === 'legacy' ? manualKey : manualKey + ':' + id; }
+  function manualUrl(id) {
+    var params = new URLSearchParams({mode:'manual'});
+    if (query.get('u') && query.get('k')) {
+      params.set('u', query.get('u'));
+      params.set('k', query.get('k'));
+    }
+    if (id) params.set('draft', id);
+    return '/handoff?' + params.toString() + (location.hash || '');
+  }
+  function updateDraftLinks() {
+    var create = $('create-client-link'), resume = $('resume-manual-draft');
+    create.hidden = manual || readonly || documentsView || !S.canManage || S.sending;
+    if (!create.hidden) create.href = manualUrl();
+    resume.hidden = true;
+    if (!manual || !S.canManage || S.sending || S.review) return;
+    var previous;
+    try { previous = localStorage.getItem(manualKey + ':recent'); } catch (_) {}
+    previous = previous || sessionValue(manualKey + ':recent');
+    if (previous === manualDraft) return;
+    var draft = isDraftId(previous) && cached(draftKey(previous));
+    if (!draft && manualDraft !== 'legacy') {
+      previous = 'legacy';
+      draft = cached(draftKey(previous));
+    }
+    if (!draft) return;
+    resume.href = manualUrl(previous);
+    resume.textContent = draft.pending || draft.completed ? 'Открыть предыдущую передачу' : 'Продолжить предыдущий черновик';
+    resume.hidden = false;
+  }
   function save() {
     if (readonly||S.hydrating) return;
     var serialized=JSON.stringify({ version: 2, savedAt:Date.now(), fingerprint: M.fingerprint(S.source), packetSignature: S.packet && S.packet.signature || '', sourceContacts: S.sourceContacts, profile: S.profile, editedFields: S.editedFields, contacts: S.contacts, lawyer: S.lawyer, priority: S.priority, comment: S.comment, egrnOrder: S.egrnOrder, submitId: S.submitId, pending: S.pending, completed: S.completed, documents: extras && extras.snapshot() });
     try { sessionStorage.setItem(cacheKey,serialized); } catch (_) {}
     try{localStorage.setItem(cacheKey,serialized);}catch(_){}
+    if (manual && isDraftId(manualDraft) && (Object.keys(S.editedFields).length || S.contacts.length || S.lawyer || S.comment || S.priority !== 'обычный' || manualQueue.length || manualFiles.length || S.pending || S.completed)) {
+      try { sessionStorage.setItem(manualKey + ':recent', manualDraft); } catch (_) {}
+      try { localStorage.setItem(manualKey + ':recent', manualDraft); } catch (_) {}
+    }
   }
-  function cached() {
-    var transient=null,durable=null;try{transient=JSON.parse(sessionValue(cacheKey)||'null');}catch(_){}
-    try{durable=JSON.parse(localStorage.getItem(cacheKey)||'null');}catch(_){}
+  function cached(key) {
+    key = key || cacheKey;
+    var transient=null,durable=null;try{transient=JSON.parse(sessionValue(key)||'null');}catch(_){}
+    try{durable=JSON.parse(localStorage.getItem(key)||'null');}catch(_){}
     return durable&&(!transient||Number(durable.savedAt||0)>=Number(transient.savedAt||0))?durable:transient;
   }
   async function api(url, options) {
@@ -99,7 +143,7 @@ function handoffClient() {
   function date(value) { if (!value) return 'дата не указана'; var d = new Date(value); return isNaN(d.getTime()) ? 'дата не указана' : d.toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' }); }
   function bytes(value) { var n = Number(value); return n > 0 ? n >= 1048576 ? (n / 1048576).toLocaleString('ru-RU', { maximumFractionDigits: 1 }) + ' МБ' : Math.ceil(n / 1024) + ' КБ' : ''; }
   function filesLabel(value) { var n = Number(value), tail = n % 100; return n + ' ' + (tail >= 11 && tail <= 14 ? 'файлов' : n % 10 === 1 ? 'файл' : n % 10 >= 2 && n % 10 <= 4 ? 'файла' : 'файлов'); }
-  function emptyProfile() { return { org: '', address: '', inn: '', cad_num: '', region: manual ? 'МО' : 'МСК', kind: '', service: '' }; }
+  function emptyProfile() { return { org: '', address: '', inn: '', cad_num: '', region: manual ? (manualDraft === 'legacy' ? 'МО' : '') : 'МСК', kind: '', service: '' }; }
   function assignmentName() { var l = S.lawyers.find(function (x) { return String(x.tg_id) === String(S.lawyer); }); return l ? l.name : ''; }
   function egrnText(info) {
     var assignment = S.packet && S.packet.assignment || S.existingAssignment;
@@ -148,7 +192,7 @@ function handoffClient() {
     $('object-source').hidden=newManual;$('object-address').hidden=newManual;$('object-meta').hidden=newManual;
     $('object-address').textContent = p.address || 'Добавьте адрес объекта';
     $('object-meta').textContent = [p.kind, p.service, p.region].filter(Boolean).join(' · ') || 'Укажите тип объекта и услугу';
-    $('object-source').textContent = confirmedCase()?'Клиент №'+confirmedCase():orderId ? 'Заявка на замер №' + orderId : requestId ? 'Заявка клиента №' + requestId : 'Новый клиент';
+    $('object-source').textContent = confirmedCase()?'Клиент №'+confirmedCase():orderId ? 'Заявка на замер №' + orderId : requestId ? 'Заявка клиента №' + requestId : 'Клиент для передачи';
     ['org', 'address', 'inn', 'cad_num', 'region', 'kind', 'service'].forEach(function (key) { $(key).value = p[key] || ''; });
     $('contacts').innerHTML = S.contacts.map(function (c, i) { return '<div class="contact-row"><div class="contact-fields"><label>Имя<input data-contact="' + i + '" data-field="name" value="' + M.escape(c.name) + '" autocomplete="name"></label><label>Телефон<input data-contact="' + i + '" data-field="phone" value="' + M.escape(c.phone) + '" inputmode="tel" autocomplete="tel"></label><label>Telegram<input data-contact="' + i + '" data-field="tg" value="' + M.escape(c.tg) + '" placeholder="@имя"></label>' + (c.comment ? '<p class="contact-note">' + M.escape(c.comment) + '</p>' : '') + '</div><button type="button" class="icon-button remove-contact" data-remove-contact="' + i + '" aria-label="Удалить контакт ' + M.escape(c.name || i + 1) + '">×</button></div>'; }).join('');
     $('no-contacts').hidden = !!S.contacts.length;
@@ -272,6 +316,7 @@ function handoffClient() {
     $('choose-report').disabled = locked;
     $('egrn-order').disabled = locked;
     $('manual-create-another').hidden=!manual||!S.completed||!!S.pending||S.sending;
+    updateDraftLinks();
     var currentCase=confirmedCase();
     if(extras){extras.render({visible:!S.hydrating&&(!manual||!!currentCase)&&!S.review,caseId:currentCase,readonly:readonly,locked:S.sending||S.review||!!S.pending||!!(S.existingAssignment&&S.existingAssignment.delivery_complete!==true)});
       if(currentCase&&extras.pendingDelivery()&&!readonly){$('delivery-title').textContent='Клиент передан · документы ожидают отправки';$('delivery-text').textContent='Основная передача сохранена.\nДополнительные документы ещё не доставлены. Статус и повтор отправки — в разделе документов.';}
@@ -366,12 +411,8 @@ function handoffClient() {
     finally{manualFilesBusy=false;updateFooter();}
   }
   function createAnotherManual(){
-    if(!manual||!S.completed||S.pending||S.sending||manualFilesBusy)return;
-    try{sessionStorage.removeItem(cacheKey);}catch(_){}
-    try{localStorage.removeItem(cacheKey);}catch(_){}
-    S.profile=emptyProfile();S.editedFields={};S.source=emptyProfile();S.contacts=[];S.sourceContacts=[];S.lawyer=null;S.priority='обычный';S.comment='';S.egrnOrder=false;S.submitId=uuid();S.pending=null;S.completed=null;S.existingAssignment=null;S.review=false;S.error='';
-    if(extras)extras.reset();
-    manualFiles=[];manualQueue=[];manualFilesReady=false;manualFilesError='';resetManualMatches();save();load();$('org').focus();
+    if (!manual || !S.completed || S.pending || S.sending || manualFilesBusy || (extras && extras.outstanding())) return;
+    location.href = manualUrl();
   }
   function buildPayload() {
     var p = S.profile, rep = S.packet && S.packet.report || S.report;
@@ -549,7 +590,8 @@ function handoffClient() {
     S.loading = true; S.error = ''; render();
     try {
       var pref = await api(manual?'/api/handoff/prefill':'/api/handoff/prefill?order_id=' + encodeURIComponent(orderId) + '&request_id=' + encodeURIComponent(requestId)+(caseId?'&case_id='+encodeURIComponent(caseId):''));
-      if(documentsView){readonly=pref.can_manage!==true;document.body.classList.toggle('readonly',readonly);}
+      S.canManage = pref.can_manage === true;
+      if(documentsView){readonly=!S.canManage;document.body.classList.toggle('readonly',readonly);}
       if(caseId&&pref.order&&pref.order.id)orderId=String(pref.order.id);
       S.lawyers = pref.lawyers || [];
       if (documentsView && caseId && Number(pref.case_id) === Number(caseId) && Number(pref.case_assignment?.case_id) === Number(caseId)) {
@@ -852,7 +894,7 @@ function handoffPage() {
 .document-history{list-style:none;padding:0;margin:20px 0 0}.document-history>li{padding:16px 0;border-top:1px solid var(--border)}.manual-client #details{margin-top:0;border:0;padding-top:0}.manual-client #manual-optional-fields{display:grid;gap:16px;padding-top:14px}.manual-client #contact-section .contacts-title{margin-top:0}.manual-client .assignment-fields{grid-template-columns:1fr}.manual-documents .details{margin:0;border:0;padding:0}.manual-documents summary{min-height:44px;align-content:center;font-weight:650}.manual-documents summary span{font-size:.86rem;font-weight:400;color:var(--muted)}.manual-match-list,.manual-file-list{list-style:none;padding:0;margin:16px 0}.manual-match-list li{border-bottom:1px solid var(--border);padding:14px 0;overflow-wrap:anywhere}.manual-match-list li:first-child{padding-top:0}.manual-match-list p{margin:5px 0}.manual-match-list a{display:block;min-height:44px;padding:12px 0 0;text-decoration:none}.manual-file-list li{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 0;border-bottom:1px solid var(--border)}.manual-file-list li>span{min-width:0}.manual-file-list strong{display:block;font-weight:550;overflow-wrap:anywhere}.manual-file-list small{display:block;margin-top:4px}.manual-file-actions{display:flex;flex-wrap:wrap;gap:10px}.manual-client #review-list{margin-bottom:16px}
 .page-heading>div{min-width:0}.back.back-to-rework{border-radius:16px;padding:8px 12px;font-size:.9rem}.saved-client{display:grid;gap:16px;margin-top:16px}.saved-client[hidden]{display:none}.saved-client h3,.file-group h3,.packet-issues h3{margin:0 0 6px;font-size:.98rem}.contact-list{padding:0;margin:0;list-style:none;display:grid;gap:10px}.contact-list li{padding:10px 12px;background:var(--input);border-radius:14px;overflow-wrap:anywhere}.verbatim{white-space:pre-wrap;overflow-wrap:anywhere}.saved-client .note{margin:0}.packet-issues{padding:14px 16px;margin:0 0 16px;border:1px solid #a9672830;border-radius:16px;background:#b8661110}.packet-issues ul{padding-left:1.2em;margin:6px 0 0}.packet-issues li+li{margin-top:6px}.file-group{margin-top:18px}.file-reference{padding:11px 15px;margin:8px 0;background:var(--input);border-radius:14px;overflow-wrap:anywhere}.file-reference small{display:block}.review-comment-block{margin-top:16px}.review-comment-block .review-comment{margin-top:4px}
 </style><script src="https://telegram.org/js/telegram-web-app.js"></script><script src="/auth.js"></script></head><body>
-<main class="shell"><header class="page-heading"><button id="back" class="back" type="button" aria-label="Назад">←</button><div><h1 id="page-title">Передача юристу</h1><small id="page-subtitle">Объект, готовый комплект и ответственный</small></div></header><p id="readonly-note" class="info readonly-note" hidden>Просмотр материалов. Изменения и передача здесь недоступны.</p><p id="notice" class="notice" role="status" aria-live="polite"></p>
+<main class="shell"><header class="page-heading"><button id="back" class="back" type="button" aria-label="Назад">←</button><div><h1 id="page-title">Передача юристу</h1><small id="page-subtitle">Объект, готовый комплект и ответственный</small></div></header><a id="create-client-link" class="report-link" hidden>Создать нового клиента</a><a id="resume-manual-draft" class="report-link" hidden>Продолжить предыдущий черновик</a><p id="readonly-note" class="info readonly-note" hidden>Просмотр материалов. Изменения и передача здесь недоступны.</p><p id="notice" class="notice" role="status" aria-live="polite"></p>
 <div id="main-form"><section class="glass card" aria-labelledby="object-org"><p id="object-source" class="object-source"></p><h2 id="object-org" class="object-org">Загружаю объект…</h2><p id="object-address" class="object-address"></p><p id="object-meta" class="object-meta"></p><div id="saved-client-summary" class="saved-client" hidden><p id="saved-client-identifiers" class="info"></p><div id="saved-client-comment-block"><h3>Комментарий менеджера</h3><p id="saved-client-comment" class="verbatim"></p></div><div id="saved-client-contacts-block"><h3>Контакты</h3><ul id="saved-client-contacts" class="contact-list"></ul></div><p id="saved-client-address-note" class="note" hidden></p></div><details id="details" class="details"><summary id="details-summary">Изменить сведения и контакты</summary><p id="historical-note" class="note" hidden></p><fieldset id="details-editable" class="details-editable"><div class="fields"><label class="wide">Организация<input id="org" autocomplete="organization"></label><label class="wide">Адрес объекта<input id="address" autocomplete="street-address"></label><label id="inn-field">ИНН <span class="muted">· необязательно</span><input id="inn" inputmode="numeric"></label><label id="cad-field">Кадастровый номер<input id="cad_num" placeholder="77:01:0000000:0000"></label><label>Регион<select id="region"><option value="">Выберите</option><option value="МСК">Москва</option><option value="МО">Московская область</option><option value="СПб">Санкт-Петербург</option></select></label><label>Тип объекта<select id="kind"><option value="">Выберите</option><option>Общепит</option><option>Магазин</option><option>Табак</option></select></label><label class="wide">Услуга<select id="service"><option value="">Выберите</option><option>Получение</option><option>Продление</option><option>Переоформление</option></select></label></div><div id="contact-section"><h3 class="contacts-title">Контакты клиента</h3><p id="no-contacts" class="empty">В заявке нет сохранённых контактов.</p><div id="contacts"></div><button type="button" id="add-contact" class="text-button">＋ Добавить контакт</button></div><details id="manual-optional" class="details" hidden><summary>Контакты, ИНН и комментарий <span class="muted">· необязательно</span></summary><div id="manual-optional-fields"></div></details></fieldset></details></section>
 <section id="manual-load-error" class="glass card" hidden><p id="manual-load-error-text" class="error" role="alert"></p><button id="manual-retry-load" class="soft-button" type="button">Повторить загрузку</button></section>
 <section id="manual-matches" class="glass card" hidden aria-labelledby="manual-match-status"><h2 id="manual-match-status"></h2><ul id="manual-match-list" class="manual-match-list"></ul><p id="manual-match-more" class="info" hidden>Есть и другие совпадения. Уточните организацию, ИНН или адрес.</p><label id="manual-new-choice" class="check" hidden><input type="checkbox" id="manual-create-new"><span>Создать отдельного клиента<small>Существующие карточки останутся без изменений.</small></span></label><button id="manual-match-retry" class="soft-button" type="button" hidden>Повторить проверку</button></section>
