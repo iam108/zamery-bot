@@ -46,9 +46,16 @@ test('a stalled PDF worker releases source upload, preserves the selected origin
     assert.equal(files.some(file => file.name === 'Synthetic stalled PDF.pdf'), false);
     assert.equal(files.some(file => file.name === 'Synthetic cancelled PDF.pdf'), false);
     assert.ok(draft.data.plan.versions.some(version => version.evidence_id === previous));
-    await choose(); await dialog.locator('input[type=file]').setInputFiles({ name: 'Synthetic malformed PDF.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.7\nNot a PDF document') });
-    await until(async () => /Не удалось прочитать PDF/.test(await page.locator('#save-state').innerText()), 'Malformed PDF rejected');
+    await choose();
+    await dialog.getByText('Страница 4 из 6', { exact: true }).waitFor();
+    await until(() => use.isEnabled(), 'Saved sheet reopened');
+    await dialog.locator('input[type=file]').setInputFiles({ name: 'Synthetic malformed PDF.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.7\nNot a PDF document') });
+    // The page-wide save status can change when an earlier autosave completes.
+    // The chooser shows the error for this specific file until the next selection.
+    await dialog.getByText('Не удалось прочитать PDF. Выберите другой файл.', { exact: true }).waitFor();
     assert.equal((await service.draft(58)).data.plan.evidence_id, draft.data.plan.evidence_id);
+    const currentFiles = (await service.pool.query('SELECT name FROM audit_evidence WHERE draft_id=$1', [draft.id])).rows;
+    assert.equal(currentFiles.some(file => file.name === 'Synthetic malformed PDF.pdf'), false);
     assert.deepEqual(visit.errors, []); assert.deepEqual(visit.blocked, []); assert.equal(service.messages.length, 0); assert.equal(service.egrnRequests.length, 0);
   } finally { await worker?.release(); await visit.context.close(); }
 });
