@@ -1,7 +1,7 @@
 const { esc } = require('./formatter');
 const { validateInspection, compactInspectionIssues } = require('./audit-inspection');
 const { isGenericAudit, validateGenericAudit, buildGenericAuditSummary } = require('./audit-generic');
-const { describe: describeReportIssue, isUnverifiedFloor } = require('../../public/audit-report-issues');
+const { archiveReviewSkipped, describe: describeReportIssue, isUnverifiedFloor } = require('../../public/audit-report-issues');
 
 const CONCLUSIONS = { ready: 'Соответствует по проверенным пунктам', actions: 'Нужны действия', insufficient: 'Недостаточно данных', obstacle: 'Выявлено препятствие' };
 const ZONE_STATUS = { pending: 'Требует уточнения', confirmed: 'Ограничение подтверждено аудитором', excluded: 'Ограничение исключено с основанием' };
@@ -28,10 +28,13 @@ function normalizeWorkflow(input) {
     if (p.service !== 'Продление') {
       for (const key of ['archive_available', 'archive_match', 'archive_url', 'licensed_boundaries_match', 'alcohol_within_licensed']) delete p[key];
       delete data.workflow.archive_skipped;
-    } else if (data.workflow.archive_skipped === 'Да') {
-      p.archive_available = 'Нет'; delete p.archive_match; delete p.licensed_boundaries_match;
+      delete data.workflow.archive_review;
     } else {
-      p.archive_available = [...(data.evidence || []), ...(data.request_packet?.materials || [])].some(file => file.role === 'archive') ? 'Да' : 'Нет';
+      const review = data.workflow.archive_review;
+      const skipped = archiveReviewSkipped(data.workflow);
+      const hasArchiveFile = [...(data.evidence || []), ...(data.request_packet?.materials || [])].some(file => file?.role === 'archive');
+      p.archive_available = review === 'checked' || (review === 'unchecked' || !skipped) && hasArchiveFile ? 'Да' : 'Нет';
+      if (skipped) { delete p.archive_match; delete p.licensed_boundaries_match; }
     }
     if (p.cadastral_count === '1') delete p.inter_cadastral_boundary;
     if (data.object_category === 'tobacco') { delete p.alcohol_present; delete p.alcohol_within_licensed; }
@@ -318,6 +321,16 @@ function compactFollowupTasks(data) {
 
 // These are findings in the auditor's recorded answers, not legal conclusions.
 // Keep the existing follow-up labels stable for saved/full report presentation.
+function missingArchiveReview(workflow, inspection, files) {
+  if (inspection.service !== 'Продление' || archiveReviewSkipped(workflow)) return [];
+  if (workflow.archive_review === 'checked') return [
+    ['inspection.archive_match', inspection.archive_match, 'Укажите, совпадает ли планировка с архивом.'],
+    ['inspection.licensed_boundaries_match', inspection.licensed_boundaries_match, 'Укажите, сохранены ли лицензированные границы.'],
+  ].filter(([, answer]) => !['Да', 'Нет'].includes(answer)).map(([control, , message]) => [control, message, 1]);
+  if (!files.some(file => file?.role === 'archive')) return [['workflow.archive_review', 'Архивная графика не приложена. Выберите, сверяли ли вы планировку с архивом.', 0]];
+  return [];
+}
+
 function compactReportIssues(data) {
   if (!data || data.ui_version !== 5 || isGenericAudit(data)) return [];
   const p = data.inspection || {}, w = data.workflow || {};
@@ -352,7 +365,7 @@ function compactReportIssues(data) {
   }
   const video = Object.hasOwn(w, 'video_url') ? w.video_url : data.video_url || '';
   if (data.request_packet?.video_required && !video) missing('workflow.video_url', 'Менеджер запросил видео: приложите ссылку на Яндекс Диск.', 2);
-  if (p.service === 'Продление' && w.archive_skipped !== 'Да' && ![...evidence, ...materials].some(file => file?.role === 'archive')) missing('workflow.archive_skipped', 'Архивная графика не приложена.', 0, 'Добавьте архив или явно отметьте «Архив не предоставлен»; это сохранит вопрос о сверке открытым.');
+  for (const [control, message, step] of missingArchiveReview(w, p, [...evidence, ...materials])) missing(control, message, step);
   if (!entrances.length) missing('entrances', 'Добавьте хотя бы один вход и его фото.', 0);
   const photo = (role, id) => evidence.some(file => file?.subject_id === id && file.role === role && /^image\//.test(file.mime || ''));
   for (const entrance of entrances) if (!photo('entrance', entrance.id)) missing('evidence.entrance.' + entrance.id, 'Добавьте фото входа «' + (entrance.label || entrance.id) + '».', 0);
@@ -476,10 +489,12 @@ function validateCompactWorkflow(data, options = {}) {
     if (typeof value !== 'string' || value.length > 6000) throw new Error('Проверьте поле отчёта: ' + key);
   }
   if (w.archive_skipped && !['Да', 'Нет'].includes(w.archive_skipped)) throw new Error('Проверьте отметку о пропуске архива.');
+  if (w.archive_review && !['checked', 'unchecked'].includes(w.archive_review)) throw new Error('Проверьте ответ о сверке с архивом.');
   const video = Object.hasOwn(w, 'video_url') ? w.video_url : data.video_url || '';
   if (video) { try { const url = new URL(video); if (url.protocol !== 'https:') throw new Error(); } catch (_) { throw new Error('Укажите полную HTTPS-ссылку на видео.'); } }
   if (data.request_packet?.video_required && !video) throw new Error('Менеджер запросил видео: приложите ссылку на Яндекс Диск.');
-  if (p.service === 'Продление' && w.archive_skipped !== 'Да' && ![...evidence, ...(data.request_packet?.materials || [])].some(file => file.role === 'archive')) throw new Error('Архивная графика не приложена. Добавьте архив или явно выберите «Архив не предоставлен».');
+  const archiveMissing = missingArchiveReview(w, p, [...evidence, ...(data.request_packet?.materials || [])]);
+  if (archiveMissing.length) throw new Error(archiveMissing[0][1]);
   const { marks, checkMarks } = validateCompactTerritory(data, evidence);
   validateCompactDrawing(data.plan, 'plan', evidence, 'annotation', true);
   if (data.additional_plans != null && (!Array.isArray(data.additional_plans) || data.additional_plans.length > 20)) throw new Error('Проверьте дополнительные планы.');

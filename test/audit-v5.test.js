@@ -73,6 +73,37 @@ test('V5 explicit archive skip permits renewal with one current plan and disclos
   assert.throws(() => validateWorkflow(data), /замечания/);
 });
 
+test('V5 confirmed archive review reports mismatches and cannot produce a conflicting positive conclusion', () => {
+  const raw = compactVisit('catering', 'Продление');
+  raw.request_packet.materials = [];
+  raw.workflow.archive_review = 'checked';
+  raw.inspection.archive_match = 'Нет';
+  raw.inspection.licensed_boundaries_match = 'Нет';
+  const checked = normalizeWorkflow(raw);
+  assert.throws(() => validateWorkflow(checked), /замечания/);
+  checked.workflow.conclusion_status = 'actions';
+  assert.doesNotThrow(() => validateWorkflow(checked));
+  const summary = buildAuditSummary(checked, 'Тестовый аудитор').plain;
+  assert.match(summary, /Архив: сверено · есть расхождения/);
+  assert.match(summary, /Лицензированные границы: есть расхождения/);
+  assert.deepEqual(followupTasks(checked).map(task => task.id), ['archive-mismatch', 'licensed-boundaries']);
+});
+
+test('V5 an unreviewed available archive is disclosed without inventing missing materials or positive findings', () => {
+  const raw = compactVisit('catering', 'Продление');
+  raw.workflow.archive_review = 'unchecked';
+  const unchecked = normalizeWorkflow(raw);
+  assert.throws(() => validateWorkflow(unchecked), /замечания/);
+  unchecked.workflow.conclusion_status = 'insufficient';
+  assert.doesNotThrow(() => validateWorkflow(unchecked));
+  assert.equal(unchecked.inspection.archive_available, 'Да');
+  assert.equal(unchecked.inspection.archive_match, undefined);
+  assert.equal(unchecked.inspection.licensed_boundaries_match, undefined);
+  const summary = buildAuditSummary(unchecked, 'Тестовый аудитор').plain;
+  assert.match(summary, /Сверка с архивом не выполнена/);
+  assert.doesNotMatch(summary, /Архив не предоставлен|планировка совпадает с архивом/);
+});
+
 test('V5 renewal without an alcohol observation has no hidden placement requirement', () => {
   const data = compactVisit('retail', 'Продление');
   data.inspection.alcohol_present = 'Не проверено'; data.workflow.conclusion_status = 'insufficient';
@@ -88,11 +119,12 @@ test('V5 renewal without an alcohol observation has no hidden placement requirem
 test('V5 hidden renewal and multiple-cadastral answers do not contaminate acquisition or single-cadastral reports', () => {
   const raw = compactVisit();
   Object.assign(raw.inspection, { archive_match: 'Нет', licensed_boundaries_match: 'Нет', inter_cadastral_boundary: 'Объединены' });
-  raw.workflow.archive_skipped = 'Да';
+  raw.workflow.archive_skipped = 'Да'; raw.workflow.archive_review = 'unchecked';
   const data = normalizeWorkflow(raw);
   assert.deepEqual(followupTasks(data), []);
   assert.equal(data.inspection.inter_cadastral_boundary, undefined);
   assert.equal(data.workflow.archive_skipped, undefined);
+  assert.equal(data.workflow.archive_review, undefined);
   assert.equal(raw.inspection.inter_cadastral_boundary, 'Объединены');
 });
 

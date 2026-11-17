@@ -35,7 +35,6 @@ function harness(data = compactVisit()) {
     root: { querySelector: node, querySelectorAll: () => [], innerHTML: '' },
     $: node, tail: Promise.resolve(), queuedJobs: 0, timer: null, clearTimeout, editor: null, tg: null, orderId: '58', localKey: 'synthetic-audit-submit-feedback', clone: copy,
     defaults: { map: { evidence_id: '', page: 1, annotations: [] } },
-    OUTCOME_LABELS: { ready: 'Соответствует по проверенным пунктам', actions: 'Нужны действия', insufficient: 'Недостаточно данных', obstacle: 'Выявлено препятствие' },
     MAP_IMAGE_TYPES: ['image/jpeg','image/png'], ZONE_STATUS: { clear:'Без замечаний', licensed:'Есть сведения о лицензии', disputed:'Спорное место', confirmed:'Есть ограничение', pending:'Нужно уточнить', other:'Наблюдение' },
     esc: value => String(value == null ? '' : value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;'),
     document: { body: { classList: { add() {}, remove() {} } } },
@@ -60,7 +59,7 @@ function harness(data = compactVisit()) {
     },
   };
   vm.createContext(c);
-  vm.runInContext(['updateClosingConfirmation','setOutcome','queue','isRenewal','packetFiles','evidenceFor','adoptRevision','removalApplied','forgetEvidence','removeEvidenceFile','removeGeneratedEvidence','mapMode','rememberTerritory','switchTerritoryMode','chooseTerritory','hasEvidenceImage','validDistance','territoryIssues','issues','requiredIssues','tasksHtml',
+  vm.runInContext(['updateClosingConfirmation','captureVisibleComments','setOutcome','queue','isRenewal','packetFiles','evidenceFor','adoptRevision','removalApplied','forgetEvidence','removeEvidenceFile','removeGeneratedEvidence','mapMode','rememberTerritory','switchTerritoryMode','chooseTerritory','hasEvidenceImage','validDistance','territoryIssues','issues','requiredIssues','tasksHtml',
     'taskDetails','goIssue','offersActions','reportFeedback','bindReportFeedback','refreshReportFeedback','chooseConclusion','showReportIssues','reportPreview','submit'].map(actualFunction).join('\n'), c);
   return { c, calls, node };
 }

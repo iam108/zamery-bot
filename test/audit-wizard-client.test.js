@@ -18,7 +18,7 @@ function harness() {
   const c={
     state:{data:{schema_version:3,ui_version:5,object_category:'catering',inspection:{org:'Тест',address:'Москва',service:'Получение',visit_date:'2026-10-30'},workflow:{step:2,conclusion_status:'actions',territory_result:'findings'},conclusion:'Есть замечания',entrances:[],zones:[],plan:{evidence_id:'plan-original',page:6,annotations:[{id:'p1',tool:'boundary'}]},map:{evidence_id:'map-original',page:1,annotations:[{id:'e1',tool:'entrance'}]},additional_plans:[]},draft:{id:'draft-test',revision:10},evidence:[],dirty:false,serverError:'',version:0,frozen:false,submitting:false,completed:false,packet:{materials:[]}},
     $:node,root:node('#root'),calls,tail:Promise.resolve(),timer:null,pendingSave:null,queuedJobs:0,closingConfirmation:false,saveRetries:0,editor:null,activePlanId:'main',managerPlanIntents:new Map(),orderId:'123',localKey:'test-only',tg:null,
-    clone:copy,clearTimeout,setTimeout,console,TextEncoder,URL,OUTCOME_LABELS:{ready:'Соответствует по проверенным пунктам',actions:'Нужны действия'},
+    clone:copy,clearTimeout,setTimeout,console,TextEncoder,URL,commentCaptures:new WeakMap(),
     document:{body:{classList:{add(){},remove(){}},appendChild(){calls.push(['host-added']);}},createElement:()=>node('export-host')},
     window:{},blobUrls:new Map(),localStorage:{setItem(){},removeItem(){}},
     render(){calls.push(['render']);},refreshChrome(){},notify(text){calls.push(['notify',text]);},notice(){},status(text){calls.push(['status',text]);},timeLabel:()=> '12:00',localDate:()=> '2026-10-30',localSave(){},issues:()=>[],packetFiles:()=>[],
@@ -31,7 +31,7 @@ function harness() {
     territoryIssues(){},
     defaults:{inspection:{region:'МСК'},workflow:{step:0},plan:{},map:{},additional_plans:[]}
   };
-  vm.createContext(c);load(c,'requiredIssues','stable','sameData','draftWriteOptions','updateClosingConfirmation','recoverUnconfirmedWrite','setOutcome','queue','step','isRenewal','evidenceFor','mapMode','adoptRevision','removeGeneratedEvidence','submit','currentPlan','setCurrentPlan');return c;
+  vm.createContext(c);load(c,'requiredIssues','stable','sameData','draftWriteOptions','updateClosingConfirmation','captureVisibleComments','recoverUnconfirmedWrite','setOutcome','queue','step','isRenewal','evidenceFor','mapMode','adoptRevision','removeGeneratedEvidence','submit','currentPlan','setCurrentPlan');return c;
 }
 
 test('switching the main plan to a ready artwork parks all drawn points and restores both modes after a draft reload',()=>{
@@ -497,15 +497,45 @@ test('a newer save by another window is not overwritten while recovering a lost 
   assert.equal(c.state.attempt.data.conclusion,first.conclusion);
 });
 
-test('changing the outcome removes the old automatic outcome text and keeps actual comments', () => {
+test('changing the outcome preserves independent comments even when they match an outcome label', () => {
   const c=harness();
   c.state.data.workflow.conclusion_status='ready';
   c.state.data.conclusion='Соответствует по проверенным пунктам';
   c.setOutcome('actions');
-  assert.equal(c.state.data.conclusion,'');
+  assert.equal(c.state.data.conclusion,'Соответствует по проверенным пунктам');
   c.state.data.conclusion='На плане и по факту разные границы';
   c.setOutcome('insufficient');
   assert.equal(c.state.data.conclusion,'На плане и по факту разные границы');
+});
+
+test('the active plan note is captured at close without an input event and a stale control cannot overwrite a loaded draft',async()=>{
+  const c=harness(),listeners={},writes=[];
+  const control={tagName:'TEXTAREA',isConnected:true,value:'',dataset:{bind:'inspection.plan_note'},addEventListener(event,fn){listeners[event]=fn;}};
+  c.root.querySelectorAll=selector=>['[data-bind]','textarea[data-bind]'].includes(selector)?[control]:[];
+  c.state.loaded=true;c.state.data.inspection.plan_note='';
+  c.localSave=()=>writes.push(['local',c.state.data.inspection.plan_note]);
+  c.request=async(url,options)=>{writes.push(['request',url,JSON.parse(options.body)]);return {ok:true,revision:11};};
+  load(c,'set','bind','saveOnExit','flush','saveNow');c.bind();
+  control.value='всё в границах, всё ок';
+  c.saveOnExit();assert.equal(c.state.data.inspection.plan_note,control.value);
+  assert.equal(writes.find(row=>row[0]==='request')[2].data.inspection.plan_note,control.value);
+  await c.pendingSave;
+  control.value='Проверил повторно';listeners.compositionend();
+  assert.equal(c.state.data.inspection.plan_note,control.value);
+  const version=c.state.version;listeners.change();assert.equal(c.state.version,version);
+  c.state.data=copy(c.state.data);c.state.data.inspection.plan_note='Загружено с сервера';
+  control.value='Устаревшая правка';listeners.input();c.captureVisibleComments();
+  assert.equal(c.state.data.inspection.plan_note,'Загружено с сервера');
+});
+
+test('the actual keepalive request starts before the next microtask', async () => {
+  const c=harness(),calls=[];
+  c.fetch=(url,options)=>{calls.push([url,options]);return Promise.resolve(new Response('{"ok":true}'));};
+  load(c,'request');
+  const result=c.request('/api/audit/drafts/draft-test',{method:'PUT',keepalive:true});
+  assert.equal(calls.length,1);
+  assert.equal(calls[0][1].keepalive,true);
+  assert.equal((await result).ok,true);
 });
 
 test('reopening a reported conflict does not treat the competing revision as the base of local edits', () => {

@@ -1,3 +1,4 @@
+const { archiveReviewSkipped } = require('../../public/audit-report-issues');
 const { esc } = require('./formatter');
 const { followupTasks, CONCLUSIONS, TERRITORY_CLEAR_LABEL } = require('./audit-workflow');
 
@@ -89,9 +90,10 @@ function buildAuditSummary(data, actor) {
   } else line(p.alcohol_present === 'Да' ? 'Алкоголь на объекте есть' : 'Наличие алкоголя не проверено');
 
   if (service === 'Продление') {
-    if (w.archive_skipped === 'Да') line('Архив: сверка пропущена');
+    if (archiveReviewSkipped(w)) line('Архив: сверка пропущена');
     else {
-      line('Архив: ' + answer(p.archive_match, 'планировка совпадает', 'есть расхождения', p.archive_match === 'Не проверено' ? 'сверка не выполнена' : 'результат сверки не отмечен'));
+      const layout = answer(p.archive_match, 'планировка совпадает', 'есть расхождения', p.archive_match === 'Не проверено' ? 'сверка не выполнена' : 'результат сверки не отмечен');
+      line('Архив: ' + (w.archive_review === 'checked' ? 'сверено · ' : '') + layout);
       line('Лицензированные границы: ' + answer(p.licensed_boundaries_match, 'сохранены', 'есть расхождения', p.licensed_boundaries_match === 'Не проверено' ? 'не проверены' : 'результат сверки не отмечен'));
     }
   }
@@ -160,7 +162,7 @@ function briefText(item, limit) {
   return result.trimEnd()+'…';
 }
 
-function buildAuditBrief(data, actor) {
+function buildAuditBrief(data, actor, { includePlanNote = false } = {}) {
   const {isGenericAudit}=require('./audit-generic'),generic=isGenericAudit(data);
   const p=data.inspection||{},w=data.workflow||{},packet=data.request_packet||{},html=[],plain=[];
   const line=(text,limit=220,bold=false)=>{const short=briefText(text,limit);html.push(bold?'<b>'+esc(short)+'</b>':esc(short));plain.push(short);};
@@ -216,6 +218,7 @@ function buildAuditBrief(data, actor) {
     if(w.conclusion_status==='ready'&&!actions.length&&!questions.length)line('Замечаний по проверенным пунктам не отмечено.',100);
     const comment=value(data.conclusion);
     if(comment&&comment!==outcome){blank();line('Комментарий аудитора: '+comment,160);}
+    if(includePlanNote&&value(p.plan_note)){blank();line('Комментарий к плану: '+value(p.plan_note),160);}
   }
   blank();line((value(p.visit_date)?visitDate(p.visit_date)+' · ':'')+'Аудитор: '+(value(actor)||'не указан'),100);
   const originals=(Array.isArray(data.documents)&&data.documents.length)||(Array.isArray(data.evidence)&&data.evidence.length);

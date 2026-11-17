@@ -54,6 +54,21 @@ test('fresh v3 sends the scheme/plans/photos before a short brief and preserves 
  const buttons=keyboard(h);assert.ok(buttons.some(button=>button.text==='📄 Полный отчёт'&&button.url.endsWith('/'+documents[0].message_id)));assert.ok(buttons.some(button=>button.text==='📎 Оригиналы'&&button.url.endsWith('/'+documents[1].message_id)));assert.ok(buttons.some(button=>button.url===data.workflow.video_url));assert.ok(buttons.some(button=>button.callback_data==='handoff:58'));
 });
 
+test('new reports show the plan note in the brief and full report, while an already-started v3 keeps its original brief',async()=>{
+  const note='всё в границах, всё ок';
+  const data=report();data.bti='Да';data.inspection.plan_note=note;
+  const checkpoint={signature:signature(data),deliveryVersion:3,destination:GROUP,textIds:[],photoIds:[],documentIds:[]};
+  const existing=harness({holder:{value:checkpoint}});await existing.send(data);
+  assert.equal(existing.holder.value.planNoteInBrief,undefined);
+  assert.equal(existing.delivered.find(item=>item.kind==='text').payload,buildAuditBrief(normalizeWorkflow(data),'@qa_brief').html);
+
+  const fresh=harness();await fresh.send(data);
+  assert.equal(fresh.events[0].value.planNoteInBrief,true);
+  assert.match(fresh.delivered.find(item=>item.kind==='text').payload,/Комментарий к плану: всё в границах, всё ок/);
+  const full=fresh.delivered.find(item=>item.filename==='Отчёт-58-полный.txt');
+  assert.match(full.buffer.toString('utf8'),/По плану: всё в границах, всё ок/);
+});
+
 for(const beforeFirst of [false,true])test('a new frozen delivery binds its chat and refuses a changed destination after restart '+(beforeFirst?'before its first message':'after confirmed photos and summary'),async()=>{
  const data=report(),holder={value:{}},saves=[];
  const first=harness({holder,saves,beforePost(method,args){if(beforeFirst||method==='sendMediaGroup'&&args[1][0].type==='document')throw{response:{error_code:400,description:'Synthetic known rejection'}};}});

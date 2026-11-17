@@ -98,12 +98,39 @@ test('missing required photos and annotated originals cannot be waived by changi
 
 test('skipping a missing archive leaves an honest question while a missing required video remains blocking', () => {
   const data = compactVisit('catering', 'Продление'); data.request_packet.materials = [];
-  assert.ok(compactReportIssues(data).some(item => item.id === 'required:workflow.archive_skipped'));
+  assert.ok(compactReportIssues(data).some(item => item.id === 'required:workflow.archive_review'));
   data.workflow.archive_skipped = 'Да'; const skipped = compactReportIssues(data).find(item => item.id === 'archive-skipped'); assert.equal(skipped.kind, 'unverified'); assert.equal(skipped.blocks_submission, false);
   data.workflow.conclusion_status = 'insufficient'; assert.doesNotThrow(() => validateWorkflow(data));
   data.request_packet.video_required = true; assert.ok(compactReportIssues(data).some(item => item.id === 'required:workflow.video_url' && item.blocks_submission));
   assert.throws(() => validateWorkflow(data), /Менеджер запросил видео/);
 });
+
+for (const archiveUrl of ['', 'https://disk.yandex.ru/d/example']) {
+  test('explicit archive review permits renewal without an uploaded archive ' + (archiveUrl ? 'with a folder link' : 'received outside the form'), () => {
+    const raw = compactVisit('catering', 'Продление');
+    raw.request_packet.materials = [];
+    raw.request_packet.archive_url = archiveUrl;
+    raw.workflow.archive_review = 'checked';
+    raw.workflow.archive_skipped = 'Да';
+    delete raw.inspection.archive_match;
+    raw.inspection.licensed_boundaries_match = 'Не проверено';
+
+    const incomplete = normalizeWorkflow(raw);
+    const blockers = compactReportIssues(incomplete).filter(issue => issue.blocks_submission);
+    assert.deepEqual(blockers.map(issue => [issue.id, issue.step]), [
+      ['required:inspection.archive_match', 1],
+      ['required:inspection.licensed_boundaries_match', 1],
+    ]);
+    assert.throws(() => validateWorkflow(incomplete), /совпадает ли планировка с архивом/);
+    raw.inspection.archive_match = 'Да';
+    assert.throws(() => validateWorkflow(normalizeWorkflow(raw)), /сохранены ли лицензированные границы/);
+    raw.inspection.licensed_boundaries_match = 'Да';
+    const checked = normalizeWorkflow(raw);
+    assert.doesNotThrow(() => validateWorkflow(checked));
+    assert.equal(checked.inspection.archive_available, 'Да');
+    assert.deepEqual(compactReportIssues(checked), []);
+  });
+}
 
 for (const status of ['pending', 'disputed', 'confirmed']) test('a '+status+' neighbor retains its own stable control and factual status', () => {
   const data = addOrganization(compactVisit(), { id: 'neighbor-7', name: 'Соседняя организация', status, note: 'Записанное наблюдение' });

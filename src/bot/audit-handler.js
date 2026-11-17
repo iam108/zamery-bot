@@ -79,7 +79,8 @@ async function handleAuditReport(ctx, data) {
     throw Object.assign(new Error('Рабочий чат отчёта изменён в настройках. Отправка остановлена: уже подтверждённые части не будут перенесены в другой чат. Восстановите прежнюю настройку чата и повторите отправку этой версии.'), { status:409, code:'AUDIT_DELIVERY_DESTINATION_CHANGED' });
   }
   if (!progress) {
-    progress = { signature, destination, ...(data.ui_version === 5 ? { deliveryVersion: 3 } : {}), textIds: [], photoIds: [], documentIds: [], saved: false, handoffSent: false, orderCardLinked: false, replied: false, job: null };
+    const planNoteInBrief = data.ui_version === 5 && String(data.inspection?.plan_note || '').trim();
+    progress = { signature, destination, ...(data.ui_version === 5 ? { deliveryVersion: 3 } : {}), ...(planNoteInBrief ? { planNoteInBrief: true } : {}), textIds: [], photoIds: [], documentIds: [], saved: false, handoffSent: false, orderCardLinked: false, replied: false, job: null };
   }
   // Former partial checkpoints contain only message IDs, with no trustworthy
   // source chat. Keep their exact resume contract; do not guess or rewrite it.
@@ -140,8 +141,8 @@ async function handleAuditReportInner(ctx, data, progress, validationOptions) {
   }
   async function checkpoint() {
     if (ctx.auditDelivery) {
-      const { signature, destination, deliveryVersion, textIds, photoIds, documentIds, saved, handoffSent, orderCardLinked, orderCardLinkSkipped, replied, inflight, lastRiskRetryCursor } = progress;
-      await ctx.auditDelivery.save({ signature, ...(destination != null ? { destination } : {}), ...(deliveryVersion != null ? { deliveryVersion } : {}), textIds, photoIds, documentIds, saved, handoffSent, orderCardLinked, ...(orderCardLinkSkipped ? { orderCardLinkSkipped } : {}), replied, ...(inflight ? { inflight } : {}), ...(lastRiskRetryCursor ? { lastRiskRetryCursor } : {}) });
+      const { signature, destination, deliveryVersion, planNoteInBrief, textIds, photoIds, documentIds, saved, handoffSent, orderCardLinked, orderCardLinkSkipped, replied, inflight, lastRiskRetryCursor } = progress;
+      await ctx.auditDelivery.save({ signature, ...(destination != null ? { destination } : {}), ...(deliveryVersion != null ? { deliveryVersion } : {}), ...(planNoteInBrief ? { planNoteInBrief } : {}), textIds, photoIds, documentIds, saved, handoffSent, orderCardLinked, ...(orderCardLinkSkipped ? { orderCardLinkSkipped } : {}), replied, ...(inflight ? { inflight } : {}), ...(lastRiskRetryCursor ? { lastRiskRetryCursor } : {}) });
     }
   }
   if (progress.inflight) throw unknownDelivery();
@@ -195,7 +196,7 @@ async function handleAuditReportInner(ctx, data, progress, validationOptions) {
   var plain;
   if (presentation) {
     const summaries = require('./audit-summary'), summary = summaries.buildAuditSummary(data, actor || 'аудитор');
-    text = albumFirst ? summaries.buildAuditBrief(data, actor || 'аудитор').html : summary.html;
+    text = albumFirst ? summaries.buildAuditBrief(data, actor || 'аудитор', { includePlanNote: progress.planNoteInBrief }).html : summary.html;
     plain = [summary.plain];
   } else {
 

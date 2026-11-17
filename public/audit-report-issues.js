@@ -30,8 +30,11 @@
   function isUnverifiedFloor(value) {
     return typeof value === 'string' && value.trim().replace(/\s+/g, ' ').toLowerCase() === 'не проверено';
   }
+  function archiveReviewSkipped(workflow) {
+    return !!workflow && (workflow.archive_review === 'unchecked' || (!workflow.archive_review && workflow.archive_skipped === 'Да'));
+  }
   function requiredStep(control) {
-    if (/^(?:map\.|entrances(?:\.|$)|zones(?:\.|$)|evidence\.(?:entrance|zone)\.|building_type$|workflow\.(?:territory_result|archive_skipped)$|inspection\.(?:org|address|service)$)/.test(control)) return 0;
+    if (/^(?:map\.|entrances(?:\.|$)|zones(?:\.|$)|evidence\.(?:entrance|zone)\.|building_type$|workflow\.(?:territory_result|archive_skipped|archive_review)$|inspection\.(?:org|address|service)$)/.test(control)) return 0;
     return /^(?:workflow\.(?:video_url|conclusion_status)|conclusion$|inspection\.video_status$)/.test(control) ? 2 : 1;
   }
   function describe(data, task) {
@@ -47,6 +50,9 @@
       control = entry[0]; reason = entry[1]; kind = entry[2] || 'adverse'; step = entry[3] == null ? 1 : entry[3];
       if (id === 'floor-mismatch') reason = 'Этаж на плане: «' + String(p.floor_plan || 'не указан') + '»; фактически: «' + String(p.floor_actual || 'не указан') + '». Значения различаются.';
       if (id === 'floor-mismatch' && (isUnverifiedFloor(p.floor_plan) || isUnverifiedFloor(p.floor_actual))) { kind = 'unverified'; reason = 'Этаж на плане или фактический этаж не проверен; сравнение не выполнено.'; }
+      if (id === 'archive-skipped' && data && data.workflow && data.workflow.archive_review === 'unchecked') {
+        control = 'workflow.archive_review'; reason = 'Сверка с архивом не выполнена.';
+      }
       if (id === 'inter-cadastral') reason = 'Помещения из ' + String(p.cadastral_count || 'нескольких') + ' кадастров объединены.';
       if (id === 'plan-mismatch' && p.plan_note) reason += ' Аудитор указал: ' + p.plan_note;
       if (id === 'alcohol-zone' && p.alcohol_within_licensed !== 'Нет') { kind = 'unverified'; reason = 'Размещение алкоголя в лицензированной зоне не подтверждено.'; }
@@ -66,5 +72,5 @@
     return { id: id, label: task.label || reason, kind: kind, section: sections[step], step: step, control: control, reason: reason, action: action,
       suggested_conclusion: kind === 'missing_required' ? null : kind === 'unverified' ? 'insufficient' : 'actions', blocks_submission: kind === 'missing_required' };
   }
-  return { describe: describe, isUnverifiedFloor: isUnverifiedFloor };
+  return { archiveReviewSkipped: archiveReviewSkipped, describe: describe, isUnverifiedFloor: isUnverifiedFloor };
 });

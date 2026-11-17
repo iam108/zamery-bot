@@ -1,3 +1,4 @@
+const { archiveReviewSkipped } = require('../../public/audit-report-issues');
 const { esc } = require('./formatter');
 
 const ANSWERS = ['Да', 'Нет', 'Не проверено'];
@@ -174,10 +175,10 @@ function compactInspectionIssues(data) {
   if (data.bti === 'Нет') add('plan-mismatch', 'Расхождения планировки: ' + (p.plan_note || 'описание не заполнено'));
   if (data.to === 'Нужно') add('technical-description', 'Требуется техническое описание.');
   if (p.service === 'Продление') {
-    if (data.workflow?.archive_skipped === 'Да') add('archive-skipped', 'Архив не предоставлен; сверка с архивом не выполнена.');
+    if (archiveReviewSkipped(data.workflow)) add('archive-skipped', data.workflow?.archive_review === 'unchecked' ? 'Сверка с архивом не выполнена.' : 'Архив не предоставлен; сверка с архивом не выполнена.');
     else if (p.archive_match === 'Нет') add('archive-mismatch', 'Аудитор отметил расхождения с архивом.');
     else if (p.archive_match !== 'Да') add('archive-unchecked', 'Сверка с архивом не выполнена.');
-    if (data.workflow?.archive_skipped !== 'Да') {
+    if (!archiveReviewSkipped(data.workflow)) {
       if (p.licensed_boundaries_match === 'Нет') add('licensed-boundaries', 'Аудитор отметил расхождение лицензированных границ.');
       else if (p.licensed_boundaries_match !== 'Да') add('licensed-boundaries-unchecked', 'Соблюдение лицензированных границ не подтверждено.');
     }
@@ -214,8 +215,12 @@ function buildCompactInspectionReport(data) {
     field('Алкоголь на объекте', p.alcohol_present);
     if (p.service === 'Продление' && p.alcohol_present !== 'Нет') field('Алкоголь в лицензированной зоне', p.alcohol_within_licensed);
   }
-  if (p.service === 'Продление' && data.workflow?.archive_skipped !== 'Да') {
-    field('Сверка с архивом', p.archive_match); field('Лицензированные границы совпадают', p.licensed_boundaries_match);
+  if (p.service === 'Продление' && !archiveReviewSkipped(data.workflow)) {
+    if (data.workflow?.archive_review === 'checked') {
+      field('Архив', 'сверено');
+      field('Планировка совпадает с архивом', p.archive_match);
+    } else field('Сверка с архивом', p.archive_match);
+    field('Лицензированные границы совпадают', p.licensed_boundaries_match);
   }
   return { plain, html: plain.map(esc) };
 }
