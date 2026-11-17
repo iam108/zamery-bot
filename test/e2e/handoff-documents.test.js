@@ -14,7 +14,10 @@ const sourceName='Synthetic source establishment';
 const managerAddress='Москва, Тестовая улица, 58, помещение 2';
 const managerInn='1234567890';
 const managerCad='77:01:0004016:9999';
-const managerComment=['Уточнить регистрацию договора аренды.', ...Array.from({length:12},(_,i)=>'Пункт '+(i+1)+'. Сверить комплект перед подачей.'), 'Техническое описание оплачено.'].join('\n');
+const clientsGroup='-1001000000002';
+const managerComment=['Уточнить регистрацию договора аренды <А> & <Б>.',
+  ...Array.from({length:54},(_,i)=>'Пункт '+(i+1)+'. Сверить сроки регистрации договора перед подачей документов.'),
+  'Проверить отметку в конце списка.'].join('\n');
 const document=name=>Buffer.concat([multiPagePdf(),Buffer.from('\n% '+name+'\n')]);
 const auditOriginal=document('Auditor source original');
 const orderOriginal=document('Original order document');
@@ -22,9 +25,9 @@ const initialDocument=document('Manager initial extra document');
 const laterDocument=document('Manager later extra document');
 before(async()=>{
   await fs.mkdir(artifacts,{recursive:true});
-  service=await createService({master:true,clientsGroup:'-1001000000002'});browser=await chromium.launch();
+  service=await createService({master:true,clientsGroup});browser=await chromium.launch();
   await service.pool.query('UPDATE orders SET contacts=$1,cad_num=\'\',owner_name=$2,object_name=$2 WHERE id=58',[
-    JSON.stringify([{name:'Synthetic contact',phone:'+79991234567'}]),sourceName]);
+    JSON.stringify([{name:'Synthetic contact',phone:'+79991234567',comment:'Связаться при получении договора'}]),sourceName]);
   const telegram=require('../../src/bot/instance').telegram;
   const request=await telegram.sendMessage(GROUP,'Synthetic request #58');
   await service.pool.query('UPDATE orders SET telegram_msg_id=$1 WHERE id=58',[request.message_id]);
@@ -78,6 +81,7 @@ test('normal report handoff preserves manager company and documents through clos
     await page.locator('#service').selectOption('Получение');
     await page.locator('[data-contact="0"][data-field="tg"]').fill('@synthetic_contact');
     await page.locator('#priority').selectOption('срочно');
+    await page.locator('#technical-description-payment').selectOption('paid');
     await page.locator('#comment').fill(managerComment);
     const initialFiles=await uploaded(page,'manager-contract.pdf',initialDocument);
     assert.equal(initialFiles.length,1);assert.equal(initialFiles[0].sha256,hash(initialDocument));
@@ -87,12 +91,27 @@ test('normal report handoff preserves manager company and documents through clos
     const url=page.url();await page.close();page=await visit.context.newPage();page.setDefaultTimeout(10000);page.on('pageerror',error=>visit.errors.push(error.message));
     await page.goto(url);await page.locator('#extra-document-list strong').getByText('manager-contract.pdf',{exact:true}).waitFor();
     assert.equal(await page.locator('#org').inputValue(),company,'Company survives a closed form without source-name overwrite');
+    assert.equal(await page.locator('#technical-description-payment').inputValue(),'paid','TO payment state survives re-opening the draft');
     await page.locator('#lawyers').selectOption(String(LAWYER));
     const start=service.messages.length;
+    const telegram=require('../../src/bot/instance').telegram;
+    const sendMessage=telegram.sendMessage;
+    let groupContinuationRejected=false;
+    telegram.sendMessage=async function(chat,text,options){
+      if(String(chat)===clientsGroup&&options?.reply_parameters&&!groupContinuationRejected){
+        groupContinuationRejected=true;
+        throw Object.assign(new Error('Synthetic Telegram rate limit'),{response:{error_code:429}});
+      }
+      return sendMessage.call(this,chat,text,options);
+    };
     await page.locator('#go').click();await page.locator('#review').waitFor({state:'visible'});
     assert.match(await page.locator('#review').innerText(),/manager-contract\.pdf/);
     assert.match(await page.locator('#review-identifiers').innerText(),/1234567890.+77:01:0004016:9999/);
     assert.equal(await page.locator('#review-comment').innerText(),managerComment);
+    assert.equal(await page.locator('#review-technical-description-payment').innerText(),'ТО: оплачено');
+    const groupPreview=page.locator('#review-clients-group');
+    assert.equal(await groupPreview.isVisible(),true);
+    assert.match(await groupPreview.innerText(),/Заявки по клиенту.*контакты и комментарий/);
     let independentPosts=0;
     page.on('request',request=>{if(request.method()==='POST'&&/\/api\/handoff\/cases\/\d+\/documents$/.test(new URL(request.url()).pathname))independentPosts++;});
     const handed=page.waitForResponse(r=>new URL(r.url()).pathname==='/api/handoff'&&r.request().method()==='POST');
@@ -102,7 +121,23 @@ test('normal report handoff preserves manager company and documents through clos
     assert.deepEqual({org:sent.org,address:sent.address,inn:sent.inn,cad:sent.cad_num,priority:sent.priority,comment:sent.comment},
       {org:company,address:managerAddress,inn:managerInn,cad:managerCad,priority:'срочно',comment:managerComment});
     assert.equal(handoff.delivery_complete,true,JSON.stringify(handoff));assert.equal(handoff.extra_documents_submit_id,saved.documents.id);
+    assert.equal(sent.technical_description_payment,'paid');
     assert.deepEqual(sent.extra_documents,{submit_id:saved.documents.id,files:initialFiles.map(({id,name,mime,role,bytes,sha256})=>({id,name,mime,role,bytes,sha256}))});
+    assert.equal(groupContinuationRejected,true);
+    assert.equal(handoff.group_notice.status,'rejected');
+    const beforeGroupRetry=service.messages.length;
+    const groupRoot=service.messages.findLast(event=>String(event.args[0])===clientsGroup);
+    const retry=page.locator('#retry-send');
+    await retry.waitFor({state:'visible'});
+    const retried=page.waitForResponse(r=>new URL(r.url()).pathname==='/api/handoff'&&r.request().method()==='POST');
+    await retry.click();
+    const retryResponse=await retried,retryResult=await retryResponse.json();
+    assert.equal(retryResponse.status(),200);
+    assert.equal(retryResult.group_notice.status,'confirmed');
+    assert.equal(retryResult.id,handoff.id);
+    assert.ok(service.messages.slice(beforeGroupRetry).every(event=>String(event.args[0])===clientsGroup&&
+      Number(event.args[2].reply_parameters.message_id)===Number(groupRoot.item.message_id)),
+    'Retry publishes only missing group continuations as replies to the original group card');
     await page.locator('#extra-document-history').getByRole('button',{name:/manager-contract\.pdf/}).waitFor();
     const caseId=Number(handoff.id),record=(await service.pool.query('SELECT * FROM cases WHERE id=$1',[caseId])).rows[0];
     const [initial]=(await service.pool.query('SELECT * FROM case_document_batches WHERE case_id=$1',[caseId])).rows;
@@ -113,15 +148,16 @@ test('normal report handoff preserves manager company and documents through clos
     assert.equal((await service.pool.query('SELECT id FROM cases WHERE order_id=58')).rows.length,1);
     const events=service.messages.slice(start),card=events.find(e=>e.method==='sendMessage'&&String(e.args[0])===String(LAWYER));
     assert.ok(card);assert.match(card.args[1],/ТЕСТОВЫЙ ДОГОВОР/);
-    for(const text of [managerAddress,managerInn,managerCad,'@synthetic_contact','Магазин','Получение','горящий'])assert.ok(card.args[1].includes(text),text);
+    for(const text of [managerAddress,managerInn,managerCad,'@synthetic_contact','Магазин','Получение','горящий','ТО: оплачено'])assert.ok(card.args[1].includes(text),text);
     assert.match(card.args[1],/Сведениях от менеджера/);
     const privateMessages=events.filter(e=>e.method==='sendMessage'&&String(e.args[0])===String(LAWYER));
-    assert.equal(privateMessages.length,2);
-    const details=privateMessages[1];
-    assert.match(details.args[1],/Сведения от менеджера/);
-    assert.ok(details.args[1].includes(managerComment));
-    assert.equal(Number(details.args[2].reply_parameters.message_id),Number(card.item.message_id));
-    assert.deepEqual(record.data._handoff.managerDetails.messageIds,[details.item.message_id]);
+    const details=privateMessages.slice(1);
+    assert.ok(details.length>=2,'The long manager comment is split into multiple private messages');
+    assert.ok(details.every(event=>Number(event.args[2].reply_parameters.message_id)===Number(card.item.message_id)));
+    const privateDetails=details.map(event=>event.args[1].split('\n\n').slice(1).join('\n\n')).join('')
+      .replaceAll('&lt;','<').replaceAll('&gt;','>').replaceAll('&amp;','&');
+    assert.ok(privateDetails.includes(managerComment),'The full comment reaches the lawyer including newlines and punctuation');
+    assert.deepEqual(record.data._handoff.managerDetails.messageIds,details.map(event=>event.item.message_id));
     const reportButton=card.args[2].reply_markup.inline_keyboard.flat().find(button=>button.text==='Перейти к отчёту');
     assert.ok(reportButton);const reportUrl=new URL(reportButton.web_app.url);assert.equal(reportUrl.searchParams.get('report_id'),String(reportId));
     assert.ok(events.filter(e=>['sendDocument','sendPhoto','sendMediaGroup'].includes(e.method)).every(e=>String(e.args[0])===String(LAWYER)),'Documents go only to assigned lawyer');
@@ -130,8 +166,25 @@ test('normal report handoff preserves manager company and documents through clos
     assert.equal(firstArchives.flatMap(a=>a.files).filter(f=>f.buffer.equals(orderOriginal)).length,1);
     const additionalArchive=firstArchives.find(archive=>archive.files.some(file=>file.buffer.equals(initialDocument)));
     const lastPrivateIndex=events.findIndex(e=>e.item?.message_id===additionalArchive.item.message_id);
-    const groupIndex=events.findIndex(e=>e.method==='sendMessage'&&String(e.args[0])==='-1001000000002');
+    const groupIndex=events.findIndex(e=>e.method==='sendMessage'&&String(e.args[0])===clientsGroup);
     assert.ok(lastPrivateIndex>=0&&groupIndex>lastPrivateIndex,'The group is notified only after the reviewed manager originals are delivered');
+    const notices=events.filter(event=>String(event.args[0])===clientsGroup);
+    assert.ok(notices.length>=2,'The group receives all text in Telegram-sized messages');
+    const groupText=notices.map(event=>event.args[1].replace(/^Клиент #\d+ · продолжение \d+\/\d+\n\n/,'')).join('');
+    for (const field of [company,managerAddress,managerInn,managerCad,'@synthetic_contact','+79991234567',
+      'Связаться при получении договора','Магазин','Получение','МСК','ТО: оплачено','Manager A','Отчёт аудитора']) {
+      assert.ok(groupText.includes(field),'Missing group field: '+field);
+    }
+    assert.ok(groupText.includes(managerComment),'The group receives the exact untruncated manager comment');
+    assert.ok(notices.every(event=>event.method==='sendMessage'&&event.args[1].length<=4096));
+    assert.ok(notices[0].args[2].reply_markup.inline_keyboard.flat().some(button=>button.url?.endsWith('?start=case_'+caseId)));
+    const deliveredCount=service.messages.length;
+    const replay=await page.evaluate(async payload=>{
+      const response=await fetch('/api/handoff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+      return {status:response.status,body:await response.json()};
+    },sent);
+    assert.equal(replay.status,200);assert.equal(replay.body.delivery_complete,true);assert.equal(replay.body.id,caseId);
+    assert.equal(service.messages.length,deliveredCount,'Replaying the reviewed handoff sends no extra private or group messages');
 
     // Add a second batch to the existing client; lose only the HTTP response,
     // after the actual server has saved Telegram receipts and immutable bytes.
@@ -190,6 +243,7 @@ test('case document view supports managers and assigned lawyers for report clien
       assert.equal(await visit.page.locator('#page-title').innerText(),'Документы клиента');
       assert.equal(await visit.page.locator('#org').inputValue(),company);
       assert.equal(await visit.page.locator('#saved-client-comment').innerText(),managerComment);
+      assert.equal(await visit.page.locator('#saved-technical-description-payment').innerText(),'ТО: оплачено');
       assert.match(await visit.page.locator('#saved-client-contacts').innerText(),/@synthetic_contact/);
       assert.match(await visit.page.locator('#saved-client-identifiers').innerText(),/1234567890.+77:01:0004016:9999/);
       assert.match(await visit.page.locator('#object-meta').innerText(),/Магазин · Получение · МСК · Срочно/);

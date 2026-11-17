@@ -37,7 +37,7 @@ async function fixture(run,config={}){
   const context={body,user:{id:101},staff:{name:'Менеджер',role:'manager',approved:true}};
   try{await run({db,pool,events,packet,body,files,pick,context,options,submit:createHandoffSubmitter(options),restart:()=>createHandoffSubmitter(options),packetCalls:()=>packetCalls,reportCalls:()=>reportCalls,egCalls,
     setFail(fn){fail=fn;},setMutation(fn){mutate=fn;},async cases(){return(await db.query('SELECT * FROM cases ORDER BY id')).rows;}});
-    assert.ok(events.every(event=>event.chat===String(LAWYER)||event.type==='notice'&&event.chat===String(event.noticeTarget)),'Only the short summary may go to the configured clients chat; package copies remain private');
+    assert.ok(events.every(event=>event.chat===String(LAWYER)||event.type==='notice'&&event.chat===String(event.noticeTarget)),'Only textual handoff details may go to the configured clients chat; package copies remain private');
   }finally{await db.close();}
 }
 test('V2 delivers the complete packet only to the assigned lawyer even when a shared chat is configured, and preserves completed idempotency',pg,async()=>fixture(async h=>{
@@ -48,10 +48,10 @@ test('V2 delivers the complete packet only to the assigned lawyer even when a sh
   assert.ok(h.events.every(event=>event.chat===String(LAWYER)||event.type==='notice'));
   assert.deepEqual(state.recipients,[{chat:String(LAWYER),role:'lawyer'}]);
   const cards=h.events.filter(event=>event.type==='card');assert.equal(cards.length,1);
-  const notices=h.events.filter(event=>event.type==='notice');assert.equal(notices.length,1);assert.equal(notices[0].chat,CLIENTS);assert.match(notices[0].text,/^Клиент передан юристу/);assert.match(notices[0].text,/Клиентов в работе у юриста: 1/);assert.doesNotMatch(notices[0].text,/Карина|7999|ПОЛНЫЙ ТЕКСТ|баланс/i);assert.ok(notices[0].opts.reply_markup.inline_keyboard.flat().every(button=>!button.web_app&&button.url==='https://t.me/LRSZamer_bot?start=case_'+c.id));
+  const notices=h.events.filter(event=>event.type==='notice');assert.equal(notices.length,1);assert.equal(notices[0].chat,CLIENTS);assert.match(notices[0].text,/^Клиент передан юристу/);assert.match(notices[0].text,/Клиентов в работе у юриста: 1/);assert.match(notices[0].text,/ИНН: 7701234567/);assert.match(notices[0].text,/Карина · \+79991234567/);assert.doesNotMatch(notices[0].text,/ПОЛНЫЙ ТЕКСТ|баланс/i);assert.ok(notices[0].opts.reply_markup.inline_keyboard.flat().every(button=>!button.web_app&&button.url==='https://t.me/LRSZamer_bot?start=case_'+c.id));
   assert.equal(state.groupNotice.status,'confirmed');assert.equal(state.groupNotice.receipt.message_id,notices[0].id);
   for(const card of cards){assert.ok(card.text.length<2000);assert.doesNotMatch(card.text,/ПОЛНЫЙ ТЕКСТ АУДИТОРА|Контакт передала Ирина|Ответы и наблюдения/);assert.match(card.text,/Карина|Лесная/);}
-  const details=h.events.find(event=>event.type==='manager-details');assert.match(details.text,/Позвонить перед выездом/);assert.match(cards[0].text,/Полный комментарий и контакты — следом/);assert.doesNotMatch(notices[0].text,/Позвонить перед выездом|Сначала согласовать время/);
+  const details=h.events.find(event=>event.type==='manager-details');assert.match(details.text,/Позвонить перед выездом/);assert.match(cards[0].text,/Полный комментарий и контакты — следом/);assert.match(notices[0].text,/Позвонить перед выездом[\s\S]*Сначала согласовать время/);
   assert.deepEqual(details.opts.reply_parameters,{message_id:cards[0].id,allow_sending_without_reply:true});
   assert.deepEqual(state.managerDetails.messageIds,[details.id]);
   const lawyerButtons=cards[0].opts.reply_markup.inline_keyboard.flat();assert.ok(lawyerButtons.some(button=>button.web_app?.url.includes('/checklist?case_id='+c.id)));assert.ok(lawyerButtons.some(button=>button.web_app?.url.includes('view=report')));assert.ok(lawyerButtons.some(button=>button.url===h.packet.report.video_url));
@@ -505,4 +505,25 @@ test('a fresh manager form resumes the frozen case body after a temporary Telegr
   assert.equal(h.events.filter(event => event.type === 'card' && event.id).length, 1);
   const copies = h.events.filter(event => event.type === 'copy');
   assert.ok(copies.every(event => event.chat === String(LAWYER)));
+}));
+
+test('technical description payment is validated before delivery, saved with the case and frozen on retry', pg, async () => fixture(async h => {
+  h.body.technical_description_payment = 'unknown';
+  await assert.rejects(h.submit(h.context), {code: 'HANDOFF_INVALID'});
+  assert.equal((await h.cases()).length, 0);
+  assert.equal(h.events.length, 0);
+
+  h.body.technical_description_payment = 'unpaid';
+  const result = await h.submit(h.context);
+  assert.equal(result.delivery_complete, true);
+  const [client] = await h.cases();
+  assert.equal(client.data._handoff.fields.technical_description_payment, 'unpaid');
+  assert.match(h.events.find(event => event.type === 'card').text, /ТО: не оплачено/);
+  assert.match(h.events.find(event => event.type === 'manager-details').text, /ТО: не оплачено/);
+
+  const sent = h.events.length;
+  assert.deepEqual(await h.restart()(h.context), result);
+  h.body.technical_description_payment = 'paid';
+  await assert.rejects(h.restart()(h.context), {code: 'HANDOFF_BODY_CHANGED'});
+  assert.equal(h.events.length, sent);
 }));

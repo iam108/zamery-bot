@@ -24,12 +24,14 @@ function createHandoffCompanyService(options={}){
     if(!c||!canManageCases({role:c.actor_role,approved:c.actor_approved},actor)||!canAccessCase({role:c.recipient_role,approved:c.recipient_approved},lawyer,c))problem('Доступ администратора или назначенного юриста изменился.');
     if(s.version!==2||s.completed!==true||s.inflight||s.manual_review||s.materials?.inflight||s.body?.lawyer_tg_id==null||String(s.body.lawyer_tg_id)!==lawyer||Number(s.body.order_id||0)!==Number(c.order_id||0)||s.body.submit_id!==c.handoff_submit_id||!positive(s.cards?.[lawyer])||!s.fields||!s.packet)problem('Нельзя изменить незавершённую или изменившуюся передачу.');
     const notice=s.groupNotice,target=String(options.clientsChatId??process.env.CLIENTS_CHAT_ID??'');
-    if(notice?.status!=='confirmed'||notice.intent||!positive(notice.receipt?.message_id)||!/^-[1-9]\d*$/.test(target)||notice.target!==target||String(notice.receipt.chat_id)!==target||typeof notice.text!=='string'||(notice.text.match(/^Организация:.*$/gm)||[]).length!==1)problem('Не подтверждены существующие сообщения передачи. Повторная отправка не выполняется.');
+    if(notice?.status!=='confirmed'||notice.intent||!positive(notice.receipt?.message_id)||!/^-[1-9]\d*$/.test(target)||notice.target!==target||String(notice.receipt.chat_id)!==target||typeof notice.text!=='string'||!/^Организация:.*$/m.test(notice.text)||
+       (notice.parts ? !Array.isArray(notice.parts)||notice.parts[0]!==notice.text : (notice.text.match(/^Организация:.*$/gm)||[]).length!==1))problem('Не подтверждены существующие сообщения передачи. Повторная отправка не выполняется.');
     if(!Array.isArray(c.contacts)||!Array.isArray(s.packet.materials))problem('Сохранённая карточка требует отдельной проверки.');
     return {c,s,privateChat:lawyer,privateId:Number(s.cards[lawyer]),groupChat:target,groupId:Number(notice.receipt.message_id)};
   }
   function view(row,newOrg){
     const {c,s}=row,updated={...c,org:newOrg},groupText=s.groupNotice.text.replace(/^Организация:.*$/m,()=> 'Организация: '+newOrg);
+    if (groupText.length>4096) problem('Новое название не помещается в существующую карточку чата клиентов.');
     return {case_id:Number(c.id),old_org:c.org,new_org:newOrg,lawyer_id:String(c.lawyer_tg_id),lawyer_name:c.lawyer_name,
       private_message_id:row.privateId,group_message_id:row.groupId,group_chat:row.groupChat,
       private_text:cardText(updated,s),group_text:groupText,revision:digest({c:{...c,data:undefined},checkpoint:s,new_org:newOrg})};
@@ -65,7 +67,7 @@ function createHandoffCompanyService(options={}){
       const record=async(next)=>{const result=await client.query("UPDATE cases SET data=jsonb_set(data,'{_handoff}',$1::jsonb) WHERE id=$2 AND org=$3 AND lawyer_tg_id=$4 AND data->'_handoff'=$5::jsonb RETURNING id",[JSON.stringify(next),c.id,expected.new_org,c.lawyer_tg_id,JSON.stringify(s)]);if(!result.rows.length)problem('Название сохранено, но результат обновления сообщений требует проверки.');s=next;};
       try{
         if(!s.companyCorrection.private_updated){const checked=await fresh();await edit(row.privateChat,row.privateId,cardText(checked.c,s),cardOptions(options.webappUrl||process.env.WEBAPP_URL,checked.c,s));const next=structuredClone(s);next.companyCorrection.private_updated=true;await record(next);}
-        if(!s.companyCorrection.group_updated){await fresh();await edit(row.groupChat,row.groupId,current.group_text,{disable_web_page_preview:true,reply_markup:{inline_keyboard:[[{text:s.body.manual_client===true?'Открыть клиента':'Открыть клиента и отчёт',url:'https://t.me/LRSZamer_bot?start=case_'+c.id}]]}});const next=structuredClone(s);next.groupNotice.text=current.group_text;next.companyCorrection.group_updated=true;await record(next);}
+        if(!s.companyCorrection.group_updated){await fresh();await edit(row.groupChat,row.groupId,current.group_text,{disable_web_page_preview:true,reply_markup:{inline_keyboard:[[{text:s.body.manual_client===true?'Открыть клиента':'Открыть клиента и отчёт',url:'https://t.me/LRSZamer_bot?start=case_'+c.id}]]}});const next=structuredClone(s);next.groupNotice.text=current.group_text;if(next.groupNotice.parts)next.groupNotice.parts[0]=current.group_text;next.companyCorrection.group_updated=true;await record(next);}
         await fresh();const next=structuredClone(s);next.companyCorrection.completed=true;await record(next);return{complete:true};
       }catch(_){return{complete:false,warning:'Название в карточке сохранено. Обновление существующих сообщений не завершено: проверьте их и откройте предварительный просмотр снова. Новые сообщения и документы не отправлялись.'};}
     }finally{if(client){if(locked)try{await client.query('SELECT pg_advisory_unlock(111,hashtext($1))',[key]);}catch(error){unlockError=error;}client.release(unlockError);}}

@@ -3,6 +3,7 @@ const { getSessionLockPool } = require('../db/session-lock-pool');
 const { canManageCases, canAccessCase } = require('./auth');
 const { createHandoffNoticePublisher, initialNotice, pendingNotice, noticeWarning, SAVE_CHECKPOINT_SQL } = require('./handoff-group-notice');
 const { manualClient } = require('./handoff-manual');
+const { technicalDescriptionPaymentLabel } = require('./handoff-case-profile');
 const { splitTelegramHtml } = require('../bot/audit-delivery');
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DDL = `ALTER TABLE cases ADD COLUMN IF NOT EXISTS handoff_submit_id TEXT;
@@ -30,6 +31,11 @@ function fields(body, optionalContacts = false) {
   if(d.inn&&!/^\d{10}(?:\d{2})?$/.test(d.inn))fail(400,'HANDOFF_INVALID','ИНН должен содержать 10 или 12 цифр.');
   if(d.cad_num&&!/^\d{2}:\d{2}:\d{6,7}:\d+$/.test(d.cad_num))fail(400,'HANDOFF_INVALID','Проверьте кадастровый номер.');
   if(d.comment.length>4000)fail(400,'HANDOFF_INVALID','Комментарий не должен превышать 4000 знаков.');
+  const payment = body.technical_description_payment;
+  if (payment != null && payment !== '') {
+    if (!technicalDescriptionPaymentLabel(payment)) fail(400, 'HANDOFF_INVALID', 'Укажите статус оплаты технического описания.');
+    d.technical_description_payment = payment;
+  }
   if(!Array.isArray(body.contacts)||body.contacts.length>10)fail(400,'HANDOFF_CONTACTS','Проверьте контакты клиента.');
   d.contacts=body.contacts.map(contact=>{
     if(!contact||typeof contact!=='object'||Array.isArray(contact))fail(400,'HANDOFF_CONTACTS','Проверьте контакты клиента.');
@@ -121,6 +127,8 @@ function managerDetailsParts(profile, managerName) {
   const lines = [esc(profile.org), esc(profile.address), esc([profile.kind,profile.service,profile.region,profile.priority].filter(Boolean).join(' · '))];
   if (profile.inn) lines.push('ИНН: ' + esc(profile.inn));
   if (profile.cad_num) lines.push('Кадастровый номер: ' + esc(profile.cad_num));
+  const paymentLabel = technicalDescriptionPaymentLabel(profile.technical_description_payment);
+  if (paymentLabel) lines.push('ТО: ' + paymentLabel);
   if (profile.contacts.length) {
     lines.push('', '<b>Контакты</b>');
     for (const [index, contact] of profile.contacts.entries()) {
@@ -141,6 +149,8 @@ function cardText(c,state) {
     short([c.kind, c.service, c.region, c.priority].filter(Boolean).join(' · '), 160)];
   const identifiers = clientIdentifiers({...c, cad_num:state.fields.cad_num});
   if (identifiers) lines.push(short(identifiers, managerCardLimits.identifiers));
+  const paymentLabel = technicalDescriptionPaymentLabel(state.fields.technical_description_payment);
+  if (paymentLabel) lines.push('ТО: ' + paymentLabel);
 
   const contacts = (c.contacts || []).filter(contact => contact.name || contact.phone || contact.tg);
   if (contacts.length) {

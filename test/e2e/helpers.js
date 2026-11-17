@@ -62,7 +62,10 @@ async function createService({ master = false, clientsGroup = '', privateChats =
       const clientNotice = clientsGroup && String(args[0]) === String(clientsGroup);
       const privateNotice = method === 'sendMessage' && allowedPrivateChats.has(String(args[0]));
       assert.ok(String(args[0]) === GROUP || master && String(args[0]) === String(LAWYER) || clientNotice || privateNotice);
-      if (clientNotice) assert.equal(method, 'sendMessage', 'The clients group may receive only a short handoff notice, never documents or photos');
+      if (clientNotice) {
+        assert.equal(method, 'sendMessage', 'The clients group receives handoff details as text');
+        assert.ok(typeof args[1] === 'string' && args[1].length <= 4096, 'Group text fits in a Telegram message');
+      }
       const event = { method, args }; messages.push(event);
       if (!master) return method === 'sendMediaGroup' ? args[1].map(() => ({ message_id: ++nextMessage })) : { message_id: ++nextMessage };
       if (method === 'sendMediaGroup') { event.items = []; for (const item of args[1]) event.items.push(recorded(args[0], { kind: item.type, bytes: await binary(item.media), caption: item.caption })); return event.items.map(item => ({ ...item, chat: { id: Number(args[0]) } })); }

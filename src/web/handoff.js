@@ -1405,6 +1405,7 @@ function setupHandoff(app) {
       }
       res.json({
         ok: true, can_manage: manager, lawyers: lawyers, request: request,
+        clients_group_notice: manager && require('./handoff-group-notice').canPublishClientNotice(process.env.CLIENTS_CHAT_ID, process.env.GROUP_CHAT_ID),
         ...(selectedCase ? {case_id:Number(selectedCase.id),case_assignment:require('./handoff-packet').assignmentView(selectedCase)} : {}),
         report: selectedCase?caseReport:audit ? { src: 'a', id: audit.id, text: audit.text, created_at: audit.created_at, order_id: audit.order_id, metadata: auditMetadata(audit) } : null,
         order: caseProfile|| (order ? {

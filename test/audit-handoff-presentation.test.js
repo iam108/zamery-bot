@@ -65,7 +65,7 @@ function assertReworkAction(message,caseId){
 function assertPrivatePackage(h){
   assert.ok(h.calls.filter(call=>call.method==='copyMessages').every(call=>String(call.payload.chat_id)===String(LAWYER)));
   assert.equal(recipient(h,SOURCE),undefined,'The measurements chat never receives a second handoff card');
-  const notice=recipient(h,CLIENTS);assert.ok(notice);assert.match(notice.text,/^Клиент передан юристу/);assert.doesNotMatch(notice.text,/Сводка аудитора|Последняя сохранённая строка|79990000000|untrusted\.example/);
+  const notice=recipient(h,CLIENTS);assert.ok(notice);assert.match(notice.text,/^Клиент передан юристу/);assert.match(notice.text,/Контакт клиента · \+79990000000/);assert.doesNotMatch(notice.text,/Сводка аудитора|Последняя сохранённая строка|untrusted\.example/);
   assert.ok(buttons(notice).every(button=>!button.web_app&&/^https:\/\/t\.me\/LRSZamer_bot\?start=case_\d+$/.test(button.url)));
   assert.ok(h.calls.filter(call=>call.method==='sendMessage').every(call=>[String(LAWYER),CLIENTS].includes(String(call.chat))));
 }
@@ -114,7 +114,7 @@ test('a missing Telegram copy ACK keeps the existing V2 case visibly incomplete 
   assert.equal(recipient(h,CLIENTS),undefined,'No public success notice before complete private delivery');const before=h.calls.length;const resumed=await h.resume(result.id);assert.equal(resumed.manual_review,true);assert.equal(resumed.delivery_complete,false);assert.equal(h.calls.length,before);assert.equal((await h.cases()).length,1);
 }));
 
-test('a request originating in CLIENTS and the auditor ZIP and EGRN are private, followed only by a short CLIENTS summary',pg,async()=>fixture({requestChat:CLIENTS},async h=>{
+test('a request originating in CLIENTS and the auditor ZIP and EGRN are private, followed by the manager data in CLIENTS',pg,async()=>fixture({requestChat:CLIENTS},async h=>{
   const result=await h.send({request_id:9,cad_num:'77:01:0004016:1064'});assert.equal(result.delivery_complete,true);assertPrivatePackage(h);
   assert.deepEqual(h.calls.filter(call=>call.method==='sendMessage').map(call=>String(call.chat)),[String(LAWYER),CLIENTS]);const copies=h.calls.filter(call=>call.method==='copyMessages');
   assert.ok(copies.some(call=>String(call.payload.from_chat_id)===CLIENTS&&call.payload.message_ids.includes(80)),'Original request messages are delivered privately');assert.ok(copies.some(call=>String(call.payload.from_chat_id)===SOURCE&&call.payload.message_ids.includes(1005)),'Auditor ZIP is delivered privately');

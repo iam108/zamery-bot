@@ -3,9 +3,9 @@
 const { createHash } = require('node:crypto');
 const { getSessionLockPool } = require('../db/session-lock-pool');
 const auth = require('./auth');
+const { buildGroupNoticeParts } = require('./handoff-group-content');
 const object = value => value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 const positive = value => (typeof value === 'number' || typeof value === 'string' && /^[1-9]\d*$/.test(value)) && Number.isSafeInteger(Number(value)) && Number(value) > 0 ? Number(value) : null;
-const clean = (value, limit = 500) => String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').trim().slice(0, limit);
 const validGroup = value => /^-[1-9]\d*$/.test(value) && Number.isSafeInteger(Number(value));
 // A losing admin command records its cursor while another sender holds lock111.
 // Every checkpoint save merges these high-water marks, including saves by that
@@ -21,6 +21,7 @@ const SAVE_CHECKPOINT_SQL = `UPDATE cases SET data=jsonb_set(COALESCE(data,'{}':
       ) merged WHERE cursor>0)),true)
   ELSE $1::jsonb END,true) WHERE id=$2`;
 const STATE_SQL = `SELECT c.id,c.order_id,c.created_by,c.handoff_submit_id,c.lawyer_tg_id,c.lawyer_name,c.org,c.address,c.kind,c.service,c.priority,c.data,to_jsonb(c)->>'request_id' AS request_id,
+  to_jsonb(c)->>'inn' AS inn,to_jsonb(c)->>'region' AS region,to_jsonb(c)->>'comment' AS comment,to_jsonb(c)->'contacts' AS contacts,
   o.object_name,o.telegram_msg_id AS order_message_id,
   actor.tg_id AS actor_id,actor.role AS actor_role,actor.approved AS actor_approved,
   recipient.role AS recipient_role,recipient.approved AS recipient_approved,
@@ -28,6 +29,10 @@ const STATE_SQL = `SELECT c.id,c.order_id,c.created_by,c.handoff_submit_id,c.law
 FROM cases c JOIN staff actor ON actor.tg_id=$2 AND actor.approved=true
 LEFT JOIN staff recipient ON recipient.tg_id=c.lawyer_tg_id LEFT JOIN orders o ON o.id=c.order_id WHERE c.id=$1`;
 
+function canPublishClientNotice(clientsChat, workingChat) {
+  const target = String(clientsChat ?? '').trim();
+  return validGroup(target) && target !== String(workingChat ?? '').trim();
+}
 function initialNotice(target) {
   const chat = String(target ?? '').trim();
   return chat ? { version: 1, required: true, target: chat, generation: 0, status: 'pending', cursors: {} } : null;
@@ -40,19 +45,18 @@ function noticeWarning(state, caseId) {
   const notice = object(state.groupNotice);
   if (!pendingNotice(state)) return '';
   const prefix = state.body?.manual_client === true ? 'Карточка клиента доставлена в личный чат юриста. ' : 'Отчёт и собранные материалы доставлены в личный чат юриста. ';
-  if (notice.status === 'unknown' || notice.intent) return prefix + 'Публикация краткой карточки в чате клиентов не подтверждена. Проверьте чат перед повтором: возможен дубликат. Проверка: /handoff_notice ' + caseId + '.';
-  return prefix + (notice.warning || 'Краткая карточка в чате клиентов ещё не опубликована.') + ' Проверка: /handoff_notice ' + caseId + '.';
+  if (notice.status === 'unknown' || notice.intent) return prefix + 'Публикация карточки в чате клиентов не подтверждена. Проверьте чат перед повтором: возможен дубликат. Проверка: /handoff_notice ' + caseId + '.';
+  return prefix + (notice.warning || 'Карточка в чате клиентов ещё не опубликована.') + ' Проверка: /handoff_notice ' + caseId + '.';
 }
-function summary(row, state) {
-  const ids = (row.order_id ? 'Заявка #' + row.order_id + ' · ' : row.request_id ? 'Исходная заявка #' + row.request_id + ' · ' : '') + 'Клиент #' + row.id;
-  const lines = ['Клиент передан юристу · ' + clean(row.lawyer_name, 200), '', 'Организация: ' + clean(row.org)];
-  if (clean(row.object_name) && clean(row.object_name) !== clean(row.org)) lines.push('Объект: ' + clean(row.object_name));
-  lines.push(clean(row.address), [clean(row.kind, 100), clean(row.service, 100), clean(row.priority, 100) && 'Приоритет: ' + clean(row.priority, 100)].filter(Boolean).join(' · '), ids, '',
-    state.body?.manual_client === true ? (state.packet?.manual_materials?.length ? 'Карточка и документы отправлены в личку юриста.' : 'Карточка отправлена в личку юриста.') : 'Отчёт и собранные материалы — в личке юриста.');
-  if (['waiting', 'ordered'].includes(state.egrn?.result)) lines.push('ЕГРН: ожидается.');
-  if (['none', 'missing', 'unavailable'].includes(state.egrn?.result)) lines.push('ЕГРН: отсутствует в комплекте.');
-  lines.push('Клиентов в работе у юриста: ' + Number(row.active_cases));
-  return lines.join('\n');
+function confirmedParts(notice) { return Array.isArray(notice.receipts) ? notice.receipts : []; }
+function validProgress(notice) {
+  if (!notice.parts && !notice.receipts) return true; // Legacy single-message checkpoint.
+  if (!Array.isArray(notice.parts) || !notice.parts.length || notice.parts.length > 20 ||
+      notice.parts.some(part => typeof part !== 'string' || !part.trim() || part.length > 4096) ||
+      !Array.isArray(notice.receipts) || notice.receipts.length > notice.parts.length ||
+      notice.receipts.some(receipt => !positive(receipt?.message_id) || receipt.chat_id !== notice.target)) return false;
+  return new Set(notice.receipts.map(receipt => Number(receipt.message_id))).size === notice.receipts.length &&
+    (notice.status !== 'confirmed' || notice.parts.length === notice.receipts.length);
 }
 
 function createHandoffNoticePublisher(options = {}) {
@@ -68,7 +72,8 @@ function createHandoffNoticePublisher(options = {}) {
   }
   function checkpoint(row) { return object(object(row.data)._handoff); }
   function reason(row, state) {
-    if (!validGroup(target())) return 'Чат клиентов не настроен; карточка туда не отправлена.';
+    if (!validProgress(object(state.groupNotice))) return 'Состояние частей карточки требует проверки. Публикация остановлена.';
+    if (!canPublishClientNotice(target(), options.workingChatId ?? process.env.GROUP_CHAT_ID)) return 'Чат клиентов не настроен отдельно от чата замеров. Карточка не отправлена.';
     if (state.groupNotice?.target && state.groupNotice.target !== target()) return 'Настройка чата клиентов изменилась. Нужна проверка сохранённого назначения уведомления.';
     if (state.version !== 2 || state.completed !== true || state.manual_review || state.inflight || state.materials?.inflight || state.materials?.completed !== true || state.egrn?.completed !== true ||
       require('./handoff-submit').hasPendingLinkedEgrn(state, row.lawyer_tg_id)) return 'Личная доставка полного собранного комплекта ещё не подтверждена; карточка в общий чат не отправлена.';
@@ -80,11 +85,14 @@ function createHandoffNoticePublisher(options = {}) {
     return '';
   }
   function view(row, state) {
-    const notice = object(state.groupNotice), text = summary(row, state), generation = Number.isSafeInteger(notice.generation) && notice.generation >= 0 ? notice.generation : 0;
+    const notice = object(state.groupNotice), generation = Number.isSafeInteger(notice.generation) && notice.generation >= 0 ? notice.generation : 0;
+    const parts = validProgress(notice) && Array.isArray(notice.parts) ? notice.parts
+      : notice.status === 'confirmed' && typeof notice.text === 'string' && notice.text.trim() ? [notice.text] : buildGroupNoticeParts(row, state);
+    const text = parts.join('\n\n'), delivered = confirmedParts(notice).length;
     const status = notice.status === 'confirmed' && positive(notice.receipt?.message_id) ? 'confirmed' : notice.intent || notice.status === 'unknown' ? 'unknown' : ['pending', 'rejected', 'blocked'].includes(notice.status) ? notice.status : 'missing';
     const warning = reason(row, state);
-    const revision = createHash('sha256').update(JSON.stringify([row.id, row.order_id, String(row.lawyer_tg_id), row.created_by, row.handoff_submit_id, target(), text, generation, status, warning])).digest('hex');
-    return { case_id: Number(row.id), generation, revision, target: target(), text, status, can_apply: !warning && status !== 'confirmed', requires_confirmation: status === 'unknown', warning: warning || (status === 'unknown' ? 'Сообщение могло дойти. Проверьте чат; повтор может создать дубликат.' : status === 'confirmed' ? 'Краткая карточка уже опубликована.' : 'Публикация затронет только краткую карточку в чате клиентов.') };
+    const revision = createHash('sha256').update(JSON.stringify([row.id, row.order_id, String(row.lawyer_tg_id), row.created_by, row.handoff_submit_id, target(), parts, delivered, generation, status, warning])).digest('hex');
+    return { case_id: Number(row.id), generation, revision, target: target(), text, parts, delivered, status, can_apply: !warning && status !== 'confirmed', requires_confirmation: status === 'unknown', warning: warning || (status === 'unknown' ? 'Сообщение могло дойти. Проверьте чат; повтор может создать дубликат.' : status === 'confirmed' ? 'Карточка уже опубликована.' : 'Публикация затронет только карточку в чате клиентов.') };
   }
   const saveState = (client, row, state) => client.query(SAVE_CHECKPOINT_SQL, [JSON.stringify(state), row.id]);
   async function consumeBusy(caseId, context) {
@@ -102,6 +110,7 @@ function createHandoffNoticePublisher(options = {}) {
     for (const source of state.source?.sources || (state.source ? [state.source] : [])) if (String(source.chat_id) === chat) (source.message_ids || []).forEach(add);
     if (String(state.request?.chat_id) === chat) (state.request.message_ids || []).forEach(add);
     add(state.groupNotice?.receipt?.message_id);
+    confirmedParts(object(state.groupNotice)).forEach(receipt => add(receipt.message_id));
     return ids;
   }
   async function publishLocked({ client, c: row, state, actorId, save = () => saveState(client, row, state) }) {
@@ -113,37 +122,56 @@ function createHandoffNoticePublisher(options = {}) {
     catch (_) { notice.status = 'blocked'; notice.warning = 'Не удалось подтвердить действующий доступ менеджера. Карточка в чат клиентов не отправлена.'; await save(); return; }
     const warning = reason(current, state);
     if (warning) { notice.status = 'blocked'; notice.warning = warning; await save(); return; }
-    const reviewed = view(current, state), generation = reviewed.generation + 1;
-    notice.generation = generation; notice.status = 'sending'; notice.warning = '';
-    notice.intent = { generation, at: new Date(now()).toISOString(), lawyer_id: String(current.lawyer_tg_id) };
-    notice.text = reviewed.text;
-    try { await save(); }
-    catch (_) { notice.status = 'blocked'; notice.intent = null; notice.warning = 'Не удалось сохранить начало публикации. Карточка в чат клиентов не отправлена.'; return; }
-    let fresh;
-    try { fresh = await load(client, row.id, actorId); }
-    catch (_) { notice.intent = null; notice.status = 'blocked'; notice.warning = 'Не удалось подтвердить действующий доступ менеджера. Карточка не отправлена.'; await save(); return; }
-    const changed = reason(fresh, checkpoint(fresh)) || (String(fresh.lawyer_tg_id) !== notice.intent.lawyer_id ? 'Назначение юриста изменилось.' : '');
-    if (changed) { notice.intent = null; notice.status = 'blocked'; notice.warning = changed; await save(); return; }
-    let receipt;
-    try {
-      // Recheck after the durable intent, immediately before the Telegram call.
-      const telegram = options.telegram || require('../bot/instance').telegram;
-      receipt = await telegram.sendMessage(notice.target, notice.text, { disable_web_page_preview: true, reply_markup: { inline_keyboard: [[{ text: state.body?.manual_client === true ? 'Открыть клиента' : 'Открыть клиента и отчёт', url: 'https://t.me/LRSZamer_bot?start=case_' + row.id }]] } });
-      if (!receipt || Array.isArray(receipt) || !positive(receipt.message_id) || receipt.chat != null && String(receipt.chat.id) !== notice.target || knownIds(current, state, notice.target).has(Number(receipt.message_id))) throw Object.assign(new Error('Invalid group notice acknowledgement'), { code: 'HANDOFF_NOTICE_ACK' });
-    } catch (error) {
-      const code = Number(error?.response?.error_code);
-      if (code >= 400 && code < 500) { notice.intent = null; notice.status = 'rejected'; notice.warning = 'Telegram отклонил краткую карточку. Личная доставка сохранена; публикацию можно повторить после проверки чата.'; }
-      else { notice.status = 'unknown'; notice.warning = 'Публикация краткой карточки не подтверждена. Проверьте чат перед повтором: возможен дубликат.'; }
-      try { await save(); } catch (_) { /* The durable intent still prevents automatic resending. */ }
-      return;
-    }
-    notice.receipt = { message_id: Number(receipt.message_id), chat_id: notice.target, at: new Date(now()).toISOString() };
-    notice.status = 'confirmed'; notice.intent = null;
-    try { await save(); }
-    catch (_) {
-      notice.status = 'unknown'; notice.intent = { generation, at: new Date(now()).toISOString(), lawyer_id: String(current.lawyer_tg_id) };
-      notice.warning = 'Telegram ответил, но квитанция публикации не сохранилась. Проверьте чат перед повтором.';
-      try { await save(); } catch (_) { /* The original send intent remains durable. */ }
+    const reviewed = view(current, state);
+    notice.parts = reviewed.parts;
+    notice.receipts = confirmedParts(notice);
+    // Keep the main message available for the existing legal-name correction.
+    notice.text = notice.parts[0];
+    while (notice.receipts.length < notice.parts.length) {
+      const part = notice.receipts.length;
+      notice.generation = (notice.generation || 0) + 1;
+      const intent = { generation: notice.generation, part, at: new Date(now()).toISOString(), lawyer_id: String(current.lawyer_tg_id) };
+      notice.status = 'sending'; notice.warning = ''; notice.intent = intent;
+      try { await save(); }
+      catch (_) { notice.status = 'blocked'; notice.intent = null; notice.warning = 'Не удалось сохранить начало публикации. Часть карточки не отправлена.'; return; }
+      let fresh;
+      try { fresh = await load(client, row.id, actorId); }
+      catch (_) { notice.intent = null; notice.status = 'blocked'; notice.warning = 'Не удалось подтвердить действующий доступ менеджера. Карточка не отправлена.'; await save(); return; }
+      const changed = reason(fresh, checkpoint(fresh)) || (String(fresh.lawyer_tg_id) !== intent.lawyer_id ? 'Назначение юриста изменилось.' : '');
+      if (changed) { notice.intent = null; notice.status = 'blocked'; notice.warning = changed; await save(); return; }
+      let receipt;
+      try {
+        const telegram = options.telegram || require('../bot/instance').telegram;
+        const extra = part === 0
+          ? { reply_markup: { inline_keyboard: [[{ text: state.body?.manual_client === true ? 'Открыть клиента' : 'Открыть клиента и отчёт', url: 'https://t.me/LRSZamer_bot?start=case_' + row.id }]] } }
+          : { reply_parameters: { message_id: notice.receipts[0].message_id, allow_sending_without_reply: true } };
+        receipt = await telegram.sendMessage(notice.target, notice.parts[part], { disable_web_page_preview: true, ...extra });
+        if (!receipt || Array.isArray(receipt) || !positive(receipt.message_id) || receipt.chat != null && String(receipt.chat.id) !== notice.target ||
+            knownIds(fresh, state, notice.target).has(Number(receipt.message_id))) throw new Error('Invalid group notice acknowledgement');
+      } catch (error) {
+        const code = Number(error?.response?.error_code);
+        if (code >= 400 && code < 500) {
+          notice.intent = null; notice.status = 'rejected';
+          notice.warning = 'Telegram отклонил часть карточки. Личная доставка сохранена; можно повторить публикацию оставшихся сведений.';
+        } else {
+          notice.status = 'unknown'; notice.warning = 'Публикация части карточки не подтверждена. Проверьте чат перед повтором: возможен дубликат.';
+        }
+        try { await save(); } catch (_) { /* The durable intent still prevents automatic resending. */ }
+        return;
+      }
+      const confirmed = { message_id: Number(receipt.message_id), chat_id: notice.target, at: new Date(now()).toISOString() };
+      notice.receipts.push(confirmed);
+      const finished = notice.receipts.length === notice.parts.length;
+      notice.status = finished ? 'confirmed' : 'pending'; notice.intent = null;
+      if (finished) notice.receipt = notice.receipts[0];
+      try { await save(); }
+      catch (_) {
+        notice.receipts.pop(); delete notice.receipt;
+        notice.status = 'unknown'; notice.intent = intent;
+        notice.warning = 'Telegram ответил, но квитанция публикации не сохранилась. Проверьте чат перед повтором.';
+        try { await save(); } catch (_) { /* The original send intent remains durable. */ }
+        return;
+      }
     }
   }
   async function preview(caseId, { actorId } = {}) {
@@ -167,7 +195,7 @@ function createHandoffNoticePublisher(options = {}) {
       const current = view(row, state);
       state.groupNotice = {...notice,cursors:{...object(notice.cursors),[String(context.actorId)]:Number(context.messageId)}};
       await saveState(client,row,state);
-      if (current.status === 'confirmed') return { state: 'confirmed', warning: 'Краткая карточка уже опубликована.', message_id: notice.receipt.message_id };
+      if (current.status === 'confirmed') return { state: 'confirmed', warning: 'Карточка уже опубликована.', message_id: notice.receipt.message_id };
       if (current.generation !== context.expectedGeneration || current.revision !== context.expectedRevision || current.target !== context.expectedTarget) return { state: 'stale', warning: 'Состояние изменилось. Выполните /handoff_notice ' + caseId + ' заново; ничего не отправлялось.' };
       if (!current.can_apply) return { state: 'blocked', warning: current.warning };
       if (current.requires_confirmation && context.confirmMissing !== true) return { state: 'unknown', warning: 'Сначала проверьте чат. Только если карточки нет, подтвердите confirm_missing; повтор может создать дубликат.' };
@@ -175,7 +203,7 @@ function createHandoffNoticePublisher(options = {}) {
         cursors: { ...object(notice.cursors), [String(context.actorId)]: Number(context.messageId) } };
       await saveState(client, row, state);
       await publishLocked({ client, c: row, state, actorId: context.actorId });
-      return { state: state.groupNotice.status, warning: noticeWarning(state, row.id) || 'Краткая карточка опубликована. Личная доставка не повторялась.', ...(state.groupNotice.status === 'confirmed' ? { message_id: state.groupNotice.receipt.message_id } : {}) };
+      return { state: state.groupNotice.status, warning: noticeWarning(state, row.id) || 'Карточка опубликована. Личная доставка не повторялась.', ...(state.groupNotice.status === 'confirmed' ? { message_id: state.groupNotice.receipt.message_id } : {}) };
     } finally {
       if (locked) try { await client.query('SELECT pg_advisory_unlock(111,hashtext($1))', [owner + ':' + submit]); } catch (error) { releaseError = error; }
       client.release(releaseError);
@@ -183,4 +211,4 @@ function createHandoffNoticePublisher(options = {}) {
   }
   return { preview, apply, publishLocked };
 }
-module.exports = { createHandoffNoticePublisher, initialNotice, pendingNotice, noticeWarning, SAVE_CHECKPOINT_SQL };
+module.exports = { canPublishClientNotice, createHandoffNoticePublisher, initialNotice, pendingNotice, noticeWarning, SAVE_CHECKPOINT_SQL };

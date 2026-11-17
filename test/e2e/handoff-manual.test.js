@@ -65,6 +65,7 @@ test('manual client: mobile creation, exact original and lost ACK recovery need 
     assert.equal(stored.length, 1); assert.equal(stored[0].name, filename); assert.equal(stored[0].sha256, hash(pdf));
     assert.ok(Buffer.from(stored[0].content).equals(pdf));
     await fillProfile();
+    await page.locator('#technical-description-payment').selectOption('unpaid');
 
     const submittedBodies = []; let firstResult;
     await page.route('**/api/handoff', async route => {
@@ -78,6 +79,7 @@ test('manual client: mobile creation, exact original and lost ACK recovery need 
     const start = service.messages.length;
     await page.locator('#go').click(); await page.locator('#review').waitFor({ state: 'visible' });
     assert.match(await page.locator('#review-list').innerText(), /Чек-лист/); assert.match(await page.locator('#review-list').innerText(), /Договор ручного клиента/);
+    assert.equal(await page.locator('#review-technical-description-payment').innerText(), 'ТО: не оплачено');
     const artifacts = path.resolve(process.env.E2E_ARTIFACTS_DIR || 'test-results/e2e');
     await fs.mkdir(artifacts, { recursive: true });
     await page.screenshot({ path: path.join(artifacts, 'manual-mobile-review.png'), fullPage: true });
@@ -92,6 +94,7 @@ test('manual client: mobile creation, exact original and lost ACK recovery need 
     assert.equal(service.messages.length, afterCommit);
     const body = submittedBodies[0];
     assert.equal(body.manual_client, true); assert.equal(body.order_id, null); assert.equal(body.request_id, null);
+    assert.equal(body.technical_description_payment, 'unpaid');
     assert.equal(body.report_id, null); assert.equal(body.report_src, null); assert.equal(body.egrn_order, false);
     assert.equal(body.cad_num, ''); assert.deepEqual(body.contacts, []); assert.equal(body.region, 'МО');
     assert.equal(body.manual_files.length, 1); assert.equal(body.manual_files[0].sha256, hash(pdf));
@@ -103,6 +106,7 @@ test('manual client: mobile creation, exact original and lost ACK recovery need 
     assert.equal(assigned.data._handoff.egrn.result, 'skipped-manual'); assert.equal(assigned.org, profile.org);
     const sent = service.messages.slice(start), cards = sent.filter(event => event.method === 'sendMessage' && String(event.args[0]) === String(LAWYER));
     assert.equal(cards.length, 1);
+    assert.match(cards[0].args[1], /ТО: не оплачено/);
     const cardButtons = cards[0].args[2].reply_markup.inline_keyboard.flat();
     assert.ok(cardButtons.some(button => button.web_app?.url.includes('/checklist?case_id=' + assigned.id)));
     assert.equal(cardButtons.some(button => button.web_app?.url.includes('view=report')), false);
@@ -112,12 +116,14 @@ test('manual client: mobile creation, exact original and lost ACK recovery need 
     assert.match(entries[0].name, /Договор ручного клиента\.pdf$/); assert.equal(hash(entries[0].bytes), hash(pdf)); assert.ok(entries[0].bytes.equals(pdf));
     const notices = sent.filter(event => event.method === 'sendMessage' && String(event.args[0]) === clientsGroup);
     assert.equal(notices.length, 1); assert.match(notices[0].args[1], /Ручной клиент/);
+    assert.match(notices[0].args[1], /ТО: не оплачено/);
     assert.equal(sent.filter(event => event.method.startsWith('copy')).length, 0);
     for (const event of sent) assert.ok([String(LAWYER), clientsGroup].includes(String(event.args[0])), 'Manual intake never publishes a new workgroup order or report');
 
     await page.locator('#manual-create-another').click();
     await until(() => page.locator('#manual-files').isEnabled(), 'An explicit next-client action starts a new document draft');
     assert.equal(await page.locator('#org').inputValue(), ''); assert.equal(await page.locator('#manual-file-list [data-manual-remove]').count(), 0);
+    assert.equal(await page.locator('#technical-description-payment').inputValue(), '');
     await fillProfile(); await page.locator('#go').click(); await page.locator('#manual-matches').waitFor({ state: 'visible' });
     const match = page.locator('#manual-match-list a').filter({ hasText: '№' + assigned.id });
     await match.waitFor({ state: 'visible' }); assert.equal(await page.locator('#review').isVisible(), false);

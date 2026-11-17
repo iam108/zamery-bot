@@ -31,20 +31,29 @@ function createHandoffNoticeAdmin(options={}) {
     try {
       const result=await service().preview(id,{actorId:ctx.from.id});
       if(previews.get(actor)!==entry)return;
+      const parts = result?.parts ?? [result?.text];
+      const partLimit = result?.parts == null ? 3000 : 4096;
+      const delivered = result?.delivered ?? 0;
       if(result?.case_id!==id||!Number.isSafeInteger(result.generation)||result.generation<0||
         !/^[a-f\d]{64}$/.test(result.revision||'')||typeof result.target!=='string'||result.target.length>32||!/^-[1-9]\d*$/.test(result.target)||
-        typeof result.text!=='string'||!result.text.trim()||result.text.length>3000||!STATUSES.has(result.status)||
+        !Array.isArray(parts)||!parts.length||parts.length>20||
+        parts.some(part=>typeof part!=='string'||!part.trim()||part.length>partLimit)||
+        !Number.isSafeInteger(delivered)||delivered<0||delivered>parts.length||!STATUSES.has(result.status)||
         typeof result.can_apply!=='boolean'||typeof result.requires_confirmation!=='boolean'||
         result.status==='confirmed'&&result.can_apply||result.status==='unknown'&&result.can_apply&&!result.requires_confirmation)throw new Error('Invalid notice preview');
       entry.result=result;
       let instructions='Уведомление клиента #'+id+' · предварительный просмотр\nЧат: '+result.target+'\nСтатус: '+result.status+'.';
+      if(delivered>0&&parts.length>1)instructions+='\nПодтверждено частей: '+delivered+' из '+parts.length+'.';
       if(typeof result.warning==='string'&&result.warning.length<=1000&&result.warning.trim())instructions+='\n'+result.warning;
-      if(result.can_apply)instructions+='\n\n'+(result.requires_confirmation?'Сначала проверьте чат: сообщение могло дойти. Только если уведомления там нет, подтвердите повтор. Возможен дубликат.\n':'Для публикации просмотренного уведомления:\n')+
-        '/handoff_notice_apply '+id+(result.requires_confirmation?' confirm_missing':'')+'\nПросмотр действует десять минут. Точный текст уведомления — следующим сообщением.';
+      if(result.can_apply)instructions+='\n\n'+(result.requires_confirmation?'Сначала проверьте чат: сообщение могло дойти. Только если неподтверждённой части там нет, подтвердите повтор. Возможен дубликат.\n':'Для публикации просмотренного уведомления:\n')+
+        '/handoff_notice_apply '+id+(result.requires_confirmation?' confirm_missing':'')+'\nПросмотр действует десять минут. Ниже текст уведомления.';
       else instructions+='\nПубликация по этому состоянию недоступна. Ниже только сохранённый текст.';
       await ctx.reply(instructions,{disable_web_page_preview:true});
       if(previews.get(actor)!==entry)return;
-      await ctx.reply(result.text,{disable_web_page_preview:true});
+      for (const part of parts) {
+        if(previews.get(actor)!==entry)return;
+        await ctx.reply(part,{disable_web_page_preview:true});
+      }
       if(previews.get(actor)===entry){entry.ready=true;entry.expiresAt=now()+PREVIEW_TTL;}
     } catch (_) {
       if(previews.get(actor)===entry)previews.delete(actor);
@@ -59,7 +68,7 @@ function createHandoffNoticeAdmin(options={}) {
     if(!entry?.ready||entry.id!==id||entry.chat!==String(ctx.chat.id)||cursor<=entry.cursor){await consume(ctx,id,cursor);return ctx.reply(current(ctx,id));}
     if(!entry.result.can_apply){await consume(ctx,id,cursor);return ctx.reply('В просмотренном состоянии публикация недоступна. Откройте /handoff_notice '+id+' заново.');}
     const confirmMissing=match[2]==='confirm_missing';
-    if(entry.result.requires_confirmation&&!confirmMissing){await consume(ctx,id,cursor);return ctx.reply('Сначала проверьте чат: сообщение могло дойти. Повтор может создать дубликат. Только если уведомления нет, отправьте /handoff_notice_apply '+id+' confirm_missing.');}
+    if(entry.result.requires_confirmation&&!confirmMissing){await consume(ctx,id,cursor);return ctx.reply('Сначала проверьте чат: сообщение могло дойти. Повтор может создать дубликат. Только если неподтверждённой части нет, отправьте /handoff_notice_apply '+id+' confirm_missing.');}
     // Forward concurrent valid commands too: the publisher consumes their
     // durable message cursor even if its shared lock returns busy.
     entry.applying=(entry.applying||0)+1;let busy=false;

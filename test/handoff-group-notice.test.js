@@ -108,3 +108,92 @@ test('checkpoint saves preserve busy cursors when a local notice is absent, null
   h.state.groupNotice={cursors:{102:300}};await h.replace(h.state);
   for(const value of [undefined,null,'invalid']){const next={...h.state,groupNotice:value};await h.pool.query(SAVE_CHECKPOINT_SQL,[JSON.stringify(next),39]);const saved=await h.saved();assert.equal(Array.isArray(saved.groupNotice),false);assert.equal(saved.groupNotice.cursors['102'],300);}
 }));
+
+async function multipartFixture(h) {
+  const comment = 'Комментарий менеджера\n' + 'Разъяснение для клиента. '.repeat(145);
+  await h.db.exec('ALTER TABLE cases ADD COLUMN comment TEXT');
+  await h.db.query('UPDATE cases SET comment=$1 WHERE id=39', [comment]);
+  const publisher = h.publisher();
+  const preview = await publisher.preview(39, { actorId: 101 });
+  assert.equal(preview.parts.length, 2);
+  return { publisher, preview };
+}
+
+test('known failure of a later group part retries only the unfinished part', pg, async () => fixture(async h => {
+  const { publisher, preview } = await multipartFixture(h);
+  h.setSend(n => {
+    if (n === 2) throw Object.assign(new Error('Rejected part 2'), { response: { error_code: 400 } });
+    return { message_id: 1700 + n, chat: { id: GROUP } };
+  });
+
+  const initial = await h.apply(publisher, preview);
+  assert.equal(initial.state, 'rejected');
+  assert.deepEqual(h.sends.map(event => event.text), preview.parts);
+  assert.equal(h.sends[1].options.reply_parameters.message_id, 1701);
+  assert.equal((await h.saved()).completed, true);
+  assert.deepEqual((await h.saved()).groupNotice.receipts.map(r => r.message_id), [1701]);
+
+  const restarted = h.publisher();
+  const retry = await restarted.preview(39, { actorId: 101 });
+  assert.equal(retry.delivered, 1);
+  assert.deepEqual(retry.parts, preview.parts);
+  assert.equal(retry.requires_confirmation, false);
+  const confirmed = await h.apply(restarted, retry, 202);
+  assert.equal(confirmed.state, 'confirmed');
+  assert.equal(confirmed.message_id, 1701);
+  assert.deepEqual(h.sends.map(event => event.text), [...preview.parts, preview.parts[1]]);
+  assert.equal(h.sends[2].options.reply_parameters.message_id, 1701);
+  assert.deepEqual((await h.saved()).groupNotice.receipts.map(r => r.message_id), [1701, 1703]);
+}));
+
+test('an uncertain later group part requires reviewed confirmation and preserves the first message', pg, async () => fixture(async h => {
+  const { publisher, preview } = await multipartFixture(h);
+  h.setSend(n => {
+    if (n === 2) throw Object.assign(new Error('Missing ACK for part 2'), { response: { error_code: 502 } });
+    return { message_id: 1700 + n, chat: { id: GROUP } };
+  });
+
+  assert.equal((await h.apply(publisher, preview)).state, 'unknown');
+  const pending = (await h.saved()).groupNotice;
+  assert.equal(pending.intent.part, 1);
+  assert.deepEqual(pending.receipts.map(r => r.message_id), [1701]);
+
+  const restarted = h.publisher();
+  const unknown = await restarted.preview(39, { actorId: 101 });
+  assert.equal(unknown.delivered, 1);
+  assert.equal(unknown.requires_confirmation, true);
+  assert.equal((await h.apply(restarted, unknown, 202)).state, 'unknown');
+  assert.equal(h.sends.length, 2);
+  const fresh = await restarted.preview(39, { actorId: 101 });
+  assert.equal((await h.apply(restarted, fresh, 203, { confirmMissing: true })).state, 'confirmed');
+  assert.deepEqual(h.sends.map(event => event.text), [...preview.parts, preview.parts[1]]);
+  assert.equal((await h.saved()).groupNotice.receipt.message_id, 1701);
+}));
+
+test('revoked manager or lawyer access between group parts prevents any further publication', pg, async () => fixture(async h => {
+  const { publisher, preview } = await multipartFixture(h);
+  h.setSend(async n => {
+    if (n === 1) await h.db.exec('UPDATE staff SET approved=false WHERE tg_id=808');
+    return { message_id: 1700 + n, chat: { id: GROUP } };
+  });
+
+  assert.equal((await h.apply(publisher, preview)).state, 'blocked');
+  assert.deepEqual(h.sends.map(event => event.text), [preview.parts[0]]);
+  const state = await h.saved();
+  assert.equal(state.completed, true);
+  assert.equal(state.groupNotice.status, 'blocked');
+  assert.equal(state.groupNotice.intent, null);
+  assert.deepEqual(state.groupNotice.receipts.map(r => r.message_id), [1701]);
+  const blocked = await publisher.preview(39, { actorId: 101 });
+  assert.equal(blocked.can_apply, false);
+}));
+
+
+test('a clients chat configured as the measurements chat never receives the manager details',pg,async()=>fixture(async h=>{
+  h.options.workingChatId = GROUP;
+  const p = h.publisher();
+  const view = await p.preview(39,{actorId:101});
+  assert.equal(view.can_apply,false);
+  assert.equal((await h.apply(p,view)).state,'blocked');
+  assert.equal(h.sends.length,0);
+}));

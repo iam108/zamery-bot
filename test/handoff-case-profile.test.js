@@ -12,3 +12,14 @@ test('confirmed manager profile exposes legal details and contacts, never packet
 test('legacy rows without a saved organisation do not fabricate a legal entity from the object brand',()=>{
   for(const row of [null,{}, {org:'',object_name:'Кафе'}, {org:{name:'bad'},address:'Москва'}])assert.equal(savedCaseProfile(row),null);
 });
+
+test('saved manager profiles distinguish a recorded payment from the absence of a payment status', () => {
+  for (const value of ['paid', 'unpaid', '', 'unknown', undefined]) {
+    const profile = savedCaseProfile({
+      org: 'ООО Пример',
+      data: {_handoff: {fields: {technical_description_payment: value}}},
+    });
+    if (value === 'paid' || value === 'unpaid') assert.equal(profile.technical_description_payment, value);
+    else assert.equal(Object.hasOwn(profile, 'technical_description_payment'), false);
+  }
+});

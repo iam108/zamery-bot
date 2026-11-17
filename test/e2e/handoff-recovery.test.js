@@ -40,6 +40,7 @@ test('a known rejected handoff resumes its existing case after a fresh browser c
     await until(()=>page.locator('#lawyers option[value="'+LAWYER+'"]').count().then(count=>count===1),'Loaded assigned-lawyer selector');
     await page.locator('#lawyers').selectOption(String(LAWYER));const start=service.messages.length;
     await page.locator('#go').click();await page.locator('#review').waitFor({state:'visible'});
+    assert.equal(await page.locator('#review-clients-group').isVisible(),false,'The disclosure is hidden when no clients group is configured');
     const pending=page.waitForResponse(response=>response.url().endsWith('/api/handoff')&&response.request().method()==='POST');await page.locator('#confirm-send').click();
     const firstResponse=await pending,first=await firstResponse.json();assert.equal(firstResponse.status(),200);assert.equal(first.delivery_complete,false);assert.equal(first.retry,true);assert.equal(first.manual_review,undefined);assert.equal(rejected,1);
     await page.locator('#delivery-title').getByText('Доставка не завершена',{exact:true}).waitFor();

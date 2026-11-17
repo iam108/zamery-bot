@@ -11,11 +11,18 @@ function handoffModel() {
   }
   function contacts(list) { return Array.isArray(list) ? list.filter(function (c) { return c && typeof c === 'object'; }).map(function (c) { return { name: text(c.name), phone: text(c.phone), tg: text(c.tg), comment: text(c.comment) }; }).filter(function (c) { return c.name || c.phone || c.tg || c.comment; }) : []; }
   function fingerprint(p) { return JSON.stringify(['org', 'address', 'inn', 'cad_num', 'region', 'kind', 'service'].map(function (key) { return text(p[key]); })); }
+  function technicalDescriptionPaymentLabel(value) {
+    if (value === 'paid') return 'оплачено';
+    if (value === 'unpaid') return 'не оплачено';
+    return '';
+  }
   function restore(state, cached, source) {
     if (!cached || cached.version !== 2) return state;
     state.lawyer = cached.lawyer || null;
     state.priority = ['обычный', 'срочно'].indexOf(cached.priority) >= 0 ? cached.priority : 'обычный';
     state.comment = typeof cached.comment === 'string' ? cached.comment : '';
+    state.technicalDescriptionPayment = technicalDescriptionPaymentLabel(cached.technicalDescriptionPayment)
+      ? cached.technicalDescriptionPayment : '';
     state.submitId = cached.submitId || state.submitId;
     state.editedFields = {};
     ['org','address','inn','cad_num','region','kind','service'].forEach(function(key){
@@ -53,7 +60,7 @@ function handoffModel() {
     var messages={confirmed:'Сводка в чате клиентов опубликована.',pending:'Сводка в чат клиентов ещё не отправлена.',rejected:'Сводку не удалось отправить в чат клиентов. Можно повторить только сводку.',blocked:'Сводка в чат клиентов пока не опубликована. Повторите проверку публикации.',unknown:'Публикация сводки в чате клиентов не подтверждена. Сначала проверьте чат; автоматический повтор остановлен.'};
     return {status:state,message:messages[state],manual_review:state==='unknown',retry:['pending','rejected','blocked'].indexOf(state)>=0};
   }
-  return { text: text, escape: escape, kind: kind, profile: profile, contacts: contacts, fingerprint: fingerprint, restore: restore, status: status, isSource: isSource, isImage: isImage, gallery: gallery, packageInfo: packageInfo, safeHttp: safeHttp, protectedUrl: protectedUrl, mediaLabel: mediaLabel, conflict: conflict, groupNotice:groupNotice };
+  return { text: text, escape: escape, kind: kind, profile: profile, contacts: contacts, fingerprint: fingerprint, restore: restore, technicalDescriptionPaymentLabel: technicalDescriptionPaymentLabel, status: status, isSource: isSource, isImage: isImage, gallery: gallery, packageInfo: packageInfo, safeHttp: safeHttp, protectedUrl: protectedUrl, mediaLabel: mediaLabel, conflict: conflict, groupNotice:groupNotice };
 }
 
 function handoffClient() {
@@ -72,7 +79,7 @@ function handoffClient() {
     history.replaceState(history.state, '', manualUrl(manualDraft));
   }
   var cacheKey = manual ? draftKey(manualDraft) : 'handoff-v2:' + userId + ':' + (caseId ? 'case-'+caseId : orderId ? 'order-' + orderId : requestId ? 'request-' + requestId : 'new');
-  var S = { hydrating:true, canManage:false, profile: {}, editedFields: {}, source: {}, sourceLoaded: false, sourceContacts: [], contacts: [], lawyer: null, lawyers: [], priority: 'обычный', comment: '', packet: null, report: null, selectedReport: null, egrnOrder: false, submitId: uuid(), pending: null, completed: null, existingAssignment: null, loading: true, packetError: '', error: '', review: false, sending: false };
+  var S = { hydrating:true, canManage:false, clientsGroupNotice:false, profile: {}, editedFields: {}, source: {}, sourceLoaded: false, sourceContacts: [], contacts: [], lawyer: null, lawyers: [], priority: 'обычный', comment: '', technicalDescriptionPayment: '', packet: null, report: null, selectedReport: null, egrnOrder: false, submitId: uuid(), pending: null, completed: null, existingAssignment: null, loading: true, packetError: '', error: '', review: false, sending: false };
   if(manual){S.source=emptyProfile();S.profile=Object.assign({},S.source);}
   var extras;
   var layer = '', reportFocus = null, zoomFocus = null, imageEpoch = 0, imageUrls = [], imageControllers = [], downloadControllers=[], zoomScale = 1, searchTimer, searchSequence = 0, packetSequence = 0;
@@ -113,10 +120,10 @@ function handoffClient() {
   }
   function save() {
     if (readonly||S.hydrating) return;
-    var serialized=JSON.stringify({ version: 2, savedAt:Date.now(), fingerprint: M.fingerprint(S.source), packetSignature: S.packet && S.packet.signature || '', sourceContacts: S.sourceContacts, profile: S.profile, editedFields: S.editedFields, contacts: S.contacts, lawyer: S.lawyer, priority: S.priority, comment: S.comment, egrnOrder: S.egrnOrder, submitId: S.submitId, pending: S.pending, completed: S.completed, documents: extras && extras.snapshot() });
+    var serialized=JSON.stringify({ version: 2, savedAt:Date.now(), fingerprint: M.fingerprint(S.source), packetSignature: S.packet && S.packet.signature || '', sourceContacts: S.sourceContacts, profile: S.profile, editedFields: S.editedFields, contacts: S.contacts, lawyer: S.lawyer, priority: S.priority, comment: S.comment, technicalDescriptionPayment: S.technicalDescriptionPayment, egrnOrder: S.egrnOrder, submitId: S.submitId, pending: S.pending, completed: S.completed, documents: extras && extras.snapshot() });
     try { sessionStorage.setItem(cacheKey,serialized); } catch (_) {}
     try{localStorage.setItem(cacheKey,serialized);}catch(_){}
-    if (manual && isDraftId(manualDraft) && (Object.keys(S.editedFields).length || S.contacts.length || S.lawyer || S.comment || S.priority !== 'обычный' || manualQueue.length || manualFiles.length || S.pending || S.completed)) {
+    if (manual && isDraftId(manualDraft) && (Object.keys(S.editedFields).length || S.contacts.length || S.lawyer || S.comment || S.technicalDescriptionPayment || S.priority !== 'обычный' || manualQueue.length || manualFiles.length || S.pending || S.completed)) {
       try { sessionStorage.setItem(manualKey + ':recent', manualDraft); } catch (_) {}
       try { localStorage.setItem(manualKey + ':recent', manualDraft); } catch (_) {}
     }
@@ -201,12 +208,13 @@ function handoffClient() {
     $('historical-note').hidden = !$('historical-note').textContent;
     var assignment = S.packet && S.packet.assignment || S.existingAssignment;
     var saved = assignment && assignment.profile;
-    if (!saved && S.completed && !S.loading && !readonly) saved = Object.assign({ comment: S.comment, priority: S.priority }, p);
+    if (!saved && S.completed && !S.loading && !readonly) saved = Object.assign({ comment: S.comment, priority: S.priority, technical_description_payment: S.technicalDescriptionPayment }, p);
     $('saved-client-summary').hidden = !saved;
     if (saved) {
       $('object-meta').textContent = [p.kind, p.service, p.region, saved.priority && (/срочно|горящий/.test(saved.priority) ? 'Срочно' : 'Обычный приоритет')].filter(Boolean).join(' · ');
       $('saved-client-identifiers').textContent = [p.inn && 'ИНН ' + p.inn, p.cad_num && 'Кадастр ' + p.cad_num].filter(Boolean).join(' · ');
       $('saved-client-identifiers').hidden = !$('saved-client-identifiers').textContent;
+      showPayment('saved-technical-description-payment', saved.technical_description_payment);
       $('saved-client-comment').textContent = saved.comment || '';
       $('saved-client-comment-block').hidden = !$('saved-client-comment').textContent;
       $('saved-client-contacts').innerHTML = contactList(S.contacts);
@@ -260,11 +268,17 @@ function handoffClient() {
       $('packet-file-list').dataset.initialized = 'true';
     }
   }
+  function showPayment(id, value) {
+    var caption = M.technicalDescriptionPaymentLabel(value);
+    $(id).textContent = caption ? 'ТО: ' + caption : '';
+    $(id).hidden = !caption;
+  }
   function renderAssignment() {
     $('lawyers').innerHTML = '<option value="">Выберите юриста</option>' + S.lawyers.map(function (l) { var known=(typeof l.active_cases==='number'||typeof l.active_cases==='string'&&/^\d+$/.test(l.active_cases))&&Number.isSafeInteger(Number(l.active_cases))&&Number(l.active_cases)>=0;return '<option value="' + M.escape(l.tg_id) + '"' + (String(l.tg_id) === String(S.lawyer) ? ' selected' : '') + '>' + M.escape(l.name) + (known?' · '+Number(l.active_cases)+' в работе':'') + '</option>'; }).join('');
     $('lawyer-empty').hidden = S.loading || S.lawyers.length > 0;
     $('priority').value = S.priority;
     $('comment').value = S.comment;
+    $('technical-description-payment').value = S.technicalDescriptionPayment;
     updateFooter();
   }
   function updateFooter() {
@@ -320,6 +334,7 @@ function handoffClient() {
     $('lawyers').disabled = locked;
     $('priority').disabled = locked;
     $('comment').disabled = locked;
+    $('technical-description-payment').disabled = locked;
     $('choose-report').disabled = locked;
     $('egrn-order').disabled = locked;
     $('manual-create-another').hidden=!manual||!S.completed||!!S.pending||S.sending;
@@ -429,6 +444,7 @@ function handoffClient() {
     var payload = Object.assign({ order_id: orderId ? Number(orderId) : null, request_id: requestId ? Number(requestId) : null, lawyer_tg_id: S.lawyer, priority: S.priority, comment: S.comment.trim(), contacts: M.contacts(S.contacts), egrn_order: !manual&&S.egrnOrder === true, report_src: rep ? rep.src : null, report_id: rep ? rep.id : null, audit_text: rep ? rep.text || '' : '', tg_user_id: tg && tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user.id : null }, p, { handoff_version: 2, submit_id: S.submitId, packet_signature: S.packet && S.packet.signature },manual?{manual_client:true,inn:manualInn(),manual_files:manualFiles.map(function(file){return Object.assign({},file);}),cad_num:''}:{});
     var attachment = !manual && extras && extras.handoffAttachment();
     if (attachment) payload.extra_documents = attachment;
+    if (S.technicalDescriptionPayment) payload.technical_description_payment = S.technicalDescriptionPayment;
     return payload;
   }
   function hasClientContact() { return S.contacts.some(function (contact) { return M.text(contact.name) || M.text(contact.phone) || M.text(contact.tg); }); }
@@ -501,12 +517,14 @@ function handoffClient() {
     var inn = manual ? manualInn() : S.profile.inn;
     $('review-identifiers').textContent = [inn && 'ИНН ' + inn, S.profile.cad_num && 'Кадастр ' + S.profile.cad_num].filter(Boolean).join(' · ');
     $('review-identifiers').hidden = !$('review-identifiers').textContent;
+    showPayment('review-technical-description-payment', S.technicalDescriptionPayment);
     $('review-title').textContent=manual?'Проверьте клиента':'Проверьте передачу';
     $('review-list').innerHTML = packetLines().map(function (line) { return '<li>' + M.escape(line) + '</li>'; }).join('');
     renderReadiness('review');
     $('review-contacts').innerHTML = contactList(S.contacts);
     $('review-contacts-block').hidden = !S.contacts.length;
     $('review-comment-block').hidden = !S.comment.trim();
+    $('review-clients-group').hidden = !S.clientsGroupNotice;
     $('review-comment').textContent = S.comment.trim(); $('review-comment').hidden = !S.comment.trim();
     updateFooter(); $('review').scrollIntoView({ block: 'start', behavior: 'auto' }); $('confirm-send').focus();
   }
@@ -615,6 +633,7 @@ function handoffClient() {
     if (S.completed && !S.pending && previous && previous.packetSignature && previous.packetSignature !== packet.signature) {
       S.completed = null; S.submitId = uuid();
       S.profile = Object.assign({}, S.source); S.contacts = M.contacts(S.sourceContacts); S.egrnOrder = false;
+      S.technicalDescriptionPayment = '';
     }
   }
   async function loadPacket(rep, options) {
@@ -633,6 +652,7 @@ function handoffClient() {
     try {
       var pref = await api(manual?'/api/handoff/prefill':'/api/handoff/prefill?order_id=' + encodeURIComponent(orderId) + '&request_id=' + encodeURIComponent(requestId)+(caseId?'&case_id='+encodeURIComponent(caseId):''));
       S.canManage = pref.can_manage === true;
+      S.clientsGroupNotice = pref.clients_group_notice === true;
       if(documentsView){readonly=!S.canManage;document.body.classList.toggle('readonly',readonly);}
       if(caseId&&pref.order&&pref.order.id)orderId=String(pref.order.id);
       S.lawyers = pref.lawyers || [];
@@ -880,6 +900,10 @@ function handoffClient() {
   $('lawyers').onchange = function () { S.lawyer = this.value || null; S.error = ''; save(); updateFooter(); };
   $('priority').onchange = function () { S.priority = this.value; save(); };
   $('comment').oninput = function () { S.comment = this.value; save(); };
+  $('technical-description-payment').onchange = function () {
+    S.technicalDescriptionPayment = this.value;
+    save();
+  };
   $('egrn-order').onchange = function () { S.egrnOrder = this.checked; save(); };
   $('go').onclick = showReview;
   $('review-back').onclick = function () { S.review = false; updateFooter(); $('go').focus(); };
@@ -937,14 +961,14 @@ function handoffPage() {
 .page-heading>div{min-width:0}.back.back-to-rework{border-radius:16px;padding:8px 12px;font-size:.9rem}.saved-client{display:grid;gap:16px;margin-top:16px}.saved-client[hidden]{display:none}.saved-client h3,.file-group h3,.packet-issues h3{margin:0 0 6px;font-size:.98rem}.contact-list{padding:0;margin:0;list-style:none;display:grid;gap:10px}.contact-list li{padding:10px 12px;background:var(--input);border-radius:14px;overflow-wrap:anywhere}.verbatim{white-space:pre-wrap;overflow-wrap:anywhere}.saved-client .note{margin:0}.packet-issues{padding:14px 16px;margin:0 0 16px;border:1px solid #a9672830;border-radius:16px;background:#b8661110}.packet-issues ul{padding-left:1.2em;margin:6px 0 0}.packet-issues li+li{margin-top:6px}.file-group{margin-top:18px}.file-reference{padding:11px 15px;margin:8px 0;background:var(--input);border-radius:14px;overflow-wrap:anywhere}.file-reference small{display:block}.review-comment-block{margin-top:16px}.review-comment-block .review-comment{margin-top:4px}
 </style><script src="https://telegram.org/js/telegram-web-app.js"></script><script src="/auth.js"></script></head><body>
 <main class="shell"><header class="page-heading"><button id="back" class="back" type="button" aria-label="Назад">←</button><div><h1 id="page-title">Передача юристу</h1><small id="page-subtitle">Объект, готовый комплект и ответственный</small></div></header><a id="create-client-link" class="report-link" hidden>Создать нового клиента</a><a id="resume-manual-draft" class="report-link" hidden>Продолжить предыдущий черновик</a><p id="readonly-note" class="info readonly-note" hidden>Просмотр материалов. Изменения и передача здесь недоступны.</p><p id="notice" class="notice" role="status" aria-live="polite"></p>
-<div id="main-form"><section class="glass card" aria-labelledby="object-org"><p id="object-source" class="object-source"></p><h2 id="object-org" class="object-org">Загружаю объект…</h2><p id="object-address" class="object-address"></p><p id="object-meta" class="object-meta"></p><div id="saved-client-summary" class="saved-client" hidden><p id="saved-client-identifiers" class="info"></p><div id="saved-client-comment-block"><h3>Комментарий менеджера</h3><p id="saved-client-comment" class="verbatim"></p></div><div id="saved-client-contacts-block"><h3>Контакты</h3><ul id="saved-client-contacts" class="contact-list"></ul></div><p id="saved-client-address-note" class="note" hidden></p></div><details id="details" class="details"><summary id="details-summary">Изменить сведения и контакты</summary><p id="historical-note" class="note" hidden></p><fieldset id="details-editable" class="details-editable"><div class="fields"><label class="wide">Организация<input id="org" autocomplete="organization"></label><label class="wide">Адрес объекта<input id="address" autocomplete="street-address"></label><label id="inn-field">ИНН <span class="muted">· необязательно</span><input id="inn" inputmode="numeric"></label><label id="cad-field">Кадастровый номер<input id="cad_num" placeholder="77:01:0000000:0000"></label><label>Регион<select id="region"><option value="">Выберите</option><option value="МСК">Москва</option><option value="МО">Московская область</option><option value="СПб">Санкт-Петербург</option></select></label><label>Тип объекта<select id="kind"><option value="">Выберите</option><option>Общепит</option><option>Магазин</option><option>Табак</option></select></label><label class="wide">Услуга<select id="service"><option value="">Выберите</option><option>Получение</option><option>Продление</option><option>Переоформление</option></select></label></div><div id="contact-section"><h3 class="contacts-title">Контакты клиента</h3><p id="no-contacts" class="empty">В заявке нет сохранённых контактов.</p><div id="contacts"></div><button type="button" id="add-contact" class="text-button">＋ Добавить контакт</button></div><details id="manual-optional" class="details" hidden><summary>Контакты, ИНН и комментарий <span class="muted">· необязательно</span></summary><div id="manual-optional-fields"></div></details></fieldset></details></section>
+<div id="main-form"><section class="glass card" aria-labelledby="object-org"><p id="object-source" class="object-source"></p><h2 id="object-org" class="object-org">Загружаю объект…</h2><p id="object-address" class="object-address"></p><p id="object-meta" class="object-meta"></p><div id="saved-client-summary" class="saved-client" hidden><p id="saved-client-identifiers" class="info"></p><p id="saved-technical-description-payment" class="info" hidden></p><div id="saved-client-comment-block"><h3>Комментарий менеджера</h3><p id="saved-client-comment" class="verbatim"></p></div><div id="saved-client-contacts-block"><h3>Контакты</h3><ul id="saved-client-contacts" class="contact-list"></ul></div><p id="saved-client-address-note" class="note" hidden></p></div><details id="details" class="details"><summary id="details-summary">Изменить сведения и контакты</summary><p id="historical-note" class="note" hidden></p><fieldset id="details-editable" class="details-editable"><div class="fields"><label class="wide">Организация<input id="org" autocomplete="organization"></label><label class="wide">Адрес объекта<input id="address" autocomplete="street-address"></label><label id="inn-field">ИНН <span class="muted">· необязательно</span><input id="inn" inputmode="numeric"></label><label id="cad-field">Кадастровый номер<input id="cad_num" placeholder="77:01:0000000:0000"></label><label>Регион<select id="region"><option value="">Выберите</option><option value="МСК">Москва</option><option value="МО">Московская область</option><option value="СПб">Санкт-Петербург</option></select></label><label>Тип объекта<select id="kind"><option value="">Выберите</option><option>Общепит</option><option>Магазин</option><option>Табак</option></select></label><label class="wide">Услуга<select id="service"><option value="">Выберите</option><option>Получение</option><option>Продление</option><option>Переоформление</option></select></label></div><div id="contact-section"><h3 class="contacts-title">Контакты клиента</h3><p id="no-contacts" class="empty">В заявке нет сохранённых контактов.</p><div id="contacts"></div><button type="button" id="add-contact" class="text-button">＋ Добавить контакт</button></div><details id="manual-optional" class="details" hidden><summary>Контакты, ИНН и комментарий <span class="muted">· необязательно</span></summary><div id="manual-optional-fields"></div></details></fieldset></details></section>
 <section id="manual-load-error" class="glass card" hidden><p id="manual-load-error-text" class="error" role="alert"></p><button id="manual-retry-load" class="soft-button" type="button">Повторить загрузку</button></section>
 <section id="manual-matches" class="glass card" hidden aria-labelledby="manual-match-status"><h2 id="manual-match-status"></h2><ul id="manual-match-list" class="manual-match-list"></ul><p id="manual-match-more" class="info" hidden>Есть и другие совпадения. Уточните организацию, ИНН или адрес.</p><label id="manual-new-choice" class="check" hidden><input type="checkbox" id="manual-create-new"><span>Создать отдельного клиента<small>Существующие карточки останутся без изменений.</small></span></label><button id="manual-match-retry" class="soft-button" type="button" hidden>Повторить проверку</button></section>
 <section id="manual-documents" class="glass card manual-documents" hidden><details id="manual-documents-details" class="details"><summary id="manual-documents-summary">Документы<span id="manual-file-count"> · необязательно</span></summary><p id="manual-file-limit" class="info block-gap"></p><ul id="manual-file-list" class="manual-file-list"></ul><input id="manual-files" type="file" multiple hidden accept=".pdf,.doc,.docx,.xls,.xlsx,.zip,.jpg,.jpeg,.png,.webp,.gif,.heic,.heif,.avif,.tif,.tiff,.bmp"><button id="manual-add-files" type="button" class="soft-button">＋ Добавить документы</button><p id="manual-file-status" class="info block-gap" role="status" aria-live="polite"></p><div class="manual-file-actions"><button id="manual-files-retry" type="button" class="soft-button" hidden>Повторить загрузку</button><button id="manual-files-cancel" type="button" class="text-button" hidden>Отменить оставшиеся</button></div></details></section>
 <section id="packet-section" class="glass card" aria-labelledby="packet-title"><div class="card-header"><h2 id="packet-title">Комплект юристу</h2></div><p id="packet-loading" class="loading" role="status">Собираю сохранённые материалы…</p><div id="packet-error" hidden><p id="packet-error-text" class="error" role="alert"></p><button type="button" id="retry-load" class="soft-button">Повторить загрузку</button></div><div id="packet-content" hidden><div class="report-overview"><span id="report-status" class="status"></span><small id="report-date"></small></div><div id="packet-issues" class="packet-issues" hidden><h3 id="packet-issues-title"></h3><ul id="packet-issues-list"></ul></div><button type="button" id="open-report" class="outline-button full">Открыть полный отчёт</button><div id="packet-counts" class="counts"></div><div class="package-details"><p id="video-state"></p><p id="materials-state"></p><p id="egrn-state"></p><p id="archive-state" hidden></p></div><a id="packet-video-link" class="report-link" target="_blank" rel="noopener noreferrer" hidden>Смотреть видео ↗</a><a id="packet-archive-link" class="report-link" target="_blank" rel="noopener noreferrer" hidden>Открыть архив объекта ↗</a><details id="packet-file-list" class="details" hidden><summary>Файлы комплекта</summary><div id="packet-originals"></div></details><label id="egrn-order-box" class="check" hidden><input type="checkbox" id="egrn-order"><span>Заказать новую выписку ЕГРН<small>По кадастровому номеру <span id="egrn-cad"></span>. Это новый заказ у поставщика.</small></span></label><div class="packet-bottom"><button type="button" id="choose-report" class="text-button">Выбрать отчёт</button></div></div></section>
-<section id="assignment" class="glass card" aria-labelledby="assignment-title"><div class="card-header"><h2 id="assignment-title">Кому передать</h2></div><div class="assignment-fields"><label>Юрист<select id="lawyers"><option value="">Выберите юриста</option></select></label><label id="priority-field">Приоритет<select id="priority"><option value="обычный">Обычный</option><option value="срочно">Срочно</option></select></label><label id="comment-field" class="wide">Комментарий юристу <span class="muted">· необязательно</span><textarea id="comment" placeholder="Только то, что важно при передаче"></textarea></label></div><p id="lawyer-empty" class="error" hidden>Нет доступных юристов. Юристу нужно зарегистрироваться через /start в боте.</p></section></div>
+<section id="assignment" class="glass card" aria-labelledby="assignment-title"><div class="card-header"><h2 id="assignment-title">Кому передать</h2></div><div class="assignment-fields"><label>Юрист<select id="lawyers"><option value="">Выберите юриста</option></select></label><label id="priority-field">Приоритет<select id="priority"><option value="обычный">Обычный</option><option value="срочно">Срочно</option></select></label><label class="wide">Оплата технического описания (ТО)<select id="technical-description-payment"><option value="">Не указано</option><option value="paid">Оплачено</option><option value="unpaid">Не оплачено</option></select></label><label id="comment-field" class="wide">Комментарий к передаче <span class="muted">· необязательно</span><textarea id="comment" placeholder="Только то, что важно при передаче"></textarea></label></div><p id="lawyer-empty" class="error" hidden>Нет доступных юристов. Юристу нужно зарегистрироваться через /start в боте.</p></section></div>
 <button type="button" id="download-package" class="soft-button full" style="margin-bottom:18px" hidden>Скачать комплект</button><section id="extra-documents" class="glass card" hidden><h2 id="extra-documents-title">Дополнительные документы</h2><p id="extra-documents-help" class="info block-gap"></p><input id="extra-document-input" type="file" multiple hidden accept=".pdf,.doc,.docx,.xls,.xlsx,.zip,.jpg,.jpeg,.png,.webp,.gif,.heic,.heif,.avif,.tif,.tiff,.bmp"><button id="extra-document-add" type="button" class="soft-button full block-gap">＋ Прикрепить документы</button><p id="extra-document-limit" class="info block-gap"></p><ul id="extra-document-list" class="manual-file-list"></ul><p id="extra-document-status" class="info" role="status" aria-live="polite"></p><div class="manual-file-actions block-gap"><button id="extra-document-send" type="button" class="primary" hidden>Дослать документы</button><button id="extra-document-retry" type="button" class="soft-button" hidden>Повторить загрузку</button><button id="extra-document-cancel" type="button" class="text-button" hidden>Убрать оставшиеся из очереди</button></div><ul id="extra-document-history" class="document-history"></ul><p id="extra-document-history-status" class="error" role="status"></p><button id="extra-document-history-retry" type="button" class="soft-button" hidden>Обновить список документов</button></section>
-<section id="review" hidden aria-labelledby="review-title"><h2 id="review-title" class="review-title">Проверьте передачу</h2><div class="glass card"><p class="review-eyebrow">Получатель в Telegram</p><h3 id="review-lawyer" class="review-lawyer"></h3><p class="review-eyebrow">Объект</p><h3 id="review-org"></h3><p id="review-address" class="review-address"></p><p id="review-meta" class="muted"></p><p id="review-identifiers" class="info" hidden></p><div id="review-issues" class="packet-issues block-gap" hidden><h3 id="review-issues-title"></h3><ul id="review-issues-list"></ul></div><p class="review-eyebrow block-gap">Что получит юрист</p><ul id="review-list" class="review-list"></ul><div id="review-contacts-block" hidden><p class="review-eyebrow">Контакты</p><ul id="review-contacts" class="contact-list"></ul></div><div id="review-comment-block" class="review-comment-block" hidden><p class="review-eyebrow">Комментарий менеджера</p><p id="review-comment" class="review-comment verbatim"></p></div><div class="review-actions"><button type="button" id="confirm-send" class="primary full">Подтвердить передачу</button><button type="button" id="review-back" class="soft-button full">Вернуться к редактированию</button></div></div></section>
+<section id="review" hidden aria-labelledby="review-title"><h2 id="review-title" class="review-title">Проверьте передачу</h2><div class="glass card"><p class="review-eyebrow">Получатель в Telegram</p><h3 id="review-lawyer" class="review-lawyer"></h3><p class="review-eyebrow">Объект</p><h3 id="review-org"></h3><p id="review-address" class="review-address"></p><p id="review-meta" class="muted"></p><p id="review-identifiers" class="info" hidden></p><p id="review-technical-description-payment" class="info" hidden></p><div id="review-issues" class="packet-issues block-gap" hidden><h3 id="review-issues-title"></h3><ul id="review-issues-list"></ul></div><p class="review-eyebrow block-gap">Что получит юрист</p><ul id="review-list" class="review-list"></ul><div id="review-contacts-block" hidden><p class="review-eyebrow">Контакты</p><ul id="review-contacts" class="contact-list"></ul></div><div id="review-comment-block" class="review-comment-block" hidden><p class="review-eyebrow">Комментарий менеджера</p><p id="review-comment" class="review-comment verbatim"></p></div><p id="review-clients-group" class="info block-gap" hidden>В чат «Заявки по клиенту» придут сведения из формы, включая контакты и комментарий.</p><div class="review-actions"><button type="button" id="confirm-send" class="primary full">Подтвердить передачу</button><button type="button" id="review-back" class="soft-button full">Вернуться к редактированию</button></div></div></section>
 <section id="delivery" class="glass card delivery" hidden role="status"><h2 id="delivery-title"></h2><p id="delivery-text"></p><button type="button" id="retry-send" class="primary full">Повторить доставку</button><button type="button" id="manual-create-another" class="soft-button full block-gap" hidden>Создать ещё клиента</button></section></main>
 <footer id="footer" class="footer"><div class="footer-inner"><p id="form-error" class="error" role="alert" hidden></p><button type="button" class="primary full" id="go" disabled>Передать юристу</button><small id="footer-note" aria-live="polite">Перед отправкой покажем получателя и состав комплекта</small></div></footer>
 <dialog id="report-dialog" class="sheet" aria-labelledby="report-heading"><div class="sheet-inner"><header class="sheet-header"><div class="sheet-heading"><h2 id="report-heading">Отчёт аудитора</h2><small id="report-subtitle"></small></div><button type="button" id="report-close" class="soft-button">К передаче</button></header><nav class="sheet-tabs" aria-label="Разделы полного отчёта"><button type="button" id="jump-text">Текст</button><button type="button" id="jump-images">Схемы и фото</button><button type="button" id="jump-files">Файлы</button></nav><div id="report-body" class="sheet-body"><p id="report-address-note" class="note" hidden></p><div id="report-issues" class="packet-issues" hidden><h3 id="report-issues-title"></h3><ul id="report-issues-list"></ul></div><pre id="report-text" class="full-report-text"></pre><a id="report-video" class="report-link" target="_blank" rel="noopener noreferrer" hidden>Смотреть видео ↗</a><a id="report-archive" class="report-link" target="_blank" rel="noopener noreferrer" hidden>Архив объекта ↗</a><a id="report-telegram" class="report-link" target="_blank" rel="noopener noreferrer" hidden>Оригинальные сообщения в Telegram ↗</a><h3 id="report-images-heading" class="report-section">Схемы, планы и фотографии</h3><p id="gallery-empty" class="empty"></p><div id="gallery"></div><h3 id="report-files-heading" class="report-section">Оригиналы и документы заявки</h3><p class="info">Нажмите на файл, чтобы скачать его целиком.</p><p id="originals-empty" class="empty">Сохранённых файлов нет.</p><button type="button" id="report-download-package" class="soft-button full" hidden>Скачать комплект</button><div id="report-originals"></div><p id="report-notice" class="error" role="status"></p></div></div></dialog>

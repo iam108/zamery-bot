@@ -887,3 +887,23 @@ test('review opening report should not silently cancel a separately started pack
   const h=harness({packet:p,fetch(url,init){if(/\/cases\/75\/package/.test(url)){signal=init.signal;return {ok:true,status:200,headers:{get:()=> 'application/zip'},blob:()=>new Promise(resolve=>{finish=resolve;})};}}});await pause();
   h.node('download-package').click();await pause();assert.ok(signal);h.node('open-report').click();await pause();assert.equal(signal.aborted,false,'Opening the report must not cancel the package download that started outside it');finish({type:'application/zip',size:100});
 });
+
+for (const [value, label] of [['paid', 'ТО: оплачено'], ['unpaid', 'ТО: не оплачено']]) {
+  test('technical description payment survives reopening and is included in the reviewed submission: ' + value, async () => {
+    const form = harness(); await pause();
+    lawyer(form);
+    const payment = form.node('technical-description-payment');
+    assert.equal(payment.value, '');
+    payment.value = value;
+    payment.onchange();
+    const reopened = harness({persistent: Object.fromEntries(form.persistent)}); await pause();
+    assert.equal(reopened.node('technical-description-payment').value, value);
+    reopened.node('go').click();
+    assert.equal(reopened.node('review-technical-description-payment').textContent, label);
+    assert.equal(reopened.node('review-technical-description-payment').hidden, false);
+    reopened.node('confirm-send').click(); await pause();
+    const post = reopened.calls.find(call => call[1] === '/api/handoff');
+    assert.equal(JSON.parse(post[2].body).technical_description_payment, value);
+    assert.equal(reopened.node('saved-technical-description-payment').textContent, label);
+  });
+}
