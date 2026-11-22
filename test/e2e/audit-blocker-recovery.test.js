@@ -3,6 +3,7 @@ const {before,after,test}=require('node:test');
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path');
 const {randomUUID}=require('node:crypto');
+const {isDeepStrictEqual}=require('node:util');
 const {chromium}=require('playwright');
 const yauzl=require('yauzl');
 const {createService,openPage,multiPagePdf,sampleImage,until,hash}=require('./helpers');
@@ -13,6 +14,12 @@ after(async()=>{await browser?.close();await service?.close();});
 const step=(page,index)=>page.locator('#steps [data-step="'+index+'"]').click();
 const field=(page,key)=>page.locator('[data-bind="'+key+'"]');
 const mode=(page,value)=>page.locator('[data-choice="plan.mode"][data-value="'+value+'"]');
+async function chooseMode(page,value) {
+ await mode(page,value).click();
+ // The click handler may still be awaiting the previous editor's flush.
+ // A canvas is already visible in both modes and is not a mode-switch ACK.
+ await mode(page,value).and(page.locator('[aria-pressed="true"]')).waitFor();
+}
 const pending={tool:'boundary',points:[{x:.12,y:.15},{x:.78,y:.18},{x:.71,y:.79}]};
 async function seed(order,school) {
  await service.pool.query("UPDATE orders SET object_type='Табак',service='Получение' WHERE id=$1",[order]);
@@ -42,8 +49,16 @@ async function seed(order,school) {
  return {...visit,draftId:draft.id,oldSource:data.plan.evidence_id,png,jpg,pdf};
 }
 async function save(page,order) {
- await page.locator('#save-now').click();await until(()=>page.evaluate(()=>/Черновик сохранён на сервере/.test(document.querySelector('#toast').textContent)),'The latest report reaches its durable draft');
- return service.draft(order);
+ // Every explicit save must acknowledge this invocation. An old (even hidden)
+ // toast can outlive a previous save and cannot confirm a subsequent PUT.
+ await page.evaluate(()=>{document.querySelector('#toast').textContent='';});
+ await page.locator('#save-now').click();
+ await until(()=>page.evaluate(()=>{const toast=document.querySelector('#toast');return !toast.hidden&&/Черновик сохранён на сервере/.test(toast.textContent);}), 'This save action receives a fresh acknowledgement');
+ const local=await page.evaluate(order=>JSON.parse(localStorage.getItem('audit-wizard-v3:1001:'+order)),order);
+ let saved;
+ await until(async()=>{saved=await service.draft(order);return saved?.id===local.draft_id&&Number(saved.revision)===Number(local.revision)&&isDeepStrictEqual(saved.data,local.data);},'The acknowledged revision and complete answers match the actual durable draft');
+ assert.deepEqual(saved.data,local.data);
+ return saved;
 }
 async function uploadArtwork(page,file,pageNumber=1) {
  const editor=page.locator('#plan-editor');await editor.getByRole('button',{name:'Прикрепить готовый план',exact:true}).click();
@@ -85,9 +100,16 @@ test('a tobacco obstacle with a confirmed school uses ready PNG/JPG artwork, ret
   await page.reload();await page.locator('#step-content[aria-busy=false]').waitFor();assert.deepEqual((await service.draft(58)).data.plan.pending,pending);await step(page,2);
   await page.locator('#report-feedback .task button[data-issue-control^="plan."]').first().click();
   await until(()=>page.locator('#plan-editor').getByRole('button',{name:'Замкнуть контур',exact:true}).evaluate(node=>document.activeElement===node),'The unfinished-contour action focuses the actual close-contour control');
-  await mode(page,'attached').click();await uploadArtwork(page,{name:'Готовый план.png',mimeType:'image/png',buffer:visit.png});await save(page,58);
-  await mode(page,'draw').click();await page.locator('#plan-editor .ape-viewport canvas').waitFor({state:'visible'});const restored=await save(page,58);assert.equal(restored.data.plan.evidence_id,visit.oldSource);assert.deepEqual(restored.data.plan.pending,pending);assert.deepEqual(restored.data.plan.annotations,[]);
-  await mode(page,'attached').click();await save(page,58);
+  await chooseMode(page,'attached');await uploadArtwork(page,{name:'Готовый план.png',mimeType:'image/png',buffer:visit.png});await save(page,58);
+  let delayedDrawSave=0;
+  await page.route('**/api/audit/drafts/*',async route=>{
+   if(route.request().method()==='PUT'&&route.request().postDataJSON()?.data?.plan?.mode==='draw'){
+    delayedDrawSave++;await new Promise(resolve=>setTimeout(resolve,450));
+   }
+   await route.continue();
+  });
+  await chooseMode(page,'draw');await page.locator('#plan-editor').getByRole('button',{name:'Замкнуть контур',exact:true}).waitFor();const restored=await save(page,58);assert.ok(delayedDrawSave>0,'The delayed drawing save really ran');assert.equal(restored.data.plan.evidence_id,visit.oldSource);assert.deepEqual(restored.data.plan.pending,pending);assert.deepEqual(restored.data.plan.annotations,[]);
+  await chooseMode(page,'attached');await save(page,58);
   await step(page,0);await page.locator('input[data-territory-upload=attached]').setInputFiles({name:'Готовая схема.jpg',mimeType:'image/jpeg',buffer:visit.jpg});await page.getByText('Готовая схема.jpg',{exact:true}).waitFor();await save(page,58);
   await step(page,2);const missingBasis=page.locator('#report-feedback .task button[data-issue-control="zones.school-1.resolution"]');await missingBasis.waitFor();
   const before=submits;await page.locator('#submit-audit').click();await page.evaluate(()=>Promise.resolve());
@@ -106,7 +128,7 @@ test('a tobacco obstacle with a confirmed school uses ready PNG/JPG artwork, ret
 test('a ready multi-page PDF keeps its selected fourth page after reload and delivers the unchanged complete PDF without requiring a new contour',{timeout:90000},async()=>{
  const visit=await seed(59,false),{page}=visit;const start=service.messages.length;
  try {
-  await step(page,1);await mode(page,'attached').click();await uploadArtwork(page,{name:'Готовый план — 6 листов.pdf',mimeType:'application/pdf',buffer:visit.pdf},4);
+  await step(page,1);await chooseMode(page,'attached');await uploadArtwork(page,{name:'Готовый план — 6 листов.pdf',mimeType:'application/pdf',buffer:visit.pdf},4);
   const saved=await save(page,59);assert.equal(saved.data.plan.mode,'attached');assert.equal(saved.data.plan.page,4);assert.equal(saved.data.plan.pending,null);assert.deepEqual(saved.data.plan.annotations,[]);
   await page.reload();await page.locator('#step-content[aria-busy=false]').waitFor();await step(page,1);const canvas=page.locator('#plan-editor .ape-viewport canvas');await canvas.waitFor({state:'visible'});
   await until(()=>canvas.evaluate(node=>{const p=node.getContext('2d').getImageData(Math.floor(node.width/2),Math.floor(node.height/2),1,1).data;return p[1]>p[0]+50&&p[1]>p[2]+50;}),'The saved fourth (green) PDF page is the visible ready artwork');
