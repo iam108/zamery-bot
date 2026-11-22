@@ -11,6 +11,18 @@ function field(value, key) {
   try { return value && value[key]; } catch (_) { return undefined; }
 }
 function identifier(value) { return typeof value === 'string' && IDENTIFIER.test(value) ? value : undefined; }
+function blockedRecipients(values) {
+  const unique = new Map();
+  for (const value of Array.isArray(values) ? values.slice(0, 200) : []) {
+    const rawChat = field(value, 'chat'), rawCase = field(value, 'case_id'), reason = field(value, 'reason');
+    const chat = ['string','number'].includes(typeof rawChat) ? String(rawChat) : '';
+    if (!/^[1-9]\d*$/.test(chat) || !Number.isSafeInteger(Number(chat)) || !['access','assignment','check_unavailable'].includes(reason)) continue;
+    const caseId = ['string','number'].includes(typeof rawCase) && /^[1-9]\d*$/.test(String(rawCase)) && Number.isSafeInteger(Number(rawCase)) && Number(rawCase) <= 2147483647 ? Number(rawCase) : null;
+    const context = { chat, ...(caseId ? { case_id: caseId } : {}), reason };
+    unique.set(JSON.stringify(context), context);
+  }
+  return [...unique.values()];
+}
 function temporaryError(cause, stage) {
   const error = Object.assign(new Error(MESSAGE), { code: TEMPORARY_CODE, temporary: true });
   const innerStage = field(cause, 'delivery_stage');
@@ -22,6 +34,8 @@ function temporaryError(cause, stage) {
     (typeof telegramCode === 'number' && Number.isSafeInteger(telegramCode) && telegramCode > 0 ? 'TELEGRAM_' + telegramCode : undefined) ||
     (sourceCode !== TEMPORARY_CODE ? sourceCode : undefined);
   if (failureCode) error.failure_code = failureCode;
+  const blocked = blockedRecipients(field(cause, 'blocked_recipients'));
+  if (blocked.length) error.blocked_recipients = blocked;
   if (typeof field(cause, 'uncertain') === 'boolean') error.uncertain = field(cause, 'uncertain');
   if (error.uncertain === true) error.message = 'Результат отправки оригинала не подтверждён. Проверьте сообщения в чате; администратор может разрешить повтор командой /egrn_retry с номером готового заказа. Новый платный заказ не создавался.';
   else if (['EGRN_RECIPIENT_UNAVAILABLE','HANDOFF_RECIPIENT_UNAVAILABLE'].includes(failureCode)) error.message = 'Получатель выписки сейчас недоступен. Проверьте доступ сотрудника и назначение юриста; доставка пока не подтверждена.';
@@ -164,6 +178,7 @@ function createLargeDelivery(options = {}) {
     const missing = required.targets.filter(value => !confirmed.has(targetKey(value)));
     if (!descriptorSaved && missing.length) await persistRecords(order, records);
     let failure;
+    const blocked = [];
     for (const destination of missing) {
       // Signing is independent of Telegram. A missing signing configuration
       // stops immediately; no unusable link or provider error is sent.
@@ -172,14 +187,24 @@ function createLargeDelivery(options = {}) {
       try {
         message = await send(record, destination, url);
         if (!message || !positive(message.message_id)) throw temporaryError(undefined, 'receipt');
-      } catch (cause) { if(cause?.uncertain===true)throw cause;failure ||= temporaryError(cause, 'telegram'); continue; }
+      } catch (cause) {
+        if(cause?.uncertain===true)throw cause;
+        const next = temporaryError(cause, 'telegram');
+        blocked.push(...(next.blocked_recipients || []));
+        failure ||= next;
+        continue;
+      }
       record.deliveries.push({ ...destination, id: positive(message.message_id) });
       setMainReceipt(record, required.main);
       // A database failure must stop the batch before another recipient is
       // notified, limiting the unavoidable send-before-commit crash window.
       await persistRecords(order, records, 'receipt');
     }
-    if (failure) throw failure;
+    if (failure) {
+      const pending = blockedRecipients(blocked);
+      if (pending.length) failure.blocked_recipients = pending;
+      throw failure;
+    }
     return record;
   }
   async function deliver(order, file, key, records) {

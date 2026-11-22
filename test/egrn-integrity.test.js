@@ -248,7 +248,7 @@ test('revoked or reassigned private recipients stay pending without physical cop
 test('revoked private primary is never sent a document or stopped notification; the configured group retains a safe original source',pg,async()=>{
   const h=await fixture({adminIDs:'111'});try{
     await h.pool.query('UPDATE staff SET approved=false WHERE tg_id=222');const order=await h.add({targets:[{chat:-100123}]});await h.pool.query('UPDATE egrn_orders SET chat_id=222,ordered_by=222 WHERE id=$1',[order.id]);await h.poll();
-    const saved=await h.row(order.id);assert.equal(saved.files_sent,0);assert.equal(h.calls.documents.length,1);assert.equal(h.calls.documents[0].chat,-100123);assert.equal(h.calls.copies.some(v=>Number(v.chat_id)===222),false);assert.equal(h.calls.messages.some(v=>Number(v.chat)===222),false);assert.ok(h.calls.messages.some(v=>Number(v.chat)===111&&/доступа получателя/.test(v.text)));assert.equal(h.calls.paid,0);
+    const saved=await h.row(order.id);assert.equal(saved.files_sent,0);assert.equal(h.calls.documents.length,1);assert.equal(h.calls.documents[0].chat,-100123);assert.equal(h.calls.copies.some(v=>Number(v.chat_id)===222),false);assert.equal(h.calls.messages.some(v=>Number(v.chat)===222),false);const notice=h.calls.messages.find(v=>Number(v.chat)===111&&/личная пересылка заказчику/.test(v.text));assert.ok(notice);assert.match(notice.text,/доставлены в чат выписок/);assert.equal(h.calls.paid,0);
   }finally{await h.close();}
 });
 

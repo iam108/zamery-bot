@@ -154,3 +154,30 @@ test('large link rejects revoked targets while preserving confirmed allowed reci
   await assert.rejects(service.deliver(o,{name:'full.pdf',buf:Buffer.alloc(100)},'sha256:original',records),e=>e.failure_code==='EGRN_RECIPIENT_UNAVAILABLE'&&e.uncertain===false);
   assert.deepEqual(sent,[-100123,111]);assert.deepEqual((await h.row()).file_msgs[0].deliveries.map(r=>r.chat),[-100123,111]);assert.equal((await h.row()).delivery_state.inflight,undefined);
 }));
+
+test('recipient rejection identifies only the blocked private copy and its verified assignment context',pg,()=>fixture(async h=>{
+  const p=h.make();
+  await h.pool.query('UPDATE staff SET approved=false WHERE tg_id=222');
+  await assert.rejects(p.authorize({}, {chat:222,display_name:'Not part of diagnostics'}),error=>{
+    assert.deepEqual(error.blocked_recipients,[{chat:'222',reason:'access'}]);
+    assert.equal(error.uncertain,false);return true;
+  });
+  await h.pool.query('UPDATE cases SET lawyer_tg_id=111 WHERE id=9');
+  await assert.rejects(p.authorize({deliver:[{chat:222,case_id:9}]}, {chat:222}),error=>{
+    assert.deepEqual(error.blocked_recipients,[{chat:'222',case_id:9,reason:'assignment'}]);return true;
+  });
+  await h.pool.query('UPDATE cases SET lawyer_tg_id=222 WHERE id=9');
+  await assert.rejects(p.authorize({}, {chat:222,case_id:9}),error=>{
+    assert.deepEqual(error.blocked_recipients,[{chat:'222',case_id:9,reason:'access'}]);return true;
+  });
+  await p.authorize({}, {chat:-100123});
+  assert.deepEqual((await h.row()).delivery_state,{});
+}));
+
+test('a recipient SQL outage is distinguished from a revoked employee without exposing error contents',pg,()=>fixture(async h=>{
+  h.setFailure(sql=>sql==='SELECT approved FROM staff WHERE tg_id=$1');
+  await assert.rejects(h.make().authorize({}, {chat:222}),error=>{
+    assert.deepEqual(error.blocked_recipients,[{chat:'222',reason:'check_unavailable'}]);
+    assert.doesNotMatch(error.message,/SQL|QA_SQL/);assert.equal(error.uncertain,false);return true;
+  });
+}));

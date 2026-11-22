@@ -124,11 +124,12 @@ function nativeDeliveryTargets(order, record) {
   return [...unique.values()];
 }
 async function nativePrimaryTarget(order) {
+  const blocked = [];
   for (const target of nativeDeliveryTargets(order, {})) {
     try { await telegramDelivery().authorize(order, target); return target; }
-    catch (error) { if (error.code !== 'EGRN_RECIPIENT_UNAVAILABLE') throw error; }
+    catch (error) { if (error.code !== 'EGRN_RECIPIENT_UNAVAILABLE') throw error; blocked.push(...blockedRecipients(error, target)); }
   }
-  throw Object.assign(new Error('Нет доступного получателя оригинала выписки. Проверьте доступ сотрудника и назначение; новый платный заказ не создавался.'), { code: 'EGRN_RECIPIENT_UNAVAILABLE', uncertain: false });
+  throw Object.assign(new Error('Нет доступного получателя оригинала выписки. Проверьте доступ сотрудника и назначение; новый платный заказ не создавался.'), { code: 'EGRN_RECIPIENT_UNAVAILABLE', uncertain: false, blocked_recipients: blocked });
 }
 async function sendNativePrimary(order, file, key, extra) {
   const target = await nativePrimaryTarget(order), configured = { ...extra };
@@ -145,6 +146,40 @@ async function sendNativePrimary(order, file, key, extra) {
     return tgApi.sendDocument(target.chat,{source:file.buf,filename:file.name},configured);
   });
   return { message, chat: target.chat };
+}
+
+function blockedRecipients(error, target) {
+  const values = Array.isArray(error?.blocked_recipients) ? error.blocked_recipients : target ? [{ ...target, reason: 'access' }] : [];
+  const unique = new Map();
+  for (const value of values) {
+    if (!value || !/^[1-9]\d*$/.test(String(value.chat || '')) || !Number.isSafeInteger(Number(value.chat))) continue;
+    const item = { chat: String(value.chat), reason: ['access', 'assignment', 'check_unavailable'].includes(value.reason) ? value.reason : 'access' };
+    if (/^[1-9]\d*$/.test(String(value.case_id || '')) && Number.isSafeInteger(Number(value.case_id)) && Number(value.case_id) <= 2147483647) item.case_id = Number(value.case_id);
+    unique.set(JSON.stringify([item.chat, item.case_id || null, item.reason]), item);
+  }
+  return [...unique.values()];
+}
+function rememberBlockedRecipients(order, error, target) {
+  const values = blockedRecipients(error, target);
+  if (!values.length) return;
+  order.blocked_recipients = blockedRecipients({ blocked_recipients: [...(order.blocked_recipients || []), ...values] });
+  order.recipient_unavailable = true;
+}
+function recipientNotice(order) {
+  const records = Array.isArray(order.file_msgs) ? order.file_msgs : [], chats = new Set();
+  for (const record of records) {
+    if (Number.isSafeInteger(Number(record?.id)) && Number(record.id) > 0 && record.chat) chats.add(canonicalChat(record.chat));
+    for (const receipt of Array.isArray(record?.deliveries) ? record.deliveries : []) if (Number.isSafeInteger(Number(receipt?.id)) && Number(receipt.id) > 0 && receipt.chat) chats.add(canonicalChat(receipt.chat));
+  }
+  const places = [];
+  if (process.env.EGRN_CHAT_ID && chats.has(canonicalChat(process.env.EGRN_CHAT_ID))) places.push('чат выписок');
+  if (process.env.GROUP_CHAT_ID && String(process.env.GROUP_CHAT_ID).toLowerCase() !== String(process.env.EGRN_CHAT_ID || '').toLowerCase() && chats.has(canonicalChat(process.env.GROUP_CHAT_ID))) places.push('чат «Замеры 2.0»');
+  const destinations = new Set((order.blocked_recipients || []).map(target => target.case_id ? 'назначенному юристу' : String(target.chat) === String(order.ordered_by) ? 'заказчику' : 'получателю'));
+  const delivered = places.length ? 'Подтверждённые файлы уже доставлены в ' + places.join(' и в ') + '. ' : records.some(record => Number(record?.id) > 0 || record?.deliveries?.length) ? 'Подтверждённые копии выписки сохранены. ' : '';
+  const manifest = Array.isArray(order.delivery_manifest) ? order.delivery_manifest : [];
+  const incomplete = manifest.some(key => !records.some(record => sourceKey(record) === key));
+  return '⚠️ ' + delivered + 'Не завершена ' + (destinations.size ? 'личная пересылка ' + [...destinations].join(' и ') : 'доставка одному из получателей') +
+    '.' + (incomplete ? ' Полный комплект файлов ещё не подтверждён.' : '') + ' Администратору нужно проверить доступ к боту' + ((order.blocked_recipients || []).some(target => target.case_id) ? ' и назначение юриста' : '') + '. Новый платный заказ не создавался.';
 }
 
 async function deliverNativeRecord(order, record, records) {
@@ -169,7 +204,7 @@ async function deliverNativeRecord(order, record, records) {
       await persistFileRecords(order, records);
     }
   }); } catch (error) {
-    if (error.code === 'EGRN_RECIPIENT_UNAVAILABLE' || error.failure_code === 'EGRN_RECIPIENT_UNAVAILABLE') blocked ||= error;
+    if (error.code === 'EGRN_RECIPIENT_UNAVAILABLE' || error.failure_code === 'EGRN_RECIPIENT_UNAVAILABLE' || error.blocked_recipients?.length) { rememberBlockedRecipients(order, error, target); blocked ||= error; }
     else throw error;
   }
   if (blocked) throw blocked;
@@ -180,7 +215,7 @@ async function markDelivered(order, records) {
   if ((order.deliver || []).some(target => target?.order_id) && records.some(file => file.kind==='link' || Number(file.bytes)>12*1024*1024)) await require('../web/order-egrn-links').registerOrderLinks(order, records);
   // A new recipient registered while delivery was running keeps the row
   // pending, so the next round sends only their missing originals.
-  await pool.query("UPDATE egrn_orders SET files_sent=$1,file_msgs=$2,error=$3,failures=0,retry_at=NULL,updated_at=NOW() WHERE id=$4 AND delivery_revision=$5 AND processing_token=$6 AND NOT (COALESCE(delivery_state,'{}'::jsonb) ? 'inflight')",
+  await pool.query("UPDATE egrn_orders SET files_sent=$1,file_msgs=$2,error=$3,failures=0,retry_at=NULL,delivery_state=COALESCE(delivery_state,'{}'::jsonb)-'stopped_notice',updated_at=NOW() WHERE id=$4 AND delivery_revision=$5 AND processing_token=$6 AND NOT (COALESCE(delivery_state,'{}'::jsonb) ? 'inflight')",
     [records.length, JSON.stringify(records), null, order.id, Number(order.delivery_revision || 0), order.processing_token]);
 }
 
@@ -841,29 +876,67 @@ function setupEgrn(bot) {
 
   // ── Опрос статусов
   async function notifyStopped(o, tooLarge) {
-    const text = o.file_limit_exceeded ? '⚠️ Поставщик передал больше 32 файлов или ссылок на оригиналы. Полный комплект не подтверждён; новые файлы не отправлены. Проверьте комплект у поставщика. Новый платный заказ не создавался.' : o.delivery_unknown ? '⚠️ Результат отправки оригинала не подтверждён. Проверьте сообщения в чате. После проверки администратор может разрешить повтор: /egrn_retry ' + o.id_statement + '. Новый платный заказ не создавался.' : o.recipient_unavailable ? '⚠️ Доставка выписки ожидает проверки доступа получателя или назначения юриста. Подтверждённые файлы сохранены; новый платный заказ не создавался.' : o.identity_unconfirmed ? '⚠️ Не удалось подтвердить оригиналы в старом частичном комплекте. Проверьте ранее доставленные файлы вручную; автоматическая пересылка остановлена и новый платный заказ не создан.' : o.status === 'done'
+    const kind = o.file_limit_exceeded ? 'file-limit' : o.delivery_unknown ? 'unknown' : o.recipient_unavailable ? 'recipient' : o.identity_unconfirmed ? 'identity' : o.status === 'done' ? tooLarge ? 'file' : 'delivery' : 'status';
+    const recipients = blockedRecipients({ blocked_recipients: o.blocked_recipients });
+    const progress = (Array.isArray(o.file_msgs) ? o.file_msgs : []).map(record => ({ key: sourceKey(record), chats: [...new Set([
+      ...(Number(record.id) > 0 && record.chat ? [canonicalChat(record.chat)] : []),
+      ...(Array.isArray(record.deliveries) ? record.deliveries : []).filter(value => Number(value?.id) > 0 && value.chat).map(value => canonicalChat(value.chat))
+    ])].sort() })).sort((a,b) => a.key.localeCompare(b.key));
+    const fingerprint = require('node:crypto').createHash('sha256').update(JSON.stringify({ kind, recipients: recipients.map(value => JSON.stringify(value)).sort(), progress, manifest: Array.isArray(o.delivery_manifest) ? o.delivery_manifest.slice().sort() : [] })).digest('hex');
+    const previous = o.delivery_state?.stopped_notice;
+    if (previous?.fingerprint === fingerprint) return;
+    const notice = { fingerprint, attempt: require('node:crypto').randomUUID(), state: 'reserved' };
+    // Reserve before Telegram. An unknown notification ACK must not create
+    // another warning on each poll or restart; preserve other delivery keys.
+    const reserved = await pool.query("UPDATE egrn_orders SET delivery_state=jsonb_set(COALESCE(delivery_state,'{}'::jsonb),'{stopped_notice}',$1::jsonb,true) WHERE id=$2 AND processing_token=$3 AND processing_until>NOW() AND COALESCE(delivery_state->'stopped_notice'->>'fingerprint','')<>$4 RETURNING delivery_state", [JSON.stringify(notice), o.id, o.processing_token, fingerprint]);
+    if (!reserved.rows.length) return;
+    o.delivery_state = reserved.rows[0].delivery_state;
+    const text = o.file_limit_exceeded ? '⚠️ Поставщик передал больше 32 файлов или ссылок на оригиналы. Полный комплект не подтверждён; новые файлы не отправлены. Проверьте комплект у поставщика. Новый платный заказ не создавался.' : o.delivery_unknown ? '⚠️ Результат отправки оригинала не подтверждён. Проверьте сообщения в чате. После проверки администратор может разрешить повтор: /egrn_retry ' + o.id_statement + '. Новый платный заказ не создавался.' : o.recipient_unavailable ? recipientNotice(o) : o.identity_unconfirmed ? '⚠️ Не удалось подтвердить оригиналы в старом частичном комплекте. Проверьте ранее доставленные файлы вручную; автоматическая пересылка остановлена и новый платный заказ не создан.' : o.status === 'done'
       ? '⚠️ Выписка готова, но ' + (tooLarge ? 'не удалось подготовить файл для скачивания.' : 'не все файлы удалось доставить после нескольких попыток.')
       : '⚠️ Не удалось проверить готовность выписки после нескольких попыток.';
-    const fallback = '\nСкачайте выписку или проверьте заявку №' + o.id_statement + ' в личном кабинете: https://armrus.org';
+    const fallback = o.recipient_unavailable ? '\nЗаказ поставщика №' + o.id_statement + '. Повтор доставки после проверки: /egrn_retry ' + o.id_statement + '.' : '\nСкачайте выписку или проверьте заявку №' + o.id_statement + ' в личном кабинете: https://armrus.org';
     if (o.status_msg_id) {
       try { await telegramDelivery().authorize(o, {chat:o.chat_id});await bot.telegram.editMessageText(o.chat_id, Number(o.status_msg_id), undefined, cardText(o, text + fallback), { parse_mode: 'HTML' }); }
-      catch (e) { console.error('egrn notification:', o.id_statement, e.message); }
+      catch (e) { console.error('egrn notification:', o.id_statement, e.code || 'unavailable'); }
     }
     // Личное уведомление — только заказавшему сотруднику, без технических ошибок и ссылок с токенами.
     const targets=[o.ordered_by||o.chat_id,...String(process.env.ADMIN_TG_IDS||'').split(/[\s,;]+/),process.env.EGRN_CHAT_ID,process.env.GROUP_CHAT_ID].filter(Boolean);
     for (const target of [...new Set(targets.map(String))]) {
-      try { await telegramDelivery().authorize(o,{chat:target});await bot.telegram.sendMessage(target, text + '\nКадастровый номер: ' + o.cad_num + fallback);break; }
-      catch (e) { console.error('egrn notification:', o.id_statement, e.code || 'unavailable'); }
+      try { await telegramDelivery().authorize(o,{chat:target}); }
+      catch (e) { console.error('egrn notification:', o.id_statement, e.code || 'unavailable'); continue; }
+      let receipt;
+      try {
+        const message = text + '\nКадастровый номер: ' + o.cad_num + fallback;
+        if (previous?.state === 'sent' && String(previous.chat) === target && Number.isSafeInteger(previous.id) && previous.id > 0) {
+          try { await bot.telegram.editMessageText(target, previous.id, undefined, message); receipt = { message_id: previous.id }; }
+          catch (error) { if (Number(error.response?.error_code) === 400 && /message is not modified/i.test(error.response?.description || error.message || '')) receipt = { message_id: previous.id }; else throw error; }
+        } else receipt = await bot.telegram.sendMessage(target, message);
+        if (!Number.isSafeInteger(Number(receipt?.message_id)) || Number(receipt.message_id) < 1 || typeof receipt.message_id === 'boolean') return;
+      } catch (error) {
+        const code = Number(error.response?.error_code || error.code);
+        console.error('egrn notification:', o.id_statement, Number.isInteger(code) ? code : 'unconfirmed');
+        if (code >= 400 && code < 500) continue;
+        return;
+      }
+      const sent = { ...notice, state: 'sent', chat: target, id: Number(receipt.message_id) };
+      await pool.query("UPDATE egrn_orders SET delivery_state=jsonb_set(COALESCE(delivery_state,'{}'::jsonb),'{stopped_notice}',$1::jsonb,true) WHERE id=$2 AND processing_token=$3 AND processing_until>NOW() AND delivery_state->'stopped_notice'->>'attempt'=$4", [JSON.stringify(sent), o.id, o.processing_token, notice.attempt]);
+      return;
     }
+    // All candidates definitely rejected. A later retry may notify once access
+    // returns. Restore a previous known receipt instead of losing its message.
+    if (previous) await pool.query("UPDATE egrn_orders SET delivery_state=jsonb_set(COALESCE(delivery_state,'{}'::jsonb),'{stopped_notice}',$1::jsonb,true) WHERE id=$2 AND processing_token=$3 AND delivery_state->'stopped_notice'->>'attempt'=$4", [JSON.stringify(previous), o.id, o.processing_token, notice.attempt]);
+    else await pool.query("UPDATE egrn_orders SET delivery_state=delivery_state-'stopped_notice' WHERE id=$1 AND processing_token=$2 AND delivery_state->'stopped_notice'->>'attempt'=$3", [o.id, o.processing_token, notice.attempt]);
   }
 
   async function saveFailure(o, errors, permanent, fileMsgs) {
     const failures = (o.failures || 0) + 1;
     const stopped = permanent || failures >= MAX_FAILURES;
     const retryAt = stopped ? null : new Date(Date.now() + 3 * 60 * 1000 * Math.pow(2, failures - 1));
-    await pool.query('UPDATE egrn_orders SET files_sent=$1, file_msgs=$2, error=$3, failures=$4, retry_at=$5, updated_at=NOW() WHERE id=$6 AND processing_token=$7',
+    const result = await pool.query('UPDATE egrn_orders SET files_sent=$1, file_msgs=$2, error=$3, failures=$4, retry_at=$5, updated_at=NOW() WHERE id=$6 AND processing_token=$7',
       [stopped ? -1 : 0, JSON.stringify(fileMsgs), errors.join('; ').slice(0, 300), failures, retryAt, o.id, o.processing_token]);
-    if (stopped || o.recipient_unavailable && o.error !== errors.join('; ').slice(0,300)) await notifyStopped(o, permanent);
+    if (result.rowCount === 0) throw lostLease();
+    o.file_msgs = fileMsgs;
+    if (stopped || o.recipient_unavailable) await notifyStopped(o, permanent);
   }
 
   let polling = false;
@@ -945,7 +1018,7 @@ function setupEgrn(bot) {
             delivery_stage: e.delivery_stage, failure_code: e.failure_code, constraint: e.constraint,
             provider_code: e.provider_code, provider_status: e.provider_status }));
           deliveryErrors.push(String(e.message || 'ошибка доставки'));
-          if (e.code === 'EGRN_RECIPIENT_UNAVAILABLE' || e.failure_code === 'EGRN_RECIPIENT_UNAVAILABLE') o.recipient_unavailable = true;
+          if (e.code === 'EGRN_RECIPIENT_UNAVAILABLE' || e.failure_code === 'EGRN_RECIPIENT_UNAVAILABLE' || e.blocked_recipients?.length) { o.recipient_unavailable = true; rememberBlockedRecipients(o, e); }
           if (e.uncertain === true) throw e;
           if (e.code === 'EGRN_FILE_TOO_LARGE' || e.code === 'EGRN_FILE_TYPE') permanent = true;
         }
@@ -1018,7 +1091,7 @@ function setupEgrn(bot) {
         if (e.code === 'EGRN_LEGACY_FILE_IDENTITY') o.identity_unconfirmed = true;
         if (e.code === 'EGRN_SOURCE_FILES') o.file_limit_exceeded = true;
         if(e.uncertain===true)o.delivery_unknown=true;
-        if(e.code==='EGRN_RECIPIENT_UNAVAILABLE'||e.failure_code==='EGRN_RECIPIENT_UNAVAILABLE')o.recipient_unavailable=true;
+        if(e.code==='EGRN_RECIPIENT_UNAVAILABLE'||e.failure_code==='EGRN_RECIPIENT_UNAVAILABLE'||e.blocked_recipients?.length){o.recipient_unavailable=true;rememberBlockedRecipients(o,e);}
         if (e.code !== 'EGRN_LEASE_LOST') await saveFailure(o, [String(e.message || 'ошибка проверки статуса')], e.uncertain===true||['EGRN_FILE_TOO_LARGE', 'EGRN_LEGACY_FILE_IDENTITY', 'EGRN_SOURCE_FILES'].includes(e.code), o.file_msgs || []);
       } finally {
         try { if (source) await source.cleanup(); } finally { await lease.close(); }

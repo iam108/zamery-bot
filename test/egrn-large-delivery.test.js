@@ -391,3 +391,41 @@ test('object storage diagnostics retain only a safe provider code and HTTP statu
   });
   assert.equal(h.sends.length,0);
 });
+
+test('large delivery preserves all blocked private copies after the group succeeds and retry sends only those copies',async()=>{
+  let permitted=false;
+  const h=fixture({sendOriginal:async(record,destination,run)=>{
+    if(!permitted&&destination.chat>0)throw Object.assign(new Error('Internal recipient details must stay private'),{
+      code:'EGRN_RECIPIENT_UNAVAILABLE',uncertain:false,delivery_stage:'validation',
+      blocked_recipients:[{chat:String(destination.chat),...(destination.case_id?{case_id:destination.case_id}:{}),reason:destination.case_id?'assignment':'access',name:'Not a notice field'}],
+    });
+    return run();
+  }});
+  h.order.deliver=[{chat:2002,reply:88,case_id:9}];
+  await assert.rejects(h.service.deliver(h.order,h.file,KEY,h.records),error=>{
+    assert.equal(error.failure_code,'EGRN_RECIPIENT_UNAVAILABLE');assert.equal(error.uncertain,false);
+    assert.deepEqual(error.blocked_recipients,[{chat:'2002',case_id:9,reason:'assignment'},{chat:'3003',reason:'access'}]);
+    assert.doesNotMatch(error.message,/Internal recipient details/);return true;
+  });
+  assert.deepEqual(h.sends.map(value=>value.chat),[-1001]);
+  assert.deepEqual(h.records[0].deliveries.map(value=>value.chat),[-1001]);
+  permitted=true;await h.service.retry(h.order,h.records[0],h.records);
+  assert.deepEqual(h.sends.map(value=>value.chat),[-1001,2002,3003]);assert.equal(h.state.saveCount,1);
+});
+
+test('large delivery retains a prior transport error while safely carrying the independently blocked recipient',async()=>{
+  const h=fixture({sendOriginal:async(record,destination,run)=>{
+    if(destination.chat===2002)throw {response:{error_code:403}};
+    if(destination.chat===3003)throw Object.assign(new Error('secret'),{code:'EGRN_RECIPIENT_UNAVAILABLE',uncertain:false,
+      blocked_recipients:[{chat:'3003',reason:'access',token:'SECRET'},
+        {chat:'https://secret.invalid',reason:'access'},{chat:3003,case_id:'bad SQL',reason:'access'},
+        {chat:'99999999999999999',reason:'access'},{chat:'4004',reason:'SECRET'}]});
+    return run();
+  }});
+  await assert.rejects(h.service.deliver(h.order,h.file,KEY,h.records),error=>{
+    assert.equal(error.failure_code,'TELEGRAM_403');
+    assert.deepEqual(error.blocked_recipients,[{chat:'3003',reason:'access'}]);
+    assert.doesNotMatch(JSON.stringify(error),/SECRET|secret\.invalid|bad SQL/);return true;
+  });
+  assert.deepEqual(h.sends.map(value=>value.chat),[-1001]);
+});

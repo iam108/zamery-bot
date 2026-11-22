@@ -4,8 +4,14 @@ const { randomUUID } = require('node:crypto');
 const DDL = "ALTER TABLE egrn_orders ADD COLUMN IF NOT EXISTS delivery_state JSONB NOT NULL DEFAULT '{}'";
 const PRIVATE = /^[1-9]\d*$/;
 function state(value) { return value && typeof value === 'object' && !Array.isArray(value) ? value : {}; }
-function unavailable(message = 'Получатель выписки больше недоступен. Проверьте назначение и доступ сотрудника; подтверждённые файлы сохранены.') {
-  return Object.assign(new Error(message), { code: 'EGRN_RECIPIENT_UNAVAILABLE', uncertain: false, delivery_stage: 'validation' });
+function unavailable(target, reason = 'access', message = 'Получатель выписки больше недоступен. Проверьте назначение и доступ сотрудника; подтверждённые файлы сохранены.') {
+  const chat = String(target?.chat ?? ''), caseId = String(target?.case_id ?? '');
+  const context = PRIVATE.test(chat) && Number.isSafeInteger(Number(chat)) ? {
+    chat,
+    ...(PRIVATE.test(caseId) && Number.isSafeInteger(Number(caseId)) && Number(caseId) <= 2147483647 ? { case_id: Number(caseId) } : {}),
+    reason,
+  } : null;
+  return Object.assign(new Error(message), { code: 'EGRN_RECIPIENT_UNAVAILABLE', uncertain: false, delivery_stage: 'validation', ...(context ? { blocked_recipients: [context] } : {}) });
 }
 function unknown() {
   return Object.assign(new Error('Результат отправки оригинала не подтверждён. Проверьте сообщения в чате; администратор может разрешить повтор командой /egrn_retry с номером готового заказа. Новый платный заказ не создавался.'), { code: 'EGRN_DELIVERY_UNCONFIRMED', uncertain: true });
@@ -33,22 +39,23 @@ function createEgrnTelegramDelivery({ pool, env = process.env } = {}) {
   async function authorize(order, target, connection = pool) {
     const chat = String(target?.chat ?? '');
     if (isGroup(chat)) return;
-    if (!PRIVATE.test(chat) || !Number.isSafeInteger(Number(chat))) throw unavailable();
+    if (!PRIVATE.test(chat) || !Number.isSafeInteger(Number(chat))) throw unavailable(target);
     try {
       const bindings = bindingsFor(order,target);
       if (!bindings.length && !admins().includes(chat)) {
         const row = (await connection.query('SELECT approved FROM staff WHERE tg_id=$1', [chat])).rows[0];
-        if (row?.approved !== true) throw unavailable();
+        if (row?.approved !== true) throw unavailable(target);
       }
       for (const caseId of new Set(bindings.map(String))) {
-        if (!/^[1-9]\d*$/.test(caseId) || !Number.isSafeInteger(Number(caseId)) || Number(caseId) > 2147483647) throw unavailable();
+        if (!/^[1-9]\d*$/.test(caseId) || !Number.isSafeInteger(Number(caseId)) || Number(caseId) > 2147483647) throw unavailable(target, 'assignment');
         // Read assignment, approval and role in the same snapshot, matching
         // the case access rule used by the handoff route.
         const current = (await connection.query('SELECT c.lawyer_tg_id,s.approved,s.role FROM cases c LEFT JOIN staff s ON s.tg_id=c.lawyer_tg_id WHERE c.id=$1', [caseId])).rows[0];
-        if (!current || String(current.lawyer_tg_id) !== chat || current.approved !== true ||
-            !(['lawyer','manager'].includes(current.role) || admins().includes(chat))) throw unavailable();
+        const boundTarget = { chat, case_id: caseId };
+        if (!current || String(current.lawyer_tg_id) !== chat) throw unavailable(boundTarget, 'assignment');
+        if (current.approved !== true || !(['lawyer','manager'].includes(current.role) || admins().includes(chat))) throw unavailable(boundTarget);
       }
-    } catch (error) { if (error.code === 'EGRN_RECIPIENT_UNAVAILABLE') throw error; throw unavailable('Не удалось проверить доступ получателя выписки. Доставка пока не подтверждена; повторите проверку позднее.'); }
+    } catch (error) { if (error.code === 'EGRN_RECIPIENT_UNAVAILABLE') throw error; throw unavailable(target, 'check_unavailable', 'Не удалось проверить доступ получателя выписки. Доставка пока не подтверждена; повторите проверку позднее.'); }
   }
   function assertAvailable(order) { if (state(order.delivery_state).inflight) throw unknown(); }
   async function retainOwnership(order,intent) {

@@ -20,6 +20,18 @@ function harness({ docs = [], urls = [], downloadedSize = 10, sendError, orderFi
     if(sql.startsWith('UPDATE egrn_orders SET delivery_manifest=$1')) {order.delivery_manifest=JSON.parse(params[0]);return {rows:[]};}
     if(sql.startsWith('UPDATE egrn_orders SET processing_token=NULL')) {order.processing_token=null;return {rows:[]};}
     if(sql.startsWith('UPDATE egrn_orders SET file_msgs=$1')) {order.file_msgs=JSON.parse(params[0]);return {rows:[]};}
+    if(sql.startsWith("UPDATE egrn_orders SET delivery_state=jsonb_set")) {
+      order.delivery_state ||= {};
+      if(sql.includes("->>'fingerprint'")) {
+        if(order.delivery_state.stopped_notice?.fingerprint===params[3])return {rows:[]};
+      } else if(order.delivery_state.stopped_notice?.attempt!==params[3])return {rows:[]};
+      order.delivery_state.stopped_notice=JSON.parse(params[0]);
+      return {rows:[{delivery_state:order.delivery_state}]};
+    }
+    if(sql.startsWith("UPDATE egrn_orders SET delivery_state=delivery_state-'stopped_notice'")) {
+      if(order.delivery_state?.stopped_notice?.attempt===params[2])delete order.delivery_state.stopped_notice;
+      return {rows:[]};
+    }
     if(sql.startsWith('UPDATE egrn_orders SET deliver=(')) {order.deliver=(order.deliver||[]).concat(JSON.parse(params[0]));order.delivery_revision=(order.delivery_revision||0)+1;if(order.files_sent>0)order.files_sent=0;return {rows:[order]};}
     if(sql.startsWith('SELECT 1 FROM staff'))return{rows:staffAllowed?[{approved:true}]:[]};
     if(sql.startsWith('UPDATE egrn_orders SET files_sent=0, failures=0, retry_at=NULL, error=NULL')) {
@@ -83,7 +95,7 @@ function harness({ docs = [], urls = [], downloadedSize = 10, sendError, orderFi
       if (error) throw error;
       return { message_id: sent.length };
     },
-    sendMessage: async (chat, text) => { notices.push({ chat, text }); },
+    sendMessage: async (chat, text) => { notices.push({ chat, text }); return {message_id:100+notices.length}; },
     editMessageText: async (...args) => { notices.push({ edit: args }); },
     callApi: async () => ({ message_id: 900 }),
   } };
