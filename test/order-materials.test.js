@@ -74,6 +74,36 @@ test('TXT support does not admit HTML XML scripts or arbitrary executable filena
   }
 });
 
+test('client video extensions canonicalize declared and generic MIME without changing the original', () => {
+  const buffer = Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from('ftypmp42'), Buffer.from('synthetic-video-original')]);
+  for (const [extension, canonical, aliases] of [
+    ['mp4', 'video/mp4', ['video/mp4', 'video/mp4; codecs="avc1"', 'application/mp4']],
+    ['mov', 'video/quicktime', ['video/quicktime', 'Video/Quicktime; codecs="avc1"']],
+    ['m4v', 'video/x-m4v', ['video/x-m4v', 'video/mp4']],
+    ['webm', 'video/webm', ['video/webm', 'video/webm; codecs="vp9"']],
+  ]) {
+    const files = ['', 'application/octet-stream', ...aliases].map(mimetype => prepareMaterials([{ originalname: 'Осмотр.' + extension.toUpperCase(), mimetype, buffer }])[0]);
+    for (const file of files) {
+      assert.equal(file.mime, canonical);
+      assert.equal(file.role, 'document');
+      assert.equal(file.id, files[0].id, 'A retry with another browser MIME reuses the same original');
+      assert.deepEqual(file.buffer, buffer);
+      assert.equal(file.sha256, require('node:crypto').createHash('sha256').update(buffer).digest('hex'));
+    }
+  }
+});
+
+test('an eleven MiB WhatsApp MP4 fits the existing limit but video cannot raise it or admit arbitrary formats', () => {
+  const buffer = Buffer.alloc(11 * 1024 * 1024, 0x76);
+  Buffer.from('synthetic WhatsApp MP4').copy(buffer);
+  const file = prepareMaterials([{ originalname: 'WhatsApp Video.mp4', mimetype: 'application/octet-stream', buffer }])[0];
+  assert.equal(file.mime, 'video/mp4'); assert.equal(file.bytes, buffer.length); assert.deepEqual(file.buffer, buffer);
+  assert.throws(() => prepareMaterials([{ originalname: 'Too large.mp4', mimetype: 'video/mp4', buffer: Buffer.alloc(12 * 1024 * 1024 + 1) }]), /12 МБ/);
+  for (const [originalname, mimetype] of [['script.js', 'video/mp4'], ['page.html', 'video/mp4'], ['file.exe', 'application/octet-stream'], ['file.constructor', 'application/octet-stream'], ['file.constructor', ''], ['file.mp4', 'text/html'], ['file.mp4', 'video/webm']]) {
+    assert.throws(() => prepareMaterials([{ originalname, mimetype, buffer: Buffer.from('synthetic') }]), /поддерживаются/);
+  }
+});
+
 test('download-all ZIP preserves UTF-8 filenames and original file contents', () => {
   const files = prepareMaterials([original('архив.png'), original('план.png', 'original second')]);
   const zip = Buffer.concat([...zipParts(files)]);

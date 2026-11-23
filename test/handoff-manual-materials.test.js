@@ -39,6 +39,19 @@ test('a company card TXT survives the manual handoff and reaches the lawyer ZIP 
   const replay=await deliver(caseId,[{chat:808}],[],{expectedFiles:files,packetHash:result.packetHash,confirmed:{808:[900]}});
   assert.equal(replay.ok,true);assert.equal(sent.length,1);
 }));
+test('an eleven MiB WhatsApp MP4 survives manual upload, private ZIP delivery and download without re-encoding',pg,()=>fixture(async h=>{
+  const buffer=Buffer.alloc(11*1024*1024,0x76);Buffer.from('synthetic WhatsApp MP4 original').copy(buffer);
+  const file={originalname:'WhatsApp Video 2026-11-19 at 17.43.49 (1).mp4',mimetype:'application/octet-stream',buffer};
+  const files=await h.store.put(101,h.sid,file);assert.equal(files[0].mime,'video/mp4');assert.equal(files[0].bytes,buffer.length);
+  assert.deepEqual(await h.store.put(101,h.sid,{...file,mimetype:'video/mp4; codecs="avc1"'}),files);
+  assert.deepEqual(await h.store.freeze(h.pool,101,h.sid,files),files);
+  const caseId=await h.makeCase(files),restored=createManualMaterialsStore(h.pool),original=(await restored.loadCase(caseId))[0];
+  assert.deepEqual(original.buffer,buffer);assert.equal(original.sha256,createHash('sha256').update(buffer).digest('hex'));
+  const sent=[],deliver=createHandoffMaterialsDelivery({label:'Клиент',loadMaterials:id=>restored.loadCase(id),telegram:{async sendDocument(chat,document){const chunks=[];for await(const part of document.source)chunks.push(part);sent.push({chat,buffer:Buffer.concat(chunks)});return{message_id:901,chat:{id:Number(chat)}};}}});
+  const result=await deliver(caseId,[{chat:808}],[],{expectedFiles:files});assert.equal(result.ok,true);assert.equal(sent.length,1);assert.equal(String(sent[0].chat),'808');assert.ok(sent[0].buffer.includes(buffer));
+  const downloaded=await restored.read(101,h.sid,files[0].id);assert.deepEqual(downloaded.buffer,buffer);assert.equal(downloaded.mime,'video/mp4');
+  assert.equal((await deliver(caseId,[{chat:808}],[],{expectedFiles:files,packetHash:result.packetHash,confirmed:{808:[901]}})).ok,true);assert.equal(sent.length,1);
+}));
 test('the first manual upload works on a fresh cases schema before any handoff submit adds its columns',pg,()=>fixture(async h=>{
   await h.db.exec('ALTER TABLE cases DROP COLUMN handoff_submit_id');
   const files=await h.store.put(101,h.sid,h.file);assert.equal(files.length,1);

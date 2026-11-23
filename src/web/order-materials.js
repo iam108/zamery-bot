@@ -57,6 +57,7 @@ function normalizeArchive(value) {
 }
 const DOCUMENT_MIMES = { pdf: 'application/pdf', doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', xls: 'application/vnd.ms-excel', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', zip: 'application/zip', txt: 'text/plain' };
 const IMAGE_MIMES = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif', heic: 'image/heic', heif: 'image/heif', avif: 'image/avif', tif: 'image/tiff', tiff: 'image/tiff', bmp: 'image/bmp' };
+const VIDEO_MIMES = { mp4: 'video/mp4', mov: 'video/quicktime', m4v: 'video/x-m4v', webm: 'video/webm' };
 function prepareMaterials(files, roles) {
   if (!Array.isArray(files) || files.length > LIMITS.files) throw error('Можно прикрепить до 20 файлов.');
   let selected = roles || [];
@@ -68,11 +69,13 @@ function prepareMaterials(files, roles) {
     let mime = String(file.mimetype || file.mime || '').toLowerCase();
     const extension = (name.match(/\.([a-z0-9]+)$/i) || [])[1]?.toLowerCase();
     if (extension === 'txt' && mime.split(';', 1)[0].trim() === 'text/plain') mime = DOCUMENT_MIMES.txt;
-    if (!mime || mime === 'application/octet-stream') mime = DOCUMENT_MIMES[extension] || IMAGE_MIMES[extension] || mime;
+    const videoMime = Object.hasOwn(VIDEO_MIMES, extension) ? VIDEO_MIMES[extension] : undefined, declaredMime = mime.split(';', 1)[0].trim();
+    if (videoMime && (declaredMime === videoMime || extension === 'mp4' && declaredMime === 'application/mp4' || extension === 'm4v' && declaredMime === 'video/mp4')) mime = videoMime;
+    if (!mime || mime === 'application/octet-stream') mime = DOCUMENT_MIMES[extension] || IMAGE_MIMES[extension] || videoMime || mime;
     if (mime === 'application/x-zip-compressed') mime = 'application/zip';
     const buffer = file.buffer;
     if (!Buffer.isBuffer(buffer) || !buffer.length || buffer.length > LIMITS.fileBytes) throw error('Файл «' + name + '» должен быть не больше 12 МБ.');
-    if ((mime === 'text/plain' && extension !== 'txt') || !Object.values(DOCUMENT_MIMES).includes(mime) && !/^image\/(jpeg|png|webp|gif|heic|heif|avif|tiff|bmp)$/.test(mime)) throw error('Файл «' + name + '»: поддерживаются PDF, изображения, Word, Excel, ZIP и TXT.');
+    if ((mime === 'text/plain' && extension !== 'txt') || !Object.values(DOCUMENT_MIMES).includes(mime) && !/^image\/(jpeg|png|webp|gif|heic|heif|avif|tiff|bmp)$/.test(mime) && mime !== videoMime) throw error('Файл «' + name + '»: поддерживаются PDF, изображения, Word, Excel, ZIP, TXT и видео MP4, MOV, M4V, WEBM.');
     total += buffer.length;
     if (total > LIMITS.totalBytes) throw error('Общий объём документов заявки не должен превышать 100 МБ.');
     const role = selected[index] || guessRole(name);

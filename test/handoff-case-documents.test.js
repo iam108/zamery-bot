@@ -41,6 +41,15 @@ test('a supplemental company card TXT is privately delivered, downloaded byte-fo
   assert.equal((await h.db.query('SELECT count(*)::int n FROM cases')).rows[0].n,2);
   assert.equal((await h.create().send(input(d))).delivery_complete,true);assert.equal(h.sent.length,1);
 }));
+test('a supplemental WEBM video is privately delivered and downloaded as the unchanged original once',pg,()=>fixture(async h=>{
+  const buffer=Buffer.concat([Buffer.from([0x1a,0x45,0xdf,0xa3]),Buffer.from('synthetic WEBM original')]);
+  const d=await h.upload(randomUUID(),[{originalname:'Видео осмотра.WEBM',mimetype:'video/webm; codecs="vp9"',buffer}]);
+  assert.equal(d.files[0].mime,'video/webm');const result=await h.service.send(input(d));assert.equal(result.delivery_complete,true);
+  assert.equal(h.sent.length,1);assert.equal(h.sent[0].chat,'808');assert.ok(h.sent[0].buffer.includes(buffer));
+  const original=await h.create().file(39,d.sid,d.files[0].id,808);assert.equal(original.mime,'video/webm');assert.deepEqual(original.buffer,buffer);
+  await assert.rejects(h.create().file(39,d.sid,d.files[0].id,909),error=>error.status===403);
+  assert.equal((await h.create().send(input(d))).delivery_complete,true);assert.equal(h.sent.length,1);
+}));
 
 test('lost HTTP response and repeated POST or retry reuse the completed batch without another Telegram send',pg,()=>fixture(async h=>{
   const d=await h.upload();await h.service.send(input(d));assert.equal((await h.create().send(input(d))).delivery_complete,true);
