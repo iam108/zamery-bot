@@ -51,6 +51,29 @@ test('long filenames retain their extension and complete Unicode characters', ()
   assert.doesNotThrow(() => encodeURIComponent(emoji.name));
 });
 
+test('company card TXT MIME variants retain exact original bytes and a stable upload identity', () => {
+  const buffer = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('ООО «Тест»\r\nИНН: 1234567890\r\n')]);
+  const files = ['', 'application/octet-stream', 'text/plain', 'text/plain; charset=UTF-8', 'Text/Plain; Charset=windows-1251']
+    .map(mimetype => prepareMaterials([{originalname: 'Карточка компании (1).TXT', mimetype, buffer}])[0]);
+  for (const file of files) {
+    assert.equal(file.mime, 'text/plain');
+    assert.equal(file.role, 'document');
+    assert.equal(file.bytes, buffer.length);
+    assert.deepEqual(file.buffer, buffer);
+    assert.equal(file.sha256, require('node:crypto').createHash('sha256').update(buffer).digest('hex'));
+    assert.equal(file.id, files[0].id, 'A retry with another browser MIME value must not create a duplicate original');
+  }
+  const legacy = Buffer.from([0xce, 0xce, 0xce, 0x20, 0xab, 0xd2, 0xe5, 0xf1, 0xf2, 0xbb, 13, 10]);
+  const txt = prepareMaterials([{originalname:'Реквизиты.txt',mimetype:'text/plain; charset=windows-1251',buffer:legacy}])[0];
+  assert.deepEqual(txt.buffer, legacy, 'Plain-text files are never re-encoded');
+});
+
+test('TXT support does not admit HTML XML scripts or arbitrary executable filenames', () => {
+  for (const [name,mimetype] of [['page.html','text/html'],['page.html','text/plain'],['data.xml','text/plain'],['script.js','text/plain'],['script.exe','application/octet-stream'],['file.txt','text/html']]) {
+    assert.throws(() => prepareMaterials([{originalname:name,mimetype,buffer:Buffer.from('synthetic')}]), /поддерживаются/);
+  }
+});
+
 test('download-all ZIP preserves UTF-8 filenames and original file contents', () => {
   const files = prepareMaterials([original('архив.png'), original('план.png', 'original second')]);
   const zip = Buffer.concat([...zipParts(files)]);

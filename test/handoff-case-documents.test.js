@@ -30,6 +30,17 @@ test('supplemental originals attach to an existing report case, deliver privatel
   assert.equal((await h.db.query('SELECT count(*)::int n FROM cases')).rows[0].n,2,'Supplemental delivery never creates another client');
   await assert.rejects(h.store.remove(101,d.sid,d.files[0].id),e=>e.code==='HANDOFF_MATERIAL_FROZEN');
 }));
+test('a supplemental company card TXT is privately delivered, downloaded byte-for-byte and does not create a duplicate case',pg,()=>fixture(async h=>{
+  const buffer=Buffer.concat([Buffer.from([0xff,0xfe]),Buffer.from('ООО «Тест»\r\nИНН 1234567890\r\n','utf16le')]);
+  const d=await h.upload(randomUUID(),[{originalname:'Карточка компании.txt',mimetype:'text/plain; charset=UTF-16LE',buffer}]);
+  assert.equal(d.files[0].mime,'text/plain');
+  const result=await h.service.send(input(d));assert.equal(result.delivery_complete,true);
+  assert.equal(h.sent.length,1);assert.equal(h.sent[0].chat,'808');assert.match(h.sent[0].filename,/\.zip$/i);assert.ok(h.sent[0].buffer.includes(buffer));
+  const restored=await h.create().file(39,d.sid,d.files[0].id,808);assert.equal(restored.mime,'text/plain');assert.deepEqual(restored.buffer,buffer);
+  await assert.rejects(h.create().file(39,d.sid,d.files[0].id,909),error=>error.status===403);
+  assert.equal((await h.db.query('SELECT count(*)::int n FROM cases')).rows[0].n,2);
+  assert.equal((await h.create().send(input(d))).delivery_complete,true);assert.equal(h.sent.length,1);
+}));
 
 test('lost HTTP response and repeated POST or retry reuse the completed batch without another Telegram send',pg,()=>fixture(async h=>{
   const d=await h.upload();await h.service.send(input(d));assert.equal((await h.create().send(input(d))).delivery_complete,true);

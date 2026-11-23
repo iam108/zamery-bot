@@ -55,7 +55,7 @@ function normalizeArchive(value) {
   if (url.href.length > 2000) throw error('Слишком длинная ссылка на архив объекта.');
   return url.href;
 }
-const DOCUMENT_MIMES = { pdf: 'application/pdf', doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', xls: 'application/vnd.ms-excel', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', zip: 'application/zip' };
+const DOCUMENT_MIMES = { pdf: 'application/pdf', doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', xls: 'application/vnd.ms-excel', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', zip: 'application/zip', txt: 'text/plain' };
 const IMAGE_MIMES = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif', heic: 'image/heic', heif: 'image/heif', avif: 'image/avif', tif: 'image/tiff', tiff: 'image/tiff', bmp: 'image/bmp' };
 function prepareMaterials(files, roles) {
   if (!Array.isArray(files) || files.length > LIMITS.files) throw error('Можно прикрепить до 20 файлов.');
@@ -67,11 +67,12 @@ function prepareMaterials(files, roles) {
     const name = cleanName(file.originalname || file.name);
     let mime = String(file.mimetype || file.mime || '').toLowerCase();
     const extension = (name.match(/\.([a-z0-9]+)$/i) || [])[1]?.toLowerCase();
+    if (extension === 'txt' && mime.split(';', 1)[0].trim() === 'text/plain') mime = DOCUMENT_MIMES.txt;
     if (!mime || mime === 'application/octet-stream') mime = DOCUMENT_MIMES[extension] || IMAGE_MIMES[extension] || mime;
     if (mime === 'application/x-zip-compressed') mime = 'application/zip';
     const buffer = file.buffer;
     if (!Buffer.isBuffer(buffer) || !buffer.length || buffer.length > LIMITS.fileBytes) throw error('Файл «' + name + '» должен быть не больше 12 МБ.');
-    if (!Object.values(DOCUMENT_MIMES).includes(mime) && !/^image\/(jpeg|png|webp|gif|heic|heif|avif|tiff|bmp)$/.test(mime)) throw error('Файл «' + name + '»: поддерживаются PDF, изображения, Word, Excel и ZIP.');
+    if ((mime === 'text/plain' && extension !== 'txt') || !Object.values(DOCUMENT_MIMES).includes(mime) && !/^image\/(jpeg|png|webp|gif|heic|heif|avif|tiff|bmp)$/.test(mime)) throw error('Файл «' + name + '»: поддерживаются PDF, изображения, Word, Excel, ZIP и TXT.');
     total += buffer.length;
     if (total > LIMITS.totalBytes) throw error('Общий объём документов заявки не должен превышать 100 МБ.');
     const role = selected[index] || guessRole(name);

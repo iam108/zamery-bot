@@ -490,12 +490,12 @@ function miniAppForm() {
 </div>
 <div class="field">
   <label>Пакет документов аудитору</label>
-  <p style="font-size:13px;line-height:1.5;color:var(--tg-theme-hint-color,#94a3b8);margin-bottom:8px">План, выписка ЕГРН, материалы прошлого продления и другие документы. До 20 файлов, каждый до 12 МБ, всего до 100 МБ. Аудитор сможет скачать всё одним ZIP.</p>
+  <p style="font-size:13px;line-height:1.5;color:var(--tg-theme-hint-color,#94a3b8);margin-bottom:8px">План, выписка ЕГРН, карточка компании в TXT, материалы прошлого продления и другие документы. До 20 файлов, каждый до 12 МБ, всего до 100 МБ. Аудитор сможет скачать всё одним ZIP.</p>
   <div id="existing-files" style="margin-bottom:10px"></div>
   <label class="toggle-row" style="cursor:pointer;justify-content:flex-start;gap:12px">
     <span>📎 Прикрепить файлы</span>
     <span class="file-count" id="file-count" style="color:var(--tg-theme-hint-color,#64748b);font-size:13px">не выбрано</span>
-    <input type="file" id="attachments" accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.zip" multiple style="display:none" onchange="previewFiles(this)">
+    <input type="file" id="attachments" accept="image/*,.pdf,.txt,.doc,.docx,.xls,.xlsx,.zip" multiple style="display:none" onchange="previewFiles(this)">
   </label>
   <div id="files-preview" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px"></div>
 </div>

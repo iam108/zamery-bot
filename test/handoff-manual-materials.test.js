@@ -23,6 +23,22 @@ test('manual originals persist across store restart, keep exact bytes and are is
   assert.equal(original.sha256,createHash('sha256').update(h.file.buffer).digest('hex'));
   assert.deepEqual(await restored.put(101,h.sid,h.file),files,'Retry after a lost upload response must not duplicate a file');
 }));
+test('a company card TXT survives the manual handoff and reaches the lawyer ZIP as the exact original',pg,()=>fixture(async h=>{
+  const buffer=Buffer.from('ООО «Тестовая карточка»\r\nИНН 1234567890\r\nКонтакт: ответственный сотрудник\r\n');
+  const file={originalname:'Карточка компании (1).txt',mimetype:'application/octet-stream',buffer};
+  const files=await h.store.put(101,h.sid,file);
+  assert.equal(files[0].mime,'text/plain');assert.equal(files[0].role,'document');
+  assert.deepEqual(await h.store.put(101,h.sid,{...file,mimetype:'text/plain; charset=UTF-8'}),files,'Retry with a different browser MIME reuses the original');
+  assert.deepEqual(await h.store.freeze(h.pool,101,h.sid,files),files);
+  const caseId=await h.makeCase(files),restored=createManualMaterialsStore(h.pool);
+  const original=(await restored.loadCase(caseId))[0];assert.deepEqual(original.buffer,buffer);assert.equal(original.sha256,createHash('sha256').update(buffer).digest('hex'));
+  const sent=[];
+  const deliver=createHandoffMaterialsDelivery({label:'Клиент',loadMaterials:id=>restored.loadCase(id),telegram:{async sendDocument(chat,document){const chunks=[];for await(const part of document.source)chunks.push(part);sent.push({chat,filename:document.filename,buffer:Buffer.concat(chunks)});return{message_id:900,chat:{id:Number(chat)}};}}});
+  const result=await deliver(caseId,[{chat:808}],[],{expectedFiles:files});
+  assert.equal(result.ok,true);assert.equal(sent.length,1);assert.equal(String(sent[0].chat),'808');assert.match(sent[0].filename,/\.zip$/i);assert.ok(sent[0].buffer.includes(buffer));
+  const replay=await deliver(caseId,[{chat:808}],[],{expectedFiles:files,packetHash:result.packetHash,confirmed:{808:[900]}});
+  assert.equal(replay.ok,true);assert.equal(sent.length,1);
+}));
 test('the first manual upload works on a fresh cases schema before any handoff submit adds its columns',pg,()=>fixture(async h=>{
   await h.db.exec('ALTER TABLE cases DROP COLUMN handoff_submit_id');
   const files=await h.store.put(101,h.sid,h.file);assert.equal(files.length,1);
