@@ -104,8 +104,8 @@ test('concurrent explicit setup initializes once and never replaces the winner o
   const retry=await setup(c.id,{region:saved.region,kind:saved.kind,service:saved.service});assert.equal(retry.status,409);assert.equal((await row(c.id)).checklist_revision,8);
 });
 
-test('invalid archived templates are not reinitialized and invalid saves and print links fail clearly',async()=>{
-  const archived=await seed({data:{...originalData,_stage:'Архив'}});assert.equal((await view(archived.id)).status,409);assert.equal((await setup(archived.id)).status,409);assert.equal((await row(archived.id)).checklist_key,null);
+test('invalid archived templates retain basic management without reinitializing and invalid saves and print links fail clearly',async()=>{
+  const archived=await seed({data:{...originalData,_stage:'Архив'}});const archivedView=await view(archived.id);assert.equal(archivedView.status,200,archivedView.text);assert.match(archivedView.text,/case-restore/);assert.doesNotMatch(archivedView.text,/id="checklist-setup"/);assert.equal((await setup(archived.id)).status,409);assert.equal((await row(archived.id)).checklist_key,null);
   const c=await seed({region:null,key:'legacy-missing'});
   const saved=await request('/api/checklist/save',LAWYER,{case_id:c.id,data:{_comment:'must not overwrite'},expectedRevision:7,done:1,total:1});assert.equal(saved.status,400,saved.text);assert.equal(saved.json.code,'CHECKLIST_SETUP_REQUIRED');
   const print=await request('/api/checklist/printlink',LAWYER,{case_id:c.id});assert.equal(print.status,409,print.text);assert.equal(print.json.code,'CHECKLIST_SETUP_REQUIRED');

@@ -1350,6 +1350,11 @@ function setupHandoff(app) {
     if (!checklistSetup) checklistSetup = require('./checklist-setup').createChecklistSetupService({ pool, counts: checklistCounts });
     return checklistSetup;
   }
+  let checklistClientActions;
+  function getChecklistClientActions() {
+    if (!checklistClientActions) checklistClientActions = require('./checklist-client-actions').createChecklistClientActions({ pool });
+    return checklistClientActions;
+  }
   const caseDocumentsService=require('./handoff-case-documents').setupHandoffCaseDocuments(app,{pool,ready:ensureTables});
   const rework = require('./case-rework').createCaseReworkService({pool,ready:ensureTables,telegram:bot.telegram,webappUrl:WEBAPP_URL});
   require('./handoff-case-package').setupCasePackage(app,{pool,ready:ensureTables,documents:caseDocumentsService});
@@ -1493,8 +1498,9 @@ function setupHandoff(app) {
       var saved = (await pool.query(
         `WITH checklist_before AS MATERIALIZED (
           SELECT id AS prior_id,data AS prior_data,completed_at AS prior_completed_at FROM cases WHERE id=$4 FOR UPDATE
-        ) UPDATE cases SET data=($1::jsonb - '_handoff' - '_workspaceNote' - '_comment')
+        ) UPDATE cases SET data=($1::jsonb - '_handoff' - '_workspaceNote' - '_comment' - '_lastClientAction')
           || CASE WHEN data ? '_handoff' THEN jsonb_build_object('_handoff', data -> '_handoff') ELSE '{}'::jsonb END
+          || CASE WHEN data ? '_lastClientAction' THEN jsonb_build_object('_lastClientAction', data -> '_lastClientAction') ELSE '{}'::jsonb END
           || CASE WHEN data ? '_workspaceNote' THEN jsonb_build_object('_workspaceNote', data -> '_workspaceNote') ELSE '{}'::jsonb END
           || CASE
             WHEN $5 OR ((data ? '_workspaceNote') AND NOT ($1::jsonb ? '_comment'))
@@ -1503,7 +1509,7 @@ function setupHandoff(app) {
             ELSE '{}'::jsonb
           END,
           checklist_revision=checklist_revision + CASE WHEN
-            (data - '_handoff' - '_workspaceNote' - '_comment') = ($1::jsonb - '_handoff' - '_workspaceNote' - '_comment') THEN 0 ELSE 1 END,
+            (data - '_handoff' - '_workspaceNote' - '_comment' - '_lastClientAction') = ($1::jsonb - '_handoff' - '_workspaceNote' - '_comment' - '_lastClientAction') THEN 0 ELSE 1 END,
           done=$2, total=$3, completed_at=` + (nowDone ? 'COALESCE(completed_at, NOW())' : 'NULL') + `,
           submitted_on=$9::date, decision_due=$10::date,
           reminded_on=CASE WHEN decision_due IS DISTINCT FROM $10::date THEN NULL ELSE reminded_on END
@@ -1512,7 +1518,7 @@ function setupHandoff(app) {
           AND EXISTS (SELECT 1 FROM staff current_actor WHERE current_actor.tg_id=$11 AND current_actor.approved IS TRUE
             AND (current_actor.role='manager' OR $12::boolean OR current_actor.role='lawyer' AND cases.lawyer_tg_id=current_actor.tg_id))
           AND (checklist_revision=$8 OR
-            (data - '_handoff' - '_workspaceNote' - '_comment') = ($1::jsonb - '_handoff' - '_workspaceNote' - '_comment'))
+            (data - '_handoff' - '_workspaceNote' - '_comment' - '_lastClientAction') = ($1::jsonb - '_handoff' - '_workspaceNote' - '_comment' - '_lastClientAction'))
           AND (
             $5 OR COALESCE(data ->> '_comment', '') = $7
             OR ($6::text IS NOT NULL AND COALESCE(data ->> '_comment', '') = $6)
@@ -1523,7 +1529,7 @@ function setupHandoff(app) {
         [data, done, total, id, preserveNote, expectedNote, requestedNote, expectedRevision, subOn, due,req.tgUser.id,canManageCases({approved:true,role:'auditor'},req.tgUser.id)]
       )).rows[0];
       if (!saved) {
-        var latest = (await pool.query("SELECT to_jsonb(c) AS access_case, actor.tg_id,actor.role,actor.approved,COALESCE(c.data ->> '_comment', '') AS note, c.checklist_revision, (c.data - '_handoff' - '_workspaceNote' - '_comment') IS DISTINCT FROM ($2::jsonb - '_handoff' - '_workspaceNote' - '_comment') AS checklist_changed FROM cases c LEFT JOIN staff actor ON actor.tg_id=$3 WHERE c.id=$1", [id, data,req.tgUser.id])).rows[0];
+        var latest = (await pool.query("SELECT to_jsonb(c) AS access_case, actor.tg_id,actor.role,actor.approved,COALESCE(c.data ->> '_comment', '') AS note, c.checklist_revision, (c.data - '_handoff' - '_workspaceNote' - '_comment' - '_lastClientAction') IS DISTINCT FROM ($2::jsonb - '_handoff' - '_workspaceNote' - '_comment' - '_lastClientAction') AS checklist_changed FROM cases c LEFT JOIN staff actor ON actor.tg_id=$3 WHERE c.id=$1", [id, data,req.tgUser.id])).rows[0];
         if (!latest) return res.status(404).json({ ok: false, error: 'Клиент не найден' });
         if(!canAccessCase(latest,req.tgUser.id,latest.access_case))return res.status(403).json({ok:false,code:'CASE_FORBIDDEN',error:'Этот клиент недоступен вашему аккаунту.'});
         var checklistConflict = latest.checklist_changed && Number(latest.checklist_revision) !== expectedRevision;
@@ -1609,12 +1615,16 @@ function setupHandoff(app) {
     try {
       // Reuse the established authenticated checklist address: an additional
       // API path may be intercepted by the hosting provider's browser check.
+      if (req.query.manage === '1') {
+        const changed = await getChecklistClientActions().change(req.query.case_id, req.tgUser.id, req.body || {});
+        return res.json({ ok: true, ...changed });
+      }
       if (req.query.setup === '1') {
         const configured = await getChecklistSetup().initialize(req.query.case_id, req.tgUser.id, req.body || {});
         return res.json({ ok: true, case_id: Number(configured.id), checklist_key: configured.checklist_key, revision: Number(configured.checklist_revision) });
       }
       var c = await getChecklistSetup().prepare(req.query.case_id, req.tgUser.id);
-      res.send(checklistExists(c.checklist_key) ? checklistPage(c, LISTS[c.checklist_key], req.tgUser.id) : require('./checklist-setup').setupPage(c));
+      res.send(checklistExists(c.checklist_key) ? checklistPage(c, LISTS[c.checklist_key], req.tgUser.id) : require('./checklist-setup').setupPage(c, req.tgUser.id));
     } catch (error) {
       if (error.status) return res.status(error.status).json({ ok: false, code: error.code, error: error.message });
       throw error;
@@ -2995,7 +3005,7 @@ function checklistPage(c, L, actorId) {
   ].join('\n');
 
   var cfg = {
-    list: L, viewer: actorId, data: Object.fromEntries(Object.entries(c.data || {}).filter(function (entry) { return entry[0] !== '_handoff'; })), stages: STAGES,
+    list: L, viewer: actorId, data: Object.fromEntries(Object.entries(c.data || {}).filter(function (entry) { return entry[0] !== '_handoff' && entry[0] !== '_lastClientAction'; })), stages: STAGES,
     caseInfo: { id: c.id, service: c.service, lawyer: c.lawyer_name, region: c.region, revision: Number(c.checklist_revision) || 0 }
   };
 

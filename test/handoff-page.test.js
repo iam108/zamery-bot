@@ -304,7 +304,9 @@ test('page contains full-height accessible sheets and reduced-motion/transparenc
   assert.match(html, /<dialog id="report-dialog"[^>]*aria-labelledby="report-heading"/);
   assert.match(html, /<pre id="report-text"/); assert.match(html, /height:100dvh/);
   assert.match(html, /prefers-reduced-motion/); assert.match(html, /prefers-reduced-transparency/);
-  assert.match(html, /<script src="\/auth.js"><\/script>/);
+  assert.ok(html.includes('<script>' + require('../src/web/auth').clientScript() + '</script>'), 'The authoritative auth bridge must be embedded so a failed script request cannot remove authentication');
+  assert.match(html, /<script async src="https:\/\/telegram\.org\/js\/telegram-web-app\.js"><\/script>/);
+  assert.doesNotMatch(html, /<script src="\/auth.js"/);
   assert.doesNotMatch(html, /parseContacts|fillFrom\(/);
 });
 
