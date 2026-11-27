@@ -218,10 +218,31 @@ function pickChecklist(region, kind, service) {
   return r0 + '_' + kk;
 }
 
+function checklistExists(key) {
+  return typeof key === 'string' && Object.hasOwn(LISTS, key);
+}
+
+// Existing clients may predate checklist assignment. Never use the historical
+// fallback in pickChecklist to guess their region, object type or service.
+const CHECKLIST_PROFILE = Object.freeze({
+  region: Object.freeze(['МСК', 'МО', 'СПб']),
+  kind: Object.freeze(['Общепит', 'Магазин', 'Табак']),
+  service: Object.freeze(['Получение', 'Продление', 'Переоформление'])
+});
+function exactChecklist(profile) {
+  if (!profile || !Object.entries(CHECKLIST_PROFILE).every(([field, values]) => values.includes(profile[field]))) return null;
+  // Only combinations covered by an actual template may be restored. The
+  // historical selector maps unsupported combinations to a nearby template.
+  if (profile.region === 'СПб' && profile.kind !== 'Табак') return null;
+  if (profile.service === 'Переоформление' && !(profile.region === 'МО' && profile.kind === 'Магазин')) return null;
+  const key = pickChecklist(profile.region, profile.kind, profile.service);
+  return checklistExists(key) ? key : null;
+}
+
 function flagLabels(key) {
   var out = {};
-  (LISTS[key] ? LISTS[key].sections : []).forEach(function (s) { s.i.forEach(function (it) { if (it.t === 'flag') out[it.id] = it.l; }); });
+  (checklistExists(key) ? LISTS[key].sections : []).forEach(function (s) { s.i.forEach(function (it) { if (it.t === 'flag') out[it.id] = it.l; }); });
   return out;
 }
 
-module.exports = { LISTS: LISTS, STAGES: STAGES, pickChecklist: pickChecklist, flagLabels: flagLabels };
+module.exports = { LISTS: LISTS, STAGES: STAGES, pickChecklist: pickChecklist, flagLabels: flagLabels, checklistExists, exactChecklist, CHECKLIST_PROFILE };

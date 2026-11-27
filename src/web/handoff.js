@@ -1,6 +1,6 @@
 // Передача клиента юристу + чек-листы юриста
 const pool = require('../db/pool');
-const { LISTS, STAGES, pickChecklist, flagLabels } = require('../checklists');
+const { LISTS, STAGES, pickChecklist, flagLabels, checklistExists } = require('../checklists');
 const { canManageCases, canAccessCase } = require('./auth');
 const { asyncHandler } = require('./http-errors');
 
@@ -92,8 +92,8 @@ function validCalendarDate(value) {
   return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
 }
 function checklistCounts(client, data) {
+  if (!checklistExists(client.checklist_key)) return null;
   const list = LISTS[client.checklist_key];
-  if (!list) return null;
   const items = list.passport.concat(list.sections.flatMap(section => section.i)).filter(item =>
     !item.when || Object.entries(item.when).every(([key, expected]) => key === 'svc'
       ? client.service === expected : data[key] === expected || data[key] === undefined && !item.strict));
@@ -1328,7 +1328,7 @@ function printCompact(c, L) {
 function checklistBoot(caseId) {
   return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">' +
     '<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">' +
-    '<title>Чек-лист</title><script src="https://telegram.org/js/telegram-web-app.js"></script><script src="/auth.js"></script>' +
+    '<title>Чек-лист</title><script async src="https://telegram.org/js/telegram-web-app.js"></script><script>' + require('./auth').clientScript() + '</script>' +
     '<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;font:15px -apple-system,BlinkMacSystemFont,sans-serif;color:#5B6B82;background:#E8EEF6;padding:24px;text-align:center}' +
     '@media (prefers-color-scheme:dark){body{background:#070B16;color:#93A0B5}}</style></head>' +
     '<body><div id="m">Загружаю чек-лист…</div><script>' +
@@ -1345,6 +1345,11 @@ function setupHandoff(app) {
   const bot = require('../bot/instance');
   startDecisionReminders(bot);
   const WEBAPP_URL = process.env.WEBAPP_URL;
+  let checklistSetup;
+  function getChecklistSetup() {
+    if (!checklistSetup) checklistSetup = require('./checklist-setup').createChecklistSetupService({ pool, counts: checklistCounts });
+    return checklistSetup;
+  }
   const caseDocumentsService=require('./handoff-case-documents').setupHandoffCaseDocuments(app,{pool,ready:ensureTables});
   const rework = require('./case-rework').createCaseReworkService({pool,ready:ensureTables,telegram:bot.telegram,webappUrl:WEBAPP_URL});
   require('./handoff-case-package').setupCasePackage(app,{pool,ready:ensureTables,documents:caseDocumentsService});
@@ -1454,6 +1459,7 @@ function setupHandoff(app) {
       var id = parseInt(req.body.case_id);
       var c = (await pool.query('SELECT * FROM cases WHERE id=$1', [id])).rows[0];
       if (!requireCase(req, res, c)) return;
+      if (!checklistExists(c.checklist_key)) return res.status(400).json({ ok: false, code: 'CHECKLIST_SETUP_REQUIRED', error: 'Сначала откройте карточку и выберите чек-лист клиента.' });
       var data = Object.assign({}, req.body.data || {});
       var expectedRevision = req.body.expectedRevision;
       if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
@@ -1589,7 +1595,7 @@ function setupHandoff(app) {
       // Версия для печати открывается в обычном браузере — по подписанной ссылке
       if (!auth.checkCaseSig(caseId, req.query.exp, req.query.sig)) return res.status(403).send('Ссылка для печати устарела. Нажмите «Печать» в чек-листе ещё раз.');
       var c = (await pool.query('SELECT * FROM cases WHERE id=$1', [caseId])).rows[0];
-      if (!c || !c.checklist_key) return res.send('Чек-лист не найден');
+      if (!c || !checklistExists(c.checklist_key)) return res.status(404).send('Сначала выберите чек-лист клиента.');
       c._sigqs = '&exp=' + encodeURIComponent(req.query.exp) + '&sig=' + encodeURIComponent(req.query.sig);
       if (req.query.print === 'full') return res.send(printPage(c, LISTS[c.checklist_key]));
       return res.send(printCompact(c, LISTS[c.checklist_key]));
@@ -1600,10 +1606,19 @@ function setupHandoff(app) {
   // Сам чек-лист отдаётся только сотруднику (проверка подписи Telegram — в auth.js)
   app.post('/checklist/view', asyncHandler(async function (req, res) {
     await ensureTables(); await ensureDeadlines();
-    var c = (await pool.query('SELECT * FROM cases WHERE id=$1', [parseInt(req.query.case_id) || 0])).rows[0];
-    if (!requireCase(req, res, c)) return;
-    if (!c.checklist_key) return res.status(404).send('Чек-лист не найден');
-    res.send(checklistPage(c, LISTS[c.checklist_key], req.tgUser.id));
+    try {
+      // Reuse the established authenticated checklist address: an additional
+      // API path may be intercepted by the hosting provider's browser check.
+      if (req.query.setup === '1') {
+        const configured = await getChecklistSetup().initialize(req.query.case_id, req.tgUser.id, req.body || {});
+        return res.json({ ok: true, case_id: Number(configured.id), checklist_key: configured.checklist_key, revision: Number(configured.checklist_revision) });
+      }
+      var c = await getChecklistSetup().prepare(req.query.case_id, req.tgUser.id);
+      res.send(checklistExists(c.checklist_key) ? checklistPage(c, LISTS[c.checklist_key], req.tgUser.id) : require('./checklist-setup').setupPage(c));
+    } catch (error) {
+      if (error.status) return res.status(error.status).json({ ok: false, code: error.code, error: error.message });
+      throw error;
+    }
   }));
 
   app.get('/api/checklist/reminders', async function (req, res) {
@@ -1674,6 +1689,7 @@ function setupHandoff(app) {
     var id = parseInt(req.body.case_id) || 0;
     var client = (await pool.query('SELECT * FROM cases WHERE id=$1', [id])).rows[0];
     if (!requireCase(req, res, client)) return;
+    if (!checklistExists(client.checklist_key)) return res.status(409).json({ ok: false, code: 'CHECKLIST_SETUP_REQUIRED', error: 'Сначала выберите чек-лист клиента.' });
     res.json({ ok: true, url: (process.env.WEBAPP_URL || '') + '/checklist?case_id=' + id + '&print=1&' + auth.signCase(id, 24) });
   }));
 }
@@ -2991,7 +3007,7 @@ function checklistPage(c, L, actorId) {
 
   return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">' +
     '<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">' +
-    '<title>Чек-лист — ' + esc(c.org) + '</title><script src="https://telegram.org/js/telegram-web-app.js"></script><script src="/auth.js"></script>' +
+    '<title>Чек-лист — ' + esc(c.org) + '</title><script async src="https://telegram.org/js/telegram-web-app.js"></script><script>' + require('./auth').clientScript() + '</script>' +
     '<style>' + css + '</style></head><body>' +
     '<div class="field" aria-hidden="true"><i></i><i></i><i></i></div>' +
     '<header class="top"><div class="kicker">' + esc(L.title) + '</div><h1>' + esc(c.org) + '</h1><div class="facts">' + facts + '</div></header>' +

@@ -32,7 +32,7 @@ async function fixture(run,options={}) {
     console: { log() {}, error() {} }, process: { env: environment }, setTimeout() {}, setInterval() {},
     require(name) {
       if (name === '../db/pool') return pool;
-      if (name === '../checklists') return { LISTS: {}, STAGES: ['Сбор документов', 'Подано', 'Выездная проверка', 'Архив'], pickChecklist: () => 'QA', flagLabels: () => options.flagLabels||{} };
+      if (name === '../checklists') return { LISTS: {}, checklistExists: key => key === 'QA', STAGES: ['Сбор документов', 'Подано', 'Выездная проверка', 'Архив'], pickChecklist: () => 'QA', flagLabels: () => options.flagLabels||{} };
       if (name === '../bot/instance') return { telegram: { async sendMessage(...args) { telegram.push(args); if(options.sendMessage)return options.sendMessage(...args);return { message_id: telegram.length }; } } };
       if (name === './handoff-packet') return { ...require('../src/web/handoff-packet'), setupHandoffPacket: () => ({}) };
       if (['./handoff-manual','./handoff-manual-materials','./handoff-case-documents','./handoff-case-package','./handoff-case-profile','./case-rework','./case-rework-ui'].includes(name)) return require('../src/web/' + name);
@@ -44,6 +44,11 @@ async function fixture(run,options={}) {
     },
   };
   vm.createContext(context); vm.runInContext(source, context);
+  // This fixture isolates atomic checkpoint, note and notification SQL from
+  // checklist definitions. Real counts and template validation are covered by
+  // case-integrity and checklist-setup tests against the full application.
+  context.syntheticProgress = { done: 1, total: 4 };
+  vm.runInContext('checklistCounts = function () { return syntheticProgress; };', context);
   const app = { get(url, ...handlers) { routes.set('GET ' + url, handlers.at(-1)); }, post(url, ...handlers) { routes.set('POST ' + url, handlers.at(-1)); }, delete(url,...handlers) {routes.set('DELETE '+url,handlers.at(-1));} };
   try {
     context.module.exports.setupHandoff(app);
@@ -51,6 +56,7 @@ async function fixture(run,options={}) {
     await db.exec("ALTER TABLE staff ADD COLUMN approved BOOLEAN;INSERT INTO staff(tg_id,name,role,approved) VALUES(808,'Тестовый юрист','lawyer',true),(909,'Другой юрист','lawyer',true),(101,'Менеджер','manager',true),(102,'Новый менеджер','manager',true),(999,'Администратор','auditor',true)");
     const route = routes.get('POST /api/checklist/save'); assert.equal(typeof route, 'function');
     async function rawSave(data, extra = {}, actor={id:808,role:'lawyer'}) {
+      context.syntheticProgress = { done: extra.done ?? 1, total: extra.total ?? 4 };
       let result, status = 200;
       const row = (await db.query('SELECT checklist_revision FROM cases WHERE id=17')).rows[0];
       await route({ body: { case_id: 17, data, done: 1, total: 4, expectedRevision: Number(row?.checklist_revision || 0), ...extra }, tgUser: { id: actor.id }, staff: { name: 'Тестовый сотрудник', role: actor.role, approved: true }, get: () => 'application/json' }, {
