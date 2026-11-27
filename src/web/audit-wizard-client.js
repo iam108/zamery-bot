@@ -158,9 +158,12 @@
     var attempt=state.attempt;
     if(!attempt)return;
     var result=await request('/api/audit/drafts/current?order_id='+encodeURIComponent(orderId)), remote=result.draft;
-    var sameVersion=remote&&state.draft&&String(remote.id)===String(state.draft.id)&&Number(remote.revision)===Number(state.draft.revision);
+    var validRemote=remote&&typeof remote.id==='string'&&remote.id&&Number(remote.order_id)===Number(orderId)&&Number.isSafeInteger(remote.revision)&&remote.revision>=1;
+    var baseline=Number.isSafeInteger(attempt.revision)?attempt.revision:Number(state.draft&&state.draft.revision);
+    var ownRevision=!attempt.draft_id||Number.isSafeInteger(baseline)&&[baseline,baseline+1].includes(remote&&remote.revision);
+    var sameVersion=validRemote&&state.draft&&String(remote.id)===String(state.draft.id)&&Number(remote.revision)===Number(state.draft.revision);
     var removal=!!attempt.remove_id;
-    var matched=remote&&!remote.submitting&&(!attempt.draft_id||String(attempt.draft_id)===String(remote.id))&&sameData(attempt.data,remote.data)&&(!removal||removalApplied(attempt,remote));
+    var matched=validRemote&&ownRevision&&!remote.submitting&&(!attempt.draft_id||String(attempt.draft_id)===String(remote.id))&&sameData(attempt.data,remote.data)&&(!removal||removalApplied(attempt,remote));
     if(matched){adoptRevision(result);state.dirty=!sameData(state.data,remote.data);if(removal)forgetEvidence(attempt.remove_id);}
     else if(!(sameVersion&&!remote.submitting&&(!removal||Number(remote.revision)===attempt.revision))&&!(!remote&&!state.draft)){
       var conflict=new Error('Черновик изменился в другом окне. Ваши правки остались на устройстве.');conflict.status=409;throw conflict;
@@ -181,8 +184,10 @@
         var version=state.version,data=clone(state.data);
         var creating=!state.draft,draftId=state.draft&&state.draft.id,rev=state.draft&&state.draft.revision;
         var path=creating?'/api/audit/drafts':'/api/audit/drafts/'+encodeURIComponent(draftId);
-        state.attempt={draft_id:draftId||null,data:data};localSave();
+        state.attempt={draft_id:draftId||null,revision:rev||null,data:data};localSave();
         var result=await request(path,draftWriteOptions(creating?'POST':'PUT',creating?{order_id:orderId,data:data}:{revision:rev,data:data}));
+        var acknowledged=result.draft;
+        if(result.ok!==true||!acknowledged||typeof acknowledged!=='object'||Array.isArray(acknowledged)||typeof acknowledged.id!=='string'||!acknowledged.id||Number(acknowledged.order_id)!==Number(orderId)||!Number.isSafeInteger(acknowledged.revision)||acknowledged.revision<1||!acknowledged.data||typeof acknowledged.data!=='object'||Array.isArray(acknowledged.data)||!creating&&(acknowledged.id!==draftId||acknowledged.revision!==rev+1||!sameData(acknowledged.data,data)))throw Object.assign(new Error('Сервер не подтвердил сохранение этой версии. Правки остались на устройстве; повторите проверку сохранения.'),{code:'AUDIT_DRAFT_ACK_INVALID',retryable:true});
         if(creating&&result.draft&&result.draft.data&&!sameData(result.draft.data,data)){adoptRevision(result);var conflict=new Error('В другом окне уже создана другая версия проверки.');conflict.status=409;throw conflict;}
         adoptRevision(result);state.dirty=state.version!==version;state.attempt=null;state.serverError='';saveRetries=0;localSave();
       }catch(error){
@@ -1206,6 +1211,7 @@
         if(submitStatus)submitStatus.textContent='Передаю отчёт. Дождитесь подтверждения…';
         enteredSubmission=true;state.frozen=true;clearTimeout(timer);
         var result=await request('/api/audit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({draft_id:state.draft.id,revision:state.draft.revision})});
+        if(result.ok!==true||result.draft_id!==state.draft.id)throw Object.assign(new Error('Сервер не подтвердил отправку этого отчёта. Повторите проверку результата той же отправки.'),{code:'AUDIT_SUBMIT_ACK_INVALID',retryable:true});
         adoptRevision(result);state.dirty=false;state.completed=true;document.body.classList.remove('submitting');
         try{if(state.recoveryData)localStorage.setItem(localKey+':recovery',JSON.stringify({data:state.recoveryData,saved_at:Date.now()}));localStorage.removeItem(localKey);}catch(e){}
         if(editor){editor.destroy();editor=null;}

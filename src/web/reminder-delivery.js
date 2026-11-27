@@ -110,6 +110,11 @@ function accessProblem(access) {
 function caseReminderStatus(reminder, lawyer, now = Date.now(), nextRetryAt, access) {
   const delivery = reminder.delivery || {}, window = dateOnly(reminder.remind_on);
   access ||= delivery._access;
+  if (access?.paused === true && !reminder.sent_at) {
+    const wanted = [...new Set([lawyer,reminder.created_by].filter(value => /^[1-9]\d*$/.test(String(value))).map(String))];
+    const progress = summarize(delivery, wanted.map(chat => ({ slot: chat, window, confirmed: validReceipt(delivery[chat]) })), { now, nextRetryAt });
+    return { ...progress, state: 'paused', nextAt: null };
+  }
   const blocked = accessProblem(access);
   if (blocked) return blocked;
   let recipients = [...new Set([lawyer,reminder.created_by].filter(value => /^[1-9]\d*$/.test(String(value))).map(String))]

@@ -91,3 +91,10 @@ test('manual and older client data show an explicit payment status only when sav
   [part] = buildGroupNoticeParts(row,state);
   assert.doesNotMatch(part,/ТО:|оплачено/);
 });
+
+test('an unconfirmed EGRN order stays an explicit question in the clients group', () => {
+  const {row,state}=sample();state.packet.egrn_links=[];state.egrn={result:'uncertain',completed:true};
+  const text=buildGroupNoticeParts(row,state).join('\n');
+  assert.match(text,/ЕГРН: результат заказа не подтверждён; нужна проверка у поставщика\./);
+  assert.doesNotMatch(text,/ЕГРН: (?:входит в комплект|ожидается|отсутствует)/);
+});

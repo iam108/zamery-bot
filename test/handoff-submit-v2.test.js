@@ -40,6 +40,20 @@ async function fixture(run,config={}){
     assert.ok(events.every(event=>event.chat===String(LAWYER)||event.type==='notice'&&event.chat===String(event.noticeTarget)),'Only textual handoff details may go to the configured clients chat; package copies remain private');
   }finally{await db.close();}
 }
+test('a provider reconciliation question is retained in the clients group and a replay never starts another EGRN request',pg,async()=>fixture(async h=>{
+  const result=await h.submit(h.context);assert.equal(result.delivery_complete,true);assert.match(result.warn,/Готовность ЕГРН не подтверждена/);
+  const [client]=await h.cases();assert.equal(client.data._handoff.egrn.result,'uncertain');
+  const notice=h.events.filter(event=>event.type==='notice').map(event=>event.text).join('\n');
+  assert.match(notice,/ЕГРН: результат заказа не подтверждён; нужна проверка у поставщика\./);
+  assert.equal(h.egCalls.length,1);assert.equal(h.egCalls[0].order,false);const sent=h.events.length;
+  assert.deepEqual(await h.restart()(h.context),result);assert.equal(h.events.length,sent);assert.equal(h.egCalls.length,1);
+},{withEgrn:false,egrn:()=>({result:'uncertain',id:null})}));
+test('an ordinary audited handoff keeps its full packet but no unrelated checklist for an unsupported manager profile',pg,async()=>fixture(async h=>{
+ h.body.region='СПб';h.body.kind='Магазин';h.body.address='Санкт-Петербург, Синтетическая улица, 5';
+ const result=await h.submit(h.context);assert.equal(result.delivery_complete,true);const[c]=await h.cases();assert.equal(c.checklist_key,null);assert.equal(c.region,'СПб');assert.equal(c.kind,'Магазин');assert.equal(c.audit_text,h.packet.report.text);assert.equal(c.data._handoff.auditCopies[LAWYER].offset,105);
+ const card=h.events.find(event=>event.type==='card'),buttons=card.opts.reply_markup.inline_keyboard.flat();assert.ok(buttons.some(button=>button.text==='Карточка клиента'));assert.ok(buttons.some(button=>button.text==='Перейти к отчёту'));assert.ok(buttons.some(button=>button.text==='Вернуть на доработку'));assert.match(card.text,/Для этой услуги пока нет подходящего чек-листа/);assert.match(h.events.find(event=>event.type==='notice').text,/Для этой услуги пока нет подходящего чек-листа/);
+ const sent=h.events.length;assert.deepEqual(await h.restart()(h.context),result);assert.equal(h.events.length,sent);assert.equal(h.egCalls.length,0);
+}));
 test('V2 delivers the complete packet only to the assigned lawyer even when a shared chat is configured, and preserves completed idempotency',pg,async()=>fixture(async h=>{
   const result=await h.submit(h.context);assert.equal(result.delivery_complete,true);assert.equal(result.ok,true);
   const cases=await h.cases();assert.equal(cases.length,1);const c=cases[0],state=c.data._handoff;

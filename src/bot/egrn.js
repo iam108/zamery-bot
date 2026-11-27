@@ -896,7 +896,7 @@ function setupEgrn(bot) {
       : '⚠️ Не удалось проверить готовность выписки после нескольких попыток.';
     const fallback = o.recipient_unavailable ? '\nЗаказ поставщика №' + o.id_statement + '. Повтор доставки после проверки: /egrn_retry ' + o.id_statement + '.' : '\nСкачайте выписку или проверьте заявку №' + o.id_statement + ' в личном кабинете: https://armrus.org';
     if (o.status_msg_id) {
-      try { await telegramDelivery().authorize(o, {chat:o.chat_id});await bot.telegram.editMessageText(o.chat_id, Number(o.status_msg_id), undefined, cardText(o, text + fallback), { parse_mode: 'HTML' }); }
+      try { await telegramDelivery().authorize(o, {chat:o.chat_id});await renewDelivery(o);await bot.telegram.editMessageText(o.chat_id, Number(o.status_msg_id), undefined, cardText(o, text + fallback), { parse_mode: 'HTML' }); }
       catch (e) { console.error('egrn notification:', o.id_statement, e.code || 'unavailable'); }
     }
     // Личное уведомление — только заказавшему сотруднику, без технических ошибок и ссылок с токенами.
@@ -907,15 +907,28 @@ function setupEgrn(bot) {
       let receipt;
       try {
         const message = text + '\nКадастровый номер: ' + o.cad_num + fallback;
+        // A definitive rejection may lead to another candidate only while
+        // this worker still owns the order. Never notify from a stale lease.
+        await renewDelivery(o);
         if (previous?.state === 'sent' && String(previous.chat) === target && Number.isSafeInteger(previous.id) && previous.id > 0) {
           try { await bot.telegram.editMessageText(target, previous.id, undefined, message); receipt = { message_id: previous.id }; }
-          catch (error) { if (Number(error.response?.error_code) === 400 && /message is not modified/i.test(error.response?.description || error.message || '')) receipt = { message_id: previous.id }; else throw error; }
+          catch (error) {
+            const description = error.response?.description || error.message || '';
+            if (Number(error.response?.error_code) === 400 && /message is not modified/i.test(description)) receipt = { message_id: previous.id };
+            else if (Number(error.response?.error_code) === 400 && /message to edit not found/i.test(description)) {
+              // Telegram definitely did not edit a deleted message. Recheck
+              // ownership and access before replacing it in the same chat.
+              await renewDelivery(o);
+              await telegramDelivery().authorize(o, { chat: target });
+              receipt = await bot.telegram.sendMessage(target, message);
+            } else throw error;
+          }
         } else receipt = await bot.telegram.sendMessage(target, message);
         if (!Number.isSafeInteger(Number(receipt?.message_id)) || Number(receipt.message_id) < 1 || typeof receipt.message_id === 'boolean') return;
       } catch (error) {
         const code = Number(error.response?.error_code || error.code);
         console.error('egrn notification:', o.id_statement, Number.isInteger(code) ? code : 'unconfirmed');
-        if (code >= 400 && code < 500) continue;
+        if (code >= 400 && code < 500 || error.code === 'EGRN_RECIPIENT_UNAVAILABLE' && error.uncertain === false) continue;
         return;
       }
       const sent = { ...notice, state: 'sent', chat: target, id: Number(receipt.message_id) };

@@ -5,6 +5,8 @@ const { createHandoffNoticePublisher, initialNotice, pendingNotice, noticeWarnin
 const { manualClient } = require('./handoff-manual');
 const { technicalDescriptionPaymentLabel } = require('./handoff-case-profile');
 const { splitTelegramHtml } = require('../bot/audit-delivery');
+const { exactChecklist } = require('../checklists');
+const CHECKLIST_UNAVAILABLE='Для этой услуги пока нет подходящего чек-листа. Клиент передан юристу; карточка, документы и доработка доступны.';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DDL = `ALTER TABLE cases ADD COLUMN IF NOT EXISTS handoff_submit_id TEXT;
   ALTER TABLE cases ADD COLUMN IF NOT EXISTS handoff_signature TEXT;
@@ -151,6 +153,7 @@ function cardText(c,state) {
   if (identifiers) lines.push(short(identifiers, managerCardLimits.identifiers));
   const paymentLabel = technicalDescriptionPaymentLabel(state.fields.technical_description_payment);
   if (paymentLabel) lines.push('ТО: ' + paymentLabel);
+  if (state.checklistUnavailable === true) lines.push('', CHECKLIST_UNAVAILABLE);
 
   const contacts = (c.contacts || []).filter(contact => contact.name || contact.phone || contact.tg);
   if (contacts.length) {
@@ -195,18 +198,18 @@ function reportUrl(base,state,caseId) {
 }
 function cardOptions(base,c,state) {
   const keyboard=[],navigation=[],report=state.packet.report||{},url=reportUrl(base,state,c.id);
-  if(c.checklist_key)navigation.push({text:'📋 Чек-лист клиента',web_app:{url:new URL('/checklist?case_id='+c.id,base).href}});
+  navigation.push({text:c.checklist_key?'📋 Чек-лист клиента':'Карточка клиента',web_app:{url:new URL('/checklist?case_id='+c.id,base).href}});
   if(url)navigation.push({text:'Перейти к отчёту',web_app:{url}});
   if(navigation.length)keyboard.push(navigation);
   keyboard.push([{text:'Документы клиента',web_app:{url:new URL('/handoff?case_id='+c.id+'&view=documents',base).href}}]);
   const video=https(report.video_url),archive=https(state.packet.archive_url);
   if(video)keyboard.push([{text:'▶ Видео осмотра',url:video}]);
   if(archive)keyboard.push([{text:'Архив объекта',url:archive}]);
-  if(c.checklist_key)keyboard.push([{text:'Вернуть на доработку',web_app:{url:new URL('/checklist?case_id='+c.id+'&rework=1',base).href}}]);
+  keyboard.push([{text:'Вернуть на доработку',web_app:{url:new URL('/checklist?case_id='+c.id+'&rework=1',base).href}}]);
   return {parse_mode:'HTML',...(keyboard.length?{reply_markup:{inline_keyboard:keyboard}}:{})};
 }
 function partial(c,state,warn,retry=true) {return {ok:true,id:Number(c.id),delivery_complete:false,retry, ...(state.manual_review?{manual_review:true}:{}),warn};}
-function completed(c,state) {const warn=[state.egrn?.note,noticeWarning(state,c.id)].filter(Boolean).join('\n');return {ok:true,id:Number(c.id),delivery_complete:true,...(warn?{warn}:{}),...(state.extraDocuments?.completed?{extra_documents_submit_id:state.extraDocuments.submit_id}:{}),...(state.groupNotice?{group_notice:{status:state.groupNotice.status,manual_review:state.groupNotice.status==='unknown'||!!state.groupNotice.intent}}:{})};}
+function completed(c,state) {const warn=[state.checklistUnavailable===true?CHECKLIST_UNAVAILABLE:'',state.egrn?.note,noticeWarning(state,c.id)].filter(Boolean).join('\n');return {ok:true,id:Number(c.id),delivery_complete:true,...(warn?{warn}:{}),...(state.extraDocuments?.completed?{extra_documents_submit_id:state.extraDocuments.submit_id}:{}),...(state.groupNotice?{group_notice:{status:state.groupNotice.status,manual_review:state.groupNotice.status==='unknown'||!!state.groupNotice.intent}}:{})};}
 
 function createHandoffSubmitter(options={}) {
   const pool=options.pool||require('../db/pool');let initialized;
@@ -351,8 +354,12 @@ function createHandoffSubmitter(options={}) {
         }
         const lawyer=(await client.query("SELECT tg_id,name FROM staff WHERE tg_id=$1 AND role='lawyer' AND approved=true",[lawyerId])).rows[0];
         if(!lawyer)fail(400,'HANDOFF_LAWYER','Юрист не найден среди одобренных сотрудников.');
-        const checklist=(options.pickChecklist||require('../checklists').pickChecklist)(d.region,d.kind,d.service);
-        if(!checklist)fail(400,'HANDOFF_CHECKLIST','Для выбранной услуги не найден чек-лист.');
+        // A historical selector falls back to Moscow/getting a licence for
+        // unsupported profiles. Preserve independent client assignment without
+        // presenting unrelated regional or service requirements as its checklist.
+        const supportedChecklist=exactChecklist(d);
+        const checklist=supportedChecklist?(options.pickChecklist?options.pickChecklist(d.region,d.kind,d.service):supportedChecklist):null;
+        if(supportedChecklist&&!checklist)fail(400,'HANDOFF_CHECKLIST','Для выбранной услуги не найден чек-лист.');
         const picked=reportId?await loadReport(body.report_src,reportId):null,source=picked?sourceReport(picked):{sources:[],hashes:[]};
         if(manual){
           try {packet.manual_materials=await manualStore().freeze(client,owner,submitId,body.manual_files||[]);}
@@ -394,7 +401,7 @@ function createHandoffSubmitter(options={}) {
         const recipients=[{chat:String(lawyer.tg_id),role:'lawyer'}];
         const groupNotice=initialNotice(options.clientsChatId??process.env.CLIENTS_CHAT_ID);
         const managerName=value(staff?.name), details=managerDetailsParts(d,managerName);
-        state={version:2,body:JSON.parse(serialized),fields:d,packet,source,request,manager_name:managerName,recipients,cards:{},auditCopies:{},requestCopies:{},materials:{confirmed:{},completed:manual?!packet.manual_materials.length:!orderId},linkedEgrn:{files:linkedOriginals(packet),confirmed:{},completed:false},egrn:{completed:manual,order_started:false,...(manual?{result:'skipped-manual'}:{})},completed:false,...(groupNotice?{groupNotice}:{}),...(extraDocuments?{extraDocuments}:{}),...(details.length?{managerDetails:{parts:details,messageIds:[]}}:{})};
+        state={version:2,body:JSON.parse(serialized),fields:d,packet,source,request,manager_name:managerName,recipients,cards:{},auditCopies:{},requestCopies:{},materials:{confirmed:{},completed:manual?!packet.manual_materials.length:!orderId},linkedEgrn:{files:linkedOriginals(packet),confirmed:{},completed:false},egrn:{completed:manual,order_started:false,...(manual?{result:'skipped-manual'}:{})},completed:false,...(!checklist?{checklistUnavailable:true}:{}),...(groupNotice?{groupNotice}:{}),...(extraDocuments?{extraDocuments}:{}),...(details.length?{managerDetails:{parts:details,messageIds:[]}}:{})};
         reportUrl(options.webappUrl||process.env.WEBAPP_URL,state);
         await checkActor(client,user.id);
         c=(await client.query(`INSERT INTO cases(order_id,lawyer_tg_id,lawyer_name,checklist_key,org,inn,client,phone,address,region,kind,service,priority,comment,audit_text,total,created_by,contacts,request_id,handoff_submit_id,handoff_signature,data)

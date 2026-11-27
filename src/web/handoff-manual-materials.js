@@ -61,12 +61,15 @@ function createManualMaterialsStore(pool) {
       await client.query('BEGIN');
       const locked=(await client.query('SELECT pg_try_advisory_xact_lock(111,hashtext($1)) AS locked',[ids.join(':')])).rows[0]?.locked;
       if (!locked) fail('Передача уже выполняется. Дождитесь результата.',409,'HANDOFF_BUSY');
-      const staff=(await client.query('SELECT tg_id,role,approved FROM staff WHERE tg_id=$1',[owner])).rows[0];
-      if (!canManageCases(staff,owner)) fail('Нет доступа к документам клиента.',403,'HANDOFF_FORBIDDEN');
+      const checkManager=async()=>{
+        const staff=(await client.query('SELECT tg_id,role,approved FROM staff WHERE tg_id=$1 FOR SHARE',[owner])).rows[0];
+        if (!canManageCases(staff,owner)) fail('Нет доступа к документам клиента.',403,'HANDOFF_FORBIDDEN');
+      };
+      await checkManager();
       if ((await client.query('SELECT id FROM cases WHERE created_by=$1 AND handoff_submit_id=$2',ids)).rows.length) fail('Передача уже началась. Состав документов сохранён.',409,'HANDOFF_MATERIAL_FROZEN');
       if ((await client.query("SELECT id FROM cases WHERE created_by=$1 AND data#>>'{_handoff,extraDocuments,submit_id}'=$2",ids)).rows.length) fail('Документы входят в сохранённую передачу. Состав документов сохранён.',409,'HANDOFF_MATERIAL_FROZEN');
       if ((await client.query('SELECT id FROM case_document_batches WHERE owner_tg_id=$1 AND id=$2',ids)).rows.length) fail('Документы уже прикреплены к клиенту. Для новых файлов создайте следующий пакет.',409,'HANDOFF_MATERIAL_FROZEN');
-      await fn(client,ids);const result=(await rows(client,...ids)).map(metadata);await client.query('COMMIT');return result;
+      await fn(client,ids);await checkManager();const result=(await rows(client,...ids)).map(metadata);await client.query('COMMIT');return result;
     } catch(error) {await client.query('ROLLBACK').catch(()=>{});throw error;} finally {client.release();}
   }
   async function put(owner,submitId,file) {

@@ -6,16 +6,22 @@ const {createManualMaterialsStore,setupHandoffManualMaterials}=require('../src/w
 const {createHandoffMaterialsDelivery}=require('../src/web/handoff-materials');
 const pg={skip:!process.env.PGLITE_TEST_MODULE};
 async function fixture(run) {
-  const {PGlite}=require(process.env.PGLITE_TEST_MODULE),db=new PGlite();let busy=false;
+  const {PGlite}=require(process.env.PGLITE_TEST_MODULE),db=new PGlite();let busy=false,before=async()=>{};
   await db.exec(`CREATE TABLE staff(tg_id BIGINT PRIMARY KEY,role TEXT,approved BOOLEAN);
     INSERT INTO staff VALUES(101,'manager',true),(102,'manager',true),(808,'lawyer',true);
     CREATE TABLE cases(id SERIAL PRIMARY KEY,created_by BIGINT,handoff_submit_id TEXT,data JSONB DEFAULT '{}');`);
-  const query=(sql,args)=>sql.startsWith('SELECT pg_try_advisory_xact_lock')?Promise.resolve({rows:[{locked:!busy}]}):args?db.query(sql,args):db.exec(sql).then(r=>r.at(-1));
+  const query=async(sql,args)=>{await before(sql,args);return sql.startsWith('SELECT pg_try_advisory_xact_lock')?{rows:[{locked:!busy}]}:args?db.query(sql,args):db.exec(sql).then(r=>r.at(-1));};
   const pool={query,async connect(){return{query,release(){}};}},store=createManualMaterialsStore(pool),sid=randomUUID();
   const file={originalname:'Договор.pdf',mimetype:'application/pdf',buffer:Buffer.from('%PDF-1.7\nSynthetic manager original\n%%EOF')};
   const makeCase=async files=>(await db.query('INSERT INTO cases(created_by,handoff_submit_id,data) VALUES(101,$1,$2) RETURNING id',[sid,JSON.stringify({_handoff:{body:{manual_client:true,submit_id:sid,manual_files:files}}})])).rows[0].id;
-  try{await run({db,pool,store,sid,file,makeCase,busy(value){busy=value;}});}finally{await db.close();}
+  try{await run({db,pool,store,sid,file,makeCase,busy(value){busy=value;},before(fn){before=fn;}});}finally{await db.close();}
 }
+for(const operation of['upload','delete'])for(const change of['approval','role'])test('manual '+operation+' rolls back when manager '+change+' changes after its initial access check',pg,()=>fixture(async h=>{
+  const initial=operation==='delete'?await h.store.put(101,h.sid,h.file):[];let changed=false;
+  h.before(async sql=>{if(!changed&&sql.startsWith(operation==='upload'?'INSERT INTO handoff_manual_materials':'DELETE FROM handoff_manual_materials')){changed=true;await h.db.query(change==='approval'?'UPDATE staff SET approved=false WHERE tg_id=101':"UPDATE staff SET role='lawyer' WHERE tg_id=101");}});
+  await assert.rejects(operation==='upload'?h.store.put(101,h.sid,h.file):h.store.remove(101,h.sid,initial[0].id),error=>error.status===403&&error.code==='HANDOFF_FORBIDDEN');
+  assert.equal(changed,true,'The race must happen at the physical file mutation');assert.deepEqual(await h.store.list(101,h.sid),initial);
+}));
 test('manual originals persist across store restart, keep exact bytes and are isolated by manager and draft',pg,()=>fixture(async h=>{
   const files=await h.store.put(101,h.sid,h.file);assert.equal(files.length,1);assert.equal('buffer' in files[0],false);
   const restored=createManualMaterialsStore(h.pool);assert.deepEqual(await restored.list(101,h.sid),files);assert.deepEqual(await restored.list(102,h.sid),[]);assert.deepEqual(await restored.list(101,randomUUID()),[]);

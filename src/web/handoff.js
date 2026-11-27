@@ -1326,18 +1326,7 @@ function printCompact(c, L) {
 
 // Загрузочная страница чек-листа: берёт подпись Telegram и запрашивает сам чек-лист
 function checklistBoot(caseId) {
-  return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">' +
-    '<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">' +
-    '<title>Чек-лист</title><script async src="https://telegram.org/js/telegram-web-app.js"></script><script>' + require('./auth').clientScript() + '</script>' +
-    '<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;font:15px -apple-system,BlinkMacSystemFont,sans-serif;color:#5B6B82;background:#E8EEF6;padding:24px;text-align:center}' +
-    '@media (prefers-color-scheme:dark){body{background:#070B16;color:#93A0B5}}</style></head>' +
-    '<body><div id="m">Загружаю чек-лист…</div><script>' +
-    '(function(){var tg=window.Telegram&&window.Telegram.WebApp;try{tg.ready();tg.expand()}catch(e){}' +
-    'fetch("/checklist/view?case_id=' + (parseInt(caseId) || 0) + '",{method:"POST"}).then(function(r){return r.text().then(function(t){return{ok:r.ok,t:t}})})' +
-    '.then(function(x){if(!x.ok){var e="Нет доступа";try{e=JSON.parse(x.t).error||e}catch(_){};if(x.t&&x.t.charAt(0)!=="{")e=x.t;document.getElementById("m").textContent=e;return}' +
-    'document.open();document.write(x.t);document.close()})' +
-    '.catch(function(){document.getElementById("m").textContent="Нет связи. Закройте и откройте чек-лист ещё раз."})})();' +
-    '</script></body></html>';
+  return require('./checklist-boot').page(caseId);
 }
 
 function setupHandoff(app) {
@@ -1606,7 +1595,7 @@ function setupHandoff(app) {
       if (req.query.print === 'full') return res.send(printPage(c, LISTS[c.checklist_key]));
       return res.send(printCompact(c, LISTS[c.checklist_key]));
     }
-    res.send(checklistBoot(caseId));
+    res.set('Cache-Control', 'no-store').send(checklistBoot(caseId));
   }));
 
   // Сам чек-лист отдаётся только сотруднику (проверка подписи Telegram — в auth.js)
@@ -1624,7 +1613,8 @@ function setupHandoff(app) {
         return res.json({ ok: true, case_id: Number(configured.id), checklist_key: configured.checklist_key, revision: Number(configured.checklist_revision) });
       }
       var c = await getChecklistSetup().prepare(req.query.case_id, req.tgUser.id);
-      res.send(checklistExists(c.checklist_key) ? checklistPage(c, LISTS[c.checklist_key], req.tgUser.id) : require('./checklist-setup').setupPage(c, req.tgUser.id));
+      const html = checklistExists(c.checklist_key) ? checklistPage(c, LISTS[c.checklist_key], req.tgUser.id) : require('./checklist-setup').setupPage(c, req.tgUser.id);
+      res.set('Cache-Control', 'no-store').set('X-LRS-Checklist-View', '1').send(html);
     } catch (error) {
       if (error.status) return res.status(error.status).json({ ok: false, code: error.code, error: error.message });
       throw error;
@@ -2127,6 +2117,7 @@ function checklistClient() {
     var nextDate = status.nextAt && new Date(status.nextAt);
     var next = nextDate ? (new Date(nextDate.getTime()+3*3600000).toISOString().slice(0,10) === mskToday() ? '' : nextDate.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', timeZone: 'Europe/Moscow' })+' ') + 'в ' + nextDate.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Moscow' }) + ' МСК' : '';
     if (status.state === 'confirmed') return 'доставка подтверждена';
+    if (status.state === 'paused') return 'Клиент в архиве. Напоминание приостановлено до возвращения в работу.';
     if (status.state === 'no_recipient') return 'Нет доступного получателя. Проверьте назначенного юриста и его доступ; проверим снова.';
     if (status.state === 'recipient_check_failed') return 'Не удалось проверить доступ получателя; повторим проверку.';
     if (status.state === 'unknown') return 'Доставка не подтверждена' + (next ? '; повтор ' + next : '; ожидает повтора') + '. Возможно повторное сообщение.';

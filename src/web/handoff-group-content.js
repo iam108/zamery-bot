@@ -56,6 +56,7 @@ function buildGroupNoticeParts(row, state) {
   if (cad) lines.push('Кадастровый номер: ' + cad);
   if (payment) lines.push('ТО: ' + payment);
   if (state.manager_name) lines.push('Передал: ' + oneLine(state.manager_name));
+  if (state.checklistUnavailable === true) lines.push('', 'Для этой услуги пока нет подходящего чек-листа. Клиент передан юристу; карточка, документы и доработка доступны.');
 
   if (profile.contacts?.length) {
     lines.push('', 'Контакты');
@@ -91,6 +92,7 @@ function buildGroupNoticeParts(row, state) {
   const egrn = state.egrn?.result;
   if (egrn === 'attached') lines.push('ЕГРН: отправлена отдельным сообщением.');
   else if (['waiting', 'ordered'].includes(egrn)) lines.push('ЕГРН: ожидается.');
+  else if (egrn === 'uncertain') lines.push('ЕГРН: результат заказа не подтверждён; нужна проверка у поставщика.');
   else if (['none', 'missing', 'unavailable'].includes(egrn)) lines.push('ЕГРН: отсутствует в комплекте.');
   else if (egrn === 'included' || count(packet.egrn_links)) lines.push('ЕГРН: входит в комплект.');
 

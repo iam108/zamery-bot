@@ -60,7 +60,7 @@ test('explicit setup cannot alter already known case metadata or accept unknown 
 });
 
 test('unsupported known combinations are explained instead of receiving a checklist for another region or service',async()=>{
-  for(const profile of[{region:'СПб',kind:'Общепит',service:'Получение'},{region:'МО',kind:'Табак',service:'Переоформление'},{region:'МСК',kind:'Общепит',service:'Переоформление'}]){
+  for(const profile of[{region:'СПб',kind:'Общепит',service:'Получение'},{region:'МО',kind:'Табак',service:'Получение'},{region:'МО',kind:'Табак',service:'Переоформление'},{region:'МСК',kind:'Общепит',service:'Переоформление'}]){
     const c=await seed(profile);const opened=await view(c.id);assert.equal(opened.status,200,opened.text);assert.match(opened.text,/checklist-setup-unsupported/);assert.doesNotMatch(opened.text,/id="checklist-setup"|id="setup-submit"/);
     const denied=await setup(c.id,profile);assert.equal(denied.status,400,denied.text);assert.equal(denied.json.code,'CHECKLIST_PROFILE_UNSUPPORTED');assert.equal((await row(c.id)).checklist_key,null);assert.deepEqual((await row(c.id)).data,originalData);
   }

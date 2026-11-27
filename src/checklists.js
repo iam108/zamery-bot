@@ -234,6 +234,7 @@ function exactChecklist(profile) {
   // Only combinations covered by an actual template may be restored. The
   // historical selector maps unsupported combinations to a nearby template.
   if (profile.region === 'СПб' && profile.kind !== 'Табак') return null;
+  if (profile.kind === 'Табак' && profile.region === 'МО') return null;
   if (profile.service === 'Переоформление' && !(profile.region === 'МО' && profile.kind === 'Магазин')) return null;
   const key = pickChecklist(profile.region, profile.kind, profile.service);
   return checklistExists(key) ? key : null;

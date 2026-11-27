@@ -12,11 +12,12 @@ function actualFunction(name) {
   return next < 0 ? rest : rest.slice(0, next + 1);
 }
 function load(c, ...names) { if(names.includes('fetchAuditFile')||names.includes('request'))names=['requestWithDeadline',...names];if(names.some(name=>['removeGeneratedEvidence','deleteEvidence','recoverUnconfirmedWrite','reconcileDraft'].includes(name)))names=['removalApplied','forgetEvidence','removeEvidenceFile',...names];if(names.includes('postEvidence')&&source.includes('async function recoverEvidenceUpload('))names=['recoverEvidenceUpload',...names];vm.runInContext(names.map(actualFunction).join('\n'), c); }
+function draftReply(c,options){const input=JSON.parse(options.body);return{ok:true,draft:{...copy(c.state.draft),order_id:123,revision:input.revision+1,data:input.data}};}
 function harness() {
   const calls=[],nodes=new Map();
   const node=key=>{if(!nodes.has(key))nodes.set(key,{textContent:'',innerHTML:'',dataset:{},style:{},disabled:false,hidden:false,querySelector:()=>null,querySelectorAll:()=>[],remove(){calls.push(['host-removed']);}});return nodes.get(key);};
   const c={
-    state:{data:{schema_version:3,ui_version:5,object_category:'catering',inspection:{org:'Тест',address:'Москва',service:'Получение',visit_date:'2026-10-30'},workflow:{step:2,conclusion_status:'actions',territory_result:'findings'},conclusion:'Есть замечания',entrances:[],zones:[],plan:{evidence_id:'plan-original',page:6,annotations:[{id:'p1',tool:'boundary'}]},map:{evidence_id:'map-original',page:1,annotations:[{id:'e1',tool:'entrance'}]},additional_plans:[]},draft:{id:'draft-test',revision:10},evidence:[],dirty:false,serverError:'',version:0,frozen:false,submitting:false,completed:false,packet:{materials:[]}},
+    state:{data:{schema_version:3,ui_version:5,object_category:'catering',inspection:{org:'Тест',address:'Москва',service:'Получение',visit_date:'2026-10-30'},workflow:{step:2,conclusion_status:'actions',territory_result:'findings'},conclusion:'Есть замечания',entrances:[],zones:[],plan:{evidence_id:'plan-original',page:6,annotations:[{id:'p1',tool:'boundary'}]},map:{evidence_id:'map-original',page:1,annotations:[{id:'e1',tool:'entrance'}]},additional_plans:[]},draft:{id:'draft-test',order_id:123,revision:10},evidence:[],dirty:false,serverError:'',version:0,frozen:false,submitting:false,completed:false,packet:{materials:[]}},
     $:node,root:node('#root'),calls,tail:Promise.resolve(),timer:null,pendingSave:null,queuedJobs:0,closingConfirmation:false,saveRetries:0,editor:null,activePlanId:'main',managerPlanIntents:new Map(),orderId:'123',localKey:'test-only',tg:null,
     clone:copy,clearTimeout,setTimeout,console,TextEncoder,URL,commentCaptures:new WeakMap(),
     document:{body:{classList:{add(){},remove(){}},appendChild(){calls.push(['host-added']);}},createElement:()=>node('export-host')},
@@ -26,13 +27,57 @@ function harness() {
     flush:async()=>{calls.push(['flush']);c.state.dirty=false;},
     exportGraphic:async(plan,kind,subject)=>{calls.push(['export',kind,subject,plan.evidence_id]);return {name:kind+'.png',mime:'image/png',role:kind,data:'generated-'+plan.evidence_id};},
     postEvidence:async(file,role,subject,data)=>{const e={id:'new-'+role+'-'+subject,role,subject_id:subject};c.state.evidence.push(e);c.state.draft.revision++;calls.push(['upload',e.id,data]);return e;},
-    request:async(url,options)=>{calls.push(['request',url,options]);if(options?.method==='DELETE')return {ok:true,revision:c.state.draft.revision+1};return {ok:true};},
+    request:async(url,options)=>{calls.push(['request',url,options]);if(options?.method==='DELETE')return {ok:true,revision:c.state.draft.revision+1};if(options?.method==='PUT')return draftReply(c,options);return url==='/api/audit'?{ok:true,draft_id:c.state.draft.id}:{ok:true};},
     checkSubmissionState:async entered=>{calls.push(['check-submission',entered]);},
     territoryIssues(){},
     defaults:{inspection:{region:'МСК'},workflow:{step:0},plan:{},map:{},additional_plans:[]}
   };
   vm.createContext(c);load(c,'requiredIssues','stable','sameData','draftWriteOptions','updateClosingConfirmation','captureVisibleComments','recoverUnconfirmedWrite','setOutcome','queue','step','isRenewal','evidenceFor','mapMode','adoptRevision','removeGeneratedEvidence','submit','currentPlan','setCurrentPlan');return c;
 }
+
+for (const reply of [{ok:true}, {ok:true,draft_id:'another-draft'}, {detail:'Bad Request'}]) test('an unrelated or incomplete submit acknowledgement cannot claim delivery: '+JSON.stringify(reply),async()=>{
+  const c=harness();c.state.frozen=true;
+  const removed=[];c.localStorage.removeItem=key=>removed.push(key);
+  c.request=async(url,options)=>{c.calls.push(['request',url,options]);return reply;};
+  await c.submit();
+  assert.equal(c.state.completed,false,'Only an acknowledgement for this exact draft confirms delivery');
+  assert.equal(c.state.frozen,true,'Keep the same submission available for safe status recovery');
+  assert.equal(removed.length,0,'Unconfirmed submission must retain local recovery data');
+  assert.ok(!c.root.innerHTML.includes('Отчёт отправлен'));
+  assert.equal(c.calls.filter(call=>call[0]==='check-submission'&&call[1]===true).length,1);
+});
+
+for (const failure of ['missing snapshot','another draft','unrelated revision','different answers']) test('draft saving keeps local observations when the acknowledgement has '+failure,async()=>{
+  const c=harness();load(c,'flush');c.state.dirty=true;c.state.localSaved=true;c.scheduleSave=()=>{};
+  const original=copy(c.state.draft),sent=copy(c.state.data);
+  c.request=async()=>{
+    const reply={ok:true,draft:{id:original.id,order_id:123,revision:original.revision+1,data:copy(sent)}};
+    if(failure==='missing snapshot')delete reply.draft;
+    if(failure==='another draft')reply.draft.id='another-draft';
+    if(failure==='unrelated revision')reply.draft.revision=99;
+    if(failure==='different answers')reply.draft.data.conclusion='Another observation';
+    return reply;
+  };
+  await assert.rejects(c.flush(),error=>error.code==='AUDIT_DRAFT_ACK_INVALID');
+  assert.equal(c.state.dirty,true);assert.deepEqual(copy(c.state.data),sent);assert.deepEqual(copy(c.state.draft),original);
+  assert.deepEqual(copy(c.state.attempt.data),sent);assert.equal(c.state.attempt.draft_id,original.id);
+  assert.ok(!c.calls.some(call=>call[0]==='status'&&/^Сохранено на сервере/.test(call[1])));
+});
+
+for (const failure of ['another order','unrelated revision']) test('recovering an unconfirmed draft write rejects a snapshot for '+failure,async()=>{
+  const c=harness();c.state.dirty=true;const original=copy(c.state.draft),data=copy(c.state.data);
+  c.state.attempt={draft_id:original.id,revision:original.revision,data};
+  c.request=async()=>({ok:true,draft:{...original,order_id:failure==='another order'?999:123,revision:failure==='unrelated revision'?99:original.revision+1,data}});
+  await assert.rejects(c.recoverUnconfirmedWrite(),error=>error.status===409);
+  assert.equal(c.state.dirty,true);assert.deepEqual(copy(c.state.draft),original);assert.equal(c.state.attempt.draft_id,original.id);
+});
+
+test('creating a draft accepts the canonical active draft returned by an idempotent create replay',async()=>{
+  const c=harness();load(c,'flush');c.state.draft=null;c.state.dirty=true;
+  const data=copy(c.state.data);
+  c.request=async(url,options)=>{assert.equal(url,'/api/audit/drafts');assert.equal(options.method,'POST');return{ok:true,draft:{id:'canonical-active-draft',order_id:123,revision:7,data,evidence:[]}};};
+  const result=await c.flush();assert.equal(result.id,'canonical-active-draft');assert.equal(result.revision,7);assert.equal(c.state.dirty,false);assert.equal(c.state.attempt,null);assert.deepEqual(copy(c.state.data),data);
+});
 
 test('switching the main plan to a ready artwork parks all drawn points and restores both modes after a draft reload',()=>{
   const c=harness();load(c,'switchPlanMode','merge','restoreData');
@@ -314,7 +359,7 @@ test('an explicit server reload clears old packet-review state when another wind
   const c=harness();load(c,'merge','restoreData','reloadServer');c.window.confirm=()=>true;
   c.state.pendingPacket={org:'New manager packet'};c.state.packetError='Сверьте обновление';c.renderPacketUpdate=()=>{};
   const remote={...c.state.draft,revision:17,submitting:true,data:copy(c.state.data),evidence:[]};
-  c.request=async(url,options)=>{c.calls.push(['request',url,options]);return options?{ok:true}:{draft:remote};};
+  c.request=async(url,options)=>{c.calls.push(['request',url,options]);return options?{ok:true,draft_id:c.state.draft.id}:{draft:remote};};
   await c.reloadServer();await c.submit();
   assert.equal(c.state.pendingPacket,null);assert.equal(c.state.packetError,'');assert.equal(c.state.completed,true);
 });
@@ -350,7 +395,7 @@ test('extra export receives that exact page, never writes draft facts, and clean
 
 test('queued save writes the newest edit after the in-flight snapshot without deadlock', {timeout:1500},async()=>{
   const c=harness();c.state.dirty=true;c.state.version=1;load(c,'flush','saveNow');let requests=0;const bodies=[];
-  c.request=async(url,options)=>{requests++;bodies.push(JSON.parse(options.body));if(requests===1){c.state.data.conclusion='Edited during request';c.state.version++;c.state.dirty=true;}return {ok:true,revision:c.state.draft.revision+1};};
+  c.request=async(url,options)=>{requests++;bodies.push(JSON.parse(options.body));if(requests===1){c.state.data.conclusion='Edited during request';c.state.version++;c.state.dirty=true;}return draftReply(c,options);};
   await c.saveNow();assert.equal(requests,2);assert.equal(bodies[0].data.conclusion,'Есть замечания');assert.equal(bodies[1].data.conclusion,'Edited during request');assert.equal(c.state.dirty,false);assert.equal(c.state.draft.revision,12);
 });
 
@@ -453,7 +498,7 @@ test('closing with an unconfirmed edit dispatches the write with keepalive, with
   const c=harness(),writes=[];
   load(c,'saveOnExit','flush','saveNow');
   c.localSave=()=>writes.push('local');
-  c.request=async(url,options)=>{writes.push([url,options]);return {ok:true,revision:11};};
+  c.request=async(url,options)=>{writes.push([url,options]);return draftReply(c,options);};
   c.state.dirty=true;c.state.loaded=false;c.saveOnExit();
   assert.deepEqual(writes,[]);
   c.state.loaded=true;c.saveOnExit();const saving=c.pendingSave;
@@ -473,7 +518,7 @@ test('after a lost acknowledgement, a newer observation saves on the revision th
   const requests=[];c.request=async(url,options)=>{
     requests.push([url,options]);
     if(!options)return {draft:{...c.state.draft,revision:11,data:first,evidence:[{id:'original'}]}};
-    return {revision:12};
+    return draftReply(c,options);
   };
   await c.saveNow();
   assert.match(requests[0][0],/drafts\/current/);
@@ -514,7 +559,7 @@ test('the active plan note is captured at close without an input event and a sta
   c.root.querySelectorAll=selector=>['[data-bind]','textarea[data-bind]'].includes(selector)?[control]:[];
   c.state.loaded=true;c.state.data.inspection.plan_note='';
   c.localSave=()=>writes.push(['local',c.state.data.inspection.plan_note]);
-  c.request=async(url,options)=>{writes.push(['request',url,JSON.parse(options.body)]);return {ok:true,revision:11};};
+  c.request=async(url,options)=>{writes.push(['request',url,JSON.parse(options.body)]);return draftReply(c,options);};
   load(c,'set','bind','saveOnExit','flush','saveNow');c.bind();
   control.value='всё в границах, всё ок';
   c.saveOnExit();assert.equal(c.state.data.inspection.plan_note,control.value);
@@ -750,7 +795,7 @@ test('a committed evidence upload with a lost ACK does not turn the next observa
     if (!options) return { draft: await store.current(108, 123) };
     const input = JSON.parse(options.body);
     if (url.endsWith('/evidence')) { await store.addEvidence(108, c.state.draft.id, input); c.state.data.conclusion = 'Typed while the original upload was in flight'; c.changed(); throw Object.assign(new Error('Synthetic lost evidence ACK'), { retryable: true }); }
-    return { draft: await store.update(108, c.state.draft.id, input.revision, input.data) };
+    return { ok:true, draft: await store.update(108, c.state.draft.id, input.revision, input.data) };
   };
   load(c, 'postEvidence', 'flush', 'saveNow');
   let uploadError; try { await c.postEvidence({ name: 'Phone.png', type: 'image/png' }, 'entrance', 'door-1', original.toString('base64')); } catch (error) { uploadError = error; }
@@ -807,7 +852,7 @@ test('a committed evidence removal with a lost ACK preserves in-flight text and 
       c.state.data.conclusion='Text typed while removal acknowledgement was lost';c.changed();
       throw Object.assign(new Error('Synthetic lost removal ACK'),{retryable:true});
     }
-    return{draft:await store.update(108,c.state.draft.id,input.revision,input.data)};
+    return{ok:true,draft:await store.update(108,c.state.draft.id,input.revision,input.data)};
   };
   load(c,'deleteEvidence','flush','saveNow');
   await c.deleteEvidence(fileId);await c.tail;
@@ -828,7 +873,7 @@ async function removalFixture(store,generated=false){
     if(!options)return{draft:await store.current(108,123)};
     const input=JSON.parse(options.body);
     if(options.method==='DELETE')return store.removeEvidence(108,c.state.draft.id,fileId,input.revision);
-    return{draft:await store.update(108,c.state.draft.id,input.revision,input.data)};
+    return{ok:true,draft:await store.update(108,c.state.draft.id,input.revision,input.data)};
   };
   load(c,'deleteEvidence','flush','saveNow','merge','restoreData','reconcileDraft');return{c,fileId};
 }

@@ -55,7 +55,7 @@ function harness(data = compactVisit()) {
       // The server's real validator must accept the exact facts and generated
       // evidence after the actual browser submission path has prepared them.
       validateWorkflow(normalizeWorkflow({ ...copy(c.state.data), evidence: copy(c.state.evidence) }));
-      return { ok: true };
+      return { ok: true, draft_id: c.state.draft.id };
     },
   };
   vm.createContext(c);

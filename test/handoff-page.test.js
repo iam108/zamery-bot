@@ -68,6 +68,12 @@ function harness(options = {}) {
 }
 function lawyer(h) { h.node('lawyers').value = '108'; h.node('lawyers').onchange(); }
 
+test('the manager checklist preview uses the exact supported server profile combinations',()=>{
+  const{CHECKLIST_PROFILE,exactChecklist}=require('../src/checklists');
+  for(const region of CHECKLIST_PROFILE.region)for(const kind of CHECKLIST_PROFILE.kind)for(const service of CHECKLIST_PROFILE.service){const profile={region,kind,service};assert.equal(M.checklistAvailable(profile),!!exactChecklist(profile),JSON.stringify(profile));}
+  for(const profile of[{},{region:'Unknown',kind:'Магазин',service:'Получение'},{region:'МСК',kind:'constructor',service:'Получение'}])assert.equal(M.checklistAvailable(profile),false);
+});
+
 test('the existing lawyer selector shows assigned workload including zero while review retains the plain recipient name',async()=>{
   const h=harness({prefill:{ok:true,lawyers:[{tg_id:108,name:'Елена',active_cases:3},{tg_id:109,name:'Мария',active_cases:0}],report:{src:'a',id:15},order:{id:60}}});await pause();
   assert.match(h.node('lawyers').innerHTML,/Елена · 3 в работе/);assert.match(h.node('lawyers').innerHTML,/Мария · 0 в работе/);
@@ -629,6 +635,11 @@ test('manual review and payload contain only real client facts and optional save
   assert.equal(body.manual_client,true);assert.equal(body.handoff_version,2);for(const key of ['order_id','request_id','report_id','report_src'])assert.equal(body[key],null,key);
   assert.equal(body.egrn_order,false);assert.equal(body.cad_num,'');assert.equal(body.audit_text,'');assert.equal(body.region,'МСК');assert.deepEqual(body.contacts,[]);assert.deepEqual(body.manual_files,[]);
   assert.match(h.node('delivery-title').textContent,/Клиент создан/);assert.doesNotMatch(h.node('delivery-text').textContent,/ЕГРН|отчёт/);
+});
+
+test('unsupported manual profiles show a clear warning before confirmation without blocking client assignment',async()=>{
+ const h=harness({query:'?mode=manual'});await pause();fillManual(h,{region:'СПб',kind:'Магазин',service:'Получение'});h.node('go').click();await pause();assert.equal(h.node('review').hidden,false);assert.equal(h.node('review-checklist-warning').hidden,false);assert.match(h.node('review-checklist-warning').textContent,/Для этой услуги пока нет подходящего чек-листа/);assert.doesNotMatch(h.node('review-list').innerHTML,/Чек-лист по выбранной услуге/);
+ h.node('confirm-send').click();await pause();const posted=JSON.parse(h.calls.find(call=>call[1]==='/api/handoff')[2].body);assert.equal(posted.region,'СПб');assert.equal(posted.kind,'Магазин');assert.equal(posted.service,'Получение');assert.equal(h.postRequests(),1);
 });
 
 test('manual creation requires a selected lawyer and displays the actual available workload',async()=>{

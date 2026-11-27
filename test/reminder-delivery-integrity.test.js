@@ -131,6 +131,40 @@ test('marking a case reminder done during its first delivery prevents sending it
   await h.reminders(); assert.deepEqual(h.deliveries.map(event => event.chat), ['808']);
 }));
 
+test('archived clients pause existing personal reminders without losing their dates or resuming them before restoration', pg, async () => fixture(async h => {
+  await h.db.exec("INSERT INTO case_reminders(id,case_id,remind_on,text,created_by) VALUES(1,17,'2026-11-05','Synthetic archived reminder',101)");
+  const before = (await h.db.query('SELECT * FROM case_reminders WHERE id=1')).rows[0];
+  await h.db.exec("UPDATE cases SET data=jsonb_set(data,'{_stage}','\"Архив\"') WHERE id=17");
+  await h.reminders(); assert.deepEqual(h.deliveries, [], 'An archived client must not send a personal reminder');
+  const paused = (await h.db.query('SELECT * FROM case_reminders WHERE id=1')).rows[0];
+  assert.equal(paused.done, false); assert.equal(paused.sent_at, null); assert.deepEqual(paused.remind_on, before.remind_on); assert.equal(paused.text, before.text);
+  const pausedStatus = (await h.getReminders()).items[0].deliveryStatus; assert.equal(pausedStatus.state, 'paused'); assert.equal(pausedStatus.nextAt, null); assert.equal(pausedStatus.total, 2);
+  h.restart(); h.advance(10*60*1000); await h.reminders(); assert.deepEqual(h.deliveries, [], 'Restarting cannot resume an archived task');
+  await h.db.exec("UPDATE cases SET data=jsonb_set(data,'{_stage}','\"Подано\"') WHERE id=17");
+  await h.reminders(); assert.deepEqual(h.deliveries.map(event => event.chat), ['808', '101']);
+  const resumed = (await h.db.query('SELECT * FROM case_reminders WHERE id=1')).rows[0]; assert.ok(resumed.sent_at); assert.equal(resumed.done, false); assert.equal(resumed.text, before.text);
+}));
+
+test('archiving a client while the final reminder recipient lookup waits prevents the first Telegram send', pg, async () => fixture(async h => {
+  await h.db.exec("INSERT INTO case_reminders(id,case_id,remind_on,text,created_by) VALUES(1,17,'2026-11-05','Synthetic archived reminder',101)");
+  let lookups = 0;
+  h.beforeQuery(async sql => { if (isRecipientLookup(sql) && ++lookups === 2) await h.db.exec("UPDATE cases SET data=jsonb_set(data,'{_stage}','\"Архив\"') WHERE id=17"); });
+  await h.reminders(); assert.ok(lookups >= 2, 'The archive transition must reach the final send gate'); assert.deepEqual(h.deliveries, []);
+  const row = (await h.db.query('SELECT * FROM case_reminders WHERE id=1')).rows[0]; assert.equal(row.done, false); assert.equal(row.sent_at, null);
+}));
+
+test('archiving after one reminder receipt pauses the other recipient and restoration resumes only its missing copy', pg, async () => fixture(async h => {
+  await h.db.exec("INSERT INTO case_reminders(id,case_id,remind_on,text,created_by) VALUES(1,17,'2026-11-05','Synthetic partly delivered reminder',101)");
+  h.mutate(async event => { if (event.chat === '808') await h.db.exec("UPDATE cases SET data=jsonb_set(data,'{_stage}','\"Архив\"') WHERE id=17"); });
+  await h.reminders(); assert.deepEqual(h.deliveries.map(event => event.chat), ['808']);
+  let row = (await h.db.query('SELECT * FROM case_reminders WHERE id=1')).rows[0]; assert.ok(row.delivery['808']); assert.equal(row.delivery['101'], undefined); assert.equal(row.sent_at, null);
+  const pausedStatus = (await h.getReminders()).items[0].deliveryStatus; assert.equal(pausedStatus.state, 'paused'); assert.equal(pausedStatus.confirmed, 1); assert.equal(pausedStatus.total, 2);
+  h.restart(); await h.reminders(); assert.equal(h.deliveries.length, 1);
+  await h.db.exec("UPDATE cases SET data=jsonb_set(data,'{_stage}','\"Подано\"') WHERE id=17");
+  await h.reminders(); assert.deepEqual(h.deliveries.map(event => event.chat), ['808', '101']);
+  row = (await h.db.query('SELECT * FROM case_reminders WHERE id=1')).rows[0]; assert.ok(row.sent_at); assert.ok(row.delivery['808']); assert.ok(row.delivery['101']);
+}));
+
 test('completing a case reminder while its final staff lookup waits prevents the first Telegram send',pg,async()=>fixture(async h=>{
   await h.db.exec("INSERT INTO case_reminders(id,case_id,remind_on,text,created_by) VALUES(1,17,'2026-11-05','Synthetic reminder',101)");
   let lookups=0;h.beforeQuery(async sql=>{if(isRecipientLookup(sql)&&++lookups===2)await h.db.exec('UPDATE case_reminders SET done=true WHERE id=1');});
@@ -226,6 +260,7 @@ test('web reminder labels disclose unknown/partial delivery and never promise 9:
   assert.equal(context.reminderStatusLabel({ state: 'confirmed' }),'доставка подтверждена');
   assert.match(context.reminderStatusLabel({ state: 'no_recipient' }),/Нет доступного получателя.*проверим снова/);
   assert.match(context.reminderStatusLabel({ state: 'recipient_check_failed' }),/Не удалось проверить доступ получателя; повторим проверку/);
+  assert.match(context.reminderStatusLabel({ state: 'paused' }), /Клиент в архиве.*приостановлено.*возвращения в работу/);
 });
 
 test('a restarted decision sender exposes its unknown DM and retries it after backoff without repeating the group receipt', pg, async () => fixture(async h => {

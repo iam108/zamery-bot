@@ -22,10 +22,14 @@ async function loadRecipientAccess(db, client, creators = [], now = Date.now(), 
     activeReminder ? [client.id,creatorIds,gate.reminderId] : [client.id,creatorIds])).rows : [];
     const current = rows[0]?.access_case || null;
     const ids = recipientIds([current?.lawyer_tg_id,...creatorIds]);
-    const allowed = ids.filter(id => canAccessCase(rows.find(actor => String(actor.tg_id) === id), id, current));
+    const paused = current?.data?._stage === 'Архив';
+    // Archiving pauses queued notifications, not the reminder or its receipts.
+    // Evaluate this in the same final snapshot as assignment and staff access,
+    // including the before-send check after an earlier recipient was notified.
+    const allowed = activeReminder && paused ? [] : ids.filter(id => canAccessCase(rows.find(actor => String(actor.tg_id) === id), id, current));
     // Keep the full case snapshot separate: persisting it under delivery would
     // recursively duplicate that case's own delivery and handoff checkpoints.
-    return { client: current, access: { checked: true, checked_at: now, next_at: now+RETRY_MS,
+    return { client: current, access: { checked: true, checked_at: now, next_at: now+RETRY_MS, paused,
       allowed, excluded: ids.filter(id => !allowed.includes(id)) } };
   } catch (_) {
     // Absence of current staff evidence never grants a send permission.

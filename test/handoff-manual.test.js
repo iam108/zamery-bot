@@ -45,6 +45,14 @@ test('manual MO client retains its cadastral number but performs no EGRN, audit,
  await h.invoke(body);await h.invoke({resume_case_id:c.id});assert.equal(h.events.length,2);assert.equal((await h.cases()).length,1);
 }));
 
+for(const profile of[{region:'СПб',kind:'Магазин',service:'Получение'},{region:'МСК',kind:'Общепит',service:'Переоформление'},{region:'МО',kind:'Табак',service:'Получение'}])test('manual '+JSON.stringify(profile)+' stays assignable without borrowing an unrelated checklist',pg,async()=>fixture(async h=>{
+ const request=await h.body(profile),result=await h.invoke(request);assert.equal(result.delivery_complete,true);const[c]=await h.cases();assert.equal(c.checklist_key,null);assert.equal(c.total,0);for(const[field,value]of Object.entries(profile))assert.equal(c[field],value);
+ assert.match(result.warn,/Для этой услуги пока нет подходящего чек-листа/);
+ const card=h.events.find(event=>event.type==='card'),notice=h.events.find(event=>event.type==='notice');assert.match(card.text,/Для этой услуги пока нет подходящего чек-листа/);assert.match(notice.text,/Для этой услуги пока нет подходящего чек-листа/);
+ const buttons=card.opts.reply_markup.inline_keyboard.flat();assert.ok(buttons.some(button=>button.text==='Карточка клиента'&&new URL(button.web_app.url).pathname==='/checklist'));assert.ok(buttons.some(button=>button.text==='Вернуть на доработку'));assert.ok(buttons.some(button=>button.text==='Документы клиента'));assert.equal(c.data._handoff.checklistUnavailable,true);
+ const sent=h.events.length;assert.deepEqual(await h.invoke(request),result);assert.deepEqual(await h.invoke({resume_case_id:c.id}),result);assert.equal(h.events.length,sent);assert.equal((await h.cases()).length,1);
+}));
+
 for(const change of [{order_id:62},{request_id:9},{report_id:15,report_src:'a'},{report_src:'a'},{egrn_order:true},{manual_client:'true'},{manual_client:false,manual_files:[{}]}])test('manual contract rejects bound sources, EGRN opt-in or a forged marker '+JSON.stringify(change),pg,async()=>fixture(async h=>{
  await assert.rejects(h.invoke(await h.body(change)),error=>error.status===400&&error.code==='HANDOFF_MANUAL_INVALID');assert.equal((await h.cases()).length,0);assert.equal(h.events.length,0);
 }));

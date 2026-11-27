@@ -13,7 +13,7 @@ const GROUP = '-100123', OWNER = '111', LAWYER = '222';
 const CAD = '77:17:0120316:999';
 const pdf = Buffer.from('%PDF-1.7\n' + 'synthetic '.repeat(35) + '\n%%EOF');
 
-async function fixture({ requester = OWNER, target = LAWYER, approved = false, notificationFailure } = {}) {
+async function fixture({ requester = OWNER, target = LAWYER, approved = false, notificationFailure, notificationEditFailure } = {}) {
   const { PGlite } = require(process.env.PGLITE_TEST_MODULE);
   const db = new PGlite(), calls = { documents: [], copies: [], notices: [], edits: [], status: [], logs: [], paid: 0 };
   let tail = Promise.resolve(), scheduled, failure;
@@ -21,7 +21,11 @@ async function fixture({ requester = OWNER, target = LAWYER, approved = false, n
     async connect() {
       const before = tail; let release;
       tail = new Promise(resolve => { release = resolve; }); await before;
-      return { async query(sql, values) { if (failure?.(sql, values)) throw Object.assign(new Error('Synthetic SQL failure'), { code: 'QA_SQL' }); return values ? db.query(sql, values) : db.exec(sql).then(rows => rows.at(-1)); }, release };
+      return { async query(sql, values) {
+        if (failure?.(sql, values)) throw Object.assign(new Error('Synthetic SQL failure'), { code: 'QA_SQL' });
+        const result = values ? await db.query(sql, values) : (await db.exec(sql)).at(-1);
+        return { ...result, rowCount: result.affectedRows };
+      }, release };
     },
     async query(sql, values) { const c = await pool.connect(); try { return await c.query(sql, values); } finally { c.release(); } },
   };
@@ -30,7 +34,7 @@ async function fixture({ requester = OWNER, target = LAWYER, approved = false, n
     async sendDocument(chat, file) { calls.documents.push({ chat: String(chat), bytes: file.source }); return { message_id: 200 + calls.documents.length, document: { file_id: 'synthetic-only', mime_type: 'application/pdf' } }; },
     async callApi(method, value) { assert.equal(method, 'copyMessage'); calls.copies.push(value); return { message_id: 300 + calls.copies.length }; },
     async sendMessage(chat, text) { const call = { chat: String(chat), text }; calls.notices.push(call); await notificationFailure?.(call); call.delivered = true; return { message_id: 400 + calls.notices.length }; },
-    async editMessageText(chat, id, inline, text) { calls.edits.push({ chat: String(chat), id, text }); return { message_id: Number(id) }; },
+    async editMessageText(chat, id, inline, text) { const call = { chat: String(chat), id, text }; calls.edits.push(call); await notificationEditFailure?.(call); return { message_id: Number(id) }; },
   };
   const bot = { on() {}, hears() {}, action() {}, command(name, handler) { commands.push({ name, handler }); }, telegram };
   const env = { EGRN_TOKEN: 'synthetic', EGRN_DECLARANT_ID: '1', EGRN_CHAT_ID: GROUP, ADMIN_TG_IDS: OWNER };
@@ -177,5 +181,100 @@ test('notification checkpoints preserve an unresolved original attempt and consu
     assert.deepEqual(row.delivery_state.retry_cursors, retry_cursors);
     assert.ok(row.delivery_state.stopped_notice);
     assert.equal(h.calls.notices.length, 1); assert.equal(h.calls.paid, 0);
+  } finally { await h.close(); }
+});
+
+
+test('a deleted prior warning is recreated for its still-authorized private recipient when the blocked assignment changes', pg, async () => {
+  let deleted = false;
+  const h = await fixture({
+    notificationEditFailure(call) { if (deleted && call.chat === OWNER) throw { response: { error_code: 400, description: 'Bad Request: message to edit not found' } }; },
+    notificationFailure(call) { if (call.chat === GROUP) throw { response: { error_code: 403, description: 'Forbidden' } }; },
+  });
+  try {
+    await h.poll();
+    const first = await h.row(), previous = first.delivery_state.stopped_notice;
+    assert.equal(previous.state, 'sent'); assert.equal(previous.chat, OWNER);
+    assert.equal(h.calls.notices.filter(call => call.delivered).length, 1);
+    deleted = true;
+    await h.pool.query('UPDATE cases SET lawyer_tg_id=333 WHERE id=9');
+    await h.due(); await h.poll();
+    const delivered = h.calls.notices.filter(call => call.delivered);
+    assert.equal(delivered.length, 2, 'A definite deleted-message rejection permits one replacement warning to the same eligible recipient');
+    assert.equal(delivered[1].chat, OWNER);
+    const saved = await h.row();
+    assert.equal(saved.delivery_state.stopped_notice.state, 'sent');
+    assert.equal(saved.delivery_state.stopped_notice.chat, OWNER);
+    assert.notEqual(saved.delivery_state.stopped_notice.id, previous.id);
+    assert.notEqual(saved.delivery_state.stopped_notice.fingerprint, previous.fingerprint);
+    await h.due(); await h.poll();
+    assert.equal(h.calls.notices.filter(call => call.delivered).length, 2, 'The replacement remains deduplicated');
+    assert.equal(h.calls.documents.length, 1); assert.equal(h.calls.paid, 0);
+  } finally { await h.close(); }
+});
+
+for (const kind of ['ambiguous', 'forbidden']) test('a prior warning edit with ' + kind + ' failure never creates another private warning to that recipient', pg, async () => {
+  let changed = false;
+  const h = await fixture({
+    notificationEditFailure() { if (changed) { if (kind === 'forbidden') throw { response: { error_code: 403, description: 'Forbidden' } }; throw new Error('Synthetic edit acknowledgement lost'); } },
+    notificationFailure(call) { if (call.chat === GROUP) throw { response: { error_code: 403, description: 'Forbidden' } }; },
+  });
+  try {
+    await h.poll(); changed = true;
+    await h.pool.query('UPDATE cases SET lawyer_tg_id=333 WHERE id=9');
+    await h.due(); await h.poll();
+    assert.equal(h.calls.notices.filter(call => call.chat === OWNER).length, 1, 'Only a definite deleted-message response can recreate the private warning');
+    if (kind === 'ambiguous') {
+      assert.equal(h.calls.notices.length, 1, 'An unknown edit result cannot fall back to another recipient');
+      assert.equal((await h.row()).delivery_state.stopped_notice.state, 'reserved');
+      h.restart(); await h.due(); await h.poll();
+      assert.equal(h.calls.notices.length, 1);
+    }
+    assert.equal(h.calls.documents.length, 1); assert.equal(h.calls.paid, 0);
+  } finally { await h.close(); }
+});
+
+test('a deleted prior warning does not recreate a private copy after access is revoked during its edit', pg, async () => {
+  let deleted = false;
+  const requester = '333';
+  const h = await fixture({ requester,
+    async notificationEditFailure(call) {
+      if (deleted && call.chat === requester) {
+        await h.pool.query('UPDATE staff SET approved=false WHERE tg_id=$1', [requester]);
+        throw { response: { error_code: 400, description: 'Bad Request: message to edit not found' } };
+      }
+    },
+  });
+  try {
+    await h.pool.query("INSERT INTO staff VALUES(333,true,'manager')");
+    await h.poll(); assert.equal(h.calls.notices[0].chat, requester);
+    deleted = true;
+    await h.pool.query('UPDATE cases SET lawyer_tg_id=444 WHERE id=9');
+    await h.due(); await h.poll();
+    assert.equal(h.calls.notices.filter(call => call.chat === requester).length, 1, 'Revoked access is rechecked after the failed edit, before any replacement');
+    assert.equal(h.calls.notices.at(-1).chat, OWNER, 'An authorized administrator can receive the fallback');
+    assert.equal((await h.row()).delivery_state.stopped_notice.chat, OWNER);
+    assert.equal(h.calls.documents.length, 1); assert.equal(h.calls.paid, 0);
+  } finally { await h.close(); }
+});
+
+for (const editFailure of ['deleted', 'forbidden']) test('a prior warning cannot fall back after a ' + editFailure + ' edit failure when its worker lease changed', pg, async () => {
+  let deleted = false, replacementToken;
+  const h = await fixture({
+    async notificationEditFailure() {
+      if (deleted) {
+        replacementToken = (await h.pool.query('UPDATE egrn_orders SET processing_token=gen_random_uuid() WHERE id=$1 RETURNING processing_token', [h.order.id])).rows[0].processing_token;
+        throw { response: editFailure === 'deleted' ? { error_code: 400, description: 'Bad Request: message to edit not found' } : { error_code: 403, description: 'Forbidden' } };
+      }
+    },
+  });
+  try {
+    await h.poll(); deleted = true;
+    await h.pool.query('UPDATE cases SET lawyer_tg_id=333 WHERE id=9');
+    await h.due(); await h.poll();
+    assert.equal(h.calls.notices.length, 1, 'A stale lease cannot send a replacement or a fallback warning');
+    const saved = await h.row(); assert.equal(saved.processing_token, replacementToken);
+    assert.equal(saved.delivery_state.stopped_notice.state, 'reserved');
+    assert.equal(h.calls.documents.length, 1); assert.equal(h.calls.paid, 0);
   } finally { await h.close(); }
 });
